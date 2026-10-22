@@ -98,9 +98,11 @@ The engine needs only the main window's `HWND`, which 03 passes in as the picker
 native/
 ├─ include/isshoni_media.h        C ABI v1 (§5)                                                    04 (audio block: 05)
 ├─ CMakeLists.txt  CMakePresets.json  vcpkg.json  vcpkg-configuration.json  .clang-format          04
+├─ triplets/x64-windows-static.cmake   vcpkg's triplet plus the MSVC toolset of tools.json (§13.1)  04
 ├─ ffmpeg/pins.json  ffmpeg/lock.json   FFmpeg inputs and the published build (06 §4.1; CMake reads lock.json)  06
 ├─ common/                         portable C++20
-│  ├─ include/im/{abi,ring,h264,pace,encpolicy,json,log,os}/…                                       04
+│  ├─ include/im/{abi,ring,h264,pace,encpolicy,json,log,os,video,capture}/…  (video: scale, resize;
+│  │                               capture: the Win10 monitor map of §7.5)                           04
 │  ├─ src/…                                                                                          04
 │  ├─ audio/                       PcmSink, the Opus stage, the PCM tap, the test tone (§10.3)       04
 │  ├─ audiopolicy/                 rules, classification, planner; target im_audiopolicy             05
@@ -124,7 +126,7 @@ native/
    ├─ tools/hwcheck.ps1            the owner's-PC hardware run (§14)                                  04
    └─ third_party/openh264/        codec_api.h, codec_app_def.h, codec_def.h, codec_ver.h and LICENSE
                                    (Cisco's BSD-2-Clause text at the pinned tag)                      04
-internal/media/native/             Go binding (§12); audio_windows.go is 05's                        04
+internal/media/native/             Go binding (§12); audio.go is 05's                                04
 cmd/isshoni-enginetest/            Go tool (§14)                                                      04
 ```
 
@@ -776,8 +778,10 @@ slice E1 from these numbers (including 05's audio structs).
 - **`im_init.abi_version`** tells the DLL which minor the caller expects; the DLL logs a mismatch and keeps working
   (struct sizes carry the real compatibility).
 - **Build version**: the DLL's `VERSIONINFO` and `im_build_info().engine` carry the release SemVer (06 sets it from
-  the tag). Go logs both versions at startup and warns on a mismatch; it does not refuse, because the installer
-  always ships both together and dev builds mix them on purpose.
+  the tag). The binding logs the engine's build, ABI and commit at `Open` (`engine opened`); it can't know the app's
+  version, because depguard keeps `internal/version` out of `internal/media/native` (01 §4). The app (03) compares
+  `Info().Build` with its own `internal/version` at startup and logs a warning on a mismatch (README §3 item 27).
+  Neither refuses, because the installer always ships both together and dev builds mix them on purpose.
 - **Static engines (M3, M4)**: `im_version` is still called, so a stale static library linked into a newer Go build
   fails loudly in CI.
 
@@ -902,7 +906,7 @@ their values for S1 compatibility and for later engines.
 |---|---|---|
 | `missing` | `IM_ERR_DEPENDENCY` | an FFmpeg DLL or the OpenH264 file is absent from its folder |
 | `version` | `IM_ERR_DEPENDENCY` | wrong FFmpeg major (or minor below the build's), or `WelsGetCodecVersion` ≠ the pin |
-| `blocked_by_policy` | `IM_ERR_DEPENDENCY` | `ERROR_ACCESS_DISABLED_BY_POLICY`, `STATUS_INVALID_IMAGE_HASH` (Smart App Control, WDAC) |
+| `blocked_by_policy` | `IM_ERR_DEPENDENCY` | `ERROR_ACCESS_DISABLED_BY_POLICY` (1260), `STATUS_INVALID_IMAGE_HASH` (577), `ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION` (4551, how current Windows reports an App Control or Smart App Control block); Go's `Open` gives a failed load of `isshoni-media.dll` with one of these three the same token (§12.2) |
 | `driver_too_old` | `IM_ERR_DEPENDENCY` (encoder status) | NVENC's API version is newer than the driver |
 | `disabled` | `IM_ERR_DEPENDENCY` (encoder status) | OpenH264 is not turned on |
 | `no_media_foundation` | `IM_ERR_DEPENDENCY` (encoder status) | `MFStartup` failed (N editions without the Media Feature Pack) |
@@ -950,6 +954,13 @@ on 01's sentinels and reads `Reason`.
 its §5.3 row's "Blocks" value + 1 s; then it returns `IM_ERR_TIMEOUT` (token `engine_timeout`) and the job's late
 result is discarded (a late `im_start` is stopped and freed by the worker itself).
 
+**`im_init` and audio**: `im_init` starts the worker and posts `AudioEngine::Init` to it. An `Init` that fails is
+logged at warn and `im_init` still returns `IM_OK` with no `im_last_error` detail left behind: audio never fails a call
+(§10.1), video sharing works without it, 05's report shows the audio state, and `im_shutdown` still calls `Shutdown`,
+which copes with a failed `Init`. Only an `Init` that outlives its bound fails `im_init` (`IM_ERR_TIMEOUT`, and the
+worker is stopped again); when that late `Init` then succeeds, the worker calls `Shutdown` on it itself, so a later
+`im_init` never finds 05's watcher running.
+
 Rules for every real-time thread (WGC callback, DD capture, video, audio capture and mixer, test tone): no
 allocation after warm-up (pools are sized at start), no lock that another thread holds across blocking work, no
 synchronous logging (the log ring is a bounded lock-free MPSC queue and drops on overflow), and never a call into the
@@ -966,7 +977,9 @@ wake-up; the result shows in packets, events and stats.
 - **One SPSC ring per stream**: per video layer (producer: the video thread), one for Opus audio and one for the PCM
   tap (producer of both: the mixer thread, or the test-tone thread, through the Opus stage). Each ring is a slot
   array plus a byte arena; a slot holds `{offset, size, flags, capture_ts, width, height, profile, duration}`. The
-  consumer is the single `im_next_packet` caller.
+  consumer is the single `im_next_packet` caller. Each packet is contiguous in the arena: one that doesn't fit before
+  the arena's end skips the tail and starts at its beginning, so a packet larger than half the arena may not fit even
+  in an empty ring (the ring's `HasRoom` gives the exact answer; layer 0's 8 MiB keeps that far above any IDR).
 
   | Stream | Slots | Arena |
   |---|---|---|
@@ -977,7 +990,8 @@ wake-up; the result shows in packets, events and stats.
 
 - **Events**: one bounded MPSC queue per session, 64 entries of at most 1 KiB of JSON each. Real-time threads only set
   atomic flags; the supervisor turns them into events. On overflow the oldest non-`ENDED` event goes (counted in the
-  next `RING_OVERFLOW`).
+  next `RING_OVERFLOW`). An `ENDED` whose JSON would exceed 1 KiB is queued with `{}` (its status still carries the
+  cause), and every push after `ENDED` is refused, a second `ENDED` included, so `ENDED` is always the last event.
 - **`im_next_packet` order**: events first; then, among the streams with a ready packet, the one with the smallest
   `capture_ts_ns`. There is no holding back: order is strict **within** a stream, not across streams. 01's publisher
   stamps each track from its own packets' capture times, so cross-stream order doesn't matter (M1's fake returned
@@ -1033,7 +1047,7 @@ wake-up; the result shows in packets, events and stats.
 
 | What | Value |
 |---|---|
-| Sessions per process | 4 (`IM_ERR_LIMIT` beyond; the v1 UI uses 1) |
+| Sessions per process | 4 (`IM_ERR_LIMIT` beyond; the v1 UI uses 1: Go's `Start` runs one at a time, only enginetest's `StartExtra` more, §12.2) |
 | Sessions with audio | 1 (05's mixer is per process) |
 | Layers per session | 3 (M2: 2) |
 | Output size per side | 64 .. 4096 pixels, even |
@@ -1295,8 +1309,9 @@ next_due[l] = −∞                      until the layer's first encode (and af
 wake on: new frame published | timer | command | stop
 for each active layer l:
   due = now >= next_due[l] − 2 ms                       (2 ms tolerance for timer and vsync jitter)
-  if new frame since last_encode[l] and due:           encode(latest, l); advance(l)
-  elif force_idr[l] and (due or no new frame for one interval[0]):   encode(latest or last, l, IDR); advance(l)
+  if new frame since last_encode[l] and due:           encode(latest, l); advance(l)       (an IDR if one is wanted)
+  elif force_idr[l] and (no new frame for one interval[0] or (paused and due)):
+                                                       encode(latest or last, l, IDR); advance(l)
   elif no new frame for 200 ms and refresh due[l]:     encode(last, l, REFRESH); advance(l)
 arm the timer at the earliest next_due[l] − 2 ms of a layer with a pending new frame or IDR, else the next refresh
 
@@ -1314,9 +1329,16 @@ advance(l):                           the nominal schedule
   about 68 fps, 13 % above the rate the CBR budget assumes.) The resync rule keeps a source that resumes after a
   pause or a static stretch from being encoded in a catch-up burst.
 - The preview layer reuses the same captured frame at its own 15 fps cadence.
+- **A wanted IDR on a moving source rides on the layer's next due new frame**, so it is never a duplicate picture: a
+  re-encode of the last frame at the due instant would often beat a 60 Hz source's next frame by the 2 ms tolerance.
+  On a static screen (no new frame for one interval of layer 0) the last frame is re-encoded as the IDR within one
+  interval, and while paused as soon as the layer is due.
 - Capture timestamps pass through unchanged (they are monotonic per stream; a timestamp not after the previous one is
-  bumped by 1 µs). A refresh or a static IDR is stamped with **now**, because RTP time must advance and the picture is
-  current.
+  bumped by 1 µs, and none is before `epoch_ns`). A refresh, a static IDR and a frame captured more than 500 ms before
+  its encode (a reactivated layer, or a resume on a static screen) are stamped with **now**, because RTP time must
+  advance, the picture is current, and the pump's 1 s stale rule (§6.2) must not drop it at once.
+- **`drops.pacer`** (§5.6) counts frames superseded while the layer was due, i.e. the encoder fell behind. Thinning a
+  faster source to the target is not a drop: `q` at 15 fps of a 60 fps source shows `pacer` 0.
 - **Overload**: when an encode takes longer than the interval, the next due frame is simply encoded later, so the frame
   rate drops by itself. When `fpsOut` stays below 90 % of `min(target, fpsIn)` for 3 s, `LIMIT_CHANGED` reports `cpu`
   (software encoder) or `gpu`; it returns to `none` after 10 s above 95 %.
@@ -1375,7 +1397,7 @@ Only encoders whose probe status is `IM_OK` take part; an encoder that fails to 
   names `avcodec-<C>.dll`/`avutil-<U>.dll` and the majors in; `tag` goes into `im_build_info`. Not import-linked:
   the engine loads, probes and captures audio when the FFmpeg DLLs are missing, damaged or blocked by policy
   (`IM_ERR_DEPENDENCY` with token `missing`, `version` or `blocked_by_policy` for `ERROR_ACCESS_DISABLED_BY_POLICY`,
-  `STATUS_INVALID_IMAGE_HASH`).
+  `STATUS_INVALID_IMAGE_HASH`, `ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION`, §5.7).
 - **Version check**: `avutil_version() >> 16 == LIBAVUTIL_VERSION_MAJOR`, `avcodec_version() >> 16 ==
   LIBAVCODEC_VERSION_MAJOR`, and the minors at least the ones built against; struct layouts are stable within a major.
   **No hash check**: the LGPL lets users replace the library, and a same-major build of their own must keep working.
@@ -1438,15 +1460,22 @@ M5.
   - splits NAL units on 3- and 4-byte start codes and re-emits them with 4-byte start codes;
   - drops access unit delimiters (9), end of sequence (10), end of stream (11), filler (12) and SEI (6);
   - keeps the latest SPS and PPS; **an IDR access unit always goes out as SPS, PPS, then the slices**: missing headers
-    are inserted from the cache, duplicates removed (the plan's "SPS/PPS in-band before every IDR", for every encoder);
+    are inserted from the cache, duplicates removed (the plan's "SPS/PPS in-band before every IDR", for every encoder).
+    An SPS or PPS larger than `kMaxSpsBytes` is dropped and empties its cache entry, so the output stays within
+    `MaxOutputSize` and the buffer `Reserve` sized (no allocation on the video thread); an access unit with parameter
+    sets only produces no output (they go into the cache);
   - parses the SPS (`common/h264/sps`): profile_idc, constraint flags, level, size after cropping; these fill
     `im_packet.profile`, `width` and `height`;
   - for a CB session, rewrites the SPS constraint byte to `0xE0` (constraint_set0/1/2), so the stream's key is
     `42e0` like the SFU's table expects (02 §8.2 of M1). Hardware and OpenH264 baseline streams use no FMO, ASO or
-    redundant slices, which is what those flags promise. The byte sits right after profile_idc and before level_idc;
-    changing it can't create an emulation-prevention sequence, and the normalizer checks that anyway;
-  - checks that a High session's SPS says profile_idc 100; an encoder that emits anything else is closed and the next
-    one tried (`ENCODER_CHANGED`, reason `encode_error`);
+    redundant slices, which is what those flags promise. For a High session it rewrites the byte to `0x00`, so the key
+    is `6400` (§12.2: the engine never sets constraint_set4/5; clearing a constraint flag only withdraws a promise, so
+    the stream stays valid). Only that byte changes, emulation prevention kept, and the normalizer parses the rewritten
+    SPS again before it caches or uses it (an SPS whose rewrite doesn't parse back is dropped like an oversized one);
+    the rewrite happens only when profile_idc matches the session;
+  - checks that a High session's SPS says profile_idc 100 and a CB session's 66; a mismatching SPS is left as it is and
+    flagged (`profile_mismatch`), and the encoder that emitted it is closed and the next one tried (`ENCODER_CHANGED`,
+    reason `encode_error`);
   - `KEYFRAME` = the access unit contains an IDR slice (type 5). The encoder's own key flag is only cross-checked.
 - The normalizer is fuzzed (§18) and idempotent.
 
@@ -1482,7 +1511,9 @@ guards the expensive case:
 - **All layers of a session carry the same profile**: the layers share one transceiver and payload type. Each layer
   takes the first encoder in the order of §9.1 that supports the session profile. If the only encoder that opens for
   some layer is CB-only (OpenH264), the session profile becomes CB for every layer, and `im_session_info` says so;
-  `im_start` never returns a mixed session. 01 offers the profile the session reports (`media.Event.Profile` of the
+  `im_start` never returns a mixed session. `SelectEncoders` (`common/encpolicy`) runs that whole-session CB round
+  after a failed High round only when some candidate can do CB but not High, so `im_start`'s time stays bounded when
+  CB couldn't help. 01 offers the profile the session reports (`media.Event.Profile` of the
   `EventLayer` events, from `im_session_info.layers[].profile`, §12.3).
 - `im_set_profile(s, p)`: every layer re-opens with the new profile and emits `REINIT|KEYFRAME` (the M1 publisher
   sends that keyframe on the new payload type, M1 02 §15.1). Asking for High when the encoders can't do it leaves the
@@ -1685,8 +1716,11 @@ on (plan "A/V sync").
   one grid differ by exactly 20 000 000 ns (05 §10.3; 05's audiotest case 20 and the A/V budget rest on it).
 - **Flags** (§5.2): the first packet of a session and the first packet after `OnGap` carry `IM_PKT_REINIT` (a new
   grid; the time step may be any value); `OnGap` drops a half-filled frame. Packets dropped because the ring was full
-  or stale (§6.2) set `IM_PKT_DISCONTINUITY` on the next delivered one; the grid is unchanged, so Go's RTP timestamps
-  keep the gap.
+  or stale (§6.2), and a frame libopus failed to encode, set `IM_PKT_DISCONTINUITY` on the next delivered one; the
+  grid is unchanged, so Go's RTP timestamps keep the gap. A pending flag stays pending until a packet carrying it got
+  into the ring. Defensively (05 never sends such chunks), a chunk that is not 10 ms after the previous one without
+  an `OnGap` starts a new grid as `OnGap` would (`REINIT`), and a chunk that would start a frame less than 20 ms after
+  the previous packet is dropped, so packet times never go back (the tap does the same with 10 ms).
 - **Start at `epoch_ns`**: the mixer starts inside `im_start` and 05 stamps chunks `L` in the past, with `L ≥ 0` (`L0` =
   50 ms at start, then the measured value, ≈ 50 ms; 05 §10.3), so the first chunks are older than `epoch_ns`. The Opus
   stage drops chunks while the packet they would start would be stamped before `epoch_ns`
@@ -1697,7 +1731,9 @@ on (plan "A/V sync").
 - **PCM tap** (`IM_AUDIOF_TAP_PCM`, 05's audiotest): in addition to Opus, each chunk becomes one `IM_PACKET_PCM` of
   480 stereo float32 frames (3840 bytes, `duration_us = 10000`, `layer = IM_NO_LAYER`) in the PCM ring of §6.2,
   stamped with the chunk's `captureNs` (no lookahead; 05 §10.3). 05's audiotest cases 20 and 21 compare the tap with
-  the Opus stream of the same session, so both always flow together. There is no PCM-instead-of-Opus mode.
+  the Opus stream of the same session, so both always flow together. There is no PCM-instead-of-Opus mode. The tap
+  follows the per-stream flag rule too: `REINIT` on its first packet and after a new grid, `DISCONTINUITY` after its
+  own ring refused a write (Go ignores PCM flags).
 - **Mute and pause**: the mix bus is 05's. The user's mute (`im_audio_set_muted`) and pause (`im_set_paused` →
   `Mixer::SetPaused`) each fade the bus to zero in 10 ms (effective mute = user mute OR pause). The Opus stage keeps
   emitting encoded digital silence every 20 ms on the unbroken grid (05 §10.2), so the track never stalls and
@@ -1706,8 +1742,14 @@ on (plan "A/V sync").
 - **Test tone** (`IM_AUDIO_MODE_TEST_TONE`): a 04-owned source thread on a high-resolution waitable timer stands in
   for 05's mixer and feeds the same sink every 10 ms with the M1 fake's signal (440 Hz, a 1 kHz beep in the first
   100 ms of every second, the beeps starting at `epoch_ns + k × 1 s`), on an exact 10 ms QPC grid; it applies the
-  same 10 ms fade for pause. For enginetest, Go integration tests on CI runners without audio devices, and the A/V
-  checks. Under `IM_TEST_HOOKS` with `IM_ENC_FAKE`, the tone's Opus packets also carry M1's audio Marker, as
+  same 10 ms fade for pause and for the user's mute (`TestTone::SetMuted`: effective mute = user mute OR pause, as on
+  05's mix bus). `common/audio`'s `TestToneSource` is its portable pacer: the Windows thread waits until the deadline
+  `Pump` returned, reads the engine clock and calls `Pump` again; a source that fell more than 20 chunks behind starts
+  a new grid (`OnGap`) at whichever of its two newest due chunks lies a whole number of 20 ms frames after the first
+  chunk, so packets stay on `epoch_ns + k × 20 ms` whatever chunk the stall began after. For enginetest, Go
+  integration tests on CI runners without audio devices, and the A/V checks. `common/audio` also has
+  `OpusPacketDecoder` (48 kHz stereo float, state kept between packets), for the stage's tests and as the building
+  block of 05's `im_test_opus_decode`. Under `IM_TEST_HOOKS` with `IM_ENC_FAKE`, the tone's Opus packets also carry M1's audio Marker, as
   `fake.Source`'s Opus packets do: the stage re-frames each packet as a code-3 packet (RFC 6716 §3.2.5) whose padding
   is the 18-byte Marker of `internal/media/fake/marker.go` (RID 0, `Frame` = packet index, `CaptureNS` =
   `capture_ts_ns − epoch_ns`, `Beep` on the first packet whose capture time is at or after each beep start).
@@ -1748,23 +1790,25 @@ on (plan "A/V sync").
 04 owns the package. Its public surface implements 01's contract (01 §5): `*Engine` is a `media.Engine`, the session
 is a `media.Session`, packets are `media.Packet`, and every error is a `*media.Error`. `*Engine` also implements 05's
 `media.AudioController`. The C mirror types are unexported; the only exported types of the package are the
-Windows-only extras of §12.2 and the OpenH264 helpers.
+Windows-only extras of §12.2, the OpenH264 helpers and 05's `AudioTest` (05 §13.2).
 
 ### 12.1 Files
 
 | File | Builds on | What |
 |---|---|---|
-| `abi.go` | all | constants mirroring the header; the unexported C-layout mirrors (`imPacket`, `imStartConfig`, `imLayerConfig`, `imAudioConfig`, `imExclusions`, `imRule`, `imCaps`, `imEncoderInfo`, `imAdapterInfo`, `imSourceInfo`, `imPickParams`, `imSessionInfo`, `imLayerInfo`, `imClockSample`, `imInitParams`, `imAudioLevels`); the status and token → `*media.Error` mapping; the encoder token table (§5.6) |
-| `bridge.go` | all | everything behind the `caller` interface (§12.4): the `Engine` and `session` logic, the snprintf retry, JSON decoding (build info, sources, stats, events), `media.Config` → `imStartConfig`, `imCaps` → `media.Probe`, the packet copy and validation rules, ENDED handling, the event mapping and `EventLayer` synthesis, the session state machine, the PCM tap, the clock cross-check |
+| `abi.go` | all | constants mirroring the header; the unexported C-layout mirrors (`imPacket`, `imStartConfig`, `imLayerConfig`, `imAudioConfig`, `imExclusions`, `imRule`, `imCaps`, `imEncoderInfo`, `imAdapterInfo`, `imSourceInfo`, `imPickParams`, `imSessionInfo`, `imLayerInfo`, `imClockSample`, `imInitParams`, `imAudioLevel`, `imAudioLevels`): the audio mirrors live here too, because `layout_test.go` checks every struct of the golden file (05 §13.2); the encoder token table (§5.6) |
+| `errors.go` | all | the detail tokens of §5.7, the status and token → `*media.Error` mapping (§12.2's table), the not-implemented error, and the Win32 error → `Reason` mapping of a failed load (`missing`, `blocked_by_policy`) |
+| `bridge.go` | all | everything behind the `caller` interface (§12.4): the export table (every `IM_API` function, 05's audio and test exports included), `addrOf` (`runtime.Pinner`), `Open`'s portable half (`openEngine`: the ABI check, `im_init`, the clock cross-check, the build info), `Close`, the log drain (§12.3), the `Engine` and `session` logic, the snprintf retry, JSON decoding (build info, sources, stats, events), `media.Config` → `imStartConfig`, `imCaps` → `media.Probe`, the packet copy and validation rules, ENDED handling, the event mapping and `EventLayer` synthesis, the session state machine, the PCM tap. WA10 wrote the skeleton; WA23 owns it next |
 | `types.go` | all | the exported Windows-only types: `BuildInfo`, `ClockSample`, `SourceDetail`, `PCMChunk` (the test tone is `media.AudioTestTone`, 05 §13.1; this package declares no mode constant) |
-| `openh264.go` | all | `OpenH264` pin, `InstallOpenH264`, `VerifyOpenH264`, `RemoveOpenH264` (pure Go; the DLL only exists on Windows, but the code and tests run everywhere) |
-| `engine_windows.go` | windows | `Open` (load, version, exports, `im_init`, clock check), `Close` (`im_shutdown`), the log drain |
+| `openh264.go` | all | `OpenH264` pin, `InstallOpenH264`, `VerifyOpenH264`, `RemoveOpenH264`, `SetOpenH264Path` (pure Go; the DLL only exists on Windows, but the code and tests run everywhere; WA51 fills WA10's stubs) |
+| `audio.go` | all | `media.AudioController` on `*Engine`, `AudioTestHooks` and the `AudioTest` wrappers (05 §13.2; **owned by 05**: WA35 fills WA10's stubs, `AudioTest.EngineClockNS` is real), over the same `caller`; also `AudioApps`, a stub WA10 declared for the report's apps |
+| `engine_windows.go` | windows | `Open`'s Windows half: `LoadLibraryEx` by full path (a load failure is `dependency` with `missing` or `blocked_by_policy`), `im_version` first (so another major fails as one, not as missing exports), every export resolved, then `openEngine` |
 | `call_windows.go` | windows | the `caller` over `syscall.SyscallN`, with `runtime.LockOSThread` around each call and its `im_last_error` read |
-| `clock_windows.go` | windows | `qpcNS()` from `windows.QueryPerformanceCounter` and the cached `QueryPerformanceFrequency` (x/sys/windows) |
-| `audio_windows.go` | windows | `media.AudioController` on `*Engine` (05 §13.1; **owned by 05**), over the same `caller` |
+| `clock_windows.go` | windows | `qpcNS()` from kernel32's `QueryPerformanceCounter` and the cached `QueryPerformanceFrequency`, through `windows.NewLazySystemDLL("kernel32.dll")` (System32 only): x/sys/windows v0.49.0 has no wrapper for them |
 | `engine_other.go` | !windows | `Open` returns an error wrapping `media.ErrUnsupportedOS` (M3 adds `engine_darwin.go` with cgo, M4 `engine_linux.go`) |
 | `layout_test.go` | all | sizes and offsets of §5.4 via `unsafe.Sizeof`/`Offsetof` against the golden file |
-| `bridge_test.go` | all | the binding logic driven by a `fakeCaller` (§18.3) |
+| `fakecaller_test.go` | all | the `fakeCaller` (§12.4); `open_test.go`, `logdrain_test.go`, `abi_test.go`, `errors_test.go`, `engine_other_test.go` and `main_test.go` (goleak) drive WA10's half with it |
+| `bridge_test.go` | all | the session logic driven by the `fakeCaller` (§18.3; WA23) |
 | `dll_windows_test.go` | windows | tests against a real DLL (`ISSHONI_TEST_ENGINE_DLL`, set by CI and enginetest only) |
 
 ### 12.2 API
@@ -1779,13 +1823,15 @@ package native // import "github.com/MoonWX/isshoni/internal/media/native"
 
 // Open loads the engine. On Windows: LoadLibraryEx(<Dir>\isshoni-media.dll,
 // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32); im_version (major 1, §5.5); every required export
-// resolved; im_init; the clock cross-check (§12.3). A version or export problem is a *media.Error with Code
-// dependency and Reason "abi" (01 §5.2). Elsewhere it returns an error wrapping media.ErrUnsupportedOS.
+// resolved; im_init; the clock cross-check (§12.3); the build info. A version or export problem is a *media.Error with
+// Code dependency and Reason "abi" (01 §5.2); a DLL that is missing (Win32 2, 3, 126) or that a code-integrity policy
+// blocked (577, 1260, 4551) is dependency with Reason "missing" or "blocked_by_policy" (§5.7). The DLL is never
+// unloaded. Elsewhere it returns an error wrapping media.ErrUnsupportedOS.
 func Open(o Options) (*Engine, error)
 
 var (
 	_ media.Engine          = (*Engine)(nil)
-	_ media.AudioController = (*Engine)(nil) // audio_windows.go (05 §13.1)
+	_ media.AudioController = (*Engine)(nil) // audio.go (05 §13.2)
 	_ media.Session         = (*session)(nil)
 )
 
@@ -1803,12 +1849,14 @@ func (e *Engine) Info() media.Info                                             /
 func (e *Engine) Probe(ctx context.Context, refresh bool) (media.Probe, error) // im_probe(FULL) first and on refresh
 func (e *Engine) Sources(ctx context.Context) ([]media.Source, error)          // im_list_sources: monitors
 func (e *Engine) Pick(ctx context.Context, r media.PickRequest) (media.Source, error) // ctx done → im_cancel_pick
-func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) // ErrBusy while one runs
-func (e *Engine) Close() error                                                 // stops sessions, im_shutdown; DLL stays
+func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) // ErrBusy while one it started runs
+// Close cancels a pick (im_cancel_pick every 20 ms until the calls in flight ended), stops sessions, im_shutdown;
+// the DLL stays. Every Close, also a concurrent second one, returns only after the shutdown finished.
+func (e *Engine) Close() error
 // Contract addition (01 §5.1).
 func (e *Engine) Release(sourceID string)                                      // im_release_source
 
-// media.AudioController (05 §13.1; audio_windows.go, owned by 05): WatchAudio → im_audio_watch, UnwatchAudio →
+// media.AudioController (05 §13.1; audio.go, owned by 05): WatchAudio → im_audio_watch, UnwatchAudio →
 // im_audio_unwatch, SetExclusions(ctx, media.Exclusions) → im_set_exclusions, SetAudioMode → im_audio_set_mode,
 // SetAudioMuted → im_audio_set_muted, AudioReport → im_list_audio_apps, AudioLevels → im_audio_levels_get,
 // SoundCheck → im_audio_sound_check.
@@ -1821,12 +1869,11 @@ func (e *Engine) ProtectWindow(hwnd uintptr) error             // im_protect_win
 func (e *Engine) SourceDetail(id string) (SourceDetail, bool)  // the im_source_info fields media.Source lacks
 func (e *Engine) StartExtra(ctx context.Context, cfg media.Config) (media.Session, error) // enginetest only
 
+// SourceDetail holds only what im_source_info says beyond media.Source (README §3 item 29): monitor_id, capture_path
+// and IM_SRCF_OS_BORDER are media.Source's MonitorID, Capture and OSBorder (01 §5.1). Local data, never logged.
 type SourceDetail struct {
-	MonitorID   string  // monitor sources: the im_list_sources id (03 places the pill on it); "" otherwise
-	CapturePath string  // "wgc" | "dd" | "test"
-	OSBorder    bool    // IM_SRCF_OS_BORDER: Windows draws its yellow border
-	Mapped      bool    // IM_SRCF_MAPPED: a Win10 monitor pick mapped to a DD output
-	Window      uintptr // the HWND when identified (§7.6), else 0
+	Mapped bool    // IM_SRCF_MAPPED: a Win10 monitor pick mapped to a DD output (§7.5)
+	Window uintptr // the HWND when identified (§7.6), else 0
 }
 
 type PCMChunk struct {
@@ -1853,11 +1900,16 @@ func (s *session) SetAudioBitrate(bps int) error                  // im_set_audi
 func (s *session) PCMTap() <-chan PCMChunk                        // buffered 128; nil unless AudioConfig.TapPCM
 ```
 
-- **One session at a time**: `Start` returns `media.ErrBusy` while a session it started runs (01 §5.3, Conformance
-  check 9). `StartExtra` skips that check (up to the DLL's 4 sessions; video only, since audio is one per process) so
-  that `enginetest sessions` can open several; the app never calls it. (These two extras, `SourceDetail` and
-  `StartExtra`, are the only additions beyond `BuildInfo`, `Clock`, `SetOpenH264Path` and `ProtectWindow`: 03 needs
-  the monitor id for the pill, and the session-limit check needs several sessions.)
+- **`SourceDetail` in the code** (README §3 item 29): `internal/media/native/types.go` (WA10) still declares
+  `MonitorID`, `CapturePath` and `OSBorder` beside `Mapped` and `Window`; WA23, which owns the package next, drops them
+  (or the integrator does at group 3's merge). The struct above is the target.
+- **One session at a time** (README §3 item 28): `Start` returns `media.ErrBusy` while a session it started runs,
+  whatever the configs (01 §5.1, §5.3; the core's one-share rule D12; Conformance check 9). `StartExtra` skips that
+  check and runs up to the DLL's 4 video-only sessions (§6.4; audio is one session per process, and the DLL answers a
+  second session with audio, like a fifth session, with `IM_ERR_LIMIT`, so `busy`), so that `enginetest sessions` can
+  open several; the app never calls it. (These two extras, `SourceDetail` and `StartExtra`, are the only additions
+  beyond `BuildInfo`, `Clock`, `SetOpenH264Path` and `ProtectWindow`: `Mapped` and `Window` are diagnostics for
+  enginetest and the owner's-PC checks, and the session-limit check needs several sessions.)
 - **Audio lives on `*Engine`**: mute, mode, exclusions, levels and the report are process-wide in the ABI, so the
   session has no audio surface beyond `SetAudioBitrate` and `PCMTap`; 05's `audio.Service` calls the
   `media.AudioController` methods. There are no native audio types (`media.Exclusions`, `media.AudioConfig` and the
@@ -1927,8 +1979,10 @@ returns each monitor as `media.Source{ID: "mon:…", Kind: screen, Name, Width, 
 | `IM_ERR_CANCELLED` | `cancelled` |
 | `IM_ERR_LIMIT` | `busy` |
 | `IM_ERR_INVALID_ARG` | `invalid` (from `im_next_packet` during `Stop`: `stopped`, §12.3) |
-| `IM_ERR_TIMEOUT` | `timeout`: 01's `CodeTimeout`, whose `Unwrap` returns `context.DeadlineExceeded`, so `errors.Is(err, context.DeadlineExceeded)` holds (there is no `native.ErrTimeout`: the package declares no sentinels of its own) |
-| `IM_ERR_BAD_STATE` (except from an audio call, 05 §13.1), `IM_ERR_NOT_IMPLEMENTED`, `IM_ERR_INTERNAL`, `IM_ERR_AUDIO_*`, others | `internal` |
+| `IM_ERR_TIMEOUT`, and `IM_TIMEOUT` outside `im_next_packet` | `timeout`: 01's `CodeTimeout`, whose `Unwrap` returns `context.DeadlineExceeded`, so `errors.Is(err, context.DeadlineExceeded)` holds (there is no `native.ErrTimeout`: the package declares no sentinels of its own) |
+| `IM_ERR_AUDIO_UNAVAILABLE` | `audio_unavailable` (01 §5.2's table, which README §3 item 17 makes the rule; the Windows engine never returns it in M2, §5.7) |
+| `IM_ERR_NOT_IMPLEMENTED` | `internal` with `Reason` `not_implemented` when the detail names no token |
+| `IM_ERR_BAD_STATE` (from an audio call it is `audio_not_running`, which 05's `audio.go` applies, 05 §13.1), `IM_ERR_AUDIO_DEVICE_CHANGED`, `IM_ERR_INTERNAL`, `IM_ENDED`, others | `internal` |
 
 ### 12.3 Next, events, the clock and the session state machine
 
@@ -1970,7 +2024,7 @@ values (it would break A/V sync and the SR anchor).
 |---|---|
 | (synthesized) after `im_start`, one per layer from its `im_session_info`, before any media; and before each video `REINIT` packet, for that layer, re-reading `im_get_session_info` | `EventLayer`: `Layer` = rid; `Width`, `Height`, `FPS`; `Encoder` = token (§5.6); `HW` = `IM_ENCF_HARDWARE`; `Profile` = `"6400"` or `"42e0"` from `layers[].profile`; `LiveBitrate` = `IM_ENCF_LIVE_BITRATE`; `NoOSIndicator` = `IM_SESS_NO_OS_INDICATOR` |
 | `SOURCE_RESIZED` | `EventSourceResized{Width, Height}` (the `EventLayer` of the re-init follows) |
-| `LIMIT_CHANGED` (`cpu`, `gpu` **and** `none`) | `EventLimit{Layer, Limit}`, every edge passed (the engine applies the hysteresis, §8.4): 01 feeds `ratectl.SetLimit` and the layer's `Limit` (01 §5.2), so the `none` edge is what releases the ramp hold and clears the CPU hint |
+| `LIMIT_CHANGED` (`cpu`, `gpu` **and** `none`) | `EventLimit{Layer, Limit}`, every edge passed (the engine applies the hysteresis, §8.4): 01 sets the layer's `Limit` (01 §5.2) and feeds `ratectl.SetLimit` the share-wide value (01 §9.1), so the `none` edge is what releases the ramp hold and clears the CPU hint |
 | `ENCODER_CHANGED` | `EventEncoderChanged{Layer, Encoder}` (`Encoder` = the `to` token), returned **before** the synthesized `EventLayer` of the new encoder's first `REINIT` packet (the engine queues it first, §9.8). 01 raises its `encoder_fallback` notice ("Switched to <encoder>") from it (01 §11.4) |
 | `SOURCE_MINIMIZED`, `SOURCE_RESTORED` | `EventSourceMinimized`, `EventSourceRestored` (01 adds the two codes; 03 shows §5.7's line) |
 | `CAPTURE_INTERRUPTED`, `CAPTURE_RESUMED` | `EventCaptureInterrupted`, `EventCaptureResumed` (01 logs them; no UI state, §5.7) |
@@ -1995,8 +2049,14 @@ This is 01 §5.2's event table; there is no other mapping (no `EventOverload`).
   before `im_stop`, so the engine never frees a slot that Go is still copying. A blocked `Next` returns
   `media.ErrStopped` within 50 ms (its call times out and sees `stopping`), inside 01's 200 ms (01 §5.3).
 - `Next` after `Stop` or after `ENDED` returns `media.ErrStopped` without calling the DLL.
-- `Stats()` decodes §5.6's JSON. A background goroutine per `Engine` drains `im_read_logs` every second (and right
-  after any error) into the logger.
+- `Stats()` decodes §5.6's JSON.
+- **The log drain** is portable code (`bridge.go`, started by `openEngine`, so it is tested on the Mac): a goroutine
+  per `Engine` drains `im_read_logs` (a 64 KiB buffer, at most 8 reads per drain) every second and right after any
+  error into the logger. Each record keeps the engine's own time, level and message; the engine's `component` goes
+  into an attribute named `area` (the logger already carries `component=engine`), the attrs follow as they are
+  (integers as `int64`, or `uint64` above `math.MaxInt64` for the log ring's unsigned attrs), and `"dropped":N`
+  becomes an attribute. `Close` stops the drain and drains once more around `im_shutdown`; an `Open` that fails at
+  `im_init` or after it drains first, so the engine's records about the failure reach the log.
 
 ### 12.4 Calling the DLL safely without cgo
 
@@ -2014,15 +2074,19 @@ type caller interface {
 
 - `call_windows.go`: `windows.LoadLibraryEx` + `windows.GetProcAddress`; calls through `syscall.SyscallN` with
   `runtime.LockOSThread` held across the call **and** the `im_last_error` read (S1's `do`), because the detail is
-  thread-local. The required exports are every `IM_API` function of v1.0, 05's audio exports and the test exports
-  included; one missing: `Open` fails with `dependency`, `Reason` `abi`, naming the export ("stale build?", as S1 did). `bridge_test.go`'s `fakeCaller` writes into the `imPacket` through the same pointer
-  arithmetic and emulates timeouts, snprintf lengths, oversized and invalid packets, `ENDED`, fatal statuses, a
-  `Stop` race and a clock offset, so the binding's logic runs on the Mac and CI ubuntu (01 §7.7).
-- Structs passed in are allocated on the heap (`new`), with every string and array they point to (`im_start_config`
-  → `source_id`, `exclusions` → `rules` → strings) built with `windows.BytePtrFromString` or `make`, and kept alive
-  with `runtime.KeepAlive` until the call returns. The engine never keeps a pointer after a call (§5.1), so nothing
-  needs pinning beyond the call. Pointer conversions are written inside the `SyscallN` argument list, which
-  `go vet`'s `unsafeptr` check accepts.
+  thread-local. The required exports are all 39 `IM_API` functions of v1.0, 05's audio exports and the `im_test_*`
+  exports included (01 §7.1 item 2); one missing: `Open` fails with `dependency`, `Reason` `abi`, naming every missing
+  export ("stale build?", as S1 did). `fakecaller_test.go`'s `fakeCaller` writes into the `imPacket` through the same
+  pointer arithmetic and emulates timeouts, snprintf lengths, oversized and invalid packets, `ENDED`, fatal statuses,
+  a `Stop` race and a clock offset, so the binding's logic runs on the Mac and CI ubuntu (01 §7.7).
+- Structs passed in are built in Go memory, with every string and array they point to (`im_start_config` →
+  `source_id`, `exclusions` → `rules` → strings) as NUL-terminated byte slices (a string holding a NUL is `invalid`).
+  Arguments travel through the `caller` interface as `uintptr`, which is no reference, so the binding pins each
+  argument's memory with a `runtime.Pinner` for the one call (`addrOf`, which also moves a stack value to the heap,
+  where Go never moves memory) and unpins after it; objects the pinned struct points to are reachable from it and stay
+  alive with it. `runtime.KeepAlive` with conversions inside the `SyscallN` argument list would not cover a pointer
+  that already became a `uintptr` before the call. The engine never keeps a pointer after a call (§5.1), so a pin
+  lasts one call.
 - `im_packet.data` is a `uintptr` field in the Go mirror, so the GC never sees a pointer into native memory;
   `unsafe.Slice((*byte)(unsafe.Pointer(p.data)), p.size)` is copied before the next call (the one `unsafeptr`
   exception, with a comment).
@@ -2102,18 +2166,31 @@ agree; a unit test reads both.
   `VCPKG_MANIFEST_FEATURES`, so its port set is exactly libopus and speexdsp (06's port-set gate, 06 §9.3);
   `win-x64-debug`, `win-x64-ci`, `win-x64-asan` and the host presets add `tests`. `builtin-baseline` pins a vcpkg
   commit (set in E1). Elsewhere the default host triplet. `native/vcpkg-configuration.json` declares no
-  `default-registry`, which would override `builtin-baseline`: it has the schema and empty `registries`,
-  `overlay-ports` and `overlay-triplets` only.
+  `default-registry`, which would override `builtin-baseline`: it has the schema, empty `registries` and
+  `overlay-ports`, and `"overlay-triplets": ["triplets"]`. **The ports build with the project's MSVC toolset**:
+  `native/triplets/x64-windows-static.cmake` is vcpkg's own `x64-windows-static` plus `VCPKG_PLATFORM_TOOLSET v143`
+  and `VCPKG_PLATFORM_TOOLSET_VERSION 14.44`, the `msvc.toolset` of `deploy/windows/tools.json`. Without it vcpkg
+  builds the ports with the newest toolset on the machine (14.51 on windows-2025), whose STL objects call helpers such
+  as `__std_rotate` that 14.44's static libraries lack, so linking gtest (or any port) into the 14.44 build fails.
+  `task lint:pins` (`repocheck pins`) fails when the triplet's version and `tools.json`'s toolset differ, and both of
+  CI's vcpkg cache keys hash `native/triplets/*.cmake` (06 §3, §5.1). The triplet is integrator-owned like the other
+  root files (README §5).
 - **MSVC flags**: `/std:c++20 /W4 /WX /permissive- /utf-8 /EHsc /Zc:__cplusplus /Zc:preprocessor /sdl /guard:cf /Zi
   /Gy /Gw /FS` (`/FS`: Ninja's parallel compiles share a PDB), `/MT` (Release) or `/MTd` (Debug); defines
   `WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00 IM_BUILDING_DLL`. Linker:
   `/DEBUG:FULL`, `/OPT:REF /OPT:ICF` (not in Debug), `/guard:cf /CETCOMPAT /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT
   /DEF:isshoni-media.def`, output `isshoni-media.dll` and `isshoni-media.pdb`. `/guard:cf` (compiler and linker)
   only when `IM_SANITIZE` is empty (see `win-x64-asan`).
-  Libraries: `d3d11 dxgi dxguid user32 ole32 oleaut32 windowsapp dwmapi shcore synchronization delayimp`, plus 05's
-  audio libraries. **Delay-loaded**: `mfplat.dll` (absent on N editions; the probe checks it with
-  `__HrLoadAllImportsForDll` before any call) and `avrt.dll`. Any new system DLL import goes onto 06's
-  `deploy/windows/dll-imports.txt` in the same PR.
+  Libraries (on the engine's object library `im_engine`, which the DLL and every Windows test executable link):
+  `kernel32 user32 ole32 oleaut32 d3d11 dxgi dxguid dwmapi shcore synchronization avrt mfplat delayimp`, plus 05's
+  audio libraries; an area that needs another one names it in its source with `#pragma comment(lib, …)`, its DLL
+  going onto `dll-imports.txt`. **`windowsapp.lib` is not on the link line**: listed after `kernel32.lib` it changes
+  nothing, but placed earlier it would make kernel32's functions import from `api-ms-win-core-*` API sets. C++/WinRT
+  code (WA50) adds `#pragma comment(lib, "windowsapp.lib")`, which the linker searches after the command-line
+  libraries, so only WinRT's functions resolve to its API sets (`dll-imports.txt` already lists the WinRT and synch
+  API sets). **Delay-loaded**: `mfplat.dll` (absent on N editions; the probe checks it with
+  `__HrLoadAllImportsForDll` before any call) and `avrt.dll` (`/IGNORE:4199` while no code imports them yet). Any new
+  system DLL import goes onto 06's `deploy/windows/dll-imports.txt` in the same PR.
 - **Delay-load hook** (`src/engine/delayload.cpp`, M2, slice E2): the default helper loads a delay-loaded DLL with
   `LoadLibraryExA(name, NULL, 0)`, i.e. the default search order (application folder, System32, Windows, the
   **current directory**, `PATH`) unless the process called `SetDefaultDllDirectories`. On an N edition `mfplat.dll`
@@ -2126,9 +2203,16 @@ agree; a unit test reads both.
   `__HrLoadAllImportsForDll` turns into a failure `HRESULT` (the probe then reports `no_media_foundation`). Every
   delay-loaded DLL is a System32 DLL, so the hook applies to all of them, and because it lives in the engine it
   protects every host process: the app, `isshoni-enginetest`, 05's `isshoni-audiotest` and 01's `tools/g2g`.
-  `/DEPENDENTLOADFLAG:0x800` (System32-only search for the image's dependencies), with a `dll-check` assertion of
-  that load-config flag (06), is added only if E2's test shows the delay-load helper honors it; the hook doesn't
-  depend on it.
+  `LoadDelayedImports(dll)` (`src/engine/delayload.h`, the probe's way in) matches `dll` without case against the
+  names in the image's own delay-import table and passes `__HrLoadAllImportsForDll` the stored spelling: those are
+  the import libraries' names (`MFPlat.DLL` for `mfplat.lib`, `AVRT.dll`), not `/DELAYLOAD`'s, and the helper's own
+  lookup compares case-sensitively. A name the table lacks is `HRESULT_FROM_WIN32(ERROR_INVALID_NAME)`, distinct from
+  `ERROR_MOD_NOT_FOUND`, so a test can't pass without reaching the hook.
+  `/DEPENDENTLOADFLAG:0x800` (System32-only search for the image's dependencies), with a `dll-check -load-config`
+  assertion of that load-config flag (06 §5.1), is added only if WA11's `dll_search_test` shows the delay-load
+  helper honors it; the hook doesn't depend on it. The DLL is linked without it for now: the verdict (the test's
+  probe DLLs, linked plain and with the flag, written to `dependentloadflag-verdict.txt` and into the
+  `windows-native` job summary) awaits the group PR's first `windows-native` run, whose summary records it.
 - **Host flags**: `-std=c++20 -Wall -Wextra -Wpedantic -Wshadow -Werror`.
 - **Shaders**: `shaders/*.hlsl` compiled by `fxc /T vs_5_0|ps_5_0 /O3 /Fh` at build time into headers (no runtime
   compiler, no `d3dcompiler_47.dll` dependency).
@@ -2337,7 +2421,9 @@ Run on the Mac (`task native:test`, preset `host-debug`), in CI on ubuntu-24.04 
 | `scale_test` | §8.3's examples, odd and tiny sizes, clamping |
 | `monitor_map_test` | §7.5 steps 2, 3 and 5 with fake outputs: one size match, a name match among several, two identical monitors with the same name falling through to WGC with the border (frame-match cases come with step 4, §16) |
 | `resize_test` | 1 s debounce; letterbox meanwhile; no re-init when the computed output size is unchanged |
-| `opus_stage_test` | 05 §10.1's settings read back with `OPUS_GET_*` (constrained VBR, FEC 0, loss 0, fullband, DTX 0); 10 ms → 20 ms framing; packet time = first chunk − lookahead, consecutive packets exactly 20 000 000 ns apart; `REINIT` on the first packet and after `OnGap` (a half frame dropped, any time step); `DISCONTINUITY` after a ring drop with the grid unchanged; chunks before `epoch_ns` dropped and the first packet ≥ `epoch_ns` with `REINIT`; a decoded 1 kHz tone at 128 kbps has SNR ≥ 30 dB; zero chunks (muted bus) → encoded silence keeps flowing at 50 packets/s; PCM tap: 3840-byte packets stamped at chunk time, flowing together with Opus; live bitrate change; the test tone's code-3 padding holds an 18-byte Marker that M1's `ParseAudioMarker` reads (golden bytes) |
+| `opus_stage_test` (`native/common/audio/tests`) | 05 §10.1's settings read back with `OPUS_GET_*` (constrained VBR, FEC 0, loss 0, fullband, DTX 0); 10 ms → 20 ms framing; packet time = first chunk − lookahead, consecutive packets exactly 20 000 000 ns apart; `REINIT` on the first packet and after `OnGap` (a half frame dropped, any time step); `DISCONTINUITY` after a ring drop with the grid unchanged; chunks before `epoch_ns` dropped and the first packet ≥ `epoch_ns` with `REINIT`; a decoded 1 kHz tone at 128 kbps has SNR ≥ 30 dB; zero chunks (muted bus) → encoded silence keeps flowing at 50 packets/s (the few-bytes size is checked from 1 s into the silence: libopus's 3 Hz DC filter leaves a decaying tail for about 0.5 s); PCM tap: 3840-byte packets stamped at chunk time, flowing together with Opus; live bitrate change; the Marker framing of the test tone's packets, byte for byte M1's `appendOpusPadded`: the golden file `tests/testdata/tone_marker_golden.txt` puts the Markers of the tone's packets 0, 1, 50, 51 and 100 on synthetic Opus payloads (codes 0 to 3, long frames, code 3 input with old padding, the largest field values), not on the tone's encoded packets, because libopus' float output is not bit-exact across CPUs; the C++ test writes each line's framed packet, and the Go half, `tests/markergolden` (a folder of its own: Go refuses a package directory with C++ files), reads every one with M1's `fake.ParseAudioMarker`. The tone's own Marker values (`Frame`, `CaptureNS`, `Beep`) are checked at run time (`TestToneCarriesM1sMarker`) |
+| `test_tone_test` | M1's fake signal locked to `epoch_ns` (beeps at `epoch_ns + k × 1 s`), continuous chunks, the 10 ms fade for pause and mute, `TestToneSource`'s exact 10 ms grid, its catch-up of short stalls and its skip after a long one, which keeps the 20 ms frame phase after any chunk count |
+| `opus_stage_rt_test` | the real-time rule (§6.1): after `Create`, `OnChunk` and `OnGap` (PCM tap and Marker framing included) and `TestToneSource::Pump` make no C++ allocation on the calling thread, counted by replacing the global `operator new` (with vcruntime's SAL annotations, which MSVC's `/W4 /WX` needs). Under ASan or TSan the sanitizer runtime owns `operator new` (Linux links it statically, so a second definition fails to link): those builds leave the replacement out, run the stage and skip the allocation checks; `host-debug` and `win-x64-ci` run them |
 | `json_test` | escaping (quotes, control characters, emoji, lone surrogates → U+FFFD), snprintf return values |
 | `status_test` | the `im_status` values and §5.7's detail tokens; the thread-local `im_last_error` detail (`<token>: ` prefix, one line, bounded, per thread, cleared, snprintf copy); §5.1's `struct_size` rule (older and newer callers read, below v1.0 → `IM_ERR_ABI`, output stops at the caller's size) |
 | `log_ring_test` | §5.6's records: the NDJSON format and timestamp, escaping and the string bounds, levels, a record that doesn't fit stays queued, `im_read_logs`' argument checks (`cap ≤ 8192` → `IM_ERR_INVALID_ARG`), a full ring's drops as `"dropped":N` in the next record, wrap-around, concurrent producers and a drainer (clean under `host-tsan`) |
@@ -2353,6 +2439,9 @@ target in the slice that adds it and in the nightly; seeds in `native/common/tes
 
 ### 18.2 Windows tests without a GPU or audio device (CI, windows-2025, `win-x64-ci`)
 
+The test executables link the engine's objects (`im_engine`), not the DLL, so `exports_test` can stall the worker
+and `dll_search_test` runs with the engine's delay-load hook; the DLL's real export table is `dll-check`'s (§13.1).
+
 | Test | Asserts |
 |---|---|
 | `exports_test` | every export with null and invalid arguments returns its documented code, and `im_last_error` starts with the §5.7 token where one applies; `struct_size` below v1.0 → `IM_ERR_ABI`, above → accepted; JSON functions follow snprintf; `im_clock` is monotonic and within 50 ms of the system time; `im_abi_layout` equals the golden file; `isshoni-media.def` lists exactly the header's `IM_API` functions (both parsed); a hook that stalls the worker makes a posted call return `IM_ERR_TIMEOUT` (`engine_timeout`) after its bound + 1 s |
@@ -2361,7 +2450,7 @@ target in the slice that adds it and in the nightly; seeds in `native/common/tes
 | `window_match_test` | §7.6's matcher over a fake window list: one match gives `window` and `pid`; two matches or none give 0; cloaked windows skipped; an `applicationframehost.exe` match takes its `Windows.UI.Core.CoreWindow` child's pid, and 0 without one |
 | `gpu_warp_test` | on WARP: the shader converter against a CPU BT.709 limited-range reference (≤ 1 code value on flat areas, ≤ 2 on edges); the VideoProcessor against the shader output (≤ 2) when WARP offers one, else skipped with the reason; letterbox geometry; rotation 90/180/270; cursor blending of color, masked and monochrome shapes against golden images, and no blend with `IM_START_HIDE_CURSOR`; the GPU test pattern renders |
 | `ffmpeg_load_test` | with the pinned artifact: loads, versions check, encoders listed (none available without a GPU, MF software if the runner has Media Foundation); `ffmpeg_dir` pointed at an empty folder → `IM_ERR_DEPENDENCY` (`missing`) and an audio-only test-tone session still works; a stub DLL with another major → `IM_ERR_DEPENDENCY` (`version`) |
-| `dll_search_test` (§13.3) | Run as a child process whose current directory and one `PATH` entry each hold marker DLLs (a tiny test DLL whose `DllMain` writes a file named after itself; built by the tests, never shipped). **Delay-load hook** (E2): the `win-x64-ci` build's test binary links the engine code with an extra `/DELAYLOAD:im-test-missing.dll` (a name that is in no system folder; the windows-2025 image has `mfplat.dll` in System32, which is searched before the current directory, so a planted `mfplat.dll` could never show the bug); with `im-test-missing.dll` planted in both places, `__HrLoadAllImportsForDll("im-test-missing.dll")` fails, no marker file appears and `GetModuleHandleW(L"im-test-missing.dll")` is NULL; the same check with `mfplat.dll` passes and loads it from System32 (`GetModuleFileNameW`). **Vendor runtimes and libvpl** (E7, in `ffmpeg_load_test`'s harness with the pinned FFmpeg): markers named `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll` and `libmfxhw64.dll` (none exist on the GPU-less runner) planted in both places, `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` set to the marker folder, and **no** process default set (the host-independent case); after `im_init` and a full `im_probe`, no marker file exists and `EnumProcessModules` lists none of them. A failure of the libvpl names is §17's libvpl risk, not a flake |
+| `dll_search_test` (§13.3) | Run as a child process whose current directory and one `PATH` entry each hold marker DLLs (a tiny test DLL whose `DllMain` writes a file named after itself; built by the tests, never shipped). **Delay-load hook** (E2): the `win-x64-ci` build's test binary links the engine code with an extra `/DELAYLOAD:im-test-missing.dll` (a name that is in no system folder; the windows-2025 image has `mfplat.dll` in System32, which is searched before the current directory, so a planted `mfplat.dll` could never show the bug); with `im-test-missing.dll` planted in both places, `__HrLoadAllImportsForDll("im-test-missing.dll")` fails, no marker file appears and `GetModuleHandleW(L"im-test-missing.dll")` is NULL; the same check with `mfplat.dll` passes and loads it from System32 (`GetModuleFileNameW`), asked as `mfplat.dll` while `mfplat.lib` stores `MFPlat.DLL` (§13.1). **The `/DEPENDENTLOADFLAG` verdict** (06 §5.1): two probe DLLs (`tests/support/dlprobe.cpp`) delay-load the marker with the default helper and no hook, one linked plain and one with `/DEPENDENTLOADFLAG:0x800`; whether the flagged one still loads the planted marker goes to the test log and to `<build>/windows/dependentloadflag-verdict.txt`, which `windows-native` writes into its summary. **Vendor runtimes and libvpl** (E7, in `ffmpeg_load_test`'s harness with the pinned FFmpeg): markers named `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll` and `libmfxhw64.dll` (none exist on the GPU-less runner) planted in both places, `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` set to the marker folder, and **no** process default set (the host-independent case); after `im_init` and a full `im_probe`, no marker file exists and `EnumProcessModules` lists none of them. A failure of the libvpl names is §17's libvpl risk, not a flake |
 | `openh264_test` | CI downloads Cisco's DLL and checks the pinned hash (a mismatch fails the job); `test:pattern` 1280×720@30 for 3 s through the full session (WARP, readback, OpenH264) and back through OpenH264's decoder: PSNR ≥ 35 dB on the pattern's static regions; profile key `42e0`; SPS and PPS before every IDR; a live bitrate step lands within ±25 % |
 | `mf_sw_test` | the same through MF software when `MFStartup` works on the runner; otherwise skipped and logged |
 
@@ -2429,7 +2518,7 @@ separately. Each slice that needs it attaches the bundle to its PR.
 | ID | OS | Steps | Expected |
 |---|---|---|---|
 | M-PICK (E10) | both | `enginetest pick`; move the picker, cancel once, then pick a window, then a monitor | the picker is modal over the tool's own owner window (centered on the primary monitor); cancel → `IM_ERR_CANCELLED`; each pick prints a source of the right kind |
-| M-APP-PICK (README WA72, after the app's share sheet and tray slices) | Win11, then Win10 22H2 | the installed PR artifact: `isshoni.exe` → Share; while the picker is open, drag another window over isshoni's main window; Cancel; Share again, pick a window → live, watch from a browser; stop; Share, pick a monitor → live, watched (Win10: the DD path); Share, pick isshoni's own window | the OS picker is modal over the main window (the Wails `HWND` as owner, §7.2) and the main window keeps repainting; Cancel returns to the share sheet with no error; window and monitor shares are live and decode in the browser (Win10 monitor: `SourceDetail.CapturePath` `dd`, no border); the own-window pick gives `self_window` and goes back to the picker |
+| M-APP-PICK (README WA72, after the app's share sheet and tray slices) | Win11, then Win10 22H2 | the installed PR artifact: `isshoni.exe` → Share; while the picker is open, drag another window over isshoni's main window; Cancel; Share again, pick a window → live, watch from a browser; stop; Share, pick a monitor → live, watched (Win10: the DD path); Share, pick isshoni's own window | the OS picker is modal over the main window (the Wails `HWND` as owner, §7.2) and the main window keeps repainting; Cancel returns to the share sheet with no error; window and monitor shares are live and decode in the browser (Win10 monitor: the pick's `Source.Capture` `dd` and `SourceDetail.Mapped`, no border); the own-window pick gives `self_window` and goes back to the picker |
 | M-WGC-WIN | Win11 | `capture -source pick -seconds 30`, pick a browser window; drag-resize it, minimize and restore it, then close it | no yellow border; cursor visible; letterboxed during the drag, `f.h264` changes size about 1 s after; `SOURCE_MINIMIZED`/`RESTORED`; `ENDED{SOURCE_GONE}` |
 | M-WGC-MON | Win11 | pick a monitor | no border; session flag `NO_OS_INDICATOR` |
 | M-SECONDARY | Win11 24H2+ | share a window, open one of its dropdown menus | the menu is in the capture |
@@ -2527,7 +2616,7 @@ build that 06 produces.
   returns `context.DeadlineExceeded`), `media.Event` fields `Profile`, `LiveBitrate`, `NoOSIndicator`, `Limit`, and
   01 §5.2's event codes as the binding uses them (`EventLimit`, `EventEncoderChanged`, `EventSourceMinimized`,
   `EventSourceRestored`, `EventCaptureInterrupted`, `EventCaptureResumed`, `EventDeviceReset`; no `EventOverload`).
-  01 feeds every `EventLimit` edge, `none` included, to `ratectl.SetLimit`, and raises the `encoder_fallback` notice
+  01 turns every `EventLimit` edge, `none` included, into the share-wide value it feeds `ratectl.SetLimit` (01 §9.1), and raises the `encoder_fallback` notice
   from `EventEncoderChanged` (01 §11.4). `internal/media` does not import `internal/media/native`.
 - 01 builds `media.Config` from `ShareParams`: layers from `encodings` in wire order (`f`, `q`: `maxPixels`,
   `maxFramerate`), `bitrate_bps` = 01's ratectl initial target (≤ `maxBitrate`; 01 starts `f` at 4 Mbit/s and ramps),
@@ -2563,8 +2652,8 @@ build that 06 produces.
 - On `encoder_lost` with `Reason` `device_removed`, shows the stop notice with **"Share again"** (§5.7). On
   `EventEncoderChanged` (through 01's `encoder_fallback` notice) the share stays live; 01 never falls back or
   restarts itself (01 D15).
-- Shows the "Sharing" pill whenever `EventLayer.NoOSIndicator` is set; places it on the shared monitor using
-  `SourceDetail(id).MonitorID` and `Sources()`.
+- Shows the "Sharing" pill whenever `EventLayer.NoOSIndicator` is set; places it on the shared monitor using the
+  pick's `media.Source.MonitorID` and `Sources()`.
 - Maps every status, token and event per §5.7 and owns every string; never sends a source name, window title, `pid`
   or app list to the server (plan "Privacy").
 - Owns the OpenH264 setting, Cisco's notice, the attribution in About and the `%LOCALAPPDATA%\isshoni\codecs` folder;
@@ -2581,7 +2670,7 @@ build that 06 produces.
 - Owns the semantics of the audio block of §5.2 (rules, modes 0–2, flags, the report JSON of `im_list_audio_apps`,
   levels, the sound check and the test exports), the user mute (`im_audio_set_muted`), the report state that
   `IM_AUDIO_STATE_*` mirrors, and the FriendsHear banners; asks for header additions after M2 as minor bumps.
-- Owns `internal/media/native/audio_windows.go` (`media.AudioController` on `*Engine`) and passes the shared
+- Owns `internal/media/native/audio.go` (`media.AudioController` on `*Engine`, `AudioTestHooks`) and passes the shared
   window's pid as `im_exclusions.shared_pid` from `audio.Service.OnShareStarted`.
 - The audiotest uses this C ABI on the shipping DLL: audio-only sessions, `IM_AUDIOF_TAP_PCM` and `PCMTap`,
   `IM_AUDIOF_TEST_FAIL_PROBE`, the test exports. 05's A6 accepts the real-mixer path through the C ABI (§21 E13).

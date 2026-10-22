@@ -113,13 +113,13 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W10 | The main window's native handle (HWND) is available to Go | Go test on Windows | `FindWindowExW` by the window class Wails registers, on the UI thread |
 | W11 | Bound methods may take `context.Context` first, cancelled when the JS call is cancelled | Bindings test | No context; each method bounds its own work (§6.2 timeouts) |
 | W12 | A Go `error` rejects the JS promise with `err.Error()` in its message, verbatim | Bindings test | Methods return `{result, error}` structs instead (one code change in `bridge`) |
-| W13 | WebView2 user data folder and additional browser arguments can be set | CDP e2e: audio plays without a click (autoplay flag) | Environment `WEBVIEW2_USER_DATA_FOLDER` and `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` set by Go before the webview starts |
+| W13 | WebView2 user data folder and additional browser arguments can be set | CDP e2e: audio plays without a click (autoplay flag) | Environment `WEBVIEW2_USER_DATA_FOLDER` and `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` set by Go before the webview starts (unusable at beta.34, which overwrites both in every build, §5.4; the app sets both through Wails' options) |
 | W14 | Quit runs our shutdown hook before the process exits (share stopped, close 1000 sent) | Go test with a fake share | Our tray Quit stops the share first, then calls Wails' quit |
 | W15 | `.bin/wails3 generate bindings` (TypeScript) is deterministic and OS-independent for our services | CI: generate on ubuntu and macOS, diff | Commit the bindings generated on one OS only (Linux CI) |
 | W16 | Element fullscreen inside WebView2 plus `Window.SetFullscreen(true)` fills the screen and returns cleanly on Esc | CDP e2e + manual | CSS pseudo-fullscreen (`fullscreen: 'none'`, as M1 has for browsers without the API) |
 | W17 | A WebView2 process failure is reported (or the page is reloaded) | Manual: kill a renderer in Task Manager | Our watchdog: the SPA calls `App.Heartbeat` every 5 s; 15 s without one → `Shell.Reload()` |
 | W18 | Tray icon, tooltip and menu can be changed at runtime; left click is reported | Manual + Go test of the view model | Rebuild the tray item on every change |
-| W19 | Unsetting every `WEBVIEW2_*` environment variable (prefix, case-insensitive, §5.4) before the webview starts takes effect | CDP e2e build vs production build: the production build started with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<p>`, `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER=<name>` and an arbitrary `WEBVIEW2_X=1` opens no debugging port or pipe and its webview sees none of them | None needed for function; record |
+| W19 | Unsetting every `WEBVIEW2_*` environment variable (prefix, case-insensitive, §5.4) before the webview starts takes effect | CDP e2e build vs production build: the production build started with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<p>`, `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER=<name>` and an arbitrary `WEBVIEW2_X=1` opens no debugging port or pipe and its webview sees none of them. At beta.34 Wails itself overwrites the first two in every build (§5.4), so only `WEBVIEW2_X` tells whether the scrub works (§22.4 B) | None needed for function; record |
 | W20 | License gate (`go-licenses`, GOOS=windows) and `govulncheck` pass for `./cmd/isshoni-desktop` | CI | Replace or drop the offending module before DK1 merges |
 | W21 | The Wails runtime's own objects. At beta.34 the same `/wails/runtime` endpoint serves, besides bound-method `Call`/`CancelCall`: `Clipboard` (`SetText`, `Text`), `Application` (`Quit`, `Hide`, `Show`), `Window` (52 methods, e.g. `Hide`, `SetAlwaysOnTop`, `Reload`, `OpenDevTools`, `Print`), `Dialog`, `ContextMenu`, `Screens`, `System`, `Events.Emit` and `Browser.OpenURL` (whose check refuses only `javascript:`, `data:`, `file:`, `ftp:`, empty schemes, shell metacharacters and backslashes, so `ms-settings:`, `search-ms:` and any registered protocol pass). `Events.On`/`Off` are JS-local. The postMessage IPC (`System.invoke`: `wails:runtime:ready`, drag and resize) is a separate path. The row records, at every pin: each object and method with its wire id, both request forms (the object in the JSON body or in the `?object=` query), the transport's chunking (its header or field names), what the runtime itself calls at load, and the postMessage messages | Go test of `assets.Guard` against requests built as the pinned runtime builds them; CDP e2e (§22.4 B): from the page, `Browser.OpenURL('ms-settings:display')`, `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403 and have no effect (no settings page or search opens, the window stays visible), and a bound method still answers | If the Guard can't see the object (W4 fails, or the body can't be read and restored without breaking the runtime): record it, prefer a pin where it can, and rely on the navigation lock, CSP and no raw HTML (§5.5, §5.8) until then |
 
@@ -206,13 +206,26 @@ cmd/isshoni-desktop/            package main
 ├─ main_other.go                //go:build !windows && !(darwin && cgo) — prints "isshoni-desktop runs on Windows and
 │                               //   macOS; Linux uses isshoni-agent" and exits 1 (06 §5.2, D18; so ./... builds and
 │                               //   vets everywhere, also GOOS=darwin with cgo off)
+├─ platform_windows.go, platform_darwin.go   the asset origin and its Guard, the data root from the shell's known
+│                               //   folder (never the environment), the OS build (README WA22)
+├─ flavor.go, flavor_{production,dev,e2e}.go  what the build tags change, each tag's file setting its part in init()
+│                               //   (dev: ISSHONI_DESKTOP_DEV_URL, §5.3); a release compiles no dev or e2e code path
+├─ webview2.go, webview2_windows.go  the WebView2 runtime check and its message box (§5.4)
+├─ main_test.go                 the scrub, logging and option tests
+├─ checklist_test.go, checklist_{windows,darwin}_test.go, testdata/checklist/   the `isshoni_hw` Wails checklist
+│                               //   harness (§3.2)
+├─ .gitignore                   /rsrc_windows_*.syso (the resource object exists only during a build, 06 §5.2)
 ├─ doc.go
 └─ build/
    ├─ windows/icon.ico          app icon (16/20/24/32/48/256); 06's `task desktop:exe:windows` reads it
    ├─ windows/app.manifest      asInvoker; PerMonitorV2 DPI awareness (PerMonitor fallback); Windows 10/11
    │                            supportedOS GUID; Common Controls v6 dependency (the pill's BUTTON controls);
    │                            activeCodePage UTF-8; longPathAware
-   └─ tray/                     tray icons (idle, live, paused, warn; .ico 16/20/24/32), go:embed by shell.go
+   ├─ windows/syso.go           //go:build ignore — writes rsrc_windows_<arch>.syso with app.manifest byte for byte,
+   │                            //   and checks a built exe for it (06 §5.2 step 1): `wails3 generate syso` round-trips
+   │                            //   the manifest through winres.AppManifest, which at beta.34 drops activeCodePage and
+   │                            //   turns the PerMonitor fallback into System
+   └─ tray/                     tray icons (idle, live, paused, warn; .ico 16/20/24/32), go:embed by shell.go (WA68)
 internal/desktop/
 ├─ app/         App: owns the share controller, sessions, tray view, window and close policy, system events, wiring
 ├─ bridge/      the Wails-bound services (§6.2); plain Go structs, no Wails import
@@ -270,10 +283,14 @@ vet ./...` stays green on ubuntu (M1's lint-go job and `task licenses` both run 
 package assets
 
 type Options struct {
-	Dist   fs.FS                // web.Dist()
+	Dist   fs.FS                // web.Dist(); unused (may be empty) when DevServer is set
 	Bridge func() BridgeConfig  // read on every bridge.js and index.html request
 	Origin string               // the asset origin: 02's protocol.DesktopAssetOriginWindows on Windows
-	Dev    bool                 // dev builds only (-tags dev): see §5.3
+	Dev    bool                 // dev and e2e builds only (-tags dev or e2e): see §5.3
+	// DevServer is the Vite dev server's http:// loopback origin (dev builds only, from ISSHONI_DESKTOP_DEV_URL,
+	// `task desktop:dev`): the SPA comes from there with live reload instead of from Dist (§5.3). New refuses it
+	// without Dev, and only flavor_dev.go reads the variable, so a release can't set it.
+	DevServer string
 }
 
 // New checks that Dist holds an index.html with exactly one `<script src="/boot-check.js">` tag (the injection
@@ -282,6 +299,9 @@ func New(o Options) (http.Handler, error)
 
 // Guard is Wails' AssetOptions.Middleware: requests under /wails/ pass only from the asset origin (§5.6).
 func Guard(origin string) func(http.Handler) http.Handler
+// GuardWKWebView is Guard for an asset origin that WKWebView serves through a URL-scheme handler (wails://localhost,
+// the macOS dev build): §5.6's one exception, for a custom-scheme origin only.
+func GuardWKWebView(origin string) func(http.Handler) http.Handler
 
 type BridgeConfig struct {
 	V         int           `json:"v"`         // 1
@@ -351,9 +371,14 @@ font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-s
 - `'self'` is the asset origin, which covers the Wails runtime's calls to `/wails/runtime`; which of those calls are
   answered is the Guard's allowlist (§5.6), not the CSP's.
 - No `unsafe-inline`, no `unsafe-eval`. If a pinned Wails needed either, that version is not used (§3.2).
-- Dev builds (`-tags dev`, never released) may add the Vite dev origin `http://localhost:5173` to `script-src`,
-  `style-src` and `connect-src` for HMR (`ISSHONI_DESKTOP_DEV_URL`); a release-build test asserts the policy has no
-  `localhost:5173`.
+- Dev builds (`-tags dev`, never released) with `assets.Options.DevServer` (`ISSHONI_DESKTOP_DEV_URL`, an http
+  loopback origin such as `http://localhost:5173`) keep the page on the asset origin and take the SPA from Vite: a
+  route gets Vite's `index.html` with the bridge tag and the CSP, every other GET or HEAD (modules, `/@vite/client`,
+  public files) is proxied to the dev server, and only the live-reload WebSocket goes to it directly. The dev origin
+  is added to `script-src`, `style-src` and `connect-src` (with its `ws://` for live reload), and a **per-request
+  nonce** goes into `script-src` and `style-src`, with Vite's `<meta property="csp-nonce">` in the page: Vite's
+  React-refresh preamble is an inline module script and Vite injects `<style>` elements, and the nonce lets exactly
+  those run. There is still no `'unsafe-inline'`. A release-build test asserts the policy has no `localhost:5173`.
 - Other headers on HTML: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy:
   same-origin`, `Permissions-Policy: fullscreen=(self), picture-in-picture=(self), autoplay=(self), display-capture=(),
   camera=(), microphone=(), geolocation=(), usb=(), payment=()`. `display-capture=()`: the app shares natively, so
@@ -371,20 +396,37 @@ font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-s
 | Status bar (link preview) | off | none needed |
 | Swipe navigation, pinch zoom | off | `touch-action` in CSS |
 | External drop (a dropped file or link navigates) | off | the SPA cancels `dragover` and `drop` on `document` |
-| User data folder | `%LOCALAPPDATA%\isshoni\WebView2`, expanded to an absolute path once at start; the same string (no trailing separator) is `audio.SelfInfo.WebViewDataDir` (§6.1) | environment variable (W13) |
-| Additional browser arguments | `--autoplay-policy=no-user-gesture-required` (viewer audio plays without the "tap to unmute"; 05 §10.3's unlock then never shows) | environment variable (W13) |
+| User data folder | `%LOCALAPPDATA%\isshoni\WebView2`, expanded to an absolute path once at start; the same string (no trailing separator) is `audio.SelfInfo.WebViewDataDir` (§6.1) | none at beta.34: Wails overwrites the variable in every build (W13); the app sets it through `WindowsOptions` (`WebviewUserDataPath`) |
+| Additional browser arguments | `--autoplay-policy=no-user-gesture-required` (viewer audio plays without the "tap to unmute"; 05 §10.3's unlock then never shows) | none at beta.34: Wails overwrites the variable in every build (W13); the app sets it through `WindowsOptions` (`AdditionalBrowserArgs`) |
 
-- **Environment scrub.** Before the webview environment is created, production builds unset every environment
-  variable whose name starts with `WEBVIEW2_` (compared case-insensitively; e.g. `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`,
-  `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`, `WEBVIEW2_USER_DATA_FOLDER`, `WEBVIEW2_RELEASE_CHANNEL_PREFERENCE`,
-  `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`, `WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER`, and any a later runtime adds), so nothing
-  outside the app can start its webview with a remote debugging port or a script debugger attached (W19). This is
-  defense in depth, not a boundary: a process that can set isshoni's environment runs as the same user and could read
-  the refresh token from Credential Manager directly (02 §11.5). The W13 fallback sets its two variables after the
-  scrub. e2e builds keep them (§22.4).
-- **WebView2 runtime**: Evergreen, minimum 120.0. When it is missing or older, a native message box says "isshoni
-  needs the Microsoft Edge WebView2 Runtime" with a link to Microsoft's Evergreen download and one to the project
-  site's `/troubleshooting#desktop-webview2`, and the app exits 1. The installer installs it when missing (06).
+- **Environment scrub.** Before `application.New` (Wails reads its updater-helper variables there, WebView2 reads
+  `WEBVIEW2_*` when the window's environment is created), production builds unset every environment variable whose
+  name starts with `WEBVIEW2_` (compared case-insensitively, as Windows compares names; e.g.
+  `WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER` and any a later runtime adds), so nothing outside the app can start its webview
+  with a remote debugging port or a script debugger attached (W19). It keeps Wails' own placeholders: at beta.34 Wails
+  sets five variables in **every** build, at package init and again right before it creates the webview environment,
+  overwriting what the parent passed (`internal/webview2/webviewloader`, `preventEnvAndRegistryOverrides`):
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`, `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` and
+  `WEBVIEW2_USER_DATA_FOLDER` to `""`, `WEBVIEW2_RELEASE_CHANNEL_PREFERENCE` to `"0"`, because a variable that exists
+  stops WebView2's registry override of the same setting. In every build the scrub also unsets
+  `FRONTEND_DEVSERVER_URL` (it would move Wails' start URL to another port, off the asset origin the Guard accepts) and
+  every `WAILS_UPDATER_HELPER*` (Wails' own updater would swap the app's files when `application.New` sees them;
+  isshoni's updates are 06's). This is defense in depth, not a boundary: a process that can set isshoni's environment
+  runs as the same user and could read the refresh token from Credential Manager directly (02 §11.5). The W13
+  environment fallback can't work at beta.34 (Wails overwrites both variables); the app sets the user data folder and
+  the autoplay argument through Wails' `WindowsOptions` (`WebviewUserDataPath`, `AdditionalBrowserArgs`). e2e builds
+  keep the `WEBVIEW2_*` variables, but Wails' overwrite applies to them too (§22.4 B).
+- **Permission policy**: the main window denies the webview's microphone, camera, geolocation and notification
+  permissions (`WebviewWindowOptions.Permissions`). Without any policy the pinned Wails grants every permission without a
+  prompt (`SetGlobalPermission(Allow)`); the kinds left out keep the webview's own prompt, and the page's
+  `Permissions-Policy` (§5.3) turns camera, microphone and geolocation off too.
+- **WebView2 runtime**: Evergreen, minimum 120.0 (`webview2Min`, which must equal the installer's `WEBVIEW2_MIN`,
+  06 §6.5). The version EdgeUpdate records is compared part by part as numbers; empty, unparsable and `0.0.0.0` (what
+  an uninstall leaves) count as none. When it is missing or older, a native message box says "isshoni needs the
+  Microsoft Edge WebView2 Runtime" with Microsoft's WebView2 download page and the project site's
+  `/troubleshooting#desktop-webview2` (English until WA41's `desktop.native.*` key; neither link is clickable in a
+  message box, Ctrl+C copies its text), and the app exits 1: the pinned Wails would only log it and show a blank
+  window. The installer installs it when missing (06).
 - **Windows N editions** have no H.264 decoder without the Media Feature Pack: `detectCaps()` then reports no H.264
   decode, and the M1 codec banner (05 §10.6) shows; the troubleshooting page names the Media Feature Pack (06).
 
@@ -411,15 +453,26 @@ Three layers, so no single one has to be perfect:
 
 ### 5.6 The `/wails/*` guard
 
-`assets.Guard(origin)` applies two checks to every request under `/wails/`; requests outside `/wails/` pass through
-unchanged.
+`assets.Guard(origin)` applies three checks to every request under `/wails/`; requests outside `/wails/` pass through
+unchanged. Its WARN lines go to `slog.Default()` with `component=assets` (the process's default logger carries no
+component of its own, so a JSON line never has the key twice).
 
 1. **Origin**: the request passes only when its `Origin` header equals the asset origin, or it has no `Origin` and
    `Sec-Fetch-Site` is `same-origin`. Otherwise 403 and one rate-limited WARN line (`desktop: runtime request from
-   another origin`, the origin truncated to 128 bytes).
-2. **Runtime allowlist** (W21): for `/wails/runtime`, the Guard reads the object and method the way the pinned
-   transport does, from the `?object=`/`?method=` query or from the JSON body (buffered up to 64 KiB, then restored
-   for the runtime with `io.NopCloser(bytes.NewReader(…))`; a larger body gets 413), and lets through only the
+   another origin`, the origin truncated to 128 bytes). **The one exception** is `assets.GuardWKWebView(origin)`, for
+   a custom-scheme asset origin only (`wails://localhost`, the macOS dev build): WKWebView hands its scheme handler no
+   `Origin` and no `Sec-Fetch-Site` at all, not even on a POST (measured with the checklist at beta.34), so a request
+   with neither header also passes, but on `/wails/runtime` only when it carries the runtime's own
+   `x-wails-client-id` header: no simple request can carry it, so a sender on another origin would need a CORS
+   preflight, which the Guard never answers with a 2xx. A request that names another origin or site is refused as by
+   `Guard`, and an http(s) origin gets no exception. Windows uses `Guard` (`platform_windows.go`); if WebView2 also
+   sent neither header, the owner's checklist run shows W4/W21 failing and the integrator decides between extending
+   the exception and W4's fallback. The macOS release (M3) re-checks it against its webview.
+2. **Runtime allowlist** (W21): `/wails/runtime` takes only POST (405 otherwise). The Guard reads the object and
+   method the way the pinned transport does, from the JSON body or, when the body is empty, from the
+   `?object=`/`?method=` query (buffered up to 64 KiB, then restored for the runtime with
+   `io.NopCloser(bytes.NewReader(…))`; a larger body gets 413; a body with object or method also in the query is
+   refused), and lets through only the
    bound-method objects `Call` and `CancelCall`, plus any read-only method that W21 finds the runtime itself calls at
    load. Everything else is refused with 403 and one rate-limited WARN line (`desktop: runtime object refused`,
    object and method names only): `Browser`, `Clipboard`, `Dialog`, `ContextMenu`, `Screens`, `System`,
@@ -428,6 +481,11 @@ unchanged.
    the transport's chunking is refused (our binding arguments are far below one chunk), so the Guard never has to
    check an object after reassembly; a request whose object it can't parse is refused. The allowlist is a table in
    `internal/desktop/assets/runtime_allow.go`, keyed by the wire ids W21 records, and is re-checked at every bump.
+3. **Path allowlist**: under `/wails/`, only `/wails/runtime` (check 2) and GET or HEAD of the runtime's static
+   scripts (`/wails/runtime.js`, `/wails/transport.js`, `/wails/custom.js`) and of `/wails/eventpayload/<id>` (an
+   event over 8 KiB that Go parked for the page) pass; every other `/wails/` path gets 403, GoStream's
+   `/wails/stream/` included (beta.34 serves it; the app registers no stream). The handler itself answers 404 for any
+   `/wails/` path Wails didn't serve.
 
 The SPA uses no WML attributes (`data-wml-*`, `wml-*`): an ESLint `no-restricted-syntax` rule on JSX attribute names
 matching `^(data-)?wml-` fails on any in `web/src`, so no markup can trigger a runtime call by itself.
@@ -539,8 +597,9 @@ Wiring in `main.go` (first instance, §13.4 step 7):
   app.OnAuthState})`. `<data dir>` is `%LOCALAPPDATA%\isshoni` (§14.1): every per-PC file under one folder, which
   06's `--purge-data` removes; the Credential Manager entries it points to don't roam either.
 - `audio.New(engine.(media.AudioController), settingsStore, audio.SelfInfo{PID: uint32(os.Getpid()),
-  WebViewDataDir: <the same absolute, expanded path given to WebView2 (W13 option or env fallback), no trailing
-  separator>, Exe: os.Executable()}, log)`; `App.Run` starts `Service.Run(ctx)`, `Quit` calls `Service.Close()`.
+  WebViewDataDir: <the same absolute, expanded path given to WebView2 (`WindowsOptions.WebviewUserDataPath`, W13),
+  no trailing separator>, Exe: os.Executable()}, log)`; `App.Run` starts `Service.Run(ctx)`, `Quit` calls
+  `Service.Close()`.
 - `update.New(update.Options{CurrentVersion: version.Version(), Enabled: func() bool { return
   settings.Updates().Check && !update.PolicyDisabled() }, Channel: func() update.Channel { return
   settings.Updates().Channel }, WizardDone: settings.WizardDone, DataDir: <data dir>, Logger: log})`; `App.Run`
@@ -1563,8 +1622,10 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
   kinds (01 §8.14).
 
 **`playback.state`** (05 §5.9: a browser that plays the user's isshoni viewer is kept out of the share):
-- **Payload**: `{playing: bool, browser: client.browser, os: client.os}` (the sender's own M1 `ClientInfo`; 01's
-  `relay.PlaybackState`). It has no `v`: its only receiver, the core, ignores unknown fields, so a later field is
+- **Payload**: `{playing: bool, browser, os: client.os}` (from the sender's own M1 `ClientInfo`; 01's
+  `relay.PlaybackState`, typed by `relay.gen.ts`). `browser` is the tab's `client.browser` mapped to one of the four
+  families of the generated `Browser` union: `chrome`, `edge` and `firefox` as they are, `safari` and anything else
+  `other` (the core ignores a report with another value, README WA18). It has no `v`: its only receiver, the core, ignores unknown fields, so a later field is
   additive, and a change of meaning takes a new kind (README §3 item 21). `playback.stop` keeps its `v: 1`.
 - **Sender**: `rooms/handoff.ts` in every browser. Addressed with `to` (never `toRole`, 01 §11.11) to each online
   connection with `kind: desktop` in the tab's `user.connections`, whenever the tab's audible playback starts or stops
@@ -1731,7 +1792,10 @@ checks it on windows-2025.
 6. **Pending values**: read and delete `PendingServer` and `PendingRoom` (§13.2).
 7. **The app**: env scrub (§5.4), `SetCurrentProcessExplicitAppUserModelID("io.isshoni.desktop")`, the WebView2
    runtime check (§5.4), settings, logs, the services of §6.1, Wails; then `HandleArgs(os.Args[1:])` and
-   `HandleLink` for the pending values.
+   `HandleLink` for the pending values. Once the engine is open, the app compares `Info().Build` with its own
+   `internal/version` and logs one warning when they differ (both versions named); it never refuses, since the
+   installer ships both together and dev builds mix them on purpose (04 §5.5; README §3 item 27: the binding logs only
+   the engine's build, because depguard keeps `internal/version` out of `internal/media/native`).
 
 Also part of the contract:
 - **No job object**: the app never puts itself or its children in a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so
@@ -2233,11 +2297,15 @@ Every spec also runs `axe` on its desktop pages (05's `a11y` helper) in both col
 with `-tags e2e`: the fake engine with 05's audio scenarios (as in A), http servers on loopback allowed, the
 `WEBVIEW2_*` scrub off, DevTools on, and `credstore.Open(credstore.Options{Prefix: "isshoni-test:<random>:"})` whose
 entries are deleted at exit (never the user's `isshoni:v1:` entries). The spec starts an `isshoni` server
-(`tls.mode=off` on `127.0.0.1`), launches the app with `--relaunched` (so Playwright keeps its process),
-`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>` and a temporary `%LOCALAPPDATA%`, and attaches
-with `chromium.connectOverCDP`. It checks W1–W3, W5, W7, W9 (observable rows), W13, W16; then a device-flow link
-approved by a second browser context, a fake share seen by a Chrome viewer, close-to-tray while live (the window
-hides, the share continues), and Quit (share ended, process exited 0 within 3 s). W21: from the page, raw runtime
+(`tls.mode=off` on `127.0.0.1`), launches the app with `--relaunched` (so Playwright keeps its process), a remote
+debugging port and a temporary `%LOCALAPPDATA%`, and attaches with `chromium.connectOverCDP`. **The port can't come
+through `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`**: at beta.34 Wails overwrites that variable (and
+`WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`) in every build (§5.4), e2e builds included. WA72 adds an e2e-only path instead:
+`flavor_e2e.go` reads the port from an e2e-only variable or flag and appends `--remote-debugging-port=<port>` to
+Wails' `WindowsOptions.AdditionalBrowserArgs`, next to the autoplay argument; no other build compiles that file
+(README WA72). The spec checks W1–W3, W5, W7, W9 (observable rows), W13, W16; then a device-flow link approved by a
+second browser context, a fake share seen by a Chrome viewer, close-to-tray while live (the window hides, the share
+continues), and Quit (share ended, process exited 0 within 3 s). W21: from the page, raw runtime
 requests built as the pinned runtime builds them for `Browser.OpenURL('ms-settings:display')`,
 `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403, no Settings or search window
 opens (no new top-level window of `SystemSettings.exe` or `SearchHost.exe` appears) and the main window stays
@@ -2245,7 +2313,9 @@ visible, while a bound method answers. It never runs against a production build:
 starts it with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>`,
 `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER=isshoni-test-<random>` and an arbitrary `WEBVIEW2_X=1` and asserts that no
 debugging port is open, no pipe `\\.\pipe\isshoni-test-<random>` exists and the webview's process command lines carry
-none of them. e2e builds keep the variables.
+none of them. Because Wails overwrites the first two in every build, "no port, no pipe" would pass even without the
+scrub; what proves the scrub is `WEBVIEW2_X` (and any other `WEBVIEW2_*` Wails doesn't set) missing from the
+webview processes' environment and command lines, and the unit test of `scrubEnv`. e2e builds keep the variables.
 
 ### 22.5 Manual (owner's PC; recorded in the PR and in the release checklist)
 

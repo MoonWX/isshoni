@@ -27,7 +27,7 @@ In this doc (all M2 unless tagged):
   classification, planning; CMake target `im_audiopolicy`) and `native/common/audiomix` (rings, resampling, mixing,
   chunk timestamps; target `im_audiomix`), both added by 04's `native/common/CMakeLists.txt`.
 - Go: the OS-neutral audio types and the `AudioController` interface (`internal/media/audio.go`, stdlib only, 01 D1);
-  the Windows binding in `internal/media/native` (untagged logic in `audio.go`, procs in `audio_windows.go`, 01 D3); the
+  the Windows binding in `internal/media/native` (untagged logic in `audio.go`, over 04's export table, 01 D3); the
   fake engine's scripted audio (`internal/media/fake/audio_ctl.go`); the built-in data (`internal/media/audiorules`);
   and the desktop policy service (`internal/desktop/audio`: settings, prompts, the `FriendsHear` model the share sheet
   renders, and `RunSoundCheckHelper`).
@@ -240,9 +240,11 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
 - **Validation** (04 §5.1). `struct_size` below the v1.0 size of `im_exclusions` (24) or `im_audio_levels` (5 152) →
   `IM_ERR_ABI`. A larger `struct_size` is accepted; so is a smaller one that is still at least the v1.0 size (an older
   caller on a newer DLL): fields beyond it read as zero, and output is written only up to it. Unknown rule kinds or
-  sources, empty values, `rule_count > IM_MAX_RULES`, a malformed pid or an `app_id` outside `[a-z0-9:._-]{1,63}` →
-  `IM_ERR_INVALID_ARG` with `im_last_error` naming the rule index; nothing is applied. Unknown `flags` bits are
-  ignored. An unknown mode → `IM_ERR_INVALID_ARG`.
+  sources, empty values, a value of `IM_MAX_RULE_VALUE` bytes or more or not UTF-8, `rule_count > IM_MAX_RULES`, a
+  malformed (non-decimal) pid, an `app_id` outside `[a-z0-9:._-]{1,63}` (NULL and `""` mean none) or a name that is
+  not UTF-8 → `IM_ERR_INVALID_ARG` with `im_last_error` naming the rule (`rules[3].app_id`); nothing is applied. 04's
+  `api/` layer runs these checks before it forwards (`validate.cpp`, README WA11), so a refused rule set never reaches
+  `AudioEngine`. Unknown `flags` bits are ignored. An unknown mode → `IM_ERR_INVALID_ARG`.
 - **Implicit rules.** The DLL always adds `IM_RULE_INSTANCE(GetCurrentProcessId())` with source `IM_RULE_SRC_SELF` and
   app id `isshoni`, whatever Go passes.
 - **Before start.** `im_set_exclusions` without a watcher or share stores the rules for the next `im_audio_watch` or
@@ -285,7 +287,9 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
   `exe:<exe of the app root>` (`exe:spotify.exe`).
 - **Display name**: the rule's `name` (Go fills it for built-ins), else `FileDescription` from the app root's version
   resource (`GetFileVersionInfoSizeExW` / `GetFileVersionInfoExW` / `VerQueryValueW`, first language), else the exe name
-  without `.exe`. Cached per image path.
+  without `.exe`. Cached per image path. When a rule matched a process other than the app root, the fallback is the
+  `FileDescription` of the process the rule matched, not the app root's: otherwise Discord's row would be named after
+  `Update.exe`, its app root (README WA14).
 
 ### 5.2 Two kinds of tree (S1)
 
@@ -318,7 +322,7 @@ lineage entry, §5.7) has exe X.
 
 | # | Condition | Verdict | Reason | User control |
 |---|---|---|---|---|
-| 1 | P is in the OS tree (strict or loose) of an `IM_RULE_INSTANCE` pid; or the walk hits `isshoni.exe` (source SELF); or P is `msedgewebview2.exe` whose `--user-data-dir` equals an `IM_RULE_WEBVIEW_DATA_DIR` value or lies below it (see the path rule after the table) | kept out | `isshoni` | locked |
+| 1 | P is in the **strict** OS tree of an `IM_RULE_INSTANCE` pid (see below); or the walk hits `isshoni.exe` (source SELF); or P is `msedgewebview2.exe` whose `--user-data-dir` equals an `IM_RULE_WEBVIEW_DATA_DIR` value or lies below it (see the path rule after the table) | kept out | `isshoni` | locked |
 | 2 | The walk hits an `IM_RULE_APP_EXCLUDE` with source BUILTIN | kept out | `builtin` | locked |
 | 3 | The walk hits an `IM_RULE_APP_EXCLUDE` with source USER | kept out | `user` | toggle |
 | 4 | The walk hits an `IM_RULE_APP_EXCLUDE` with source VIEWER | kept out | `viewer` | toggle (per-run override) |
@@ -341,6 +345,11 @@ lineage entry, §5.7) has exe X.
   normalized (`/` → `\`, trailing separators stripped) and compared case-insensitively (`CompareStringOrdinal` with
   `bIgnoreCase = TRUE`). P matches when the parsed value equals the rule value or starts with the rule value followed
   by `\` (a path-separator boundary, so `…\isshoni2` never matches `…\isshoni`).
+- **Row 1 follows strict links only** (README WA14's review): a process linked to an instance pid only through a loose
+  (PID-only) link is older than that instance, so the instance is never in its tree, and an INCLUDE stream on it can't
+  re-capture isshoni's playback. Matching loose links would lock out, as `isshoni`, a game whose exited bootstrapper's
+  PID isshoni.exe happened to reuse, with no way to include it. The safety side stays with I1 and the fast path's I4,
+  which use the loose union (§5.2, §6.3).
 - `IM_RULE_INSTANCE` with a pid that doesn't exist is ignored (and reported in `warnings` as `instance_gone`).
 - The warnings of §5.8 attach to the row of the shared app.
 
@@ -434,7 +443,8 @@ be told apart. Consequences:
   protected process stripping rights; rare, since most strip neither right), the target is activated anyway: dropping
   it would silently lose the shared game's sound, the main content. Without the handle, I3 is checked by snapshot: on
   every reconcile (≤ 1 s apart, §7.3) the target's pid must still be in the Toolhelp snapshot with the planned
-  creation time (or, when the creation time is unknown, the same exe name and parent pid), otherwise the stream fades
+  creation time (or, when the creation time is unknown, a creation time that is still unknown, the same exe name and
+  the same parent pid: a pid whose time became known is another process), otherwise the stream fades
   out at once; exit is detected through `session_disconnected` or that 1 s poll instead of the wait. The session row
   gets the note `no_handle` (§12.1). The window in which the pid could be reused unnoticed is at most one poll, and
   reuse needs the process to have exited first, which ends its own capture.
@@ -467,8 +477,10 @@ mechanism (the relay messages are 01's, the SPA side is 03's, §22):
    playing; steps 2–4 cover them. In the common case no browser plays isshoni audio at all.
 2. A tab that plays reports `playback.state {playing, browser, os}` over the relay. The core receives it (01 §11.11)
    and emits `EventPlaybackState` with the sender's connection id; 03 calls
-   `audio.Service.SetViewerBrowser(connID, family, os, playing)`. `family` is M1's `client.browser` value (`chrome`,
-   `edge`, `firefox`, `safari`, `other`), `os` M1's `ClientOS`. A connection that leaves the user's connections
+   `audio.Service.SetViewerBrowser(connID, family, os, playing)`. `family` is one of `relay.PlaybackState`'s four
+   families (`chrome`, `edge`, `firefox`, `other`; README WA18): the tab maps M1's `client.browser` to it, `safari`
+   and anything else to `other`, and the core ignores a report with any other value. `os` is M1's `ClientOS`. A
+   connection that leaves the user's connections
    (01's `user.connections`) counts as `playing: false` for its connID (03 makes that call).
 3. If `os == "windows"` and the family is `chrome`, `edge` or `firefox`, the service adds `IM_RULE_APP_EXCLUDE`
    (source VIEWER, app id `exe:<name>`) for every exe of that family (§5.4) whose session is active in the latest
@@ -509,7 +521,7 @@ kind and its targets.
 | Mode | Process loopback works (probe ok) | Excluded set is one tree and fast path allowed | Engine |
 |---|---|---|---|
 | any | no | — | `endpoint`: classic loopback of the default render endpoint (`eConsole`); nothing is excluded, banner (§15) |
-| `IM_AUDIO_MODE_EVERYTHING` (reserved, later; refused with `IM_ERR_INVALID_ARG` in M2) | yes | — | `exclude-self`: one EXCLUDE stream on isshoni's tree (the fast path's code with R = isshoni) |
+| `IM_AUDIO_MODE_EVERYTHING` (reserved, later; refused with `IM_ERR_INVALID_ARG` in M2) | yes | — | later: `exclude-self`, one EXCLUDE stream on isshoni's tree (the fast path's code with R = isshoni). M2's planner plans no capture for it (engine `none`), since every layer refuses the mode (README §3 item 15); a test checks that |
 | `IM_AUDIO_MODE_EXCLUDE_APPS` | yes | yes | `exclude-self` (the fast path), target R (§6.4) |
 | `IM_AUDIO_MODE_EXCLUDE_APPS` | yes | no | `include-set` (§6.2) |
 | `IM_AUDIO_MODE_OFF` | — | — | `none` |
@@ -534,7 +546,17 @@ leaks, and a failed probe switches to `endpoint`.
    fails** on Windows: step 3 drops only candidates created before the ancestor's stream was activated (creation time
    < the activation's QPC time), and a later child gets its own stream (still subject to step 2).
 4. Order the remaining targets: active sessions first, then by most recent activity, then oldest process first. Take at
-   most **48** (§17). The rest are not captured (`limit`) until a slot frees.
+   most **48** (§17). The rest are not captured (`limit`) until a slot frees. Live include streams keep their slots
+   ahead of that order, so a full set doesn't churn ("until a slot frees"). A live stream below a newly selected
+   ancestor is removed with reason `covered`, and the watcher fades it out only once the ancestor's stream runs; a
+   live descendant of a new root that the cap cut keeps its stream. Counting the covered streams that wait for their
+   coverer, the engine holds at most one more stream than the cap during such a handover (`PlannerOptions::
+   max_include_streams`).
+   **The planner's input** (`PlanInput::streams`) is every stream the engine holds, from the start of its activation
+   until it is gone: activating, waiting for the commit check, in preroll, running, and removed-but-waiting
+   (`covered`). A stream still activating has `activated_filetime` 0 and counts as covering every process of the
+   snapshot. Leaving it out would make the next reconcile open it again and leave a reconcile in the preroll window
+   unable to drop it (step 5).
 5. **Commit check** (on the watcher thread, right before a newly activated stream joins the mixer): take a fresh
    snapshot and repeat step 2 for that target. The stream joins the mixer in `Preroll` (§9.2), so nothing it captured
    is mixed for the next 40 ms; any reconcile in that window that finds the target unsafe drops it without output.
@@ -1255,20 +1277,22 @@ Golden fixtures: `internal/media/testdata/audio/report-*.json` (normal, degraded
 browser mic, shared mic) are parsed in Go tests and produced by the C++ report writer's tests (the same files), so the
 two sides can't drift.
 
-### 13.2 The Windows binding (`internal/media/native/audio.go`, `audio_windows.go`)
+### 13.2 The Windows binding (`internal/media/native/audio.go`)
 
-- **`audio.go`** (no build tag, 01 §7.7): the C-layout mirrors `imRule`, `imExclusions`, `imAudioLevel` and
-  `imAudioLevels` (sizes and offsets of §4.1 asserted in `layout_test.go`); `buildExclusions` (the struct, the rule
-  array and a NUL-terminated byte slice per string, all heap memory kept alive with `runtime.KeepAlive` until the call
-  returns: the DLL copies everything, §4.3); the status → error table of §13.1; the single mode mapping of §13.1 (used
-  by 04's `media.Config` → `imStartConfig` conversion for `AudioConfig.Mode` and by `SetAudioMode`); level decoding;
-  report decoding through `media.ParseAudioReport`. The methods of `media.AudioController` are implemented here, on
-  the engine type `native.Open` returns (01 §7.1, 04 §12.2), calling procs through the `caller` interface, so all of
-  this is tested on the Mac and CI ubuntu with 01 §7.7's `caller` fake.
-- **`audio_windows.go`** only adds the audio procs to the set `native.Open` resolves on the DLL handle it loaded
-  (absolute path, `LoadLibraryEx(…, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)`, 01 D4, 04 §12.4)
-  and calls them with 04's `call_windows.go` helpers: `SyscallN` with the `im_last_error` read on the same locked OS
-  thread. No `LazyDLL`, no purego. It also holds `AudioTestHooks` (below).
+- **`audio.go`** (no build tag, 01 §7.7; README WA10 declared it with not-implemented stubs, WA35 fills them):
+  `buildExclusions` (the struct, the rule array and a NUL-terminated byte slice per string, pinned for the call with
+  04 §12.4's `addrOf`/`runtime.Pinner`: the DLL copies everything, §4.3); the status → error table of §13.1; the
+  single mode mapping of §13.1 (used by 04's `media.Config` → `imStartConfig` conversion for `AudioConfig.Mode` and by
+  `SetAudioMode`); level decoding; report decoding through `media.ParseAudioReport`. The methods of
+  `media.AudioController` are implemented here, on the engine type `native.Open` returns (01 §7.1, 04 §12.2), calling
+  procs through the `caller` interface, so all of this is tested on the Mac and CI ubuntu with 01 §7.7's `caller`
+  fake. The C-layout mirrors `imRule`, `imExclusions`, `imAudioLevel` and `imAudioLevels` are in 04's `abi.go`, beside
+  the other mirrors, because `layout_test.go` checks every struct of the golden file (sizes and offsets of §4.1).
+- **The procs**: the audio exports and the three `im_test_*` exports are in 04's export table (`bridge.go`), which
+  `native.Open` resolves on the DLL handle it loaded (absolute path, `LoadLibraryEx(…, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+  | LOAD_LIBRARY_SEARCH_SYSTEM32)`, 01 D4, 04 §12.4), every one required, and they are called with 04's
+  `call_windows.go` helpers: `SyscallN` with the `im_last_error` read on the same locked OS thread. No `LazyDLL`, no
+  purego. So no `audio_windows.go` is needed; one would hold Windows-only helpers only, if WA35 has any.
 - **Buffers**: `im_list_audio_apps` and `im_audio_sound_check` go through 01 §7.3's buffer helper under 04's snprintf
   rule (64 KiB first, one retry with `n + 1` bytes, at most 4 MiB). No second buffer rule.
 - **Serialization**: the audio exports are control calls under 01 §7.3's mutex, never under the pump, except
@@ -1278,7 +1302,8 @@ two sides can't drift.
 - **Packets**: Opus packets become `media.Packet{Kind: KindAudio, Layer: "", CaptureNS, Data, Reinit}` (04 §12.3);
   `IM_PACKET_PCM` packets become `media.Packet{Kind: KindPCM, CaptureNS, Data}` (01 §5.1). Only a config with
   `TapPCM` produces them, and the core never sets it, so the pump and the publisher never see PCM.
-- **`AudioTestHooks`** (Windows only; `cmd/isshoni-audiotest/driver_windows.go` is its one user):
+- **`AudioTestHooks`** (in `audio.go`, so it compiles everywhere; it answers only the engine `native.Open` returned,
+  which exists only on Windows; `cmd/isshoni-audiotest/driver_windows.go` is its one user):
 
   ```go
   // AudioTestHooks returns the im_test_* exports of the engine native.Open returned; for any other media.Engine an
@@ -2191,8 +2216,8 @@ R1–R7 (§18.9); the first-run sound check on both OSes; a 2-hour watch-togethe
    with `AudioStatus = AudioReport`, `AudioApp`, `ParseAudioReport`, `AudioLevels`, `SoundCheckResult`,
    `AudioController`, `ErrAudioNotRunning`; the status → error table of §13.1 (codes `CodeAudioNotRunning` and
    `CodeTimeout` declared in 01's `errors.go`).
-6. **Go `internal/media/native`**: `media.AudioController` on the engine `native.Open` returns (`audio.go`,
-   `audio_windows.go`); `KindPCM` packets only with `TapPCM`; `AudioTestHooks` and `AudioTest` (Windows only).
+6. **Go `internal/media/native`**: `media.AudioController` on the engine `native.Open` returns (`audio.go`);
+   `KindPCM` packets only with `TapPCM`; `AudioTestHooks` and `AudioTest` (useful on Windows only).
 7. **Go `internal/media/audiorules`**: `VoiceApps`, `Launchers`, `SharedRuntimes`, `Browsers` (with families), per OS.
 8. **Go `internal/desktop/audio`**: `Service` and its methods (§14.2: `AudioConfig`, `Exclusions`, `SetSharedPID`,
    `OnShareStarted`, `OnShareStopped`, `SetPaused` (no engine call), `SetShareSound`, `WatchLevels`, `AppRules`,
@@ -2328,7 +2353,7 @@ Each slice is independently testable. "Mac" means `task test` on the developer's
 | A2 | Go audio types and fake | `internal/media/audio.go` (§13.1), goldens, `fake/audio_ctl.go` (`EngineConfig.AudioScenario`, the scenarios of §13.3, the call-log fields) | goldens parse; fake scenarios scripted under synctest; the fake's `AudioController` works before `Start`; `GOOS=windows/darwin/linux` and the gomobile package builds pass | Mac, CI | 01's C01 (media package) | 1.5 |
 | A3 | `audiopolicy` core | portable C++20 of §5–6 as CMake target `im_audiopolicy` in `native/common/audiopolicy/` (added by 04's `native/common/CMakeLists.txt`): snapshot, rules, classifier, lineage, mic state, planner, invariants, the WebView2 path rule | ≈ 60 GoogleTest table cases and the 10 000-seed property test pass under `task native:test` in `host-debug` and `host-tsan` (macOS clang, ubuntu-24.04) and `win-x64-ci` (windows-2025, MSVC) | Mac, CI | 04's E1 | 3 |
 | A4 | `audiomix` core | target `im_audiomix` in `native/common/audiomix/`: rings with QPC side ring, PI resampler (speexdsp from `native/vcpkg.json`, `init_frac` creation, \|ppm\| ≥ 1, `reset_mem` on leaving the bypass), silence drop/pad, channel states, fades, onset fade (saturated counter for new channels), soft clip, levels, silence flags, chunk timestamps (mix time, L0 = 50 ms, re-anchor only in silence) and the `OnGap` rules (§10.3, §10.4); report writer producing the goldens | §19.1 `audiomix` and report-writer tests pass, including the 30 ms-silence onset, ppm never 0, no mixer-thread allocation (Linux `host-debug`) and sound from t = 0; the drift simulation meets §17 | Mac, CI | A2 (goldens), 04's E1 | 3 |
-| A5 | Windows watcher (no capture) | process table, endpoints, session notifications, meters, mic detection, device notifications, `AudioEngine::Init/Shutdown/Watch/Unwatch/SetRules/ListAppsJson/LevelsGet/ProbeFlags`, `im_caps.audio_flags`; Go `internal/media/native/audio.go` and `audio_windows.go` | caller-fake tests on the Mac and CI ubuntu; hosted CI windows: process-table tests, 100 start/stop cycles without leaks, `no-device` state, `IM_INIT_NO_AUDIO` returns. PC (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR): `isshoni-audiotest apps` lists playing apps with correct verdicts for Discord, a browser and a Steam game | Mac, CI, PC | A3, 04's E2 (DLL skeleton and loader) | 2.5 |
+| A5 | Windows watcher (no capture) | process table, endpoints, session notifications, meters, mic detection, device notifications, `AudioEngine::Init/Shutdown/Watch/Unwatch/SetRules/ListAppsJson/LevelsGet/ProbeFlags`, `im_caps.audio_flags`; Go `internal/media/native` (`audio.go`; an `audio_windows.go` only if WA35 needs Windows-only helpers, §13.2) | caller-fake tests on the Mac and CI ubuntu; hosted CI windows: process-table tests, 100 start/stop cycles without leaks, `no-device` state, `IM_INIT_NO_AUDIO` returns. PC (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR): `isshoni-audiotest apps` lists playing apps with correct verdicts for Discord, a browser and a Steam game | Mac, CI, PC | A3, 04's E2 (DLL skeleton and loader) | 2.5 |
 | A6 | Windows capture and mixer | activators, held handles (and the no-handle path, §5.7), commit check, loopback streams, capture thread, include set (`pid_reuse` verdicts, `covered` notes), fast path with retroactive cut, endpoint engine, probe, mode/mute/pause flags, sound check, health checks, `Mixer` of §10.5 calling 04's `PcmSink` (packets reach `im_next_packet` through 04's bridge), test exports (`im_test_render_bursts` predicting from `IAudioClock`, §13.2), `AudioTestHooks` | hosted CI builds and `selfcheck` passes. PC: cases 1–4, 10, 15, 19–21 pass (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR), and 04's E13 acceptance: `enginetest capture -audio mix` gives a playable `audio.ogg` | CI windows, PC | A0, A4, A5, 04's E13 | 4 |
 | A7 | Audiotest harness | §18 complete: analyzer (S1's as base, plus the 50 ms short-window rule and measured cut/onset of §18.6), runner, the `SetExclusions` recorder, fixtures (`firstRenderNs`, `reuse-pid`), all cases (24–27 included), gate configuration, report, redaction, summary, `record`, `merge`, README with the "unverified" column for R7 | Mac: analyzer and verdict tests, including the 20 ms burst that must FAIL absent and the faded 1000 Hz tone that must not trip 907 Hz. PC: all required cases run; any failure is a real engine bug, fixed in A6's code by a `WF` fix slice that lists `native/windows/src/audio/`, never in a harness PR (README §3 item 13; a case 25 or 26 failure switches on its fallback, §6.2, §6.4) | Mac, CI, PC | A6 (runs), A2, A8 (the harness drives the service) | 3 |
 | A8 | Desktop policy service | `internal/desktop/audio`: settings, rules builder, prompts, viewer browser (connIDs, override), banners/tips (`ducking_windows.go`/`ducking_other.go`), `FriendsHear` (with `alert`), `AppRules`, errors, `AudioConfig`, `SetSharedPID`, `SetShareSound`, `SetPaused`, `WatchLevels` polling, events (`audio.alert` included), `RunSoundCheckHelper` (`helper_windows.go`/`helper_other.go`) | §19.1 Go tests and the lifecycle integration test with the fake pass with goleak, on the Mac and CI ubuntu, macos, windows | Mac, CI | A1, A2 | 2.5 |

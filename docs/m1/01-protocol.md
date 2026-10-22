@@ -2454,7 +2454,7 @@ Files:
 - `resume.go`;
 - `ratelimit.go`;
 - `stats.go`: `stats` and `stats.watch` in both directions (§8.11);
-- `metrics.go`: the hub's series (§18); `semver.go`: the comparison behind `Policy.MinClientVersion` (§6.1);
+- `metrics.go`: the hub's series (§18); the comparison behind `Policy.MinClientVersion` (§6.1) is `internal/version`'s `Below` since M2 (its `semver.go` moved there, M2 02 §13.2);
 - `interfaces.go`;
 - `snapshot.go`;
 - `signaltest/`: a fake `MediaPlane`, `Authenticator` and `RoomDirectory` for tests (also used by 02 and 04).
