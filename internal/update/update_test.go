@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -263,6 +265,116 @@ func TestCheckNowDebounce(t *testing.T) {
 		}
 		if n := h.checks(); n != 3 {
 			t.Errorf("%d checks, want 3: the three calls share one", n)
+		}
+	})
+}
+
+// The 30 s limit counts checks: a CheckNow that found the updater off made none, so once it is turned on the next
+// CheckNow checks at once.
+func TestCheckNowAfterTurnedOn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t)
+		h.gh.publish(h.active, testCurrent, installerBytes(100, 1))
+		h.enabled.Store(false)
+		h.checkNow(StateOff, "")
+		h.enabled.Store(true)
+		time.Sleep(time.Second)
+		h.checkNow(StateUpToDate, "")
+		if n := h.checks(); n != 1 {
+			t.Errorf("%d manifest requests, want 1", n)
+		}
+	})
+}
+
+// hangDownload makes the fake GitHub send half of rel's installer and then hang until the client gives up, while
+// hang is true.
+func hangDownload(h *harness, rel release, hang *atomic.Bool) {
+	h.gh.setHook(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Host != assetHost || !strings.HasSuffix(r.URL.Path, rel.name) || !hang.Load() {
+			return false
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(rel.installer)))
+		_, _ = w.Write(rel.installer[:len(rel.installer)/2])
+		_ = http.NewResponseController(w).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-h.gh.quit:
+		}
+		return true
+	})
+}
+
+// A CheckNow cancelled mid-download (its binding call cancelled) is no check for the 30 s limit: the next CheckNow
+// with a live context checks, and downloads, at once.
+func TestCheckNowCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t)
+		rel := h.gh.publish(h.active, "0.2.1", installerBytes(1000, 2))
+		var hang atomic.Bool
+		hang.Store(true)
+		hangDownload(h, rel, &hang)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			_, err := h.u.CheckNow(ctx)
+			done <- err
+		}()
+		synctest.Wait()
+		if st := h.u.Status(); st.State != StateDownloading {
+			t.Fatalf("status %+v, want downloading", st)
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("the cancelled CheckNow = %v, want context.Canceled", err)
+		}
+		hang.Store(false)
+		time.Sleep(time.Second)
+		h.checkNow(StateReady, "")
+		if n := h.checks(); n != 2 {
+			t.Errorf("%d manifest requests, want 2", n)
+		}
+	})
+}
+
+// A check that joined a CheckNow whose context then ended runs its own check rather than taking context.Canceled:
+// the schedule would otherwise wait a whole day.
+func TestJoinedCheckOutlivesCancelledCheckNow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t)
+		rel := h.gh.publish(h.active, "0.2.1", installerBytes(1000, 2))
+		var hang atomic.Bool
+		hang.Store(true)
+		hangDownload(h, rel, &hang)
+		ctx, cancel := context.WithCancel(t.Context())
+		user := make(chan error, 1)
+		go func() {
+			_, err := h.u.CheckNow(ctx)
+			user <- err
+		}()
+		synctest.Wait()
+		type result struct {
+			st  Status
+			err error
+		}
+		scheduled := make(chan result, 1)
+		go func() {
+			st, err := h.u.runCheck(t.Context(), false)
+			scheduled <- result{st, err}
+		}()
+		synctest.Wait()
+		if n := h.checks(); n != 1 {
+			t.Fatalf("%d manifest requests, want 1: the scheduled check joins the running one", n)
+		}
+		hang.Store(false)
+		cancel()
+		if err := <-user; !errors.Is(err, context.Canceled) {
+			t.Fatalf("the cancelled CheckNow = %v, want context.Canceled", err)
+		}
+		if r := <-scheduled; r.st.State != StateReady || r.err != nil {
+			t.Errorf("the joined check = %+v, %v; want its own check, ready", r.st, r.err)
+		}
+		if n := h.checks(); n != 2 {
+			t.Errorf("%d manifest requests, want 2", n)
 		}
 	})
 }
@@ -769,7 +881,64 @@ func TestApplyReverifies(t *testing.T) {
 	})
 }
 
+// A launch that fails (Smart App Control or an antivirus blocks the installer) leaves the app running: one failed
+// attempt stays ready, and the second trips the loop guard at once (06 §8.5, §8.7), not at the next start or check.
 func TestApplyLaunchFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t)
+		rel := h.gh.publish(h.active, "0.2.1", installerBytes(100, 2))
+		h.checkNow(StateReady, "")
+		h.launchErr = &Error{Code: CodeInstallFailed, Err: errors.New("start: access denied")}
+		p := h.u.Ready()
+		if err := h.u.Apply(t.Context(), p, true); CodeOf(err) != CodeInstallFailed {
+			t.Errorf("Apply = %v", err)
+		}
+		if a := h.diskState().Pending.Attempts; a != 1 {
+			t.Errorf("attempts %d, want 1: counted before the launch", a)
+		}
+		if st := h.u.Status(); st.State != StateReady || h.u.Ready() == nil {
+			t.Fatalf("status %+v, Ready() %+v after one failed launch; want ready", st, h.u.Ready())
+		}
+		if n := h.logs.count(slog.LevelWarn); n != 0 {
+			t.Errorf("%d WARN lines after one failed launch: %v", n, h.logs.lines())
+		}
+
+		if err := h.u.Apply(t.Context(), p, true); CodeOf(err) != CodeInstallFailed {
+			t.Errorf("a second Apply = %v", err)
+		}
+		st := h.u.Status()
+		if st.State != StateError || st.ErrorCode != CodeInstallFailed || st.Available != "0.2.1" ||
+			st.NotesURL != ReleasesURL+"/tag/v0.2.1" || st.CheckedAt.IsZero() || h.u.Ready() != nil {
+			t.Errorf("status %+v, Ready() %+v after two failed launches; want error/install_failed with 0.2.1", st,
+				h.u.Ready())
+		}
+		if h.logs.count(slog.LevelWarn, "version=0.2.1", "attempts=2") != 1 {
+			t.Errorf("want one WARN naming the version and the attempts; logs %v", h.logs.lines())
+		}
+		// A third Apply, with the Pending from before, starts nothing.
+		if err := h.u.Apply(t.Context(), p, true); CodeOf(err) != CodeInstallFailed {
+			t.Errorf("a third Apply = %v", err)
+		}
+		if n := len(h.launched()); n != 2 {
+			t.Errorf("%d launches, want 2", n)
+		}
+		// CheckNow within 30 s of the last one gives the status as it is now; a check after that finds the same
+		// version, which stays install_failed and is not downloaded again.
+		if st, err := h.u.CheckNow(t.Context()); st.State != StateError || st.ErrorCode != CodeInstallFailed || err != nil {
+			t.Errorf("CheckNow within 30 s = %+v, %v; want the current error/install_failed", st, err)
+		}
+		time.Sleep(checkNowInterval)
+		if st := h.checkNow(StateError, CodeInstallFailed); st.Available != "0.2.1" || h.u.Ready() != nil {
+			t.Errorf("status %+v, Ready() %+v", st, h.u.Ready())
+		}
+		if n := h.gh.count(rel.name); n != 2 {
+			t.Errorf("%d installer requests (redirect and asset), want the first download's 2", n)
+		}
+	})
+}
+
+// A cancelled context while Apply waits for the installer's mutex is not a failed launch: the guard doesn't trip.
+func TestApplyCancelledIsNoFailedLaunch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t)
 		h.gh.publish(h.active, "0.2.1", installerBytes(100, 2))
@@ -778,8 +947,12 @@ func TestApplyLaunchFails(t *testing.T) {
 		if err := h.u.Apply(t.Context(), h.u.Ready(), true); CodeOf(err) != CodeInstallFailed {
 			t.Errorf("Apply = %v", err)
 		}
-		if a := h.diskState().Pending.Attempts; a != 1 {
-			t.Errorf("attempts %d, want 1: counted before the launch", a)
+		h.launchErr = context.Canceled
+		if err := h.u.Apply(t.Context(), h.u.Ready(), true); !errors.Is(err, context.Canceled) {
+			t.Errorf("a second Apply = %v", err)
+		}
+		if st := h.u.Status(); st.State != StateReady || h.u.Ready() == nil || h.diskState().Pending.Attempts != 2 {
+			t.Errorf("status %+v, Ready() %+v, attempts %d; want ready", st, h.u.Ready(), h.diskState().Pending.Attempts)
 		}
 	})
 }

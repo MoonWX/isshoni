@@ -141,6 +141,11 @@ func (l launcher) run(ctx context.Context, path string, args []string, log *slog
 // startInstaller starts the installer with exactly args (06 §8.7: hidden window, a new process group, no job object
 // of the app's) and lets it go: the installer outlives the app, which quits right after. The end of ctx must never
 // kill it, so the command's context is never done (which also means os/exec starts no goroutine to watch it).
+//
+// HideWindow is 06 §8.7's literal. It sets STARTUPINFO's SW_HIDE, which Windows may apply to the installer's first
+// top-level window: in /S /UPDATE mode that is §6.4's "Updating isshoni to {v}…" banner. Whether the banner shows
+// through Apply is not verified on Windows yet (an owner's-PC step); if it doesn't, 06 §8.7 drops HideWindow (an NSIS
+// GUI exe opens no console, so it buys nothing).
 func startInstaller(ctx context.Context, path string, args []string) error {
 	//nolint:gosec // G204: the verified installer in the updates folder, with fixed arguments
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), path, args...)

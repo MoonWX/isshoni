@@ -12,11 +12,9 @@ import (
 	"testing"
 )
 
-// The updatetest hooks (06 §8.11). Run them with
+// The updatetest hooks (06 §8.11), tested only in a build that has them (the package's other tests pass in both):
 //
-//	go test -tags updatetest -run TestTestHooks ./internal/update/
-//
-// (manifest_test.go's TestEligible and TestCheckChannel assume a build without the hooks).
+//	go test -tags updatetest ./internal/update/
 func TestTestHooks(t *testing.T) {
 	if !updateTestBuild || testHooks == nil || !Eligible("0.0.1-ci.1") {
 		t.Fatal("the updatetest hooks are not installed")

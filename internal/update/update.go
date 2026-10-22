@@ -133,6 +133,7 @@ type checkCall struct {
 	started time.Time // monotonic
 	st      Status
 	err     error
+	cut     bool // it failed because its starter's context ended
 }
 
 // env is what the updatetest hooks (06 §8.11) and the tests change: the keys, the URLs and the OS seams.
@@ -361,29 +362,44 @@ func sleep(ctx context.Context, d time.Duration) bool {
 }
 
 // CheckNow runs a check now, as a user action (06 §8.6): it never waits for WizardDone, and with Enabled false it
-// makes no request and returns StateOff. At most one check starts per 30 s: a call within 30 s of the last CheckNow,
-// or while any check runs, returns that check's result. The check includes the download, so a newer version that
+// makes no request and returns StateOff. At most one check starts per 30 s: a call while any check runs returns that
+// check's result, and a call within 30 s of the last CheckNow that checked returns the current status (with that
+// check's error while the status is the one it left). The check includes the download, so a newer version that
 // applies to this copy returns StateReady (or an error). The error is the check's (an *Error with its code), or
 // ctx's.
 func (u *Updater) CheckNow(ctx context.Context) (Status, error) { return u.runCheck(ctx, true) }
 
 // runCheck runs one check, or joins the one that runs (and, for CheckNow, the last CheckNow's within 30 s).
+//
+// A check runs on the context of the caller that started it. When that context ends the check (a binding call
+// cancelled mid-download, say), a joined caller whose own context is live doesn't take that caller's error: it runs
+// (or joins) a check of its own. Only a CheckNow that checked counts for the 30 s limit: one that ended with its
+// context, or found the updater off or disabled, made no complete check, so the next CheckNow checks at once.
 func (u *Updater) runCheck(ctx context.Context, user bool) (Status, error) {
-	u.mu.Lock()
-	c := u.inflight
-	if c == nil && user && u.lastUser != nil && time.Since(u.lastUser.started) < checkNowInterval {
-		c = u.lastUser
-	}
-	if c != nil {
+	for {
+		u.mu.Lock()
+		c, finished := u.inflight, false
+		if c == nil && user && u.lastUser != nil && time.Since(u.lastUser.started) < checkNowInterval {
+			c, finished = u.lastUser, true
+		}
+		if c == nil {
+			break // start one, below, with mu held
+		}
 		u.mu.Unlock()
 		select {
 		case <-c.done:
-			return c.st, c.err
 		case <-ctx.Done():
 			return u.Status(), ctx.Err()
 		}
+		if c.cut && ctx.Err() == nil {
+			continue // the check ended with its starter's context, not with ours
+		}
+		if st := u.Status(); finished && st != c.st {
+			return st, nil // changed since the check (Apply, a scheduled check): the current status, not its error
+		}
+		return c.st, c.err
 	}
-	c = &checkCall{done: make(chan struct{}), started: time.Now()}
+	c := &checkCall{done: make(chan struct{}), started: time.Now()}
 	u.inflight = c
 	if user {
 		u.lastUser = c
@@ -397,6 +413,10 @@ func (u *Updater) runCheck(ctx context.Context, user bool) (Status, error) {
 
 	u.mu.Lock()
 	c.st, c.err = st, err
+	c.cut = err != nil && ctx.Err() != nil
+	if u.lastUser == c && (c.cut || st.State == StateOff || st.State == StateDisabled) {
+		u.lastUser = nil
+	}
 	u.inflight = nil
 	u.mu.Unlock()
 	close(c.done)
@@ -627,8 +647,7 @@ func (u *Updater) doStartup() error {
 
 	switch {
 	case rec != nil && rec.Attempts >= maxAttempts:
-		u.set(Status{State: StateError, ErrorCode: CodeInstallFailed, Available: rec.Version, Required: rec.Required,
-			NotesURL: rec.NotesURL}, nil)
+		u.installFailed(rec)
 	case rec != nil:
 		_, _ = u.becomeReady(Status{}, rec)
 	case verr != nil:
@@ -644,8 +663,9 @@ func (u *Updater) doStartup() error {
 // mismatch deletes it and returns CodeHashMismatch), returns ErrNotInstalled when the exe is not in InstallDir,
 // counts the attempt in state.json, starts the installer with /S /UPDATE (and /RELAUNCH when relaunch is true), waits
 // (≤ 10 s) until the installer's mutex Local\io.isshoni.desktop.installing exists, and returns. The app then quits
-// within 5 s (03). After 10 s without the mutex it logs a WARN and returns nil anyway. Where there is no apply method
-// it returns ErrUnsupported.
+// within 5 s (03). After 10 s without the mutex it logs a WARN and returns nil anyway. The loop guard: once 2
+// attempts failed to start, or for a pending update that has had 2, it publishes error/install_failed (Ready() is then
+// nil) and returns CodeInstallFailed. Where there is no apply method it returns ErrUnsupported.
 func (u *Updater) Apply(ctx context.Context, p *Pending, relaunch bool) error {
 	if p == nil {
 		return errors.New("update: Apply without a pending update")
@@ -673,6 +693,7 @@ func (u *Updater) Apply(ctx context.Context, p *Pending, relaunch bool) error {
 	case u.o.Now().After(rec.ExpiresAt.Time):
 		return &Error{Code: CodeManifestExpired, Err: fmt.Errorf("the update %s expired", rec.Version)}
 	case rec.Attempts >= maxAttempts:
+		u.installFailed(rec)
 		return &Error{Code: CodeInstallFailed, Err: fmt.Errorf("%s failed to install %d times", rec.Version, rec.Attempts)}
 	}
 	installed, err := u.env.sys.installed()
@@ -698,7 +719,25 @@ func (u *Updater) Apply(ctx context.Context, p *Pending, relaunch bool) error {
 		args = append(args, "/RELAUNCH")
 	}
 	u.log.Info("starting the installer", "version", rec.Version, "attempt", attempts)
-	return u.env.sys.launch(ctx, path, args, u.log)
+	err = u.env.sys.launch(ctx, path, args, u.log)
+	// A launch that failed (Smart App Control or an antivirus blocked the installer, say) leaves the app running. The
+	// last allowed attempt then trips the loop guard now, not at the next start or check: "Restart and update" goes
+	// and 03 shows "The update didn't install" (06 §8.5, §8.7). A context that ended while Apply waited for the
+	// installer's mutex is not a failed launch: the installer was started.
+	if err != nil && attempts >= maxAttempts && !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		u.log.Warn("the installer failed to start; the update is not applied again", "version", rec.Version,
+			"attempts", attempts, logx.Err(err))
+		u.installFailed(rec)
+	}
+	return err
+}
+
+// installFailed publishes the tripped loop guard for rec (06 §8.5): StateError with install_failed and Available,
+// until a check finds a newer version.
+func (u *Updater) installFailed(rec *pendingRec) {
+	u.set(Status{State: StateError, ErrorCode: CodeInstallFailed, Available: rec.Version, Required: rec.Required,
+		NotesURL: rec.NotesURL, CheckedAt: u.Status().CheckedAt}, nil)
 }
 
 // waitInstalling polls exists, the probe of the installer's mutex Local\io.isshoni.desktop.installing, every 50 ms

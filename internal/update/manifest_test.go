@@ -330,7 +330,10 @@ func TestCheckChannel(t *testing.T) {
 			t.Errorf("%s manifest, app %q, test build %t: err = %v, want wrong_channel", tt.manifest, tt.app, tt.testBuild, err)
 		}
 	}
-	if err := (&Manifest{Channel: channelCI}).CheckChannel(ChannelBeta); CodeOf(err) != CodeWrongChannel {
+	switch err := (&Manifest{Channel: channelCI}).CheckChannel(ChannelBeta); {
+	case updateTestBuild && err != nil:
+		t.Errorf("CheckChannel in a build with the updatetest hooks: %v, want nil", err)
+	case !updateTestBuild && CodeOf(err) != CodeWrongChannel:
 		t.Errorf("CheckChannel in a build without the updatetest hooks: err = %v, want wrong_channel", err)
 	}
 }
@@ -365,8 +368,12 @@ func TestEligible(t *testing.T) {
 		if got := eligible(tt.version, true); got != tt.test {
 			t.Errorf("eligible(%q) in an updatetest build = %t, want %t", tt.version, got, tt.test)
 		}
-		if got := Eligible(tt.version); got != tt.release {
-			t.Errorf("Eligible(%q) = %t, want %t (this test binary has no updatetest hooks)", tt.version, got, tt.release)
+		want := tt.release
+		if updateTestBuild {
+			want = tt.test
+		}
+		if got := Eligible(tt.version); got != want {
+			t.Errorf("Eligible(%q) = %t, want %t (updatetest hooks: %t)", tt.version, got, want, updateTestBuild)
 		}
 	}
 }
