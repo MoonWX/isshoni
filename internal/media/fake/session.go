@@ -41,7 +41,8 @@ type Session struct {
 	preset       string
 	layers       []*layerState
 	audioBitrate int
-	audioMuted   bool
+	audioMuted   bool // AudioController.SetAudioMuted: the pause mute
+	audioOff     bool // AudioController.SetAudioMode(AudioOff): "Share sound" off
 	audioStarted bool // the first audio packet went out (it is the Reinit one)
 	paused       bool
 	events       []media.Event   // returned by Next before any media
@@ -50,7 +51,8 @@ type Session struct {
 	pending      map[string]bool // layers to re-initialize at Next's next pull, or nil
 	failErr      error           // what Next returns next (Fail), then the session stops
 	pullCancel   context.CancelFunc
-	done         bool // stopped: by Stop, Engine.Close or a Fail that Next returned
+	done         bool      // stopped: by Stop, Engine.Close or a Fail that Next returned
+	endedAt      time.Time // when it stopped
 	stopCalled   bool
 	calls        []Call
 }
@@ -75,13 +77,16 @@ type layerState struct {
 type Call struct {
 	At time.Time
 	// Op is "keyframe" (RequestKeyframe), "bitrate" (SetBitrate; Layer is media.LayerAudio for the Opus target),
-	// "active" (SetLayerActive), "paused" (SetPaused), "reconfigure" (Reconfigure), "audio_muted"
-	// (AudioController.SetAudioMuted), "exclusions" (AudioController.SetExclusions) or "stop" (the first Stop).
+	// "active" (SetLayerActive), "paused" (SetPaused), "reconfigure" (Reconfigure), "audio_mode"
+	// (AudioController.SetAudioMode), "audio_muted" (AudioController.SetAudioMuted), "exclusions"
+	// (AudioController.SetExclusions) or "stop" (the first Stop).
 	Op     string
 	Layer  string
 	Bps    int
-	On     bool           // "active": active; "paused": paused; "audio_muted": muted
-	Reconf media.Reconfig // "reconfigure": the argument
+	On     bool            // "active": active; "paused": paused; "audio_muted": muted (as Muted)
+	Reconf media.Reconfig  // "reconfigure": the argument
+	Mode   media.AudioMode // "audio_mode": the mode (05 §13.3)
+	Muted  bool            // "audio_muted": muted (05 §13.3)
 }
 
 var _ media.Session = (*Session)(nil)
@@ -256,7 +261,7 @@ func (s *Session) queuedLocked(now time.Time) (media.Packet, bool) {
 	case len(s.pcm) > 0 && !now.Before(s.src.Origin().Add(time.Duration(s.pcm[0]))):
 		capture := s.pcm[0]
 		s.pcm = s.pcm[1:]
-		return media.Packet{Kind: media.KindPCM, CaptureNS: capture, Data: pcmChunk(capture, s.audioMuted)}, true
+		return media.Packet{Kind: media.KindPCM, CaptureNS: capture, Data: pcmChunk(capture, s.audioSilentLocked())}, true
 	}
 	return media.Packet{}, false
 }
@@ -289,7 +294,7 @@ func (s *Session) deliverLocked(p Packet, now time.Time) (media.Packet, bool) {
 		if !s.audioStarted {
 			s.audioStarted, p.Reinit = true, true // 05 §10.4: the first packet after Start
 		}
-		if s.audioMuted {
+		if s.audioSilentLocked() {
 			p.Data = silenced(p.Data)
 		}
 		if s.tapPCM {
@@ -666,7 +671,7 @@ func (s *Session) endLocked() {
 	if s.done {
 		return
 	}
-	s.done = true
+	s.done, s.endedAt = true, time.Now()
 	s.pending, s.events, s.held, s.pcm = nil, nil, nil, nil
 	_ = s.src.Close()
 	s.kickLocked()
@@ -741,15 +746,46 @@ func (s *Session) setAudioMuted(muted bool) error {
 		return &media.Error{Code: media.CodeAudioNotRunning, Op: "audio_set_muted"}
 	}
 	s.audioMuted = muted
-	s.recordLocked(Call{Op: "audio_muted", On: muted})
+	s.recordLocked(Call{Op: "audio_muted", On: muted, Muted: muted})
 	return nil
 }
 
-// liveAudio reports whether the session runs and has audio.
-func (s *Session) liveAudio() bool {
+// setAudioMode is AudioController.SetAudioMode's part in the session, for a mode the caller checked: with
+// media.AudioOff ("Share sound" off) the audio packets carry Opus silence as when muted, since the native mix is
+// silent while either flag is set (05 §4.3); media.AudioExcludeApps turns the sound back on. Each flag is cleared
+// only by its own call. It needs a running session with audio.
+func (s *Session) setAudioMode(m media.AudioMode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.done && s.hasAudio
+	if s.done || !s.hasAudio {
+		return &media.Error{Code: media.CodeAudioNotRunning, Op: "audio_set_mode"}
+	}
+	s.audioOff = m == media.AudioOff
+	s.recordLocked(Call{Op: "audio_mode", Mode: m})
+	return nil
+}
+
+// audioSilentLocked reports whether the session's audio is silence: muted or sound off.
+func (s *Session) audioSilentLocked() bool {
+	return s.audioMuted || s.audioOff
+}
+
+// audioInfo is what the AudioController's report reads from a session with audio.
+type audioInfo struct {
+	start, end         time.Time // end is zero while it runs
+	paused, muted, off bool
+}
+
+// liveAt reports whether the session ran at t.
+func (i audioInfo) liveAt(t time.Time) bool {
+	return !t.Before(i.start) && (i.end.IsZero() || t.Before(i.end))
+}
+
+// audioInfo returns the session's audioInfo.
+func (s *Session) audioInfo() audioInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return audioInfo{start: s.startedAt, end: s.endedAt, paused: s.paused, muted: s.audioMuted, off: s.audioOff}
 }
 
 // recordExclusions records an AudioController.SetExclusions call made while the session runs.

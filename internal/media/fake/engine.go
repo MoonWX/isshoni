@@ -39,8 +39,10 @@ type EngineConfig struct {
 	// PickDelay longer than the request's Timeout makes Pick time out (ErrCancelled), and a ctx that ends first ends
 	// Pick: how tests exercise the picker's timeout and ctx.
 	PickDelay time.Duration
-	// AudioScenario names one of 05 §13.3's scripted scenarios of the AudioController ("" = "normal"). The scenarios
-	// come with docs/m2/README.md slice WA26; until then audio_ctl.go ignores it.
+	// AudioScenario names the script of the Engine's media.AudioController (05 §13.3, audio_ctl.go): "normal" (the
+	// default for ""), "degraded", "degrade-live", "old-windows", "no-device", "fast-path", "shared-mic" or "many".
+	// With any other name every AudioController call is CodeInvalid. The desktop app's dev build reads it from
+	// ISSHONI_FAKE_AUDIO.
 	AudioScenario string
 	Seed          uint64        // Synthetic's filler bytes and frame-size jitter (Config.Seed)
 	FlashEvery    time.Duration // as Config.FlashEvery: flash frames and beeps at k·FlashEvery
@@ -62,11 +64,12 @@ type Engine struct {
 	pickResult media.Source
 	cancel     bool
 	pickDelay  time.Duration
-	scenario   string
 	seed       uint64
 	flashEvery time.Duration
 
-	done chan struct{} // closed by Close: ends a Pick that waits out PickDelay
+	done chan struct{} // closed by Close: ends a Pick that waits out PickDelay, and a SoundCheck
+
+	audio audioState // the AudioController's script and state (audio_ctl.go); its own mutex
 
 	mu       sync.Mutex // guards the fields below
 	closed   bool
@@ -110,8 +113,9 @@ var encoderTokens = []string{"nvenc", "qsv", "amf", "mf-hw", "mf-sw", "openh264"
 func NewEngine(cfg EngineConfig) *Engine {
 	e := &Engine{
 		mode: cfg.Mode, sourceSize: cfg.SourceSize, cancel: cfg.Cancel, pickDelay: cfg.PickDelay,
-		scenario: cfg.AudioScenario, seed: cfg.Seed, flashEvery: cfg.FlashEvery, done: make(chan struct{}),
+		seed: cfg.Seed, flashEvery: cfg.FlashEvery, done: make(chan struct{}),
 	}
+	e.audio.init(cfg.AudioScenario)
 	if e.sourceSize[0] <= 0 || e.sourceSize[1] <= 0 {
 		e.sourceSize = [2]int{DefaultSourceWidth, DefaultSourceHeight}
 	}
@@ -289,8 +293,29 @@ func (e *Engine) prunePicksLocked(now time.Time) {
 // are CodeInvalid, a consumed, expired, evicted or unknown pick is source_gone with Reason "pick_expired", a second
 // session is ErrBusy with Reason "session_limit" (IM_ERR_LIMIT, 04 §5.7), a forced encoder the probe lacks is
 // no_encoder) and starts a Session: one Source layer per cfg.Layers entry, audio when cfg.Audio is set. A successful
-// Start consumes a picked source; a failed one keeps it.
+// Start consumes a picked source; a failed one keeps it. A session with audio replaces the AudioController's rule set
+// with cfg.Audio.Exclusions, as im_start does with its exclusions (05 §4.2), and runs its watcher while it lives.
 func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
+	// A session with audio holds the AudioController's lock from before the session exists until the controller
+	// knows it, so no SetAudioMuted or SetAudioMode finds the session (Engine.Session) before the report follows it.
+	audio := cfg.Audio != nil && e.audio.sc != nil
+	if audio {
+		e.audio.mu.Lock()
+		defer e.audio.mu.Unlock()
+	}
+	s, err := e.start(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if audio {
+		e.audioSessionStartedLocked(s, cfg.Audio.Exclusions)
+	}
+	return s, nil
+}
+
+// start is Start's checks and new Session, under e.mu. Start holds audioState.mu around it for a session with audio
+// (audio_ctl.go's lock order: audioState.mu, then Engine.mu).
+func (e *Engine) start(ctx context.Context, cfg media.Config) (*Session, error) {
 	const op = "start"
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -585,8 +610,8 @@ func checkAudio(op string, a media.AudioConfig) (media.AudioConfig, error) {
 		return a, errorf(media.CodeInvalid, op, "", "audio bitrate %d not in %d–%d", a.BitrateBPS,
 			minAudioBitrate, maxAudioBitrate)
 	}
-	if len(a.Exclusions.Rules) > maxRules {
-		return a, errorf(media.CodeInvalid, op, "", "%d rules, at most %d", len(a.Exclusions.Rules), maxRules)
+	if err := checkExclusions(op, a.Exclusions); err != nil {
+		return a, err
 	}
 	return a, nil
 }
