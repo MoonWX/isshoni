@@ -197,11 +197,13 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
 
   **The toolset build** (README §3 item 30, WF1) means the compiler's and linker's own builds, not the folder: VS
   servicing updates `cl.exe` and `link.exe` in place under the same `VCToolsVersion` folder name (the first FFmpeg run:
-  folder `14.44.35207`, `cl.exe` 19.44.35229). FFmpeg's `build.sh` therefore reads `cl.exe`'s and `link.exe`'s banner
+  folder `14.44.35207`, `cl.exe` 19.44.35229; WF1's run, §4.6: `cl.exe` 19.44.35229 and `link.exe` 14.44.35229.0 in
+  that folder). FFmpeg's `build.sh` therefore reads `cl.exe`'s and `link.exe`'s banner
   versions (`{ cl.exe 2>&1 || true; } | tr -d '\r' | sed -n … | head -n 1`, no early-exiting reader under
   `pipefail`) and dies when either is empty; `build-manifest.json`, `result.json` and `lock-candidate.json` carry them
   as `msvcCompiler` and `msvcLinker` next to `msvcToolset`, which stays the `VCToolsVersion` folder (it still selects
-  the toolset). `tools/desktoppkg`'s `Lock` has both fields, validated like the other versions. "Same toolset build"
+  the toolset). `tools/desktoppkg`'s `Lock` requires both fields (3 or 4 dotted numbers each, under the lock's strict
+  decoding, which refuses unknown fields). "Same toolset build"
   in §4.6 means the same `msvcToolset` **and** the same `msvcCompiler` and `msvcLinker`.
 - **vcpkg's toolset**: without the overlay triplet vcpkg builds its ports with the newest toolset on the machine
   (14.51 on windows-2025), whose STL objects call helpers (`__std_rotate`) that 14.44's static libraries lack, so the
@@ -261,7 +263,9 @@ by hand against FFmpeg's release key):
 }
 ```
 
-- `revision` starts at 1 and goes up whenever the build changes without a version change (a flag, the script).
+- `revision` starts at 1 and goes up whenever the build changes without a version change (a flag, the script), once
+  that revision has been published: `deps-ffmpeg-9.0.2-r1` had not been published when WF1 changed `build.sh`, so
+  `revision` stayed 1 (`inputsSha256` moved with the script, and the first publish writes the lock for it).
 - Each entry stays on one line, as above: `build.sh` reads `pins.json` line by line (no JSON parser in MSYS2's bash),
   and `tools/desktoppkg`'s check of `pins.json` enforces it. `native/ffmpeg/.gitattributes` (`eol=lf`) and
   `tools/desktoppkg/testdata/.gitattributes` (`-text`) keep the bytes that `inputsSha256` hashes the same in every
@@ -291,7 +295,7 @@ by hand against FFmpeg's release key):
   "dlls": {"avcodec-<avcodecMajor>.dll": "<sha256>", "avutil-<avutilMajor>.dll": "<sha256>"},
   "msvcToolset": "14.44.yyyyy",
   "msvcCompiler": "<cl.exe's banner version, e.g. 19.44.35229>",
-  "msvcLinker": "<link.exe's banner version>",
+  "msvcLinker": "<link.exe's banner version, e.g. 14.44.35229.0>",
   "commit": "<the commit the run built>"
 }
 ```
@@ -356,8 +360,11 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
 
 1. **Preflight**: MSYS2's bash and the MSVC variables (`VCToolsInstallDir`, `VCToolsVersion`, `WindowsSDKVersion`)
    are required. MSVC's `Hostx64/x64` folder goes first on `PATH`, before `/usr/bin`, so MSYS2's coreutils `link.exe`
-   can't shadow MSVC's linker; a PC's MSYS2 install is left untouched (no `mv /usr/bin/link.exe`). CMake and Ninja
-   come from the VS instance ("C++ CMake tools for Windows"), else from `PATH`.
+   can't shadow MSVC's linker; a PC's MSYS2 install is left untouched (no `mv /usr/bin/link.exe`). Both `cl.exe` and
+   `link.exe` must be in that folder, and their banner builds are read (§3) and logged ("MSVC toolset … (cl.exe …,
+   link.exe …), Windows SDK …"); an empty build fails the run. CMake and Ninja come from the VS instance ("C++ CMake
+   tools for Windows"), else from `PATH`. When the built DLLs differ from `lock.json`'s, the log line names the
+   lock's and this build's toolset, compiler and linker.
 2. **Sources**: each `pins.json` tarball into `WORKDIR/src/`, downloaded with MSYS2's `curl` (3 retries) unless
    already there or in the source archive's `src/`, and checked against its SHA-256 either way.
 3. **libvpl**: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
@@ -443,7 +450,8 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
 - **The source archive** `ffmpeg-<ver>-r<rev>-source.tar` holds one top-level folder, `ffmpeg-<ver>-r<rev>-source/`,
   with: the four upstream tarballs exactly as downloaded (`src/`), `native/ffmpeg/{pins.json,build.sh,ffcheck.c,
   README-LGPL.txt}`, `deploy/windows/{msvc-env.ps1,tools.json}` (so the archive alone rebuilds the DLLs, the relink
-  check of §9.1), `CONFIGURE.txt` (the configuration string `ffcheck` printed, the toolset and SDK, and how to build),
+  check of §9.1), `CONFIGURE.txt` (the configuration string `ffcheck` printed, the toolset folder with the compiler and
+  linker builds, the SDK, and how to build),
   and `SHA256SUMS` of the tarballs. The zip likewise has one top-level folder, `ffmpeg-<ver>-r<rev>-win-x64/`. Every
   isshoni release copies the source archive as `isshoni-desktop_<v>_ffmpeg-source.tar` (§11.1).
 - **Consumers** (the `windows-native` job of both ci.yml and release.yml, `task ffmpeg:fetch`) download
@@ -492,6 +500,12 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   So MSVC's PDBs are not reproducible even with `-Brepro`, which is expected, not a failure: the report compares the
   DLLs, and consumers check the zip against the hash the lock pins. The majors of this build are `avcodec` 63 and
   `avutil` 61 (§4.1's numbers are placeholders until the publishing run writes the lock).
+- **WF1's run** (the group 3 PR's FFmpeg workflow, PR #39, run 39717169067, head `0fcb261`): `build.sh` logged "MSVC
+  toolset 14.44.35207 (cl.exe 19.44.35229, link.exe 14.44.35229.0), Windows SDK 10.0.26100.0"; `report`'s table had
+  toolset 14.44.35207, compiler 19.44.35229 and linker 14.44.35229.0 for `build` and `rebuild` alike, and the DLL
+  hashes were unchanged from the first run (`avcodec-63.dll` `954840c9…`, `avutil-61.dll` `4e8d2abe…`). These are the
+  values a publishing run on that image writes as `msvcToolset`, `msvcCompiler` and `msvcLinker` (§4.1). The publish
+  itself is the owner's (README §8), now that WF1 has merged.
 
 ### 4.7 Security updates
 
@@ -549,12 +563,15 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
     (`VCRUNTIME*`, `MSVCP*`, `MSVCR*` such as `msvcrt.dll`, `api-ms-win-crt-*`, `ucrtbase*`, `concrt*`, `vccorlib*`,
     their debug builds) and `opus*.dll`: the engine must load, probe and capture audio when FFmpeg is missing or
     blocked (04 §9.2, §13.3).
-  - **Load config** (conditional, `-load-config`): only if WA11's `dll_search_test` shows that the delay-load helper
-    honors `/DEPENDENTLOADFLAG:0x800` (04 §13.1, §18.2), the DLL must carry `DependentLoadFlags` 0x800
-    (`LOAD_LIBRARY_SEARCH_SYSTEM32`) in its load config; otherwise this check doesn't exist, dll-check only prints the
-    value, and 04's delay-load hook is the guard. The DLL is linked without the flag and the job runs without
-    `-load-config` until the verdict, which the test writes to `dependentloadflag-verdict.txt` and the job puts into
-    its summary, is read from the group PR's first `windows-native` run.
+  - **Load config**: printed, not checked (README §3 item 34). WA11's `dll_search_test` verdict on windows-2025 (the
+    group 2 PR's `windows-native` run, PR #38, run 39690115167) is "not honored": with `/DEPENDENTLOADFLAG:0x800` the
+    default delay-load helper still loaded the planted DLL from the current directory. So the DLL is linked without
+    the flag, no job passes `-load-config`, dll-check prints `load config: DependentLoadFlags 0x0000 (not checked …)`,
+    and 04's delay-load hook is the guard (04 §13.1). The test keeps writing the verdict to
+    `dependentloadflag-verdict.txt` and the job summary. (`-load-config` and its check stay in dll-check, unused; its
+    printed note still names WA11's verdict as pending, a wording a later dll-check change can drop.) The same run's
+    dll-check of the first real DLL (39 exports; static imports `KERNEL32.dll` and `ole32.dll` only; no delay imports;
+    the version resource as below with `0.0.0-ci.77`) and its ctest results are recorded in 04 §18.2.
   - **Version resource**: `FILEVERSION` and `PRODUCTVERSION` = `<winver>`; the strings `ProductVersion` = `<v>`,
     `FileVersion` = `<winver>`, `ProductName` = `isshoni`, `CompanyName` = `isshoni project`, `LegalCopyright` =
     `Copyright the isshoni authors. Apache-2.0.`, `OriginalFilename` = `isshoni-media.dll`, `FileDescription` =
@@ -941,8 +958,12 @@ double quotes.
   `/download#windows-verify`. An `ssh-keygen` older than 8.1 shows a usage error, which the script names ("your
   ssh-keygen is older than OpenSSH 8.1").
 - **Constraint from Windows 10's 8.1p1**: `deploy/keys/allowed_signers` may use only options that 8.1 parses
-  (`namespaces=`, `cert-authority`). A rotation that needs `valid-before=` (OpenSSH 8.8+, M1 06 §9.4) removes the old
-  key line instead; `repocheck keys` fails on any other option. M1 06 §9.4's rotation text gets this note.
+  (`namespaces=`, `cert-authority`). A rotation that would need `valid-before=` (OpenSSH 8.8+, M1 06 §9.4) adds the new
+  key's line and deletes the old key's (at once after a leak, otherwise in a later change) instead; `repocheck keys`
+  (`task lint:keys`, WA25) fails on `valid-before` and any other option and passes `cert-authority`, and M1's rotation
+  test was rewritten to that sequence. M1 06 §9.4's step 1 (mark the old line `valid-before`) is superseded by this
+  rule; `deploy/keys/README.md`'s rotation step, `release:keys`' comment and `lint:keys`' description say so (group 3's
+  integration).
 - **Later (after SignPath)**: when `ssh-keygen` is missing, a valid Authenticode signature whose subject is SignPath
   Foundation's certificate for isshoni is accepted as the fallback (`Get-AuthenticodeSignature`), never instead of a
   present `ssh-keygen`.
@@ -1140,17 +1161,20 @@ allowed by the compatibility rule (§11.6).
 | `schema` | `1`. Another value: the app ignores the manifest (`manifest_unsupported`) and never installs from it |
 | `product` | `isshoni-desktop` |
 | `version` | canonical SemVer without `v`, equal to the tag |
-| `channel` | `stable` for `X.Y.Z`, `beta` for `X.Y.Z-rc.N`; `ci` for `X.Y.Z-ci.N` (written only for the updater e2e's test manifests; accepted only by `updatetest` builds, §8.11) |
-| `minVersion` | the update floor from `deploy/desktop/min-version` (one SemVer line; starts at the first desktop release). An app below it shows the update as required (§8.5) |
+| `channel` | `stable` for `X.Y.Z`, `beta` for `X.Y.Z-rc.N`; `ci` for every other prerelease (WA25): the updater e2e's `X.Y.Z-ci.N` test manifests and the release dry run's never-published `0.0.0-dryrun.N` (§11.1). The parser applies the same rule; only `updatetest` builds accept `ci` (§8.11), and `Eligible` stays strict, so no release build installs from such a manifest |
+| `minVersion` | the update floor from `deploy/desktop/min-version` (one SemVer line; starts at the first desktop release, `0.2.0-rc.1`). An app below it shows the update as required (§8.5). `desktoppkg manifest` refuses a `minVersion` above a stable or beta release's own version (every app, the updated ones too, would show the update as required) |
 | `publishedAt` | the tag commit's date, M1's wire time form (`api.WireTime`) |
 | `expiresAt` | `publishedAt` + 180 days (D21) |
-| `notesUrl` | the release page |
-| `artifacts` | one entry per (os, arch); `kind` `nsis` in M2 (**later (M3)**: `darwin-app`, a `.tar.gz` of the signed `.app`); `url` must be exactly `https://github.com/MoonWX/isshoni/releases/download/v<version>/<name>`; `size` ≤ 256 MiB |
-| `revokedKeys` | SHA256 fingerprints as `ssh-keygen -l` prints them (`SHA256:…`), from `deploy/keys/update_revoked` (empty normally); honoured only in a manifest signed by the backup key, never for the backup key itself (§8.1) |
+| `notesUrl` | the release page, exactly `https://github.com/MoonWX/isshoni/releases/tag/v<version>` |
+| `artifacts` | one entry per (os, arch); `kind` `nsis` in M2 (**later (M3)**: `darwin-app`, a `.tar.gz` of the signed `.app`); `url` must be exactly `https://github.com/MoonWX/isshoni/releases/download/v<version>/<name>`; an `nsis` artifact's `name` must be §2.1's `isshoni-desktop_<version>_<os>_<arch>_setup.exe`; at most one entry per (os, arch); an artifact of an unknown `kind` is checked but never selected; `size` ≤ 256 MiB |
+| `revokedKeys` | SHA256 fingerprints as `ssh-keygen -l` prints them (`SHA256:…`), from `deploy/keys/update_revoked` (empty normally); at most 64 (`MaxRevokedKeys`, so `state.json` stays small); honoured only in a manifest signed by the backup key, never for the backup key itself (§8.1). `desktoppkg manifest` refuses an `update_revoked` entry that names the backup key or a key `update_signers` still lists (§8.12) |
 
 Unknown fields are ignored (the bytes are signed; the schema number guards incompatible changes). The manifest is at
 most 64 KiB. `tools/desktoppkg manifest` writes it in the unprivileged packaging job (§11.1) from the installer file,
-the tag and the two committed files; the JSON is written with sorted keys and LF so it is reproducible.
+the tag and the two committed files; the JSON is written with sorted keys and LF so it is reproducible. Its
+`-releases <url>` flag (for a `ci` version only: `https://…`, or `http://127.0.0.1:<port>` with an optional path, as
+`ISSHONI_UPDATE_TEST_BASE` names it, §8.11) points `notesUrl` and the installer's `url` at another releases URL, so the
+updater e2e's manifests (§16) come from the repository's own writer.
 
 ### 8.3 Signature format (`isshoni-desktop-update.json.sig`)
 
@@ -1182,11 +1206,17 @@ The app's verifier (`internal/update/sshsig.go`, following OpenSSH's `PROTOCOL.s
    plain Ed25519.
 
 The embedded keys live in `internal/update/signers.go` between `// BEGIN UPDATE SIGNERS` and `// END UPDATE SIGNERS`,
-written from `deploy/keys/update_signers` by `task release:update-keys` and checked equal by `repocheck keys`
-(`task lint:keys`). Each entry is `{Name, Backup, Key}`; `Backup` is true exactly when the line's key comment matches
-`^isshoni-update-backup-[0-9]+$`. `repocheck keys` requires exactly one backup line and at least one other line in
-`update_signers`; `ISSHONI_UPDATE_TEST_SIGNERS` (§8.11) follows the same comment rule. An app built with an empty block reports `disabled` with `no_keys`; `release.yml` refuses to build
-a release while the file is missing or empty (§11.1).
+written from `deploy/keys/update_signers` by `task release:update-keys` (which runs `repocheck update-keys`, the writer,
+sharing one renderer with the check) and checked equal by `repocheck keys` (`task lint:keys`; `ci.yml`'s `repocheck`
+filter counts `internal/update/signers.go`, so a hand edit of the block runs it). `repocheck keys` also requires every
+`update_signers` name to be `isshoni-update-<n>` or `isshoni-update-backup-<n>`, only `ssh-ed25519` keys, and no key in
+both `allowed_signers` and `update_signers` (D3). `deploy/keys/update_signers` is checked out with LF
+(`.gitattributes`), as `allowed_signers` is: `verify-windows` and `check-draft.sh` hand it to `ssh-keygen` byte for byte
+(the Go code reads every key file CRLF-tolerantly). Each entry is `{Name, Backup, Key}`; `Backup` is true exactly when
+the line's key comment matches `^isshoni-update-backup-[0-9]+$`. `repocheck keys` requires exactly one backup line and
+at least one other line in `update_signers`; `ISSHONI_UPDATE_TEST_SIGNERS` (§8.11) follows the same comment rule. An app
+built with an empty block reports `disabled` with `no_keys`; `release.yml` refuses to build a release while the file is
+missing or empty (§11.1).
 
 ### 8.4 Where the app looks
 
@@ -1381,7 +1411,22 @@ var (
 	ErrNotInstalled = errors.New("update: not running from the installed folder")
 	ErrUnsupported  = errors.New("update: no apply method on this OS") // apply_other.go
 )
+
+// Error carries a §8.10 code (the constants CodeNetwork … CodeNotInstalled, CodeNoKeys, CodeNotRelease); Err is the
+// cause, for logs only (it may quote the manifest, never a URL with a query string). CodeOf returns the code of the
+// first *Error in err's chain, or "".
+type Error struct {
+	Code string
+	Err  error
+}
+func CodeOf(err error) string
 ```
+
+WA25 declared the part of this API that `manifest.go`, `sshsig.go` and `signers.go` need (`Channel` and its
+constants, `Eligible`, `Error`, `CodeOf` and the `Code*` constants, `ParseManifest`, `VerifyManifest` and the
+manifest types); the rest (`State`, `Status`, `Options`, `Updater`, `New`, `Run`, `CheckNow`, `PendingAtStartup`,
+`Ready`, `Apply`, `PolicyDisabled`, `ErrNotInstalled`, `ErrUnsupported`) is WA40's, in `update.go` and `apply_*.go`.
+The channel `ci` (§8.2) is the unexported `channelCI`: no app setting names it.
 
 - Files: `update.go` (states, schedule), `manifest.go`, `sshsig.go`, `fetch.go` (HTTP client, limits, redirects),
   `state.go` (`state.json`), `signers.go` (the embedded keys), `apply_windows.go`, `policy_windows.go`,
@@ -1404,9 +1449,12 @@ them to `desktop.update.errors.<code>` in `web/src/i18n/lazy/desktop.en.json`. 0
 
 ### 8.11 Test hooks (`updatetest` build tag)
 
-Only in builds with `-tags updatetest` (CI test builds, never a release):
+Only in builds with `-tags updatetest` (CI test builds, never a release). WA40's tagged hooks file sets the
+unexported package variable `updateTestBuild` in `init()`; `manifest.go` reads it through an unexported
+`rules{releases, testBuild}`, so a release build has no code that turns either on:
 - `ISSHONI_UPDATE_TEST_BASE` replaces both the stable URL base and the beta API (an `http://127.0.0.1:<port>` origin
-  is then allowed);
+  is then allowed), and with it the releases URL that `notesUrl` and every artifact `url` must start with (§8.2;
+  `desktoppkg manifest -releases` writes manifests for such a base);
 - `ISSHONI_UPDATE_TEST_SIGNERS` names an allowed-signers file used instead of the embedded keys;
 - `Eligible` also accepts a `-ci.N` prerelease, and a manifest with channel `beta` (or `ci`) is accepted whatever
   the app's channel setting, so the CI builds `0.0.1-ci.N` of §16 check and update;
@@ -1549,10 +1597,13 @@ New `changes` filters:
 - `pins`: `web/package.json`, `web/package-lock.json`: they run `lint-deploy`, so a pull request that changes only
   `@wailsio/runtime` still runs `lint:pins` (§3), which neither the `go` nor the `deploy` filter would trigger.
 - M1's `run-e2e` decision also counts `internal/desktop/**` (the desktop e2e specs).
-- M1's `go` filter also counts the non-Go inputs of M2's Go tests (group 2's integration fix):
-  `internal/protocol/relay/testdata/**`, `internal/client/deeplink/testdata/**`,
-  `native/common/tests/testdata/abi_layout.json` (which `internal/media/native`'s `layout_test` compares) and
-  `native/common/audio/tests/testdata/**` (the golden Markers `markergolden` reads).
+- M1's `go` filter also counts the non-Go inputs of M2's Go tests: every Go package's testdata,
+  `internal/**/testdata/**` and `cmd/**/testdata/**` (goldens, vectors, fuzz corpora; group 3's integration replaced
+  group 2's list of single folders with these), plus `native/common/tests/testdata/abi_layout.json` (which
+  `internal/media/native`'s `layout_test` compares) and `native/common/audio/tests/testdata/**` (the golden Markers
+  `markergolden` reads).
+- M1's `repocheck` filter also counts `internal/update/signers.go`, so a change of the embedded update keys runs
+  `lint:keys` in `lint-deploy` (§8.3).
 - M1's `protocol` filter also counts `internal/desktop/bridge/**`, `cmd/isshoni-desktop/**`, `tools/wails3/**` and
   `web/src/platform/desktop/**`.
 
@@ -2034,7 +2085,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Level | Test | Asserts | Where |
 |---|---|---|---|
 | Unit | `internal/update` `sshsig_test.go` | committed vectors (an ephemeral key made once, its public key, message and signature in `testdata/`) verify; a flipped byte in message, signature or blob, the wrong namespace, `sha256` instead of `sha512`, an untrusted or revoked key, trailing bytes, bad armor and oversize input all fail; the verifier reports which key matched and whether it is the backup (an entry whose comment is `isshoni-update-backup-<n>`), and a persisted revocation naming the backup key doesn't stop it verifying; when `ssh-keygen` is on the PATH, signatures it makes now verify too; `FuzzSSHSIG` (30–60 s per PR, seeds in `testdata/fuzz`) | CI ubuntu, macos, windows; Mac |
-| Unit | `manifest_test.go` | schema, product, channel acceptance per app channel (`ci` only with the `updatetest` tag), SemVer compare through `internal/version` (rc < final; a `version` or `minVersion` that doesn't parse → `bad_manifest`), `Eligible` (empty and `rc.N` yes, `ci.N` only with `updatetest`, dev no), expiry at the boundary, `minVersion` → required, artifact selection per OS/arch, the exact URL rule; `revokedKeys`: an active-key manifest revoking the backup → ignored, nothing persisted, the backup still verifies the next manifest; an active-key manifest revoking another active key → ignored; a backup-key manifest revoking the active key → persisted in `state.json` (also when the manifest is not newer) and a later manifest signed by that key → `bad_signature`; a backup-key manifest listing the backup itself → that entry dropped, the rest honoured; the internal `applyRevocations` helper called directly with a list that covers every trusted key (unreachable through a manifest, since the backup entry is always dropped; the check is defence in depth) → refused as a whole, nothing persisted; unknown fields ignored, 64 KiB limit | same |
+| Unit | `manifest_test.go` | schema, product, channel acceptance per app channel (`ci` only with the `updatetest` tag), SemVer compare through `internal/version` (rc < final; a `version` or `minVersion` that doesn't parse → `bad_manifest`), `Eligible` (empty and `rc.N` yes, `ci.N` only with `updatetest`, dev no), expiry at the boundary, `minVersion` → required, artifact selection per OS/arch, the exact URL rule; `revokedKeys`: an active-key manifest revoking the backup → ignored, nothing persisted, the backup still verifies the next manifest; an active-key manifest revoking another active key → ignored; a backup-key manifest revoking the active key → persisted in `state.json` (also when the manifest is not newer) and a later manifest signed by that key → `bad_signature`; a backup-key manifest listing the backup itself → that entry dropped, the rest honoured; the internal `applyRevocations` helper called directly with a list that covers every trusted key (unreachable through a manifest, since the backup entry is always dropped; the check is defence in depth) → refused as a whole, nothing persisted; unknown fields ignored, 64 KiB limit; WA25's extra rules: `ci` for any prerelease but `rc.N` (`0.0.0-dryrun.N` included), at most 64 `revokedKeys`, `notesUrl` exactly the release page, the `nsis` artifact name, one entry per OS/arch, an unknown `kind` checked but never selected | same |
 | Unit | `update_test.go` (httptest TLS server, `testing/synctest`) | first check in 60–300 s and not before the wizard; `CheckNow` before `WizardDone` makes the request (and makes none when `Enabled` is false); daily ± 1 h; 6 h after an error; `CheckNow` debounce; `Ready()` non-nil only in `StateReady`; a newer verified manifest in a copy outside `InstallDir` → `error`/`not_installed` with `Available` and `NotesURL` and zero download requests; after 2 failed attempts → `error`/`install_failed` with `Available` until a newer manifest appears, which downloads; `Apply` re-verifies (a changed file → `hash_mismatch`, deleted) and returns `ErrNotInstalled` outside `InstallDir`; `PendingAtStartup(true)` (an `--autostart` start) returns nil while `PendingAtStartup(false)` returns the same pending update; `Enabled` false → the server counts zero requests; redirects to another host or to http refused; stall and total timeouts; size and hash mismatch delete the partial file; disk check; `state.json` atomic and versioned; `PendingAtStartup` rules (newer, not expired, verifies, attempts < 2); `ErrNotInstalled`; beta listing parse, 403/429 → `rate_limited`, non-SemVer tags skipped; goleak | same |
 | Unit | `apply_windows_test.go`, `policy_windows_test.go` | the installer is started with exactly `/S /UPDATE /RELAUNCH` (a fake installer, a Go test binary, records its arguments); `Apply` returns only once the fake installer has created `Local\io.isshoni.desktop.installing`, and returns nil with one WARN after 10 s when it never does (an injected clock and mutex probe); the HKLM policy value is read (a test key under HKCU through an injected root) | CI windows |
 | Unit | `tools/desktoppkg` | the winver table; stage list and mtimes; NSIS defines; manifest golden; `check` rules (unknown binary, literal strings in NSIS, size budget: warn above 40 MB, fail above 100 MB); `ffmpeg-inputs` hash; `dll-check` against synthetic PE images that a test builder writes (`pebuild_test.go`; dll-check reads PE files, not dumpbin text, §5.1): an extra or missing export, an ordinal-only or forwarded export, another export name, a `VCRUNTIME140.dll`, UCRT, `opus.dll`, unlisted or `avcodec-*`/`avutil-*` import fail; `mfplat.dll` and `avrt.dll` pass only as delay imports; a 32-bit image, an executable, no Control Flow Guard, a wrong `ProductVersion`, `FileVersion`, `OriginalFilename` or binary `FILEVERSION` and a missing VERSIONINFO fail; the load-config cases; an FFmpeg DLL importing `mfplat.dll` fails; DLL names unequal to `lock.json`'s majors fail; `stage -release` refuses a `windows_amd64-test` exe and a DLL whose `--self-check` reports `testHooks: true` (fixture) | CI ubuntu; Mac |
@@ -2042,7 +2093,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Unit | `internal/server/httpapi` `desktopscripts_test.go` | `RenderInstallPS1`: `'` doubled, a non-ASCII origin or an `http://` non-loopback origin gives an empty server, a dev/CI/e2e version gives an empty version, rc kept, missing or doubled markers error; the route: 200, content type with charset, `Cache-Control`, `ETag`, `HEAD` without body; `/install-desktop.sh` is 404 text, never the SPA; the template itself (`deploy.InstallDesktopPS1`) renders | CI ubuntu; Mac |
 | Unit | `web/src/download/links.test.ts`, `DownloadPage.test.tsx` | release vs non-release links, the exact installer URL, the ps1 command, `openAppUrl` exactly `isshoni://watch.example.com/` for `https://watch.example.com` (via `appLinkFor`) and `""` for an `http://localhost` origin, the "Open isshoni" button hidden then, the requirement lines, the three warning lines (browser download, SmartScreen, Smart App Control) with their project-site anchors, OS ordering | CI ubuntu; Mac |
 | Unit | `deploy/test/install-desktop.Tests.ps1` (Pester) | the checksum-line lookup (exact name, both forms, duplicates refused), version regex, the quoting helper with spaces, `ssh-keygen` discovery (mocked), the exit-code messages (8 included), no `exit` anywhere in the script; the Smart App Control read (mocked `Get-ItemProperty`): `1` → the `isshoni:` Smart App Control line, "Nothing was installed." and no `Invoke-WebRequest` call; `2`, `0` and a missing key → the download proceeds; a mocked `Start-Process` that throws → "isshoni: Windows blocked the installer (" with the exception's message, no error record escapes the script block | `pwsh` on CI ubuntu; Windows PowerShell 5.1 on CI windows |
-| Unit | `check-draft-test.sh` new cases (§11.3); `repocheck` tests for `update_signers` (exactly one `isshoni-update-backup-<n>` line and at least one other; `Backup` set in `signers.go` exactly for it), `signers.go` block, ps1 block, the 8.1-option rule | | CI ubuntu; Mac |
+| Unit | `check-draft-test.sh` new cases (§11.3); `repocheck` tests for `update_signers` (exactly one `isshoni-update-backup-<n>` line and at least one other; every name `isshoni-update-<n>` or `isshoni-update-backup-<n>`; `ssh-ed25519` only; no key also in `allowed_signers`; `Backup` set in `signers.go` exactly for it), `signers.go` block (`repocheck update-keys` writes it; `TestCommittedUpdateKeys` checks the real tree), ps1 block, the 8.1-option rule (`valid-before` fails, `cert-authority` passes, an unknown option fails; M1's rotation test now adds a key and later deletes the old line) | | CI ubuntu; Mac |
 | Static | PSScriptAnalyzer, ASCII-only, PowerShell 5.1 parse (`[System.Management.Automation.Language.Parser]::ParseFile` under `powershell.exe`), `makensis -WX`, actionlint, the DLL export/import/version checks, FFmpeg's license checks | | CI ubuntu and windows |
 | Integration | `smoke.ps1 -Mode ci` in `windows-desktop` | fresh silent install: files, registry, the protocol command exactly `"<InstallDir>\isshoni.exe" --open-url "%1"`, shortcut AUMID, `--version` (`engineAbi` 1), `--self-check` (`ok`, `ffmpegLoaded`, `testHooks` false); upgrade from a build with an extra fake `avcodec-00.dll` in `install-files.txt` removes it; an upgrade while a helper process keeps `isshoni-media.dll` and an FFmpeg DLL mapped for 3 s after the mutex is gone succeeds (the `.old` rename loop, §6.7); same-version reinstall; an older build over a newer one exits 4 and `/ALLOWDOWNGRADE` works; a process holding the mutex makes `/UPDATE` exit 3 after 60 s; `/D=` into a folder with a foreign file, then uninstall: the foreign file and the folder stay. **The installing mutex**: while a helper process holds `Local\io.isshoni.desktop.installing` (`[System.Threading.Mutex]::new($false, 'Local\io.isshoni.desktop.installing')` in a second PowerShell), a second `setup.exe /S` exits 8 and changes no file or registry value, and starting the installed `isshoni.exe` through the registered protocol command (read from the registry, `%1` = `isshoni://smoke.invalid/r/abc`) exits 0 within 10 s with no `isshoni.exe` left running and no `Local\io.isshoni.desktop.running` ever created (polled every 100 ms), and leaves `PendingServer` = `https://smoke.invalid` and `PendingRoom` = `abc` (deleted by the test afterwards); during a `/S /UPDATE` run the installer's own process holds the mutex (`OpenMutexW` succeeds) and after it exits the mutex is gone. **Both uninstall modes** first seed `cmdkey /generic:isshoni:v1:https://smoke.invalid /user:t /pass:x`, the toast keys of §2.3 (an `AppUserModelId\io.isshoni.desktop` key whose `CustomActivator` names a `CLSID` key with `LocalServer32` in `InstallDir`, plus a second `CLSID` key pointing elsewhere) and a `Software\isshoni\NotificationCategories` subkey; afterwards `cmdkey /list` shows no `isshoni:v1:` target, the AUMID key, the matching `CLSID` key and `Software\isshoni` are gone and the foreign `CLSID` key stays. A keep-data uninstall keeps `%LOCALAPPDATA%\isshoni`; `/PURGE` removes it, and nothing of §2.2 and §2.3 is left | CI windows |
 | Integration | server-rendered ps1 (`windows-desktop`) | `isshoni serve` (the CI binary, off mode on loopback) serves `/install-desktop.ps1`; with `ISSHONI_DOWNLOAD_BASE` pointing to relserve holding the CI installer signed by an ephemeral key (the block replaced as in §11.4), Windows PowerShell 5.1 installs it, `PendingServer` equals the server's origin; a tampered installer is refused with nothing installed; a `checksums.txt` signed by another key is refused; an `isshoni-desktop_<v>_windows_amd64_setup.exe` that is not an executable (a text file, correctly listed in a correctly signed `checksums.txt`) ends with the line `isshoni: Windows blocked the installer (` and "Nothing was installed.", and the `powershell.exe -NoProfile -Command "irm … \| iex"` process exits 0 with nothing on stderr (no unhandled error) | CI windows |

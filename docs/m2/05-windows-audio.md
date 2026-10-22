@@ -1188,18 +1188,22 @@ type AudioConfig struct {
 // AudioReport mirrors §12.1 (json tags camelCase, as the DLL writes them); its parts likewise, one type each:
 // AudioProbeResult (probe), AudioDeviceState (device), AudioApp (apps[]), AudioSession (sessions[]), AudioWarning
 // (warnings[]), AudioCounters (counters) and AudioEvent (events[]). Parse with ParseAudioReport, which rejects v != 1
-// and ignores unknown fields.
+// and ignores unknown fields. Its errors are *Error with Op "parse_audio_report": a document that is not a report is
+// internal; a report of another version is dependency with Reason "abi", like any other binding/DLL mismatch (03's
+// reinstall text). An error never quotes the document, which names apps.
 type AudioReport struct { /* fields of §12.1 */ }
 
 // AudioStatus is 01's name for "What friends hear" (Session.AudioStatus, core events).
 type AudioStatus = AudioReport
 
-// AudioApp is one apps[] row of §12.1. 01 relies on ID, Name and UsesMic.
+// AudioApp is one apps[] row of §12.1, its fields in §12.1's key order (Detail after Streams). 01 relies on ID,
+// Name and UsesMic.
 type AudioApp struct {
-	ID, Name, Exe, Verdict, Reason, Detail string
-	Playing, UsesMic, Browser, Shared       bool
-	PIDs, Sessions, Streams                 int
-	Warnings                                []string
+	ID, Name, Exe, Verdict, Reason   string
+	Playing, UsesMic, Browser, Shared bool
+	PIDs, Sessions, Streams          int
+	Detail                           string
+	Warnings                         []string
 }
 
 func ParseAudioReport(b []byte) (AudioReport, error)
@@ -1257,8 +1261,14 @@ Errors follow 01 §5.2 (`*media.Error{Code, Op, Detail}`, `Error.Is` by code). T
 | `IM_ERR_ABI` | a struct the DLL doesn't accept | `&Error{Code: CodeDependency, Reason: "abi", Op, Detail}` (01 §5.2, README §3 item 17: an installation mixing two releases gets 03's reinstall text) |
 | others | — | 01 §7.2's mapping |
 
-`Op` is the export's name without `im_`. **Mode validation** happens in Go, without a call, in the binding's single
-mode mapping (`audio.go`, §13.2):
+`Op` is the export's name without `im_`. The table is written once, as `media.AudioController`'s doc comment
+(`internal/media/audio.go`, WA26), and holds for every implementation: the Windows binding maps the DLL's statuses to
+it (the mapping itself is `internal/media/native/audio.go`'s, WA35, since `internal/media` doesn't know the C ABI) and
+the fake makes the same errors itself. **Rule checks before a call**: the binding refuses, as `CodeInvalid` with a
+`Detail` naming the rule's index (never its strings), a value, app id or name holding a NUL byte (a C string would
+silently carry a shorter value, and §4.3 gives the DLL no way to see it) and a value of 520 bytes or more
+(`IM_MAX_RULE_VALUE` counts the NUL); everything else of §4.3's rule checks is the DLL's `IM_ERR_INVALID_ARG`.
+**Mode validation** happens in Go, without a call, in the binding's single mode mapping (`audio.go`, §13.2):
 - `AudioConfig.Mode` (at `im_start`): `""` and `AudioExcludeApps` → `IM_AUDIO_MODE_EXCLUDE_APPS`, `AudioTestTone` →
   `IM_AUDIO_MODE_TEST_TONE` (100); `AudioOff`, `AudioEverything` (reserved; rejected in M2, README §3 item 15) and
   anything else → `CodeInvalid`. The DLL refuses `IM_AUDIO_MODE_EVERYTHING` too (`IM_ERR_INVALID_ARG`, 04 §10.2), so
@@ -1300,8 +1310,13 @@ two sides can't drift.
   DLL is thread-safe, §4.3).
 - **Bitrate**: 01's `Session.SetBitrate(media.LayerAudio, bps)` maps to `im_set_audio_bitrate(s, bps)`.
 - **Packets**: Opus packets become `media.Packet{Kind: KindAudio, Layer: "", CaptureNS, Data, Reinit}` (04 §12.3);
-  `IM_PACKET_PCM` packets become `media.Packet{Kind: KindPCM, CaptureNS, Data}` (01 §5.1). Only a config with
-  `TapPCM` produces them, and the core never sets it, so the pump and the publisher never see PCM.
+  `IM_PACKET_PCM` packets become `media.Packet{Kind: KindPCM, CaptureNS, Data}` (01 §5.1), returned by
+  `Session.Next` like every other packet (README §3 item 32: WA35 replaces the interim `PCMTap()` channel and
+  `PCMChunk` type WA23 left in `bridge.go` and `types.go`). Only a config with `TapPCM` produces them, and the core
+  never sets it, so the pump and the publisher never see PCM.
+- **Start-time mapping**: WA35 folds WA23's `startAudioConfig` and `startExclusions` (`bridge.go`) into this file's
+  single mode mapping and `buildExclusions`, so `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode` share one
+  mapping.
 - **`AudioTestHooks`** (in `audio.go`, so it compiles everywhere; it answers only the engine `native.Open` returned,
   which exists only on Windows; `cmd/isshoni-audiotest/driver_windows.go` is its one user):
 
@@ -1338,8 +1353,11 @@ watches before a share. `SetAudioMode` and `SetAudioMuted` need a running sessio
 `ErrAudioNotRunning`, as native) and are recorded in 01's call log (`Session.Calls()`, Op `"audio_mode"` or
 `"audio_muted"`, in two fields 05 adds to `fake.Call`: `Mode media.AudioMode` and `Muted bool`), so the core's pause
 test can assert them. The scenario comes from `fake.EngineConfig.AudioScenario string` (default `"normal"`; the
-desktop app's dev build reads `ISSHONI_FAKE_AUDIO`; never in release builds). `Session.AudioStatus` (01) returns the
-same scripted report unless a test set one with `SetAudioStatus`.
+desktop app's dev build reads `ISSHONI_FAKE_AUDIO`; never in release builds); an unknown scenario makes every
+`AudioController` call `CodeInvalid`. `AudioReport` returns the scripted report unless a test set one with
+`(*fake.Engine).SetAudioStatus(*media.AudioStatus)` (nil goes back to the script), and `AudioLevels`' `ReportSeq`
+then follows the override's `Seq`. The override is the Engine's, not the session's: `media.Session` has no audio
+methods (01 §5.1), and the report comes only from `AudioController.AudioReport`.
 
 | Scenario | Script (seconds since watch start) |
 |---|---|
@@ -1352,12 +1370,24 @@ same scripted report unless a test set one with `SetAudioStatus`.
 | `shared-mic` | shared app `exe:valorant.exe` uses the mic, heard with `shared_app_uses_mic` |
 | `many` | 60 apps (row limit and scrolling) |
 
-`SetExclusions` re-derives verdicts with the same precedence (a small Go port of §5.3 over the scripted apps, enough
-for the fake). `SetAudioMode` validates modes as §13.1 does; `SetAudioMode(AudioOff)` makes the report's `mode`
-`off`; `SetAudioMuted` sets `muted`. `SoundCheck`
-answers after 1.5 s (the test clock): `{captured: true, backend: "process-loopback", levelDb: -14}`; `degraded` and
-`old-windows` → `backend: "endpoint"`; `no-device` → `{captured: false, reason: "no_device", backend: "none"}`. Its
-tone Opus packets are unchanged from M1, whatever `AudioConfig.Mode` is (`AudioTestTone` included).
+Verdicts are not scripted: every report classifies the scripted apps against the **current** `Exclusions` with the
+same precedence (a small Go port of §5.3, enough for the fake), whichever call set them: `WatchAudio`,
+`SetExclusions`, or a `Start` with audio, whose `AudioConfig.Exclusions` replace the rule set as `im_start`'s do
+(§4.2). The table's verdicts are what the rules the desktop service builds give (the built-ins, the browsers,
+`KeepOutMicUsers`, §14.3); with no rules at all Discord is heard (row id `exe:discord.exe`). `SetAudioMode` validates
+modes as §13.1 does; `SetAudioMode(AudioOff)` makes the report's `mode` `off` (engine `none`, no streams) and the
+session's Opus packets (and PCM chunks) silent until `SetAudioMode(AudioExcludeApps)`, as the native mix is (§4.3);
+the pause's unmute doesn't turn the sound back on. `SetAudioMuted` sets `muted`. `SoundCheck` answers after 1.5 s
+(the test clock): `{captured: true, backend: "process-loopback", levelDb: -14}`; `degraded` and `old-windows` →
+`backend: "endpoint"`; `no-device` → `{captured: false, reason: "no_device", backend: "none"}`. A timeout outside
+1–10 s (`timeout_ms` 1000..10000) is `CodeInvalid`; one under 1.5 s gives `{captured: false, reason: "timeout"}` when
+it ends. Its tone Opus packets are M1's, whatever `AudioConfig.Mode` is (`AudioTestTone` included), silenced only by
+the mute and `AudioOff`.
+
+Choices the scenarios make where the table says nothing (WA26): `no-device` reports engine `none` and probe
+`skipped`; `old-windows` reports probe `unsupported`, `osBuild` 18363, engine `endpoint` and state `degraded`.
+Chrome's level is −30 dB, the game's −20 dB, VALORANT's −16 dB; a captured level's RMS is its peak − 3 dB.
+`Probe().Audio` stays 01 §6.2's default (all four bits) in every scenario.
 
 ## 14. Go side: the desktop policy service (`internal/desktop/audio`)
 
