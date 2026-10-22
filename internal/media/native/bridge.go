@@ -3,9 +3,11 @@ package native
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -23,9 +25,11 @@ import (
 // This file is everything behind the caller interface (04 §12.1, §12.4), so it builds and is tested on every OS
 // against fakecaller_test.go's fake: the Engine and session logic, the snprintf retry, JSON decoding, the clock
 // cross-check, the log drain. README WA10 wrote the loader half (Open's checks, build info, clock, log drain,
-// Close); the parts marked "not implemented yet" are README WA23's (Probe, Sources, Pick, Start and the session),
-// with 05's audio in audio.go (WA35), OpenH264 in openh264.go (WA51) and ProtectWindow and the self-window pick in
-// WA70.
+// Close); README WA23 the rest of the engine (Probe, Sources, Pick, Start, StartExtra, SourceDetail, Close stopping
+// the sessions) and the session (§12.3: Next with the event table and EventLayer synthesis, the copy and its limits,
+// ENDED, Stop, the controls, Reconfigure, Stats, PCMTap). 05's audio is in audio.go (README WA35), OpenH264 in
+// openh264.go (WA51), ProtectWindow is WA70's. session_windows.go holds the one Windows-only part of a pick (the
+// executable name of its process).
 
 // The engine and its sessions implement the contract (04 §12.2).
 var (
@@ -384,6 +388,21 @@ type Engine struct {
 	logKick  chan struct{}
 	logStop  chan struct{}
 	logDone  chan struct{}
+
+	// The sessions (04 §12.2): startMu orders Start and StartExtra (im_start runs on the engine's one worker anyway);
+	// smu guards the rest. primary is the session Start started while it runs (Start is ErrBusy meanwhile); sessions
+	// holds every live one, which Close stops before im_shutdown; details are the SourceDetail of the sources this
+	// engine listed or picked.
+	startMu   sync.Mutex
+	smu       sync.Mutex
+	primary   *session
+	sessions  map[*session]struct{}
+	details   map[string]SourceDetail
+	pickOrder []string // the picks in details, oldest first (maxPickDetails)
+
+	// probeMu orders Probe; probe is the last full probe (nil before the first).
+	probeMu sync.Mutex
+	probe   *media.Probe
 }
 
 // openEngine is Open's portable half, on a resolved caller: the ABI check, im_init, the clock cross-check
@@ -420,12 +439,14 @@ func openEngine(c caller, o Options) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{
-		c:       c,
-		log:     log,
-		logBuf:  make([]byte, logBufSize),
-		logKick: make(chan struct{}, 1),
-		logStop: make(chan struct{}),
-		logDone: make(chan struct{}),
+		c:        c,
+		log:      log,
+		logBuf:   make([]byte, logBufSize),
+		logKick:  make(chan struct{}, 1),
+		logStop:  make(chan struct{}),
+		logDone:  make(chan struct{}),
+		sessions: map[*session]struct{}{},
+		details:  map[string]SourceDetail{},
 	}
 	var pn runtime.Pinner
 	r, lastErr := c.call(procInit, addrOf(&pn, params))
@@ -531,6 +552,7 @@ func (e *Engine) Release(sourceID string) {
 	var pn runtime.Pinner
 	defer pn.Unpin()
 	e.c.call(procReleaseSource, addrOf(&pn, id))
+	e.forgetDetail(sourceID)
 }
 
 // Close stops every running session, then im_shutdown (04 §5.3: ≤ 3 s); the DLL stays loaded (no FreeLibrary,
@@ -551,7 +573,14 @@ func (e *Engine) close() {
 	// cancels every cancelPickEvery until it holds life, and stops before im_shutdown.
 	locked, cancelDone := make(chan struct{}), make(chan struct{})
 	go e.cancelPicks(locked, cancelDone)
-	// README WA23 stops the running sessions here (im_stop, ≤ 2 s each), before the shutdown.
+	// The running sessions stop first (im_stop, ≤ 2 s each; a blocked Next returns ErrStopped). A Start still in
+	// flight stops its own session when it sees closed (start), before life lets the shutdown run.
+	for _, s := range e.liveSessions() {
+		s.stopping.Store(true)
+		if err := s.free("close"); err != nil {
+			e.log.Warn("engine: stopping a session at close failed", logx.Err(err))
+		}
+	}
 	close(e.logStop)
 	<-e.logDone
 	e.life.Lock() // the calls in flight end first
@@ -577,43 +606,6 @@ func (e *Engine) cancelPicks(locked <-chan struct{}, done chan<- struct{}) {
 		case <-t.C:
 		}
 	}
-}
-
-// Probe reports what the PC can do: im_probe(FULL) on the first call and with refresh, cached otherwise, decoded
-// as 04 §12.2's "im_caps → media.Probe". Not implemented yet (README WA23).
-func (e *Engine) Probe(ctx context.Context, refresh bool) (media.Probe, error) {
-	return media.Probe{}, notImplemented("probe")
-}
-
-// Sources lists the monitors (im_list_sources) as media.Source{ID: "mon:…", Kind: screen, Name, Width, Height}.
-// Not implemented yet (README WA23).
-func (e *Engine) Sources(ctx context.Context) ([]media.Source, error) {
-	return nil, notImplemented("sources")
-}
-
-// Pick runs the OS picker (im_pick_source, on its own goroutine; ctx's end calls im_cancel_pick). A pick of an
-// isshoni window is released and returns *media.Error{Code: invalid, Reason: "self_window"}. Not implemented yet
-// (README WA23; the self-window rule WA70).
-func (e *Engine) Pick(ctx context.Context, r media.PickRequest) (media.Source, error) {
-	return media.Source{}, notImplemented("pick")
-}
-
-// Start starts a session (im_start) with 04 §12.2's media.Config mapping; media.ErrBusy while a session it started
-// runs. Not implemented yet (README WA23).
-func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
-	return nil, notImplemented("start")
-}
-
-// StartExtra is Start without the one-session check (up to the DLL's 4 sessions, video only), for enginetest
-// sessions only; the app never calls it. Not implemented yet (README WA23).
-func (e *Engine) StartExtra(ctx context.Context, cfg media.Config) (media.Session, error) {
-	return nil, notImplemented("start_extra")
-}
-
-// SourceDetail returns the im_source_info fields media.Source lacks for a source this engine listed or picked; ok
-// is false for an unknown id. Until README WA23 keeps sources, every id is unknown.
-func (e *Engine) SourceDetail(id string) (SourceDetail, bool) {
-	return SourceDetail{}, false
 }
 
 // ProtectWindow is im_protect_window (04 §11): enginetest's protect-check only (the app's WDA is 03's winos). Not
@@ -772,54 +764,1416 @@ func attrValue(raw json.RawMessage) any {
 	return v
 }
 
-// session is a running im_session, returned as a media.Session (04 §12.3). Next is for one goroutine; every other
-// method may be called from any goroutine, also while Next blocks. README WA23 implements it; until then Start
-// returns none.
-type session struct {
-	c       caller
-	epochNS int64 // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+// ---------------------------------------------------------------------------------------------------- the probe
+
+// Probe reports what the PC can do, decoded as 04 §12.2's "im_caps → media.Probe": im_probe(IM_PROBE_FULL) on the
+// first call and with refresh, the cached result otherwise. A full probe takes up to 2 s and can't be interrupted,
+// so ctx is checked before it starts (its error is returned as it is, as Next returns it).
+func (e *Engine) Probe(ctx context.Context, refresh bool) (media.Probe, error) {
+	const op = "probe"
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if e.probe != nil && !refresh {
+		return cloneProbe(*e.probe), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return media.Probe{}, err
+	}
+	if err := e.begin(op); err != nil {
+		return media.Probe{}, err
+	}
+	caps := &imCaps{structSize: uint32(unsafe.Sizeof(imCaps{}))}
+	var pn runtime.Pinner
+	r, lastErr := e.c.call(procProbe, imProbeFull, addrOf(&pn, caps))
+	pn.Unpin()
+	e.end()
+	if st := int32(r); st != imOK {
+		return media.Probe{}, e.failed(statusError(op, procProbe.String(), st, lastErr))
+	}
+	p := decodeCaps(caps)
+	e.probe = &p
+	return cloneProbe(p), nil
 }
 
-// Next returns the next packet or event (04 §12.3). Not implemented yet (README WA23).
+// decodeCaps is im_caps → media.Probe (04 §12.2). Encoders are every encoders[] entry in the engine's order,
+// unavailable ones included; an entry of a kind this binding has no token for (a later DLL's) is left out.
+func decodeCaps(c *imCaps) media.Probe {
+	p := media.Probe{
+		OS: media.OSInfo{
+			Name:      "windows",
+			Version:   fmt.Sprintf("10.0.%d.%d", c.osBuild, c.osUBR),
+			Build:     int(c.osBuild),
+			Supported: c.osFlags&imOSSupported != 0,
+		},
+		Capture: media.CaptureCaps{
+			Picker:             c.osFlags&imOSWGCPicker != 0,
+			Borderless:         c.osFlags&imOSWGCBorderless != 0,
+			DesktopDuplication: c.osFlags&imOSDesktopDuplication != 0,
+			ExcludeFromCapture: c.osFlags&imOSExcludeFromCapture != 0,
+			MaxFPS:             60,
+		},
+		Audio: media.AudioCapsFromFlags(c.audioFlags),
+	}
+	if c.osFlags&imOSWGCMinInterval != 0 {
+		p.Capture.MaxFPS = 240
+	}
+	for i := range min(int(c.encoderCount), imMaxEncoders) {
+		ei := &c.encoders[i]
+		name, ok := encoderToken(ei.kind)
+		if !ok {
+			continue
+		}
+		info := media.EncoderInfo{
+			Name:        name,
+			Adapter:     -1,
+			HW:          ei.flags&imEncfHardware != 0,
+			Tested:      ei.flags&imEncfAvailable != 0,
+			LiveBitrate: ei.flags&imEncfLiveBitrate != 0,
+			ZeroCopy:    ei.flags&imEncfZeroCopy != 0,
+			Reason:      cBytes(ei.reason[:]),
+		}
+		if ei.adapterIndex != 0xFFFFFFFF {
+			info.Adapter = int(ei.adapterIndex)
+		}
+		if ei.flags&imEncfHigh != 0 {
+			info.Profiles = append(info.Profiles, profileHigh)
+		}
+		if ei.flags&imEncfCB != 0 {
+			info.Profiles = append(info.Profiles, profileCB)
+		}
+		if !info.Tested {
+			info.Status = media.CodeInternal // not available, yet IM_OK: the engine didn't say why
+			if ei.status != imOK {
+				info.Status = statusCode(ei.status)
+			}
+		}
+		p.Encoders = append(p.Encoders, info)
+	}
+	return p
+}
+
+// cloneProbe copies p's slices, so a caller can't change the cached probe.
+func cloneProbe(p media.Probe) media.Probe {
+	p.Encoders = slices.Clone(p.Encoders)
+	for i := range p.Encoders {
+		p.Encoders[i].Profiles = slices.Clone(p.Encoders[i].Profiles)
+	}
+	return p
+}
+
+// ---------------------------------------------------------------------------------------------------- sources
+
+// The profile keys of 04 §12.2 (01 §8.6): the session profiles the engine runs, and High's SDP alias.
+const (
+	profileHigh      = "6400"
+	profileHighAlias = "640c"
+	profileCB        = "42e0"
+)
+
+// sourcesDoc is im_list_sources' JSON (04 §5.6): monitors only on Windows ("windows" stays empty).
+type sourcesDoc struct {
+	Monitors []struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Width  int    `json:"width"`
+		Height int    `json:"height"`
+	} `json:"monitors"`
+}
+
+// Sources lists the monitors (im_list_sources) as media.Source{ID: "mon:…", Kind: screen, Name, Width, Height},
+// with MonitorID their own id; starting one needs media.Config.Listed. Source names are local data: never logged.
+func (e *Engine) Sources(ctx context.Context) ([]media.Source, error) {
+	const op = "sources"
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := e.begin(op); err != nil {
+		return nil, err
+	}
+	doc, err := callJSON(e.c, op, procListSources, jsonMaxCap, 0)
+	e.end()
+	if err != nil {
+		return nil, e.failed(err)
+	}
+	var d sourcesDoc
+	if err := json.Unmarshal(doc, &d); err != nil {
+		return nil, codeError(media.CodeInternal, op, "", "im_list_sources: %v", err)
+	}
+	out := make([]media.Source, 0, len(d.Monitors))
+	e.smu.Lock()
+	defer e.smu.Unlock()
+	for _, m := range d.Monitors {
+		out = append(out, media.Source{ID: m.ID, Kind: media.SourceScreen, Name: m.Name, Width: m.Width,
+			Height: m.Height, MonitorID: m.ID})
+		e.details[m.ID] = SourceDetail{MonitorID: m.ID}
+	}
+	return out, nil
+}
+
+// exeOfPID is the base name of a process's image (QueryFullProcessImageNameW, session_windows.go), "" when it can't
+// be read or off Windows; media.Source.Exe of a window pick (01 §5.1). Local data: never logged.
+var exeOfPID = func(pid uint32) string { return "" }
+
+// maxPickTimeout is im_pick_params.timeout_ms's limit (04 §6.4).
+const maxPickTimeout = 600 * time.Second
+
+// Pick runs the OS picker (im_pick_source) on its own goroutine, never on the caller's (03 calls it from the Wails
+// UI's handler, 04 §12.4); ctx's end calls im_cancel_pick, after which the pick returns cancelled. The result is
+// media.Source{ID, Kind, Name, Width, Height, PID, Exe, MonitorID, Capture, OSBorder} (04 §12.2). A pick of an
+// isshoni window (IM_SRCF_SELF) is released at once and returns *media.Error{Code: invalid, Reason: "self_window"}
+// (README §3 item 17), so the app opens the picker again.
+func (e *Engine) Pick(ctx context.Context, req media.PickRequest) (media.Source, error) {
+	const op = "pick"
+	if req.Timeout < 0 || req.Timeout > maxPickTimeout {
+		return media.Source{}, codeError(media.CodeInvalid, op, "", "PickRequest.Timeout %v is outside 0..%v",
+			req.Timeout, maxPickTimeout)
+	}
+	if err := ctx.Err(); err != nil {
+		return media.Source{}, err
+	}
+	if err := e.begin(op); err != nil {
+		return media.Source{}, err
+	}
+	defer e.end()
+	params := &imPickParams{
+		structSize:   uint32(unsafe.Sizeof(imPickParams{})),
+		parentWindow: req.OwnerWindow,
+		timeoutMS:    uint32(req.Timeout / time.Millisecond),
+	}
+	info := &imSourceInfo{structSize: uint32(unsafe.Sizeof(imSourceInfo{}))}
+	type result struct {
+		st      int32
+		lastErr string
+	}
+	done := make(chan result, 1)
+	go func() {
+		var pn runtime.Pinner
+		r, lastErr := e.c.call(procPickSource, addrOf(&pn, params), addrOf(&pn, info))
+		pn.Unpin()
+		done <- result{int32(r), lastErr}
+	}()
+	var res result
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+		e.c.call(procCancelPick)
+		res = <-done
+	}
+	if res.st != imOK {
+		return media.Source{}, e.failed(statusError(op, procPickSource.String(), res.st, res.lastErr))
+	}
+	src, d := decodeSource(info)
+	if info.flags&imSrcfSelf != 0 {
+		if id, err := cString(op, src.ID); err == nil {
+			var pn runtime.Pinner
+			e.c.call(procReleaseSource, addrOf(&pn, id))
+			pn.Unpin()
+		}
+		return media.Source{}, &media.Error{Code: media.CodeInvalid, Op: op, Reason: tokenSelfWindow,
+			Detail: "the user picked an isshoni window; the pick was released"}
+	}
+	e.rememberPick(src.ID, d)
+	return src, nil
+}
+
+// decodeSource is im_source_info → media.Source and the SourceDetail of 04 §12.2.
+func decodeSource(info *imSourceInfo) (media.Source, SourceDetail) {
+	kind := media.SourceScreen // IM_SOURCE_MONITOR and IM_SOURCE_TEST_PATTERN
+	if info.kind == imSourceWindow {
+		kind = media.SourceWindow
+	}
+	capture := captureToken(info.capturePath)
+	src := media.Source{
+		ID:        cBytes(info.id[:]),
+		Kind:      kind,
+		Name:      cBytes(info.name[:]),
+		Width:     int(info.width),
+		Height:    int(info.height),
+		PID:       int(info.pid),
+		MonitorID: cBytes(info.monitorID[:]),
+		Capture:   capture,
+		OSBorder:  info.flags&imSrcfOSBorder != 0,
+	}
+	if info.pid != 0 {
+		src.Exe = exeOfPID(info.pid)
+	}
+	d := SourceDetail{
+		MonitorID:   src.MonitorID,
+		CapturePath: capture,
+		OSBorder:    src.OSBorder,
+		Mapped:      info.flags&imSrcfMapped != 0,
+		Window:      uintptr(info.window),
+	}
+	return src, d
+}
+
+// captureToken is IM_CAPTURE_* → "wgc", "dd", "test" (media.Source.Capture); "" for the other platforms' paths.
+func captureToken(path uint32) string {
+	switch path {
+	case imCaptureWGC:
+		return "wgc"
+	case imCaptureDD:
+		return "dd"
+	case imCaptureTest:
+		return "test"
+	}
+	return ""
+}
+
+// maxPickDetails bounds the picks SourceDetail remembers (unused picks live 5 min and at most 4 are kept, 04 §7.2).
+const maxPickDetails = 16
+
+// rememberPick keeps a pick's SourceDetail; the oldest picks go beyond maxPickDetails.
+func (e *Engine) rememberPick(id string, d SourceDetail) {
+	e.smu.Lock()
+	defer e.smu.Unlock()
+	e.details[id] = d
+	e.pickOrder = append(e.pickOrder, id)
+	for len(e.pickOrder) > maxPickDetails {
+		delete(e.details, e.pickOrder[0])
+		e.pickOrder = e.pickOrder[1:]
+	}
+}
+
+// forgetDetail drops a released pick's SourceDetail.
+func (e *Engine) forgetDetail(id string) {
+	e.smu.Lock()
+	defer e.smu.Unlock()
+	if i := slices.Index(e.pickOrder, id); i >= 0 {
+		e.pickOrder = slices.Delete(e.pickOrder, i, i+1)
+		delete(e.details, id)
+	}
+}
+
+// SourceDetail returns the im_source_info fields media.Source lacks for a source this engine listed (Sources) or
+// picked (Pick, until its release); ok is false for any other id. 03 places the pill on MonitorID.
+func (e *Engine) SourceDetail(id string) (SourceDetail, bool) {
+	e.smu.Lock()
+	defer e.smu.Unlock()
+	d, ok := e.details[id]
+	return d, ok
+}
+
+// ---------------------------------------------------------------------------------------------------- start
+
+// Start starts a session (im_start) with 04 §12.2's media.Config mapping. One session at a time: while a session
+// Start started runs (until its Stop, or until Next returned its end), another Start is media.ErrBusy (01 §5.3,
+// Conformance check 9); the DLL's own limits (4 sessions, 1 with audio) are busy too. im_start takes up to 3 s and
+// can't be interrupted, so ctx is checked before it starts.
+func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
+	return e.start(ctx, "start", cfg, false)
+}
+
+// StartExtra is Start without the one-session check, for enginetest's sessions only (the app never calls it): up to
+// the DLL's 4 sessions, video only (audio is one per process), so a cfg with Audio is invalid (04 §12.2).
+func (e *Engine) StartExtra(ctx context.Context, cfg media.Config) (media.Session, error) {
+	const op = "start_extra"
+	if cfg.Audio != nil {
+		return nil, codeError(media.CodeInvalid, op, "", "StartExtra runs video-only sessions (Audio must be nil)")
+	}
+	return e.start(ctx, op, cfg, true)
+}
+
+func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra bool) (media.Session, error) {
+	args, err := buildStart(op, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.startMu.Lock()
+	defer e.startMu.Unlock()
+	if !extra {
+		e.smu.Lock()
+		busy := e.primary != nil
+		e.smu.Unlock()
+		if busy {
+			return nil, &media.Error{Code: media.CodeBusy, Op: op,
+				Detail: "a session started by Start still runs (one at a time, 01 §5.3)"}
+		}
+	}
+	if err := e.begin(op); err != nil {
+		return nil, err
+	}
+	defer e.end()
+	var h uint64
+	info := &imSessionInfo{structSize: uint32(unsafe.Sizeof(imSessionInfo{}))}
+	var pn runtime.Pinner
+	cfgAddr := args.pin(&pn)
+	r, lastErr := e.c.call(procStart, cfgAddr, addrOf(&pn, &h), addrOf(&pn, info))
+	pn.Unpin()
+	runtime.KeepAlive(args)
+	if st := int32(r); st != imOK {
+		return nil, e.failed(statusError(op, procStart.String(), st, lastErr))
+	}
+	s := newSession(e, h, info, cfg, args.sc)
+	e.smu.Lock()
+	if e.closed.Load() {
+		// Close began while im_start ran: it stopped the sessions it knew of, so this one stops itself, before life
+		// lets im_shutdown run.
+		e.smu.Unlock()
+		s.stopping.Store(true)
+		_ = s.free(op)
+		return nil, errClosed(op)
+	}
+	e.sessions[s] = struct{}{}
+	if !extra {
+		e.primary = s
+	}
+	e.smu.Unlock()
+	e.log.Info("engine session started", "layers", len(s.rids), "audio", s.hasAudio, "extra", extra)
+	return s, nil
+}
+
+// liveSessions is every session that hasn't been stopped yet.
+func (e *Engine) liveSessions() []*session {
+	e.smu.Lock()
+	defer e.smu.Unlock()
+	out := make([]*session, 0, len(e.sessions))
+	for s := range e.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
+// forget drops a stopped session; a Start may follow once Start's own session is gone.
+func (e *Engine) forget(s *session) {
+	e.smu.Lock()
+	defer e.smu.Unlock()
+	delete(e.sessions, s)
+	if e.primary == s {
+		e.primary = nil
+	}
+}
+
+// startArgs is im_start's input in Go memory: the struct and every string and array it points to (04 §12.4).
+type startArgs struct {
+	sc    *imStartConfig
+	ex    *imExclusions
+	rules []imRule
+	strs  []*byte // source_id and the rules' strings
+}
+
+// pin pins everything the struct points to for the one im_start call and returns the struct's address.
+func (a *startArgs) pin(pn *runtime.Pinner) uintptr {
+	for _, p := range a.strs {
+		pn.Pin(p)
+	}
+	if len(a.rules) > 0 {
+		pn.Pin(&a.rules[0])
+	}
+	if a.ex != nil {
+		pn.Pin(a.ex)
+	}
+	return addrOf(pn, a.sc)
+}
+
+func (a *startArgs) str(op, s string) (*byte, error) {
+	p, err := cString(op, s)
+	if err != nil {
+		return nil, err
+	}
+	a.strs = append(a.strs, p)
+	return p, nil
+}
+
+// maxSourceID is im_source_info.id's size: an id fits with its NUL.
+const maxSourceID = 64
+
+// buildStart is media.Config → im_start_config (04 §12.2's table). Anything the engine would refuse that Go can tell
+// is CodeInvalid without a DLL call.
+func buildStart(op string, cfg media.Config) (*startArgs, error) {
+	a := &startArgs{sc: &imStartConfig{structSize: uint32(unsafe.Sizeof(imStartConfig{}))}}
+	sc := a.sc
+	if cfg.Source == "" {
+		if len(cfg.Layers) != 0 || cfg.Audio == nil {
+			return nil, codeError(media.CodeInvalid, op, "",
+				"Config.Source \"\" is an audio-only session: no Layers, and Audio set")
+		}
+	} else {
+		if len(cfg.Layers) == 0 {
+			return nil, codeError(media.CodeInvalid, op, "", "Config.Layers is empty: a source needs a video layer")
+		}
+		if len(cfg.Source) >= maxSourceID {
+			return nil, codeError(media.CodeInvalid, op, "", "Config.Source is longer than a source id")
+		}
+		p, err := a.str(op, cfg.Source)
+		if err != nil {
+			return nil, err
+		}
+		sc.sourceID = p
+	}
+	if cfg.Listed {
+		sc.flags |= imStartAllowListedSource
+	}
+	if !cfg.Borderless {
+		sc.flags |= imStartKeepBorder
+	}
+	// IM_START_HIDE_CURSOR is never set: shares show the pointer.
+	kind, ok := encoderKind(cfg.Encoder)
+	if !ok {
+		return nil, codeError(media.CodeInvalid, op, "", "Config.Encoder %q is not an encoder token", cfg.Encoder)
+	}
+	sc.encoder = kind
+	if len(cfg.Layers) > 0 {
+		p, ok := profileValue(cfg.Profile)
+		if !ok {
+			return nil, codeError(media.CodeInvalid, op, "", "Config.Profile %q is not 6400 or 42e0", cfg.Profile)
+		}
+		sc.profile = p
+	}
+	hint, ok := contentHint(cfg.Preset)
+	if !ok {
+		return nil, codeError(media.CodeInvalid, op, "", "Config.Preset %q is not auto, game, movie or text", cfg.Preset)
+	}
+	sc.contentHint = hint
+	if len(cfg.Layers) > imMaxLayers {
+		return nil, codeError(media.CodeInvalid, op, "", "%d layers: at most %d", len(cfg.Layers), imMaxLayers)
+	}
+	for i, l := range cfg.Layers {
+		lc, err := layerConfig(op, i, l)
+		if err != nil {
+			return nil, err
+		}
+		for k := range i {
+			if cfg.Layers[k].RID == l.RID {
+				return nil, codeError(media.CodeInvalid, op, "", "Config.Layers[%d] repeats rid %q", i, l.RID)
+			}
+		}
+		sc.layers[i] = lc
+	}
+	sc.layerCount = uint32(len(cfg.Layers))
+	if cfg.Audio != nil {
+		ac, err := startAudioConfig(op, a, cfg.Audio)
+		if err != nil {
+			return nil, err
+		}
+		sc.audio = ac
+	}
+	return a, nil
+}
+
+// layerConfig is one media.LayerConfig → im_layer_config: rid, max_pixels, fps = MaxFPS, bitrate_bps = Bitrate,
+// gop_ms 0 (the engine's defaults, 01 §5.1), IM_LAYER_INACTIVE when Inactive; width and height 0.
+func layerConfig(op string, i int, l media.LayerConfig) (imLayerConfig, error) {
+	var lc imLayerConfig
+	if l.RID == "" || len(l.RID) >= len(lc.rid) || strings.IndexByte(l.RID, 0) >= 0 {
+		return lc, codeError(media.CodeInvalid, op, "", "Config.Layers[%d].RID %q: 1 to 3 bytes", i, l.RID)
+	}
+	if l.MaxFPS < 1 || l.MaxFPS > maxFPS {
+		return lc, codeError(media.CodeInvalid, op, "", "Config.Layers[%d].MaxFPS %d is outside 1..%d", i, l.MaxFPS,
+			maxFPS)
+	}
+	if l.MaxPixels < 0 || int64(l.MaxPixels) > math.MaxUint32 {
+		return lc, codeError(media.CodeInvalid, op, "", "Config.Layers[%d].MaxPixels %d", i, l.MaxPixels)
+	}
+	if l.Bitrate != 0 && !validVideoBitrate(i, l.Bitrate) {
+		return lc, codeError(media.CodeInvalid, op, "", "Config.Layers[%d].Bitrate %d is outside the layer's range "+
+			"(04 §6.4)", i, l.Bitrate)
+	}
+	copy(lc.rid[:], l.RID)
+	lc.maxPixels = uint32(l.MaxPixels)
+	lc.fps = uint32(l.MaxFPS)
+	lc.bitrateBPS = uint32(l.Bitrate)
+	if l.Inactive {
+		lc.flags |= imLayerInactive
+	}
+	return lc, nil
+}
+
+// The control limits of 04 §6.4.
+const (
+	maxFPS             = 240
+	minBitrateLayer0   = 100_000
+	maxBitrateLayer0   = 50_000_000
+	minBitrateLayer    = 50_000
+	maxBitrateLayer    = 2_000_000
+	minAudioBitrateBPS = 32_000
+	maxAudioBitrateBPS = 510_000
+)
+
+// validVideoBitrate is 04 §6.4's range for the layer at index i: "f" (index 0) 100 kbit/s–50 Mbit/s, the others
+// 50 kbit/s–2 Mbit/s.
+func validVideoBitrate(i, bps int) bool {
+	if i == 0 {
+		return bps >= minBitrateLayer0 && bps <= maxBitrateLayer0
+	}
+	return bps >= minBitrateLayer && bps <= maxBitrateLayer
+}
+
+// profileValue maps a profile key to IM_PROFILE_*: "6400" and its SDP alias "640c" are High (the engine never sets
+// constraint_set4/5, so packets and EventLayer say 6400), "42e0" is Constrained Baseline.
+func profileValue(key string) (uint32, bool) {
+	switch key {
+	case profileHigh, profileHighAlias:
+		return imProfileHigh, true
+	case profileCB:
+		return imProfileCB, true
+	}
+	return 0, false
+}
+
+// profileKey is im_layer_info.profile → the key media.Event.Profile carries ("6400", "42e0").
+func profileKey(p uint32) string { return fmt.Sprintf("%04x", p&0xFFFF) }
+
+// contentHint maps a preset to IM_CONTENT_*: auto ("" too) → AUTO, game and movie → MOTION, text → DETAIL.
+func contentHint(preset string) (uint32, bool) {
+	switch preset {
+	case "", "auto":
+		return imContentAuto, true
+	case "game", "movie":
+		return imContentMotion, true
+	case "text":
+		return imContentDetail, true
+	}
+	return 0, false
+}
+
+// startAudioConfig is media.AudioConfig → im_audio_config for im_start: 05 §13.1's single mode mapping as far as a
+// start needs it ("" and exclude-apps → EXCLUDE_APPS, test-tone → TEST_TONE; everything and off → CodeInvalid
+// without a DLL call, README §3 item 15), bitrate_bps, frame_ms 20, the flags (TapPCM, TestFlags), and for
+// EXCLUDE_APPS the exclusions (05's semantics). README WA35 owns audio.go's mapping for SetAudioMode and folds this
+// one into it.
+func startAudioConfig(op string, a *startArgs, ac *media.AudioConfig) (imAudioConfig, error) {
+	var out imAudioConfig
+	switch ac.Mode {
+	case "", media.AudioExcludeApps:
+		out.mode = imAudioModeExcludeApps
+	case media.AudioTestTone:
+		out.mode = imAudioModeTestTone
+	case media.AudioEverything:
+		return out, codeError(media.CodeInvalid, op, "",
+			"Config.Audio.Mode everything is reserved and refused in M2 (docs/m2/README.md §3 item 15)")
+	case media.AudioOff:
+		return out, codeError(media.CodeInvalid, op, "",
+			"Config.Audio.Mode off is a mid-share SetAudioMode value; a session without audio has Audio nil")
+	default:
+		return out, codeError(media.CodeInvalid, op, "", "Config.Audio.Mode %q is not an audio mode", ac.Mode)
+	}
+	if ac.BitrateBPS != 0 && (ac.BitrateBPS < minAudioBitrateBPS || ac.BitrateBPS > maxAudioBitrateBPS) {
+		return out, codeError(media.CodeInvalid, op, "", "Config.Audio.BitrateBPS %d is outside %d..%d",
+			ac.BitrateBPS, minAudioBitrateBPS, maxAudioBitrateBPS)
+	}
+	if ac.TestFlags&^imAudiofTestFailProbe != 0 {
+		return out, codeError(media.CodeInvalid, op, "", "Config.Audio.TestFlags %#x: only IM_AUDIOF_TEST_FAIL_PROBE",
+			ac.TestFlags)
+	}
+	out.bitrateBPS = uint32(ac.BitrateBPS)
+	out.frameMS = 20
+	out.flags = ac.TestFlags
+	if ac.TapPCM {
+		out.flags |= imAudiofTapPCM
+	}
+	if out.mode == imAudioModeExcludeApps {
+		ex, err := startExclusions(op, a, ac.Exclusions)
+		if err != nil {
+			return out, err
+		}
+		a.sc.exclusions = ex
+	}
+	return out, nil
+}
+
+// startExclusions is media.Exclusions → im_exclusions (rules in order, KeepOutMicUsers, FastPath, SharedPID); the
+// engine checks the rules themselves (05 §4.3). README WA35's audio.go builds the same struct for SetExclusions and
+// WatchAudio.
+func startExclusions(op string, a *startArgs, x media.Exclusions) (*imExclusions, error) {
+	if len(x.Rules) > imMaxRules {
+		return nil, codeError(media.CodeInvalid, op, "", "%d exclusion rules: at most %d", len(x.Rules), imMaxRules)
+	}
+	ex := &imExclusions{structSize: uint32(unsafe.Sizeof(imExclusions{})), sharedPID: x.SharedPID}
+	if x.KeepOutMicUsers {
+		ex.flags |= imExclfKeepOutMicUsers
+	}
+	if x.FastPath {
+		ex.flags |= imExclfFastPath
+	}
+	a.rules = make([]imRule, len(x.Rules))
+	for i, r := range x.Rules {
+		v, err := a.str(op, r.Value)
+		if err != nil {
+			return nil, err
+		}
+		rule := imRule{kind: uint32(r.Kind), source: uint32(r.Source), value: v}
+		if r.AppID != "" {
+			if rule.appID, err = a.str(op, r.AppID); err != nil {
+				return nil, err
+			}
+		}
+		if r.Name != "" {
+			if rule.name, err = a.str(op, r.Name); err != nil {
+				return nil, err
+			}
+		}
+		a.rules[i] = rule
+	}
+	if len(a.rules) > 0 {
+		ex.rules = &a.rules[0]
+		ex.ruleCount = uint32(len(a.rules))
+	}
+	a.ex = ex
+	return ex, nil
+}
+
+// ---------------------------------------------------------------------------------------------------- the session
+
+// session is a running im_session, returned as a media.Session (04 §12.3). Next is for one goroutine; every other
+// method may be called from any goroutine, also while Next blocks.
+//
+// Locks: pull is held from each im_next_packet through the copy of its packet, and by im_stop, so the engine never
+// frees a slot Go is still copying; ctl orders the control calls among themselves (01 §7.1 item 4), never
+// im_next_packet; tapMu orders PCMTap's sends and its close; smu guards freed. Next's own state (queue, startPending,
+// lastLayer, dropWarnAt) belongs to the one goroutine that calls Next.
+type session struct {
+	e       *Engine
+	c       caller
+	log     *slog.Logger
+	h       uint64
+	epochNS int64 // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+
+	rids          []string // layer index → rid
+	hasAudio      bool
+	noOSIndicator bool
+
+	ctl      sync.Mutex
+	layerCfg []imLayerConfig // each layer's current config, for Reconfigure's im_update_layer
+
+	pull     sync.Mutex
+	stopping atomic.Bool // Stop, Close or the session's end: Next returns ErrStopped from here on
+
+	queue        []media.Packet // Next's: ready to return (the start's EventLayers, a held Reinit packet)
+	startPending []bool         // Next's: the layer's first packet hasn't come yet (its EventLayer went at start)
+	lastLayer    []media.Event  // Next's: each layer's last EventLayer
+	dropWarnAt   time.Time      // Next's: the last warning about a dropped packet
+
+	tapMu     sync.Mutex
+	tap       chan PCMChunk // nil unless AudioConfig.TapPCM
+	tapOpen   bool
+	tapDrops  uint64
+	tapWarnAt time.Time
+
+	smu   sync.Mutex
+	freed bool // im_stop ran: the handle never reaches the DLL again
+}
+
+// The session's limits (04 §12.3): the pull timeout, and each packet kind's largest size (the f arena; one Opus
+// packet with the Marker framing; one 10 ms PCM chunk; an event's JSON).
+const (
+	pullTimeoutMS  = 50
+	maxVideoBytes  = 8 << 20
+	maxAudioBytes  = 4096
+	pcmChunkBytes  = 3840
+	maxEventBytes  = 1024
+	pcmTapCapacity = 128
+	dropWarnEvery  = time.Second
+)
+
+// maxPacketBytes is the size limit of a packet kind (0: a kind Next doesn't take).
+func maxPacketBytes(kind uint32) int {
+	switch kind {
+	case imPacketVideo, imPacketDebug:
+		return maxVideoBytes
+	case imPacketAudio:
+		return maxAudioBytes
+	case imPacketPCM:
+		return pcmChunkBytes
+	case imPacketEvent:
+		return maxEventBytes
+	}
+	return 0
+}
+
+// newSession is the session of a successful im_start: one EventLayer per layer from info, queued for Next before any
+// media (04 §12.3).
+func newSession(e *Engine, h uint64, info *imSessionInfo, cfg media.Config, sc *imStartConfig) *session {
+	n := len(cfg.Layers)
+	s := &session{
+		e:             e,
+		c:             e.c,
+		log:           e.log,
+		h:             h,
+		epochNS:       info.epochNS,
+		rids:          make([]string, n),
+		hasAudio:      cfg.Audio != nil,
+		noOSIndicator: info.flags&imSessNoOSIndicator != 0,
+		layerCfg:      slices.Clone(sc.layers[:n]),
+		startPending:  make([]bool, n),
+		lastLayer:     make([]media.Event, n),
+	}
+	for i, l := range cfg.Layers {
+		s.rids[i] = l.RID
+	}
+	if cfg.Audio != nil && cfg.Audio.TapPCM {
+		s.tap = make(chan PCMChunk, pcmTapCapacity)
+		s.tapOpen = true
+	}
+	for i := range n {
+		ev := s.layerEvent(info, i)
+		s.lastLayer[i] = ev
+		s.startPending[i] = true
+		s.queue = append(s.queue, media.Packet{Kind: media.KindEvent, Event: &ev})
+	}
+	return s
+}
+
+// layerEvent is the EventLayer of layer i from a session info (04 §12.3's table).
+func (s *session) layerEvent(info *imSessionInfo, i int) media.Event {
+	li := &info.layers[i]
+	ev := media.Event{
+		Code:          media.EventLayer,
+		Layer:         s.rids[i],
+		Width:         int(li.width),
+		Height:        int(li.height),
+		FPS:           int(li.fps),
+		HW:            li.flags&imEncfHardware != 0,
+		Profile:       profileKey(li.profile),
+		LiveBitrate:   li.flags&imEncfLiveBitrate != 0,
+		NoOSIndicator: info.flags&imSessNoOSIndicator != 0,
+	}
+	ev.Encoder, _ = encoderToken(li.encoder)
+	return ev
+}
+
+// errStopped is Next's (and the controls') answer once the session is stopped or ended.
+func errStopped(op string) *media.Error { return &media.Error{Code: media.CodeStopped, Op: op} }
+
+// Next returns the next packet or event (04 §12.3): it pulls with im_next_packet(s, 50 ms) in a loop, returns ctx's
+// error once ctx is done (within one pull), copies every payload into fresh memory, maps events, synthesizes
+// EventLayer before each Reinit packet (holding the packet for the next call), routes PCM to PCMTap, and turns the
+// ENDED event into its error (the binding then frees the session with im_stop itself). After Stop, Close or the end
+// it returns media.ErrStopped without calling the DLL.
 func (s *session) Next(ctx context.Context) (media.Packet, error) {
-	return media.Packet{}, notImplemented("next")
+	const op = "next"
+	for {
+		if s.stopping.Load() {
+			s.queue = nil // what was held for the next call goes with the session
+			return media.Packet{}, errStopped(op)
+		}
+		if len(s.queue) > 0 {
+			p := s.queue[0]
+			s.queue[0] = media.Packet{}
+			s.queue = s.queue[1:]
+			if len(s.queue) == 0 {
+				s.queue = nil
+			}
+			return p, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return media.Packet{}, err
+		}
+		pk, ok := s.pullOne()
+		if !ok {
+			return media.Packet{}, errStopped(op)
+		}
+		switch pk.st {
+		case imTimeout:
+			continue
+		case imOK:
+			p, deliver, err := s.handle(&pk)
+			if err != nil {
+				return media.Packet{}, err
+			}
+			if deliver {
+				return p, nil
+			}
+		case imEnded:
+			// IM_ENDED without the ENDED event first (the engine always queues one, §6.3): internal, defensively.
+			return media.Packet{}, s.end(&media.Error{Code: media.CodeInternal, Op: op,
+				Detail: "im_next_packet: the session ended without an ENDED event"})
+		default:
+			if pk.st == imErrInvalidArg && s.stopping.Load() {
+				return media.Packet{}, errStopped(op) // racing a Stop
+			}
+			// The handle is gone, or the engine refuses the session: it can't deliver anything any more.
+			return media.Packet{}, s.end(statusError(op, procNextPacket.String(), pk.st, pk.lastErr))
+		}
+	}
+}
+
+// pulled is one im_next_packet result with its payload copied.
+type pulled struct {
+	p         imPacket
+	data      []byte
+	oversized bool // larger than its kind's limit: not copied
+	st        int32
+	lastErr   string
+}
+
+// pullOne runs one im_next_packet under the pull lock and copies the payload before the lock goes (the slot stays
+// valid until the next call or im_stop, 04 §5.1). ok is false when the session is stopping or the engine closed.
+func (s *session) pullOne() (pk pulled, ok bool) {
+	if s.e.begin("next") != nil {
+		return pk, false
+	}
+	defer s.e.end()
+	s.pull.Lock()
+	defer s.pull.Unlock()
+	if s.stopping.Load() {
+		return pk, false
+	}
+	pk.p.structSize = uint32(unsafe.Sizeof(imPacket{}))
+	var pn runtime.Pinner
+	r, lastErr := s.c.call(procNextPacket, uintptr(s.h), pullTimeoutMS, addrOf(&pn, &pk.p))
+	pn.Unpin()
+	pk.st, pk.lastErr = int32(r), lastErr
+	if pk.st == imOK && pk.p.size > 0 {
+		if int64(pk.p.size) <= int64(maxPacketBytes(pk.p.kind)) {
+			pk.data = bytes.Clone(nativeBytes(pk.p.data, int(pk.p.size)))
+		} else {
+			pk.oversized = true
+		}
+	}
+	return pk, true
+}
+
+// nativeBytes is the n bytes at the engine address a (valid until the next call on the session), aliased for the
+// copy that follows at once. The address is reinterpreted rather than converted: a uintptr → unsafe.Pointer
+// conversion is what vet's unsafeptr check and -race's checkptr flag, and neither concerns memory the Go heap doesn't
+// own (04 §12.4: im_packet.data is a uintptr so the collector never sees a pointer into native memory).
+func nativeBytes(a uintptr, n int) []byte {
+	if a == 0 || n <= 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&a))), n)
+}
+
+// handle turns one packet into what Next returns: deliver is false for a packet that is consumed here (PCM, a
+// dropped or unmapped packet), err is set for the session's end.
+func (s *session) handle(pk *pulled) (p media.Packet, deliver bool, err error) {
+	switch pk.p.kind {
+	case imPacketVideo:
+		return s.video(pk)
+	case imPacketAudio:
+		return s.audio(pk)
+	case imPacketPCM:
+		s.pcm(pk)
+		return media.Packet{}, false, nil
+	case imPacketEvent:
+		return s.event(pk)
+	case imPacketDebug:
+		// The luma tap of IM_TEST_HOOKS builds (README WA52 adds its hook): nobody listens yet.
+		return media.Packet{}, false, nil
+	}
+	s.dropped("an unknown packet kind", pk, -1)
+	return media.Packet{}, false, nil
+}
+
+// dropped logs a packet Next refuses (at warn, at most once a second, with its size; no payload) and, for a video
+// layer (layer ≥ 0), asks for a keyframe: the engine's next IDR repairs the gap (04 §12.3).
+func (s *session) dropped(why string, pk *pulled, layer int) {
+	if now := time.Now(); now.Sub(s.dropWarnAt) >= dropWarnEvery {
+		s.dropWarnAt = now
+		s.log.Warn("engine packet dropped", "why", why, "kind", pk.p.kind, "layer", pk.p.layer, "bytes", pk.p.size)
+	}
+	if layer >= 0 {
+		s.RequestKeyframe(s.rids[layer])
+	}
+}
+
+// captureNS is the packet's CaptureNS: capture_ts_ns − epoch_ns (04 §12.3), ≥ 0 for every kind.
+func (s *session) captureNS(pk *pulled) int64 { return pk.p.captureTSNS - s.epochNS }
+
+func (s *session) video(pk *pulled) (media.Packet, bool, error) {
+	idx := int(pk.p.layer)
+	if pk.p.layer >= uint32(len(s.rids)) {
+		s.dropped("a video packet of an unknown layer", pk, -1)
+		return media.Packet{}, false, nil
+	}
+	switch {
+	case pk.oversized:
+		s.dropped("a video packet over 8 MiB", pk, idx)
+		return media.Packet{}, false, nil
+	case len(pk.data) == 0:
+		s.dropped("an empty video packet", pk, idx)
+		return media.Packet{}, false, nil
+	case s.captureNS(pk) < 0:
+		s.dropped("a video packet captured before the session's epoch", pk, idx)
+		return media.Packet{}, false, nil
+	}
+	p := media.Packet{
+		Kind:      media.KindVideo,
+		Layer:     s.rids[idx],
+		Keyframe:  pk.p.flags&imPktKeyframe != 0,
+		Reinit:    pk.p.flags&imPktReinit != 0,
+		CaptureNS: s.captureNS(pk),
+		Data:      pk.data,
+	}
+	first := s.startPending[idx]
+	s.startPending[idx] = false
+	if !p.Reinit {
+		return p, true, nil
+	}
+	// Before each Reinit packet, the layer's EventLayer from a fresh session info (the packet is held for the next
+	// call). The layer's first packet needs none when nothing changed since the start's EventLayer.
+	ev, err := s.readLayerEvent(idx)
+	if err != nil {
+		if s.stopping.Load() {
+			return media.Packet{}, false, errStopped("next")
+		}
+		s.log.Warn("engine session info unreadable before a re-init", logx.Err(err))
+		return p, true, nil
+	}
+	if first && ev == s.lastLayer[idx] {
+		return p, true, nil
+	}
+	s.lastLayer[idx] = ev
+	s.queue = append(s.queue, p)
+	return media.Packet{Kind: media.KindEvent, Event: &ev}, true, nil
+}
+
+// readLayerEvent is layer i's EventLayer from im_get_session_info.
+func (s *session) readLayerEvent(i int) (media.Event, error) {
+	const op = "next"
+	if err := s.e.begin(op); err != nil {
+		return media.Event{}, err
+	}
+	defer s.e.end()
+	info := &imSessionInfo{structSize: uint32(unsafe.Sizeof(imSessionInfo{}))}
+	var pn runtime.Pinner
+	r, lastErr := s.c.call(procGetSessionInfo, uintptr(s.h), addrOf(&pn, info))
+	pn.Unpin()
+	if st := int32(r); st != imOK {
+		return media.Event{}, statusError(op, procGetSessionInfo.String(), st, lastErr)
+	}
+	if i >= int(info.layerCount) || i >= imMaxLayers {
+		return media.Event{}, codeError(media.CodeInternal, op, "", "im_get_session_info has %d layers, not %d",
+			info.layerCount, i+1)
+	}
+	return s.layerEvent(info, i), nil
+}
+
+func (s *session) audio(pk *pulled) (media.Packet, bool, error) {
+	switch {
+	case pk.oversized || len(pk.data) == 0:
+		s.dropped("an audio packet that is empty or over 4096 bytes", pk, -1)
+		return media.Packet{}, false, nil
+	case s.captureNS(pk) < 0:
+		s.dropped("an audio packet captured before the session's epoch", pk, -1)
+		return media.Packet{}, false, nil
+	}
+	// DISCONTINUITY has no media.Packet field: the grid is kept, and Go's RTP timestamps keep the gap (04 §12.3).
+	return media.Packet{Kind: media.KindAudio, Reinit: pk.p.flags&imPktReinit != 0, CaptureNS: s.captureNS(pk),
+		Data: pk.data}, true, nil
+}
+
+// pcm sends an IM_PACKET_PCM chunk to PCMTap without blocking: a full channel drops it, counted and logged at warn
+// at most once a second (04 §12.2). Next never returns PCM.
+func (s *session) pcm(pk *pulled) {
+	if len(pk.data) != pcmChunkBytes || s.captureNS(pk) < 0 {
+		s.dropped("a PCM chunk that is not 3840 bytes or captured before the epoch", pk, -1)
+		return
+	}
+	c := PCMChunk{CaptureNS: s.captureNS(pk), Frames: make([]float32, pcmChunkBytes/4)}
+	for i := range c.Frames {
+		c.Frames[i] = math.Float32frombits(binary.LittleEndian.Uint32(pk.data[4*i:]))
+	}
+	s.tapMu.Lock()
+	defer s.tapMu.Unlock()
+	if !s.tapOpen {
+		return
+	}
+	select {
+	case s.tap <- c:
+	default:
+		s.tapDrops++
+		if now := time.Now(); now.Sub(s.tapWarnAt) >= dropWarnEvery {
+			s.tapWarnAt = now
+			s.log.Warn("engine PCM tap full: chunks dropped", "dropped", s.tapDrops)
+		}
+	}
+}
+
+// eventDoc is the union of 04 §5.6's event details.
+type eventDoc struct {
+	Reason  string `json:"reason"`
+	Detail  string `json:"detail"`
+	Width   int    `json:"width"`
+	Height  int    `json:"height"`
+	Cause   string `json:"cause"`
+	Layer   string `json:"layer"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	Limit   string `json:"limit"`
+	Stream  string `json:"stream"`
+	Dropped int64  `json:"dropped"`
+}
+
+// event maps an IM_PACKET_EVENT (04 §12.3's table, 01 §5.2's): ENDED becomes Next's error, RING_OVERFLOW and the
+// audio range are logged, unknown events are logged and skipped.
+func (s *session) event(pk *pulled) (media.Packet, bool, error) {
+	if pk.oversized {
+		s.dropped("an event over 1 KiB", pk, -1)
+		return media.Packet{}, false, nil
+	}
+	var d eventDoc
+	if len(pk.data) > 0 {
+		if err := json.Unmarshal(pk.data, &d); err != nil {
+			s.log.Warn("engine event detail unreadable", "event", pk.p.event, "bytes", len(pk.data))
+		}
+	}
+	layer := d.Layer
+	if layer == "" && pk.p.layer < uint32(len(s.rids)) {
+		layer = s.rids[pk.p.layer]
+	}
+	var ev media.Event
+	switch pk.p.event {
+	case imEventEnded:
+		return media.Packet{}, false, s.end(endedError(pk.p.status, d))
+	case imEventSourceResized:
+		ev = media.Event{Code: media.EventSourceResized, Width: d.Width, Height: d.Height}
+	case imEventSourceMinimized:
+		ev = media.Event{Code: media.EventSourceMinimized}
+	case imEventSourceRestored:
+		ev = media.Event{Code: media.EventSourceRestored}
+	case imEventCaptureInterrupted:
+		s.log.Info("engine capture interrupted", "cause", d.Cause)
+		ev = media.Event{Code: media.EventCaptureInterrupted}
+	case imEventCaptureResumed:
+		s.log.Info("engine capture resumed", "cause", d.Cause)
+		ev = media.Event{Code: media.EventCaptureResumed}
+	case imEventEncoderChanged:
+		s.log.Warn("engine encoder changed", "layer", layer, "from", d.From, "to", d.To, "reason", d.Reason)
+		ev = media.Event{Code: media.EventEncoderChanged, Layer: layer, Encoder: d.To}
+	case imEventDeviceReset:
+		s.log.Warn("engine device reset", "reason", d.Reason)
+		ev = media.Event{Code: media.EventDeviceReset}
+	case imEventLimitChanged:
+		ev = media.Event{Code: media.EventLimit, Layer: layer, Limit: d.Limit}
+	case imEventRingOverflow:
+		s.log.Warn("engine ring overflow: the consumer fell behind", "stream", d.Stream, "dropped", d.Dropped)
+		return media.Packet{}, false, nil
+	default:
+		if pk.p.event >= 32 && pk.p.event <= 63 {
+			s.log.Debug("engine audio event ignored", "event", pk.p.event) // 05 reports audio through its report
+		} else {
+			s.log.Warn("engine event unknown: skipped", "event", pk.p.event)
+		}
+		return media.Packet{}, false, nil
+	}
+	return media.Packet{Kind: media.KindEvent, Event: &ev}, true, nil
+}
+
+// endedError is the error of an ENDED event (04 §12.3): IM_OK → media.ErrStopped; else the status's code, with the
+// detail's token (§5.7) as Reason.
+func endedError(st int32, d eventDoc) error {
+	if st == imOK {
+		return errStopped("next")
+	}
+	e := statusError("next", "ENDED", st, d.Detail)
+	if d.Reason != "" {
+		e.Detail += " (" + d.Reason + ")"
+	}
+	return e
+}
+
+// end makes err the session's last word: Next answers ErrStopped from now on, and the binding frees the session with
+// im_stop itself (≤ 2 s; the host's Stop then does nothing).
+func (s *session) end(err error) error {
+	s.stopping.Store(true)
+	if ferr := s.free("next"); ferr != nil {
+		s.log.Warn("engine session: im_stop after its end failed", logx.Err(ferr))
+	}
+	s.e.kickLogs()
+	return err
+}
+
+// free runs im_stop once (it waits for a Next in im_next_packet, ≤ 50 ms, through the pull lock), closes PCMTap and
+// forgets the session. Later calls return nil.
+func (s *session) free(op string) error {
+	s.pull.Lock()
+	defer s.pull.Unlock()
+	s.smu.Lock()
+	if s.freed {
+		s.smu.Unlock()
+		return nil
+	}
+	s.freed = true
+	s.smu.Unlock()
+	r, lastErr := s.c.call(procStop, uintptr(s.h))
+	s.tapMu.Lock()
+	if s.tapOpen {
+		close(s.tap)
+		s.tapOpen = false
+	}
+	s.tapMu.Unlock()
+	s.e.forget(s)
+	if st := int32(r); st != imOK {
+		return s.e.failed(statusError(op, procStop.String(), st, lastErr))
+	}
+	return nil
 }
 
 // Now is qpcNS − epoch_ns: the clock of Packet.CaptureNS (04 §12.3).
 func (s *session) Now() int64 { return s.c.qpcNS() - s.epochNS }
 
-// RequestKeyframe is im_request_keyframe; unknown layers are ignored. Not implemented yet (README WA23): a no-op.
-func (s *session) RequestKeyframe(layer string) {}
+// Stop ends the session: the first call sets stopping (a blocked Next returns ErrStopped within one 50 ms pull),
+// waits for the pull lock and runs im_stop (≤ 2 s), and returns its result; later calls, and a Stop after the
+// session's end, return nil. The handle never reaches the DLL twice.
+func (s *session) Stop() error {
+	s.stopping.Store(true)
+	return s.free("stop")
+}
 
-// SetBitrate: video → im_set_bitrate; 0 → im_set_layer_active(l, 0), the next non-zero value reactivating the layer;
-// media.LayerAudio → im_set_audio_bitrate. Not implemented yet (README WA23).
-func (s *session) SetBitrate(layer string, bps int) error { return notImplemented("set_bitrate") }
+// control runs one control export on the session (thread-safe in the engine, 04 §5.1). A Stop whose im_stop runs
+// between the stopping check and the call leaves the engine a stale handle, which it answers with
+// IM_ERR_INVALID_ARG: that is ErrStopped, as in Next (04 §12.3).
+func (s *session) control(op string, p proc, args ...uintptr) error {
+	if s.stopping.Load() {
+		return errStopped(op)
+	}
+	if err := s.e.begin(op); err != nil {
+		return err
+	}
+	defer s.e.end()
+	r, lastErr := s.c.call(p, args...)
+	if st := int32(r); st != imOK {
+		if st == imErrInvalidArg && s.stopping.Load() {
+			return errStopped(op)
+		}
+		return s.e.failed(statusError(op, p.String(), st, lastErr))
+	}
+	return nil
+}
 
-// Reconfigure applies 04 §12.2's order (im_set_profile, im_set_content_hint, im_update_layer or im_set_bitrate per
-// layer). Not implemented yet (README WA23).
-func (s *session) Reconfigure(r media.Reconfig) error { return notImplemented("reconfigure") }
+// layerIndex is the index of a layer's rid.
+func (s *session) layerIndex(rid string) (int, bool) {
+	i := slices.Index(s.rids, rid)
+	return i, i >= 0
+}
 
-// Stop runs im_stop once (≤ 2 s) and closes PCMTap; later calls return nil. Not implemented yet (README WA23).
-func (s *session) Stop() error { return notImplemented("stop") }
+// RequestKeyframe is im_request_keyframe: unknown layers are ignored, and so is a failure (logged at debug).
+func (s *session) RequestKeyframe(layer string) {
+	const op = "request_keyframe"
+	i, ok := s.layerIndex(layer)
+	if !ok {
+		return
+	}
+	if err := s.control(op, procRequestKeyframe, uintptr(s.h), uintptr(i)); err != nil {
+		s.log.Debug("engine keyframe request failed", logx.Err(err))
+	}
+}
 
-// SetLayerActive is im_set_layer_active. Not implemented yet (README WA23).
+// SetBitrate: a video layer's target → im_set_bitrate (04 §6.4's range; 0 is CodeInvalid as 01 §5.1's contract and
+// the fake have it: a layer pauses with SetLayerActive); media.LayerAudio → im_set_audio_bitrate.
+func (s *session) SetBitrate(layer string, bps int) error {
+	const op = "set_bitrate"
+	if layer == media.LayerAudio {
+		return s.setAudioBitrate(op, bps)
+	}
+	i, ok := s.layerIndex(layer)
+	if !ok {
+		return codeError(media.CodeInvalid, op, "", "unknown layer %q", layer)
+	}
+	if !validVideoBitrate(i, bps) {
+		return codeError(media.CodeInvalid, op, "", "layer %q: %d bit/s is outside its range (04 §6.4)", layer, bps)
+	}
+	s.ctl.Lock()
+	defer s.ctl.Unlock()
+	if err := s.control(op, procSetBitrate, uintptr(s.h), uintptr(i), uintptr(bps)); err != nil {
+		return err
+	}
+	s.layerCfg[i].bitrateBPS = uint32(bps)
+	return nil
+}
+
+// SetLayerActive is im_set_layer_active: an inactive layer is not encoded; a resumed one starts with an IDR that is
+// not a Reinit (04 §8.5).
 func (s *session) SetLayerActive(layer string, active bool) error {
-	return notImplemented("set_layer_active")
+	const op = "set_layer_active"
+	i, ok := s.layerIndex(layer)
+	if !ok {
+		return codeError(media.CodeInvalid, op, "", "unknown layer %q", layer)
+	}
+	s.ctl.Lock()
+	defer s.ctl.Unlock()
+	return s.control(op, procSetLayerActive, uintptr(s.h), uintptr(i), boolArg(active))
 }
 
-// SetPaused is im_set_paused (the video freezes; the mixer's pause flag). Not implemented yet (README WA23).
-func (s *session) SetPaused(paused bool) error { return notImplemented("set_paused") }
+// SetPaused is im_set_paused: the video freezes from the next frame interval (04 §8.5), and the mixer's pause flag is
+// set (the tone fades out).
+func (s *session) SetPaused(paused bool) error {
+	const op = "set_paused"
+	s.ctl.Lock()
+	defer s.ctl.Unlock()
+	return s.control(op, procSetPaused, uintptr(s.h), boolArg(paused))
+}
 
-// Stats is im_get_stats (04 §5.6), decoded. Not implemented yet (README WA23).
+func boolArg(b bool) uintptr {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// Reconfigure applies r's non-zero fields in 04 §12.2's order and returns the first error: Profile →
+// im_set_profile; Preset → im_set_content_hint; each of Layers (by RID) with MaxFPS or MaxPixels → im_update_layer
+// with the layer's current config and those fields (and Bitrate, if set) replaced, with only Bitrate →
+// im_set_bitrate. The engine coalesces the re-inits (04 §9.5).
+func (s *session) Reconfigure(r media.Reconfig) error {
+	const op = "reconfigure"
+	s.ctl.Lock()
+	defer s.ctl.Unlock()
+	if r.Profile != "" {
+		p, ok := profileValue(r.Profile)
+		if !ok {
+			return codeError(media.CodeInvalid, op, "", "Reconfig.Profile %q is not 6400 or 42e0", r.Profile)
+		}
+		if err := s.control(op, procSetProfile, uintptr(s.h), uintptr(p)); err != nil {
+			return err
+		}
+	}
+	if r.Preset != "" {
+		hint, ok := contentHint(r.Preset)
+		if !ok {
+			return codeError(media.CodeInvalid, op, "", "Reconfig.Preset %q is not auto, game, movie or text",
+				r.Preset)
+		}
+		if err := s.control(op, procSetContentHint, uintptr(s.h), uintptr(hint)); err != nil {
+			return err
+		}
+	}
+	for _, l := range r.Layers {
+		if err := s.reconfigureLayer(op, l); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *session) reconfigureLayer(op string, l media.LayerConfig) error {
+	i, ok := s.layerIndex(l.RID)
+	if !ok {
+		return codeError(media.CodeInvalid, op, "", "Reconfig.Layers: unknown layer %q", l.RID)
+	}
+	switch {
+	case l.MaxFPS < 0 || l.MaxFPS > maxFPS:
+		return codeError(media.CodeInvalid, op, "", "layer %q: MaxFPS %d is outside 1..%d", l.RID, l.MaxFPS, maxFPS)
+	case l.MaxPixels < 0 || int64(l.MaxPixels) > math.MaxUint32:
+		return codeError(media.CodeInvalid, op, "", "layer %q: MaxPixels %d", l.RID, l.MaxPixels)
+	case l.Bitrate != 0 && !validVideoBitrate(i, l.Bitrate):
+		return codeError(media.CodeInvalid, op, "", "layer %q: %d bit/s is outside its range (04 §6.4)", l.RID,
+			l.Bitrate)
+	}
+	if l.MaxFPS == 0 && l.MaxPixels == 0 {
+		if l.Bitrate == 0 {
+			return nil
+		}
+		if err := s.control(op, procSetBitrate, uintptr(s.h), uintptr(i), uintptr(l.Bitrate)); err != nil {
+			return err
+		}
+		s.layerCfg[i].bitrateBPS = uint32(l.Bitrate)
+		return nil
+	}
+	cfg := new(imLayerConfig)
+	*cfg = s.layerCfg[i]
+	if l.MaxFPS != 0 {
+		cfg.fps = uint32(l.MaxFPS)
+	}
+	if l.MaxPixels != 0 {
+		cfg.maxPixels = uint32(l.MaxPixels)
+	}
+	if l.Bitrate != 0 {
+		cfg.bitrateBPS = uint32(l.Bitrate)
+	}
+	cfg.flags &^= imLayerInactive // a start flag; im_set_layer_active owns the state afterwards
+	var pn runtime.Pinner
+	err := s.control(op, procUpdateLayer, uintptr(s.h), uintptr(i), addrOf(&pn, cfg))
+	pn.Unpin()
+	if err != nil {
+		return err
+	}
+	s.layerCfg[i] = *cfg
+	return nil
+}
+
+// statsDoc is im_get_stats' JSON (04 §5.6), the fields media.EngineStats takes.
+type statsDoc struct {
+	Layers []struct {
+		RID        string  `json:"rid"`
+		Encoder    string  `json:"encoder"`
+		HW         bool    `json:"hw"`
+		FPSIn      float64 `json:"fpsIn"`
+		FPSOut     float64 `json:"fpsOut"`
+		BitrateBps int     `json:"bitrateBps"`
+		TargetBps  int     `json:"targetBps"`
+		Limit      string  `json:"limit"`
+		Drops      struct {
+			Pacer int `json:"pacer"`
+			Ring  int `json:"ring"`
+			Stale int `json:"stale"`
+		} `json:"drops"`
+		EncodeMs struct {
+			P95 float64 `json:"p95"`
+		} `json:"encodeMs"`
+		LatencyMs struct {
+			P50 float64 `json:"p50"`
+			P95 float64 `json:"p95"`
+		} `json:"latencyMs"`
+	} `json:"layers"`
+}
+
+// Stats is im_get_stats (04 §5.6), decoded into media.EngineStats; Drops is pacer + ring + stale. A failure while
+// a Stop runs is ErrStopped, as in control.
 func (s *session) Stats() (media.EngineStats, error) {
-	return media.EngineStats{}, notImplemented("stats")
+	const op = "stats"
+	if s.stopping.Load() {
+		return media.EngineStats{}, errStopped(op)
+	}
+	if err := s.e.begin(op); err != nil {
+		return media.EngineStats{}, err
+	}
+	doc, err := callJSON(s.c, op, procGetStats, jsonMaxCap, uintptr(s.h))
+	s.e.end()
+	if err != nil {
+		if s.stopping.Load() {
+			return media.EngineStats{}, errStopped(op)
+		}
+		return media.EngineStats{}, s.e.failed(err)
+	}
+	var d statsDoc
+	if err := json.Unmarshal(doc, &d); err != nil {
+		return media.EngineStats{}, codeError(media.CodeInternal, op, "", "im_get_stats: %v", err)
+	}
+	out := media.EngineStats{Layers: make([]media.EngineLayerStats, 0, len(d.Layers))}
+	for _, l := range d.Layers {
+		out.Layers = append(out.Layers, media.EngineLayerStats{
+			RID: l.RID, Encoder: l.Encoder, HW: l.HW, FPSIn: l.FPSIn, FPSOut: l.FPSOut, BitrateBps: l.BitrateBps,
+			TargetBps: l.TargetBps, Limit: l.Limit, EncodeP95: msDuration(l.EncodeMs.P95),
+			LatencyP50: msDuration(l.LatencyMs.P50), LatencyP95: msDuration(l.LatencyMs.P95),
+			Drops: l.Drops.Pacer + l.Drops.Ring + l.Drops.Stale,
+		})
+	}
+	return out, nil
 }
 
-// SetAudioBitrate is im_set_audio_bitrate (a Windows-only extra, by type assertion). Not implemented yet
-// (README WA23).
-func (s *session) SetAudioBitrate(bps int) error { return notImplemented("set_audio_bitrate") }
+func msDuration(ms float64) time.Duration {
+	return time.Duration(math.Round(ms * float64(time.Millisecond)))
+}
+
+// SetAudioBitrate is im_set_audio_bitrate (a Windows-only extra; SetBitrate(media.LayerAudio) is the contract's
+// way): live, 32 000–510 000 bit/s.
+func (s *session) SetAudioBitrate(bps int) error { return s.setAudioBitrate("set_audio_bitrate", bps) }
+
+func (s *session) setAudioBitrate(op string, bps int) error {
+	if !s.hasAudio {
+		return codeError(media.CodeInvalid, op, "", "the session has no audio")
+	}
+	if bps < minAudioBitrateBPS || bps > maxAudioBitrateBPS {
+		return codeError(media.CodeInvalid, op, "", "%d bit/s is outside %d..%d", bps, minAudioBitrateBPS,
+			maxAudioBitrateBPS)
+	}
+	s.ctl.Lock()
+	defer s.ctl.Unlock()
+	return s.control(op, procSetAudioBitrate, uintptr(s.h), uintptr(bps))
+}
 
 // PCMTap returns the session's PCM chunks (buffered 128, closed when the session stops) when it was started with
 // media.AudioConfig.TapPCM, else nil (a Windows-only extra; cmd/isshoni-audiotest type-asserts
-// interface{ PCMTap() <-chan native.PCMChunk }). Until README WA23 it is always nil.
-func (s *session) PCMTap() <-chan PCMChunk { return nil }
+// interface{ PCMTap() <-chan native.PCMChunk }).
+func (s *session) PCMTap() <-chan PCMChunk {
+	if s.tap == nil {
+		return nil
+	}
+	return s.tap
+}
