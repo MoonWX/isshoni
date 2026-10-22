@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createMemoryStorage, createWebStorage } from './storage';
+import { createMemoryStorage, createWebStorage, listWebStorageKeys } from './storage';
 
 /** A Web Storage whose methods throw like a blocked or full one. */
 function brokenStorage(broken: { get?: boolean; set?: boolean; remove?: boolean }): Storage {
@@ -88,5 +88,31 @@ describe('createWebStorage (05 §6.1)', () => {
     s.set('b', '2');
     s.remove('a');
     expect([s.get('a'), s.get('b')]).toEqual([null, '2']);
+  });
+});
+
+describe('listWebStorageKeys (docs/m2/03 §14.3)', () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it('lists the keys of the real storage', () => {
+    localStorage.setItem('isshoni:j92qv4mz:isshoni.lastRoomId', 'lounge');
+    localStorage.setItem('other', 'x');
+    expect(listWebStorageKeys('local').sort()).toEqual(['isshoni:j92qv4mz:isshoni.lastRoomId', 'other']);
+  });
+
+  it('is empty without storage, and keeps what it read before storage failed', () => {
+    expect(listWebStorageKeys('local', null)).toEqual([]);
+    const s = brokenStorage({});
+    s.setItem('a', '1');
+    s.setItem('b', '2');
+    const key = s.key.bind(s);
+    let calls = 0;
+    s.key = (i: number) => {
+      if (calls++ > 0) throw new DOMException('blocked', 'SecurityError');
+      return key(i);
+    };
+    expect(listWebStorageKeys('local', s)).toEqual(['a']);
   });
 });
