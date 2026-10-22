@@ -20,10 +20,17 @@
 // PI with a 20 s time constant follows (mix_drift_test's SampledFillControlMissesTheRatioBound shows the ratio's
 // spread). The controller therefore holds the head's age instead: d = tick time - the QPC time of the ring's head
 // frame, the same d that §10.3 measures for timestamps. d doesn't depend on when packets arrive, only on how many
-// frames were consumed against how many were captured; it is the fill plus the age of the newest captured frame. Its
-// target is the mixer's stamping delay L (MixEngine sets it every tick, kept within 40..60 ms): L0 = 50 ms is §9.3's
-// 40 ms fill plus one 10 ms capture packet (§10.3's "typical d"), and after a silence re-anchor L is the measured
-// delay. Holding d at L keeps every chunk stamped with the time its audio was mixed (§10.3), and the fill near 40 ms.
+// frames were consumed against how many were captured; it is the fill plus the age of the newest captured frame.
+//
+// The target. MixEngine sets it every tick to the larger of two head ages, kept within 40..90 ms. One is the mixer's
+// stamping delay L: holding d at L stamps every chunk with the time its audio was mixed (§10.3). The other is the
+// stream's fill floor F = 40 ms + the ring's arrival lag + half its packet length (capture_ring.h): the newest frame's
+// age averages the packets' lag behind the mix plus half a packet, so at d = F the fill averages §9.3's 40 ms. With
+// 10 ms packets that reach the capture thread within 5 ms of their mix, F <= L0 = 50 ms (§10.3's "typical d": 40 ms of
+// fill and one packet), so d = L: exact stamps and a fill of 40 ms or a little more. Packets that come later (a capture
+// offset S1 never measured, longer packets) would leave less fill at L, down to underruns; d then sits at F instead,
+// the fill still averages 40 ms, and the stamps carry the error |L_true - L| that §10.3 accepts for L0 (a re-anchor
+// can't raise L). So §9.3's 40 ms is held on average over the packet phase rather than as the tick-sampled value.
 #pragma once
 
 #include <cstdint>

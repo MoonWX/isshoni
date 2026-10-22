@@ -366,7 +366,8 @@ std::string WriteReportJson(const Report &r) {
   w.EndArray();
 
   w.Key("warnings").BeginArray();
-  for (const ReportWarning &x : r.warnings) {
+  for (std::size_t i = 0; i < r.warnings.size() && i < Report::kMaxWarnings; ++i) {
+    const ReportWarning &x = r.warnings[i];
     w.BeginObject();
     o.Name("code", ReportName(x.code));
     o.Str("app", x.app);

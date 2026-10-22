@@ -7,7 +7,8 @@
 // output for fixed inputs (mix_report_test) and Go's parse input, so the two sides can't drift.
 //
 // The caps of §12.1 are the writer's: the first 128 apps, the first 256 sessions, the last 300 events, and every
-// string cut to 260 bytes on a UTF-8 boundary (invalid UTF-8 becomes U+FFFD). The writer allocates: never on a
+// string cut to 260 bytes on a UTF-8 boundary (invalid UTF-8 becomes U+FFFD); also the first 128 of the report's
+// warnings, which §12.1 doesn't cap, so the report stays within §17's 256 KiB. The writer allocates: never on a
 // real-time thread.
 #pragma once
 
@@ -167,6 +168,7 @@ struct Report {
   static constexpr std::size_t kMaxApps = 128;
   static constexpr std::size_t kMaxSessions = 256;
   static constexpr std::size_t kMaxEvents = 300;
+  static constexpr std::size_t kMaxWarnings = 128;
   static constexpr std::size_t kMaxString = 260; // bytes
 
   uint32_t seq = 0;
@@ -182,7 +184,7 @@ struct Report {
   ReportDevice device;
   std::vector<ReportApp> apps;
   std::vector<ReportSession> sessions;
-  std::vector<ReportWarning> warnings;
+  std::vector<ReportWarning> warnings; // the writer keeps the first kMaxWarnings
   ReportCounters counters;
   std::vector<ReportEvent> events; // oldest first; the writer keeps the last kMaxEvents
 };

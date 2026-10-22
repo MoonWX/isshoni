@@ -43,10 +43,22 @@ CaptureRing::CaptureRing(uint32_t capacity_frames)
       storage_(new uint64_t[cap_]()), frames_(storage_.get()), side_first_(new std::atomic<uint64_t>[kSideEntries]()),
       side_qpc_(new std::atomic<int64_t>[kSideEntries]()) {}
 
-void CaptureRing::Write(const float *frames, uint32_t n, int64_t qpc_ns) noexcept {
+void CaptureRing::Write(const float *frames, uint32_t n, int64_t qpc_ns, int64_t arrival_ns) noexcept {
   if (n == 0) {
     return;
   }
+  // The packet's timing: its lag behind the mix and its length, in sums that decay with every packet's length (an
+  // exponential average over kTimingAverageNs of audio; while less has come, the weights' sum makes it a plain mean).
+  const double length = static_cast<double>(n) * static_cast<double>(kNsPerSecond) / kRate;
+  double lag = static_cast<double>(arrival_ns) - static_cast<double>(qpc_ns) - length;
+  lag = lag < 0 ? 0 : (lag > static_cast<double>(kMaxArrivalLagNs) ? static_cast<double>(kMaxArrivalLagNs) : lag);
+  const double decay = static_cast<double>(kTimingAverageNs) / (static_cast<double>(kTimingAverageNs) + length);
+  timing_weight_ = timing_weight_ * decay + length;
+  lag_sum_ = lag_sum_ * decay + length * lag;
+  packet_sum_ = packet_sum_ * decay + length * length;
+  lag_pub_.store(static_cast<int64_t>(lag_sum_ / timing_weight_ + 0.5), std::memory_order_relaxed);
+  packet_pub_.store(static_cast<int64_t>(packet_sum_ / timing_weight_ + 0.5), std::memory_order_relaxed);
+
   uint64_t first = w_.load(std::memory_order_relaxed);
   if (n > cap_) { // keep the packet's last cap_ frames
     const uint32_t drop = n - cap_;

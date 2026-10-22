@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #include "im/audiomix/dsp.h"
@@ -161,7 +162,7 @@ TEST(MixEngine, FarBehindFadesOutTrimsToFortyMsAndComesBack) {
   r.RunTo(200 * kMs);
   // A burst: 80 ms more than the stream's own packets (a capture that caught up after a stall).
   std::vector<float> burst(2 * 3840, 0.5f);
-  ch->ring()->Write(burst.data(), 3840, 0);
+  ch->ring()->Write(burst.data(), 3840, 0, r.now);
   r.RunFor(10 * kMs);
   EXPECT_EQ(ch->trims(), 1u);
   EXPECT_EQ(r.engine.counters().trims, 1u);
@@ -222,7 +223,7 @@ TEST(MixEngine, AudioEndingMidChunkGetsTheTail) {
   // The stream fails with only 100 frames left: the fade-out chunk ends early.
   ch->ring()->DiscardAll();
   std::vector<float> rest(2 * 100, 0.5f);
-  ch->ring()->Write(rest.data(), 100, 0);
+  ch->ring()->Write(rest.data(), 100, 0, r.now);
   ch->Fail();
   r.RunFor(10 * kMs);
   const uint64_t c = r.sink.chunks - 1;
@@ -299,7 +300,7 @@ TEST(MixEngine, ATailCarriesIntoTheNextChunk) {
   // 450 frames left: the chunk ends 30 frames early, so the rest of the tail goes into the next chunk.
   ch->ring()->DiscardAll();
   std::vector<float> rest(2 * 450, 0.5f);
-  ch->ring()->Write(rest.data(), 450, 0);
+  ch->ring()->Write(rest.data(), 450, 0, r.now);
   ch->Fail();
   r.RunFor(10 * kMs);
   const uint64_t c = r.sink.chunks - 1;
@@ -443,7 +444,8 @@ TEST(MixEngine, SilentBypassAndACleanFilterAtTheOnset) {
 }
 
 // In the bypass the head age is corrected directly, up to 48 frames per tick, so a silent stream still sits at its
-// target when its sound starts. (Its target is L: this stream started running in silence, so L was re-measured.)
+// target when its sound starts. (Its target is L0: the 40 ms it measured when it started running lie below its fill
+// floor of 45 ms, so there was no re-anchor; AReanchorNeverGoesBelowTheFillFloor.)
 TEST(MixEngine, SilentBypassHoldsTheAgeByDroppingAndPaddingZeros) {
   Rig r(false);
   test::Zeros zeros;
@@ -453,43 +455,107 @@ TEST(MixEngine, SilentBypassHoldsTheAgeByDroppingAndPaddingZeros) {
   r.Begin(0);
   r.RunTo(120'000 * kMs); // 2 minutes of silence with a fast device
   EXPECT_TRUE(ch->bypassed());
-  EXPECT_EQ(r.engine.delay_ns(), 40 * kMs);
-  EXPECT_NEAR(static_cast<double>(ch->age_ns()), 40.0 * kMs, 0.1 * kMs);
+  EXPECT_EQ(r.engine.delay_ns(), 50 * kMs);
+  EXPECT_EQ(ch->target_age_ns(), 50 * kMs);
+  EXPECT_NEAR(static_cast<double>(ch->age_ns()), 50.0 * kMs, 0.1 * kMs);
   EXPECT_EQ(ch->underruns() + ch->trims(), 0u);
 }
 
 // -------------------------------------------------------------------------------------- crossfades and cuts
 
-// An engine switch: the new stream fades in over 20 ms while the old one fades out over the same 20 ms (equal gain),
-// then the old one leaves (§6.5, §9.4).
-TEST(MixEngine, CrossfadeIsEqualGainOverTwentyMs) {
-  Rig r;
-  r.controller = Frozen();
-  test::Level a(0.25f), b(0.25f);
-  Channel *old = r.Add(&a, Plain(), false, kGroupInclude);
-  r.Begin(0);
-  r.RunTo(200 * kMs);
-  ProducerConfig pb = Plain();
-  pb.start_ns = 200 * kMs;
-  Channel *neu = r.Add(&b, pb, false, kGroupSingle, /*crossfade=*/true);
-  uint64_t xf = 0;
-  r.before_tick = [&] {
-    if (xf == 0 && neu->state() == StreamState::kPreroll && neu->ring()->Buffered() >= 40 * kFramesPerMs) {
-      xf = r.sink.chunks;
-    }
-  };
-  r.RunTo(300 * kMs);
-  ASSERT_GT(xf, 0u);
-  EXPECT_TRUE(old->released());
-  EXPECT_EQ(neu->state(), StreamState::kRunning);
-  // Over the 20 ms the gains sum to 1; the new channel's own 5 ms onset ramp comes on top at its start.
+// Over the 20 ms of a crossfade from chunk xf on the gains sum to 1; the new channel's own 5 ms onset ramp comes on
+// top at its start (both streams a 0.25 DC level).
+void ExpectCrossfade(const Rig &r, uint64_t xf) {
   for (uint32_t j = 0; j < 2 * kChunkFrames; ++j) {
     const float t = static_cast<float>(j + 1) / 960.0f;
     const float onset = j < 240 ? static_cast<float>(j + 1) / 240.0f : 1.0f;
     ASSERT_NEAR(r.sink.audio[2 * (xf * kChunkFrames + j)], 0.25f * (1 - t) + 0.25f * t * onset, 1e-5f) << j;
   }
   EXPECT_EQ(Out(r, xf + 2, 0), 0.25f);
-  EXPECT_EQ(r.sink.gap_count, 1u); // an engine switch keeps the grid
+}
+
+// An engine switch: the new stream fades in over 20 ms while the old one fades out over the same 20 ms (equal gain),
+// then the old one leaves (§6.5, §9.4). Every engine is a group of its own, so this holds between any two of them,
+// exclude-self -> endpoint included (the probe or process loopback failing while the fast path runs).
+TEST(MixEngine, CrossfadeIsEqualGainOverTwentyMs) {
+  const uint8_t pairs[][2] = {{kGroupInclude, kGroupExcludeSelf},
+                              {kGroupExcludeSelf, kGroupEndpoint},
+                              {kGroupInclude, kGroupEndpoint},
+                              {kGroupEndpoint, kGroupInclude},
+                              {kGroupExcludeSelf, kGroupInclude}};
+  for (const auto &pair : pairs) {
+    SCOPED_TRACE(testing::Message() << "group " << int{pair[0]} << " -> " << int{pair[1]});
+    Rig r;
+    r.controller = Frozen();
+    test::Level a(0.25f), b(0.25f);
+    Channel *old = r.Add(&a, Plain(), false, pair[0]);
+    r.Begin(0);
+    r.RunTo(200 * kMs);
+    ProducerConfig pb = Plain();
+    pb.start_ns = 200 * kMs;
+    Channel *neu = r.Add(&b, pb, false, pair[1], /*crossfade=*/true);
+    uint64_t xf = 0;
+    r.before_tick = [&] {
+      if (xf == 0 && neu->state() == StreamState::kPreroll && neu->ring()->Buffered() >= 40 * kFramesPerMs) {
+        xf = r.sink.chunks;
+      }
+    };
+    r.RunTo(300 * kMs);
+    ASSERT_GT(xf, 0u);
+    EXPECT_TRUE(old->released());
+    EXPECT_EQ(neu->state(), StreamState::kRunning);
+    ExpectCrossfade(r, xf);
+    EXPECT_EQ(r.sink.gap_count, 1u); // an engine switch keeps the grid
+  }
+}
+
+// A group takes over once (§6.5, §7.5): the endpoint stream E, which took over when it started, underruns while the
+// watcher is switching back to the include set, and re-enters Running before the include stream has prerolled. The
+// re-entry fades in over 10 ms (§9.2) and leaves the include stream alone; when that one starts running, E fades out
+// over its 20 ms crossfade.
+TEST(MixEngine, AGroupTakesOverOnlyOnce) {
+  Rig r;
+  r.controller = Frozen();
+  test::Level a(0.25f), b(0.25f);
+  Channel *e = r.Add(&a, Plain(), false, kGroupEndpoint, /*crossfade=*/true);
+  r.Begin(0);
+  r.RunTo(200 * kMs);
+  ASSERT_EQ(e->state(), StreamState::kRunning);
+  r.stream(e).producer->Pause();
+  r.RunTo(250 * kMs);
+  ASSERT_EQ(e->state(), StreamState::kPreroll);
+  ASSERT_EQ(e->underruns(), 1u);
+  // E's packets come again from 250 ms (it has 40 ms at 280 ms); the include stream's from 260 ms (its join drops the
+  // first, so it has 40 ms at 300 ms).
+  r.stream(e).producer->Resume(r.now);
+  ProducerConfig pi = Plain();
+  pi.start_ns = 250 * kMs;
+  Channel *inc = r.Add(&b, pi, false, kGroupInclude, /*crossfade=*/true);
+  uint64_t reentry = 0, takeover = 0;
+  r.before_tick = [&] {
+    if (reentry == 0 && e->state() == StreamState::kPreroll && e->ring()->Buffered() >= 40 * kFramesPerMs) {
+      reentry = r.sink.chunks;
+    }
+    if (takeover == 0 && inc->state() == StreamState::kPreroll && inc->ring()->Buffered() >= 40 * kFramesPerMs) {
+      takeover = r.sink.chunks;
+    }
+  };
+  r.RunTo(290 * kMs);
+  ASSERT_GT(reentry, 0u);
+  EXPECT_EQ(e->state(), StreamState::kRunning);
+  EXPECT_EQ(inc->state(), StreamState::kPreroll); // not released by E's re-entry
+  EXPECT_FALSE(inc->released());
+  // The re-entry's ramp: 480 frames, with the onset ramp of a channel re-entering Running (§9.5).
+  for (uint32_t j = 0; j < kChunkFrames; ++j) {
+    const float onset = j < 240 ? static_cast<float>(j + 1) / 240.0f : 1.0f;
+    ASSERT_NEAR(Out(r, reentry, j), 0.25f * onset * static_cast<float>(j + 1) / 480.0f, 1e-5f) << j;
+  }
+  r.RunTo(400 * kMs);
+  ASSERT_GT(takeover, reentry);
+  EXPECT_EQ(inc->state(), StreamState::kRunning);
+  EXPECT_TRUE(e->released());
+  ExpectCrossfade(r, takeover);
+  EXPECT_EQ(r.engine.counters().underruns, 1u);
 }
 
 TEST(MixEngine, CrossfadeOfTwoTonesIsClickFree) {
@@ -500,7 +566,7 @@ TEST(MixEngine, CrossfadeOfTwoTonesIsClickFree) {
   r.RunTo(300 * kMs);
   ProducerConfig pb = Plain();
   pb.start_ns = 300 * kMs;
-  r.Add(&b, pb, true, kGroupSingle, true);
+  r.Add(&b, pb, true, kGroupExcludeSelf, true);
   r.RunTo(700 * kMs);
   EXPECT_TRUE(ClickFrames(AudioFrom(r, 4)).empty());
   // And back to the include set.
@@ -517,7 +583,7 @@ TEST(MixEngine, CutEndsAtTheCaptureTimeWithAFiveMsFade) {
   Rig r;
   r.controller = Frozen();
   test::Level dc(0.5f);
-  Channel *ch = r.Add(&dc, Plain(), false, kGroupSingle);
+  Channel *ch = r.Add(&dc, Plain(), false, kGroupExcludeSelf);
   r.Begin(0);
   r.RunTo(100 * kMs);
   int64_t head = 0;
@@ -544,7 +610,7 @@ TEST(MixEngine, ALateCutFadesOutAtOnceAndCounts) {
   Rig r;
   r.controller = Frozen();
   test::Level dc(0.5f);
-  Channel *ch = r.Add(&dc, Plain(), false, kGroupSingle, false, 77);
+  Channel *ch = r.Add(&dc, Plain(), false, kGroupExcludeSelf, false, 77);
   r.Begin(0);
   r.RunTo(100 * kMs);
   int64_t head = 0;
@@ -571,7 +637,7 @@ TEST(MixEngine, CutsAreClickFree) {
   for (const int64_t ahead_ms : {20, 3, -5}) {
     Rig r(true);
     test::Tone tone(1000, 0.5f);
-    Channel *ch = r.Add(&tone, Plain(), true, kGroupSingle);
+    Channel *ch = r.Add(&tone, Plain(), true, kGroupExcludeSelf);
     r.Begin(0);
     r.RunTo(300 * kMs);
     int64_t head = 0;
@@ -759,57 +825,113 @@ TEST(MixEngine, SoundFromTheStartKeepsL0AndTheGrid) {
   }
 }
 
+// The error of each chunk's time against the QPC time at which its first frame was mixed (the ring's head right
+// before the tick), from chunk `from` on.
+struct StampCheck {
+  int64_t worst = 0;
+  std::size_t checked = 0;
+  int64_t head = 0;
+  bool have = false;
+  void Before(const Rig &r, Channel *ch, std::size_t from) {
+    if (have && r.sink.chunks > from) {
+      const int64_t err = r.sink.times.back() - head;
+      worst = std::max(worst, err < 0 ? -err : err);
+      ++checked;
+    }
+    have = ch->state() == StreamState::kRunning && ch->ring()->HeadQpc(&head);
+  }
+};
+
 // A stream that starts running in silence re-measures L: the grid restarts once, L0 is replaced by the measured
 // delay, and from then on a chunk's time is the QPC time at which its first frame was mixed (no device-latency
-// term), within 1 ms, while the controller holds the stream at that delay.
+// term), within 1 ms, while the controller holds the stream at that delay. The packets are 2 ms long and come
+// without lag, so the stream's fill floor (40 ms + half a packet) is 41 ms: the measured delay is not below it.
 TEST(MixEngine, SilenceReanchorReplacesL0WithTheMeasuredDelay) {
   Rig r(false);
   test::Segments sig;
   sig.Add(0, 24000, 0, 0.0f);             // 500 ms of silence
   sig.Add(24000, 50'000'000, 1000, 0.5f); // then a tone
   ProducerConfig p = Plain();
-  p.start_ns = -3 * kMs; // packets end 3 ms before each tick: the head is 43 ms old when 40 ms are buffered
+  p.packet_frames = 2 * kFramesPerMs;
+  p.start_ns = -1 * kMs; // packets end 1 ms before each tick: the head is 41 ms old when 40 ms are buffered
   Channel *ch = r.Add(&sig, p, false);
-  int64_t worst = 0;
-  std::size_t checked = 0;
-  int64_t head_before = 0;
-  bool have_head = false;
-  r.before_tick = [&] {
-    if (have_head && r.sink.gap_count == 2 && r.sink.chunks > r.sink.gap_at[1]) {
-      const int64_t err = r.sink.times.back() - head_before;
-      worst = std::max(worst, err < 0 ? -err : err);
-      ++checked;
-    }
-    have_head = ch->state() == StreamState::kRunning && ch->ring()->HeadQpc(&head_before);
-  };
+  StampCheck stamps;
+  r.before_tick = [&] { stamps.Before(r, ch, r.sink.gap_count == 2 ? r.sink.gap_at[1] : SIZE_MAX); };
   r.Begin(0);
   r.RunTo(180'000 * kMs); // 3 minutes
   ASSERT_EQ(r.sink.gap_count, 2u);
   EXPECT_EQ(r.sink.gap_at[1], 4u); // the chunk at which the stream started running
-  EXPECT_EQ(r.sink.gap_ns[1], -3 * kMs);
+  EXPECT_EQ(r.sink.gap_ns[1], -1 * kMs);
   EXPECT_EQ(r.engine.counters().reanchors, 1u);
-  EXPECT_EQ(r.engine.delay_ns(), 43 * kMs);
-  EXPECT_EQ(r.sink.times[4] - r.sink.times[3], 17 * kMs); // the grid moved 7 ms forward, in silence
+  EXPECT_EQ(r.engine.delay_ns(), 41 * kMs);
+  EXPECT_EQ(ch->target_age_ns(), 41 * kMs);
+  EXPECT_EQ(r.sink.times[4] - r.sink.times[3], 19 * kMs); // the grid moved 9 ms forward, in silence
   ExpectGrid(r, 4, r.sink.times.size());
-  EXPECT_GT(checked, 17000u);
-  EXPECT_LE(worst, 1 * kMs);
+  EXPECT_GT(stamps.checked, 17000u);
+  EXPECT_LE(stamps.worst, 1 * kMs);
   auto ev = Events(r.engine);
   EXPECT_EQ(CountEvents(ev, MixEventCode::kReanchor), 1);
 }
 
+// A re-anchor never sets L below the head age a stream settles at. These 10 ms packets come without lag, 3 ms before
+// each tick: the stream measures 43 ms when it starts running in silence, but its fill floor is 45 ms (40 ms + half a
+// packet), where its controller would hold it, so L' is 45 ms, within 5 ms of L0: no re-anchor. The controller then
+// holds the head age at L0, and once it got there the chunk times are the mix times again.
+TEST(MixEngine, AReanchorNeverGoesBelowTheFillFloor) {
+  Rig r(false);
+  test::Segments sig;
+  sig.Add(0, 24000, 0, 0.0f);             // 500 ms of silence
+  sig.Add(24000, 50'000'000, 1000, 0.5f); // then a tone
+  ProducerConfig p = Plain();
+  p.start_ns = -3 * kMs;
+  Channel *ch = r.Add(&sig, p, false);
+  StampCheck stamps;
+  r.before_tick = [&] { stamps.Before(r, ch, 6000); }; // from 60 s on
+  r.Begin(0);
+  r.RunTo(180'000 * kMs);
+  EXPECT_EQ(r.sink.gap_count, 1u);
+  EXPECT_EQ(r.engine.counters().reanchors, 0u);
+  EXPECT_EQ(r.engine.delay_ns(), 50 * kMs);
+  EXPECT_EQ(ch->target_age_ns(), 50 * kMs);
+  EXPECT_NEAR(static_cast<double>(ch->age_ns()), 50.0 * kMs, 0.5 * kMs);
+  EXPECT_GT(stamps.checked, 11000u);
+  EXPECT_LE(stamps.worst, 1 * kMs);
+  EXPECT_EQ(ch->underruns() + ch->trims(), 0u);
+}
+
 // A re-measured L' more than 20 ms above L never gives a chunk time at or before the previous one: the new grid may
-// not start earlier than the previous chunk + 10 ms, which here leaves L where it was (§10.3's clamp).
+// not start earlier than the previous chunk + 10 ms, which here leaves L where it was (§10.3's clamp). The packets
+// reach the capture thread 25 ms after their mix, so at L the fill would sit near the 20 ms low water: the stream's
+// fill floor (40 + 25 + 5 ms) holds its head age at 70 ms instead, and its fill at 40 ms, silent or playing.
 TEST(MixEngine, AReanchorNeverMovesTheGridBack) {
   Rig r(false);
-  test::Zeros zeros;
+  test::Segments sig;
+  sig.Add(0, 48000, 0, 0.0f);             // 1 s of silence
+  sig.Add(48000, 50'000'000, 1000, 0.5f); // then a tone
   ProducerConfig p = Plain();
   p.latency_ns = 25 * kMs; // the head is about 70 ms old when it starts running
-  Channel *ch = r.Add(&zeros, p, false);
+  Channel *ch = r.Add(&sig, p, false);
+  double fill_min = 1e9, fill_max = 0;
+  r.before_tick = [&] {
+    if (r.now >= 10'000 * kMs) {
+      const double fill = static_cast<double>(ch->ring()->Buffered()) / kFramesPerMs;
+      fill_min = std::min(fill_min, fill);
+      fill_max = std::max(fill_max, fill);
+    }
+  };
   r.Begin(0);
   r.RunTo(1000 * kMs);
   ASSERT_EQ(ch->state(), StreamState::kRunning);
   EXPECT_EQ(r.sink.gap_count, 1u);
   EXPECT_EQ(r.engine.delay_ns(), 50 * kMs);
+  r.RunTo(60'000 * kMs);
+  EXPECT_EQ(r.sink.gap_count, 1u);
+  EXPECT_EQ(r.engine.delay_ns(), 50 * kMs);
+  EXPECT_EQ(ch->target_age_ns(), 70 * kMs);
+  EXPECT_EQ(ch->underruns() + ch->trims(), 0u);
+  EXPECT_GE(fill_min, 25.0);
+  EXPECT_LE(fill_max, 55.0);
+  EXPECT_GT(r.sink.loud_chunks, 5800u);
   for (std::size_t k = 1; k < r.sink.times.size(); ++k) {
     ASSERT_GT(r.sink.times[k], r.sink.times[k - 1]);
   }
@@ -855,7 +977,7 @@ TEST(MixEngine, NoGapForDeviceChangesEngineSwitchesOrSoundOffAndOn) {
   // An engine switch: the include set gives way to an EXCLUDE stream.
   p.start_ns = 1000 * kMs;
   p.latency_ns = 6 * kMs;
-  Channel *x = r.Add(&tone, p, false, kGroupSingle, true);
+  Channel *x = r.Add(&tone, p, false, kGroupExcludeSelf, true);
   r.RunTo(1500 * kMs);
   // Sound off (the streams close) and on (new streams).
   r.engine.SetSoundOff(true);
@@ -865,7 +987,7 @@ TEST(MixEngine, NoGapForDeviceChangesEngineSwitchesOrSoundOffAndOn) {
   r.engine.SetSoundOff(false);
   p.start_ns = 2000 * kMs;
   p.latency_ns = 2 * kMs;
-  r.Add(&tone, p, false, kGroupSingle);
+  r.Add(&tone, p, false, kGroupExcludeSelf);
   r.RunTo(3000 * kMs);
   EXPECT_EQ(r.sink.gap_count, 1u);
   EXPECT_EQ(r.engine.counters().reanchors, 0u);

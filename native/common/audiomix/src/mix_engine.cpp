@@ -251,7 +251,8 @@ void MixEngine::Prepare(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
     any_entered_ = true;
     ch.gain_ = 0.0f;
     ch.gain_target_ = 1.0f;
-    ch.gain_step_ = 1.0f / static_cast<float>(ch.crossfade_ ? kCrossfadeFrames : kFadeFrames);
+    // The 20 ms crossfade ramp only when this entry takes over (Tick); a re-entry fades in over 10 ms (§9.2).
+    ch.gain_step_ = 1.0f / static_cast<float>(ch.crossfade_ && !ch.took_over_ ? kCrossfadeFrames : kFadeFrames);
     // A channel (re)entering Running ramps its first non-silent sample in (§9.5: the counter starts saturated).
     ch.silent_frames_ = kOnsetSilenceFrames;
     ch.onset_pos_ = kOnsetRampFrames;
@@ -294,6 +295,18 @@ void MixEngine::EmitTail(Channel &ch, uint32_t from) noexcept {
   }
 }
 
+int64_t MixEngine::TargetFor(Channel &ch) noexcept {
+  // The fill floor: the head age at which the fill averages 40 ms, i.e. 40 ms plus the newest frame's mean age (the
+  // packets' lag behind the mix plus half a packet, capture_ring.h). The target holds L unless that leaves less fill.
+  const CaptureRing &ring = *ch.ring_;
+  const int64_t packet = ring.packet_ns();
+  ch.floor_ns_ = packet > 0 ? params_.fill_target_ns + ring.arrival_lag_ns() + packet / 2 : 0;
+  const int64_t target =
+      std::clamp(std::max(delay_, ch.floor_ns_), params_.min_target_age_ns, params_.max_target_age_ns);
+  ch.target_pub_.store(target, std::memory_order_relaxed);
+  return target;
+}
+
 void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
   EmitTail(ch, 0); // the rest of a tail that began near the end of the previous chunk
   if (ch.skip_ || (ch.st_ != StreamState::kRunning && ch.st_ != StreamState::kFading)) {
@@ -304,15 +317,16 @@ void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
   }
   CaptureRing &ring = *ch.ring_;
 
-  // The head age d (§10.3) drives the controller (§9.3) and the bypass's correction.
+  // The head age d (§10.3) drives the controller (§9.3) and the bypass's correction, towards the channel's target.
+  const int64_t target_age = TargetFor(ch);
   int64_t head = 0;
   const bool have_head = ring.HeadQpc(&head);
-  int64_t age = have_head ? tick_ns - head : target_age_;
+  int64_t age = have_head ? tick_ns - head : target_age;
   if (age < 0) {
     age = 0; // a bad timestamp; causality says d > 0
   }
   if (ch.st_ == StreamState::kRunning) {
-    ch.ctl_.SetTarget(target_age_);
+    ch.ctl_.SetTarget(target_age);
     if (ch.ctl_.Tick(age)) {
       ch.resampler_->SetSteps(ch.ctl_.steps());
       const int32_t ppm = ch.ctl_.ppm();
@@ -330,7 +344,7 @@ void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
   bool done = false;
   if (ch.bypass_) {
     // Silent: no resampler; the age is corrected directly by dropping or padding up to 48 frames of zeros (§9.3).
-    int64_t corr = (age - target_age_) * kFramesPerMs / kNsPerMs;
+    int64_t corr = (age - target_age) * kFramesPerMs / kNsPerMs;
     corr = corr > kBypassMaxCorrection ? kBypassMaxCorrection
                                        : (corr < -kBypassMaxCorrection ? -kBypassMaxCorrection : corr);
     const auto want = static_cast<uint32_t>(static_cast<int64_t>(kChunkFrames) + corr);
@@ -498,7 +512,6 @@ void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
 void MixEngine::Tick(int64_t tick_ns) noexcept {
   std::memset(bus_, 0, sizeof bus_);
   any_entered_ = false;
-  target_age_ = std::clamp(delay_, params_.min_target_age_ns, params_.max_target_age_ns);
 
   // The channels of this tick: one that the watcher adds meanwhile joins at the next one.
   for (uint32_t i = 0; i < kMaxMixChannels; ++i) {
@@ -509,11 +522,13 @@ void MixEngine::Tick(int64_t tick_ns) noexcept {
       Prepare(i, *ch, tick_ns);
     }
   }
-  // A crossfading channel that started running takes over from the other engines: they fade out over the same
-  // 20 ms (§6.5), or leave at once when nothing of them is audible.
+  // The first crossfading channel of a group to start running takes over from the other engines: they fade out over
+  // the same 20 ms (§6.5), or leave at once when nothing of them is audible. Its group takes over once: every channel
+  // of it here now is marked, so a re-entry (after an underrun or a trim) or a later first entry of the same switch
+  // never releases the streams another switch has opened meanwhile.
   int keep = -1;
   for (const Channel *ch : cur_) {
-    if (ch != nullptr && ch->entered_ && ch->crossfade_) {
+    if (ch != nullptr && ch->entered_ && ch->crossfade_ && !ch->took_over_) {
       keep = ch->group_;
       break;
     }
@@ -521,7 +536,14 @@ void MixEngine::Tick(int64_t tick_ns) noexcept {
   if (keep >= 0) {
     for (uint32_t i = 0; i < kMaxMixChannels; ++i) {
       Channel *ch = cur_[i];
-      if (ch == nullptr || ch->group_ == keep || ch->st_ == StreamState::kFading) {
+      if (ch == nullptr) {
+        continue;
+      }
+      if (ch->group_ == keep) {
+        ch->took_over_ = true;
+        continue;
+      }
+      if (ch->st_ == StreamState::kFading) {
         continue;
       }
       if ((ch->st_ != StreamState::kRunning || ch->gain_ <= 0.0f) && ch->tail_pos_ == 0) {
@@ -589,12 +611,13 @@ void MixEngine::Tick(int64_t tick_ns) noexcept {
     silent_since_anchor_ = false;
   }
   if (!gap && any_entered_ && silent_since_anchor_) {
-    // Re-anchor in silence: L' = the median of the running channels' smoothed head ages.
+    // Re-anchor in silence: L' = the median of the head ages the running channels settle at (their smoothed head
+    // age, or their fill floor when higher: the target never goes below it).
     double ages[kMaxMixChannels];
     uint32_t n = 0;
     for (const Channel *ch : cur_) {
       if (ch != nullptr && ch->st_ == StreamState::kRunning) {
-        ages[n++] = ch->ctl_.age_ns();
+        ages[n++] = std::max(ch->ctl_.age_ns(), static_cast<double>(ch->floor_ns_));
       }
     }
     if (n > 0) {

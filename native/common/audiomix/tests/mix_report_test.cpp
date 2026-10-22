@@ -344,7 +344,7 @@ TEST(Goldens, AllSevenAreCovered) {
   }
 }
 
-TEST(ReportWriter, CapsAppsSessionsAndEvents) {
+TEST(ReportWriter, CapsAppsSessionsWarningsAndEvents) {
   Report r = Base(1, 10, ReportEngine::kIncludeSet, ReportState::kOk, true);
   for (int i = 0; i < 130; ++i) {
     r.apps.push_back(Spotify(0));
@@ -354,6 +354,9 @@ TEST(ReportWriter, CapsAppsSessionsAndEvents) {
   }
   for (int i = 0; i < 305; ++i) {
     r.events.push_back(Event(i, ReportEventCode::kMuted));
+  }
+  for (int i = 0; i < 200; ++i) {
+    r.warnings.push_back(ReportWarning{AppWarning::kMultiProcessSession, "exe:w" + std::to_string(i) + ".exe"});
   }
   const std::string j = WriteReportJson(r);
   auto count = [&](const std::string &needle) {
@@ -366,6 +369,9 @@ TEST(ReportWriter, CapsAppsSessionsAndEvents) {
   EXPECT_EQ(count("\"name\":\"Spotify\""), 128u);
   EXPECT_EQ(count("\"appId\":\"exe:a.exe\""), 256u);
   EXPECT_EQ(count("\"code\":\"muted\""), 300u);
+  EXPECT_EQ(count("\"code\":\"multi_process_session\""), 128u);
+  EXPECT_NE(j.find("\"app\":\"exe:w127.exe\""), std::string::npos); // the first 128 stay
+  EXPECT_EQ(j.find("\"app\":\"exe:w128.exe\""), std::string::npos);
   EXPECT_EQ(j.find("{\"tNs\":4,"), std::string::npos); // the oldest ones went
   EXPECT_NE(j.find("{\"tNs\":5,"), std::string::npos);
   EXPECT_NE(j.find("{\"tNs\":304,"), std::string::npos);

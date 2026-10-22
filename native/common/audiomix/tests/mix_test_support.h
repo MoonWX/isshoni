@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -177,7 +178,7 @@ struct ProducerConfig {
   double drift_ppm = 0; // the device clock against QPC: positive = the device runs fast (fills the ring)
   uint32_t packet_frames = kChunkFrames;
   int64_t start_ns = 0;              // QPC time of the stream's first frame
-  int64_t latency_ns = 3 * kNsPerMs; // a packet arrives this long after its last frame was mixed ...
+  int64_t latency_ns = 3 * kNsPerMs; // a packet reaches the capture thread this long after its last frame was mixed
   int64_t jitter_ns = 0;             // ... plus or minus up to this (uniform), never before an earlier packet
   int64_t qpc_noise_ns = 0;          // plus or minus up to this on the reported QPC position
   uint64_t seed = 1;
@@ -205,7 +206,7 @@ public:
       if (c_.qpc_noise_ns > 0) {
         qpc += rng_.UniformInt(-c_.qpc_noise_ns, c_.qpc_noise_ns);
       }
-      ring_->Write(buf_.data(), c_.packet_frames, qpc);
+      ring_->Write(buf_.data(), c_.packet_frames, qpc, next_arrival_);
       next_frame_ += c_.packet_frames;
       ScheduleNext();
     }
@@ -242,7 +243,7 @@ private:
   std::vector<float> buf_;
   uint64_t next_frame_ = 0;
   int64_t next_arrival_ = 0;
-  int64_t last_arrival_ = 0;
+  int64_t last_arrival_ = INT64_MIN; // a stream playing before time 0 had its packets arrive at their own times
   bool enabled_ = true;
 };
 

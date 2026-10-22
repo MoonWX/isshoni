@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cmath>
 #include <thread>
 #include <vector>
 
@@ -24,6 +25,9 @@ std::vector<float> Counting(uint64_t first, uint32_t n) {
 
 int64_t FrameNs(uint64_t frames) { return static_cast<int64_t>(frames * static_cast<uint64_t>(kNsPerSecond) / kRate); }
 
+// When a packet of n frames whose first frame was mixed at qpc_ns ends: its arrival when it comes without lag.
+int64_t Ends(int64_t qpc_ns, uint32_t n) { return qpc_ns + FrameNs(n); }
+
 TEST(CaptureRing, WrapsAroundFrameExact) {
   CaptureRing ring(1000);
   EXPECT_EQ(ring.capacity(), 1000u);
@@ -32,7 +36,7 @@ TEST(CaptureRing, WrapsAroundFrameExact) {
   for (int round = 0; round < 50; ++round) {
     const uint32_t n = 300 + static_cast<uint32_t>(round % 7) * 17; // packets that straddle the end at changing points
     auto packet = Counting(written, n);
-    ring.Write(packet.data(), n, FrameNs(written));
+    ring.Write(packet.data(), n, FrameNs(written), Ends(FrameNs(written), n));
     written += n;
     // Read back in pieces of another size.
     while (ring.Buffered() >= 230) {
@@ -58,9 +62,9 @@ TEST(CaptureRing, SideRingGivesEachFrameItsPacketsTime) {
   CaptureRing ring;
   // Three packets with gaps between their capture times (a glitch: Windows dropped audio in between).
   auto a = Counting(0, 480), b = Counting(480, 480), c = Counting(960, 100);
-  ring.Write(a.data(), 480, 1'000'000'000);
-  ring.Write(b.data(), 480, 1'030'000'000); // 20 ms later than contiguous
-  ring.Write(c.data(), 100, 1'040'000'000);
+  ring.Write(a.data(), 480, 1'000'000'000, Ends(1'000'000'000, 480));
+  ring.Write(b.data(), 480, 1'030'000'000, Ends(1'030'000'000, 480)); // 20 ms later than contiguous
+  ring.Write(c.data(), 100, 1'040'000'000, Ends(1'040'000'000, 100));
   int64_t qpc = 0;
   ASSERT_TRUE(ring.HeadQpc(&qpc));
   EXPECT_EQ(qpc, 1'000'000'000);
@@ -93,9 +97,9 @@ TEST(CaptureRing, NoTimeBeforeTheFirstPacket) {
 TEST(CaptureRing, OverflowDropsTheOldest) {
   CaptureRing ring(1000);
   auto p = Counting(0, 600);
-  ring.Write(p.data(), 600, 0);
+  ring.Write(p.data(), 600, 0, Ends(0, 600));
   auto q = Counting(600, 600);
-  ring.Write(q.data(), 600, FrameNs(600));
+  ring.Write(q.data(), 600, FrameNs(600), Ends(FrameNs(600), 600));
   EXPECT_EQ(ring.Buffered(), 1000u);
   EXPECT_EQ(ring.overflows(), 1u);
   EXPECT_EQ(ring.overflow_frames(), 200u);
@@ -110,7 +114,7 @@ TEST(CaptureRing, OverflowDropsTheOldest) {
 TEST(CaptureRing, APacketLongerThanTheRingKeepsItsEnd) {
   CaptureRing ring(100);
   auto p = Counting(0, 250);
-  ring.Write(p.data(), 250, 5'000'000);
+  ring.Write(p.data(), 250, 5'000'000, Ends(5'000'000, 250));
   EXPECT_EQ(ring.Buffered(), 100u);
   std::vector<float> got(2 * 100);
   ASSERT_EQ(ring.Peek(got.data(), 100), 100u);
@@ -125,8 +129,8 @@ TEST(CaptureRing, APacketLongerThanTheRingKeepsItsEnd) {
 TEST(CaptureRing, SilentPacketsAreZeros) {
   CaptureRing ring(100);
   auto p = Counting(1, 10);
-  ring.Write(p.data(), 10, 0);
-  ring.Write(nullptr, 10, FrameNs(10)); // AUDCLNT_BUFFERFLAGS_SILENT
+  ring.Write(p.data(), 10, 0, Ends(0, 10));
+  ring.Write(nullptr, 10, FrameNs(10), Ends(FrameNs(10), 10)); // AUDCLNT_BUFFERFLAGS_SILENT
   std::vector<float> got(2 * 20);
   ASSERT_EQ(ring.Peek(got.data(), 20), 20u);
   for (uint32_t i = 10; i < 20; ++i) {
@@ -138,11 +142,11 @@ TEST(CaptureRing, SilentPacketsAreZeros) {
 TEST(CaptureRing, ConsumeAfterARacedOverflowSaysSo) {
   CaptureRing ring(1000);
   auto p = Counting(0, 900);
-  ring.Write(p.data(), 900, 0);
+  ring.Write(p.data(), 900, 0, Ends(0, 900));
   std::vector<float> got(2 * 500);
   ASSERT_EQ(ring.Peek(got.data(), 500), 500u);
   auto q = Counting(900, 300); // the producer drops 200 of the peeked frames meanwhile
-  ring.Write(q.data(), 300, FrameNs(900));
+  ring.Write(q.data(), 300, FrameNs(900), Ends(FrameNs(900), 300));
   EXPECT_FALSE(ring.Consume(500));
   ASSERT_EQ(ring.Peek(got.data(), 1), 1u);
   EXPECT_EQ(got[0], 500.0f); // past both: the raced 200 and the 500
@@ -152,8 +156,8 @@ TEST(CaptureRing, ConsumeAfterARacedOverflowSaysSo) {
 TEST(CaptureRing, FramesBeforeAQpcTime) {
   CaptureRing ring;
   auto a = Counting(0, 480), b = Counting(480, 480);
-  ring.Write(a.data(), 480, 100'000'000);
-  ring.Write(b.data(), 480, 110'000'000);
+  ring.Write(a.data(), 480, 100'000'000, Ends(100'000'000, 480));
+  ring.Write(b.data(), 480, 110'000'000, Ends(110'000'000, 480));
   EXPECT_EQ(ring.FramesBefore(50'000'000), 0u);  // before the head
   EXPECT_EQ(ring.FramesBefore(100'000'000), 0u); // the head itself
   EXPECT_EQ(ring.FramesBefore(100'000'001), 1u); // the first frame at or after it is frame 1
@@ -171,7 +175,7 @@ TEST(CaptureRing, ManyTinyPacketsOverflowTheSideRingNotTheTimes) {
   // 3000 packets of 2 frames: the side ring keeps the newest 1024 entries.
   for (uint64_t k = 0; k < 3000; ++k) {
     auto p = Counting(2 * k, 2);
-    ring.Write(p.data(), 2, 1'000'000 + FrameNs(2 * k));
+    ring.Write(p.data(), 2, 1'000'000 + FrameNs(2 * k), Ends(1'000'000 + FrameNs(2 * k), 2));
   }
   int64_t qpc = 0;
   ASSERT_TRUE(ring.HeadQpc(&qpc)); // the head's entry is gone: extrapolated back from the oldest one left
@@ -179,6 +183,50 @@ TEST(CaptureRing, ManyTinyPacketsOverflowTheSideRingNotTheTimes) {
   ASSERT_TRUE(ring.Consume(5000));
   ASSERT_TRUE(ring.HeadQpc(&qpc));
   EXPECT_NEAR(static_cast<double>(qpc), static_cast<double>(1'000'000 + FrameNs(5000)), 1.0);
+}
+
+// How late the packets reach the capture thread and how long they are, averaged over ~10 s of audio (the mixer's fill
+// floor, mix_engine.h).
+TEST(CaptureRing, PacketTimingAveragesLagAndLength) {
+  constexpr int64_t kMs = kNsPerMs;
+  CaptureRing ring;
+  EXPECT_EQ(ring.arrival_lag_ns(), 0);
+  EXPECT_EQ(ring.packet_ns(), 0);
+  int64_t qpc = 0;
+  auto write = [&](uint32_t n, int64_t lag) {
+    ring.Write(nullptr, n, qpc, Ends(qpc, n) + lag);
+    qpc += FrameNs(n);
+  };
+  // While far less than 10 s has come, about a plain mean: one packet 200 ms late (counted as 50 ms), then nine
+  // without lag (the first one's weight has decayed by 1 % meanwhile).
+  write(480, 200 * kMs);
+  EXPECT_EQ(ring.arrival_lag_ns(), 50 * kMs);
+  EXPECT_EQ(ring.packet_ns(), 10 * kMs);
+  for (int i = 0; i < 9; ++i) {
+    write(480, 0);
+  }
+  EXPECT_NEAR(static_cast<double>(ring.arrival_lag_ns()), 5.0 * kMs, 0.05 * kMs);
+  // 100 s at 7 ms: the start is forgotten.
+  for (int i = 0; i < 10'000; ++i) {
+    write(480, 7 * kMs);
+  }
+  EXPECT_NEAR(static_cast<double>(ring.arrival_lag_ns()), 7.0 * kMs, 1000.0);
+  // 10 s at 17 ms: about 1 - 1/e of the way.
+  for (int i = 0; i < 1000; ++i) {
+    write(480, 17 * kMs);
+  }
+  EXPECT_NEAR(static_cast<double>(ring.arrival_lag_ns()), (7.0 + 10.0 * (1 - std::exp(-1.0))) * kMs, 0.05 * kMs);
+  // A packet that seems to arrive before its end (a bad position) counts as no lag.
+  for (int i = 0; i < 10'000; ++i) {
+    write(480, -5 * kMs);
+  }
+  EXPECT_LT(ring.arrival_lag_ns(), 1000);
+  // Lengths are weighted by length: 10 and 20 ms packets in turn average (10^2 + 20^2) / (10 + 20) ms.
+  for (int i = 0; i < 5000; ++i) {
+    write(480, 0);
+    write(960, 0);
+  }
+  EXPECT_NEAR(static_cast<double>(ring.packet_ns()), 500.0 / 30.0 * kMs, 0.2 * kMs);
 }
 
 // One producer thread, one consumer thread (clean under host-tsan): frames arrive in order, gaps only where an
@@ -197,7 +245,7 @@ TEST(CaptureRing, ProducerAndConsumerThreads) {
         buf[2 * i] = static_cast<float>(next + i);
         buf[2 * i + 1] = 1.0f;
       }
-      ring.Write(buf.data(), n, FrameNs(next));
+      ring.Write(buf.data(), n, FrameNs(next), Ends(FrameNs(next), n));
       next += n;
       if (rng.UniformInt(0, 3) == 0) {
         std::this_thread::yield();

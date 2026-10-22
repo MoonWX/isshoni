@@ -6,18 +6,21 @@
 // is the delay from the audio engine's mix to the mixer's pop. L starts at L0 = 50 ms with the first chunk and changes
 // only at a new grid:
 //   - a silence re-anchor: a channel entered Running at this tick, every chunk since the last grid started, this one
-//     included, is digital silence, and the median over running channels of their smoothed head ages, L', differs
-//     from L by more than 5 ms. The new grid starts at max(tick - L', previous chunk + 10 ms), and L becomes tick
-//     minus that. "Every chunk since the grid started" includes the one being made, so a stream that is already
-//     playing when it starts running (the common case of a game playing at share start) never moves the grid, and a
-//     jump never lands in sound. Because the new grid can't start before the previous chunk + 10 ms, between two
-//     consecutive ticks a re-anchor can only lower L (a later L' leaves the grid where it is).
+//     included, is digital silence, and L', the median over running channels of the head age each settles at, differs
+//     from L by more than 5 ms. A channel settles at its smoothed head age, or at its fill floor when that is higher
+//     (controller.h): an L below the floor would only make its stamps late, since its controller holds the floor. The
+//     new grid starts at max(tick - L', previous chunk + 10 ms), and L becomes tick minus that. "Every chunk since
+//     the grid started" includes the one being made, so a stream that is already playing when it starts running (the
+//     common case of a game playing at share start) never moves the grid, and a jump never lands in sound. Because
+//     the new grid can't start before the previous chunk + 10 ms, between two consecutive ticks a re-anchor can only
+//     lower L (a later L' leaves the grid where it is).
 //   - a resync: the mixer fell more than 100 ms behind (§9.1): the grid restarts at now, at least 10 ms after the
 //     previous chunk.
 // The sink gets OnGap exactly at the first chunk after Begin, at a resync and at a re-anchor (§10.4), and chunk times
 // never decrease. Device changes, engine crossfades, sound off and on and pause keep the grid. Every channel's
-// controller holds its head age at L (kept within 40..60 ms, controller.h), so a chunk's time is the QPC time at which
-// the audio engine mixed its first frame, also after a re-anchor changed L.
+// controller holds its head age at L, or at its fill floor when that is higher (controller.h), so a chunk's time is
+// the QPC time at which the audio engine mixed its first frame whenever the streams' packets reach the capture thread
+// within about 5 ms of their mix, also after a re-anchor changed L.
 //
 // Threads. Begin and Pump run on the mixer thread only (Mixer, or a test driving simulated time); they never block or
 // allocate. Add, the silence flags, ReadLevels, counters and DrainEvents are for any other thread and are lock-free.
@@ -36,10 +39,12 @@ struct MixParams {
   int64_t initial_delay_ns = 50 * kNsPerMs;  // L0 (§10.3)
   int64_t resync_after_ns = 100 * kNsPerMs;  // behind by more than this: resync (§9.1)
   int64_t reanchor_change_ns = 5 * kNsPerMs; // a re-anchor needs |L' - L| above this (§10.3)
-  // The channels' controllers hold their head age at L, kept within these bounds (controller.h): the fill stays
-  // above the 20 ms low water and near §9.3's 40 ms whatever L a re-anchor measured.
+  // Each channel's controller holds its head age at max(L, its fill floor), kept within the bounds below
+  // (controller.h). The floor is fill_target_ns plus the ring's arrival lag and half its packet length
+  // (capture_ring.h), so the fill averages §9.3's 40 ms however late the packets come.
+  int64_t fill_target_ns = 40 * kNsPerMs;
   int64_t min_target_age_ns = 40 * kNsPerMs;
-  int64_t max_target_age_ns = 60 * kNsPerMs;
+  int64_t max_target_age_ns = 90 * kNsPerMs;
 };
 
 // What the mixer counts (the report's counters, 05 §12.1, as far as they are the mixer's). Monotonic.
@@ -154,6 +159,7 @@ private:
   void Tick(int64_t tick_ns) noexcept;
   void Prepare(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept;
   void Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept;
+  int64_t TargetFor(Channel &ch) noexcept;
   void Release(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept;
   void StartFade(Channel &ch, uint32_t frames) noexcept;
   void EmitTail(Channel &ch, uint32_t from) noexcept;
@@ -199,8 +205,7 @@ private:
   int64_t tick0_ = 0;
   int64_t k_ = 0;
   int64_t next_due_ = 0;
-  int64_t delay_ = 0;      // L
-  int64_t target_age_ = 0; // the controllers' target: L within the bounds
+  int64_t delay_ = 0; // L
   int64_t prev_chunk_ = 0;
   bool have_prev_ = false;
   bool need_gap_ = false;

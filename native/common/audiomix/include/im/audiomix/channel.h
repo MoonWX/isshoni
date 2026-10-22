@@ -29,19 +29,26 @@ enum class StreamState : uint8_t {
   kReleased, // the mixer let go of it
 };
 
-// The engines whose streams crossfade (§6.5): the include set's streams, and the single EXCLUDE or endpoint stream.
+// The engines whose streams crossfade (§6.5), one group each: the include set's streams, the EXCLUDE stream of the
+// fast path (exclude-self, §6.4) and the endpoint stream. A crossfading channel takes over from every channel of every
+// other group, so each engine needs its own group: "any -> endpoint" includes exclude-self -> endpoint.
 inline constexpr uint8_t kGroupInclude = 0;
-inline constexpr uint8_t kGroupSingle = 1;
+inline constexpr uint8_t kGroupExcludeSelf = 1;
+inline constexpr uint8_t kGroupEndpoint = 2;
 
 struct ChannelOptions {
   // The stream's ring (required). It must outlive the channel's time in the mixer, i.e. until released().
   CaptureRing *ring = nullptr;
   // The caller's id for this stream: levels and events carry it.
   uint64_t tag = 0;
-  // The engine the stream belongs to (kGroupInclude, kGroupSingle).
+  // The engine the stream belongs to (kGroupInclude, kGroupExcludeSelf, kGroupEndpoint; any value works).
   uint8_t group = kGroupInclude;
-  // When the channel starts running, the streams of every other group fade out over the same 20 ms in which this
-  // one fades in (an equal-gain crossfade between engines, §6.5) and then leave the mixer.
+  // An engine switch (§6.5): when the first crossfading channel of its group starts running, the channels of every
+  // other group fade out over the same 20 ms in which it fades in (an equal-gain crossfade between engines) and then
+  // leave the mixer (those not audible yet leave at once). That takeover happens once per group: from then on every
+  // channel of the group that was in the mixer at that tick counts as taken over, so a re-entry after an underrun or
+  // a trim fades in over 10 ms and leaves the other groups alone (§9.2). Set it only on the streams that open for a
+  // switch; a stream reopened inside the running engine (a device change, §7.5) fades in on its own.
   bool crossfade = false;
   // nullptr: speexdsp (NewSpeexResampler), the production resampler. Tests and simulations pass NewModelResampler().
   std::unique_ptr<Resampler> resampler;
@@ -80,6 +87,9 @@ public:
   CaptureRing *ring() const noexcept { return ring_; }
   int32_t ppm() const noexcept { return ppm_.load(std::memory_order_relaxed); }
   int64_t age_ns() const noexcept { return age_ns_.load(std::memory_order_relaxed); } // smoothed head age
+  // The head age its controller holds now: L, or more when the ring's fill would average less than 40 ms there
+  // (controller.h). 0 before it first ran.
+  int64_t target_age_ns() const noexcept { return target_pub_.load(std::memory_order_relaxed); }
   uint64_t underruns() const noexcept { return underruns_.load(std::memory_order_relaxed); }
   uint64_t trims() const noexcept { return trims_.load(std::memory_order_relaxed); }
   bool bypassed() const noexcept { return bypass_flag_.load(std::memory_order_relaxed); } // in the silent bypass
@@ -104,6 +114,7 @@ private:
   std::atomic<StreamState> state_{StreamState::kIdle};
   std::atomic<int32_t> ppm_{kPpmPerStep};
   std::atomic<int64_t> age_ns_{0};
+  std::atomic<int64_t> target_pub_{0};
   std::atomic<uint64_t> underruns_{0};
   std::atomic<uint64_t> trims_{0};
   std::atomic<bool> bypass_flag_{false};
@@ -124,8 +135,10 @@ private:
   uint32_t cut_fade_ = 1;   // the cut's fade: 5 ms, or what is left when the cut point is nearer
   bool stop_after_ = false; // fade out this chunk, then back to Preroll (an underrun or trim)
   bool trim_after_ = false;
-  bool entered_ = false; // entered Running at this tick
-  bool skip_ = false;    // nothing to mix at this tick
+  bool entered_ = false;   // entered Running at this tick
+  bool took_over_ = false; // its group took over from the other groups (ChannelOptions::crossfade): no second time
+  int64_t floor_ns_ = 0;   // the head age at which its fill averages 40 ms (0: no packet yet), set at each Render
+  bool skip_ = false;      // nothing to mix at this tick
   uint64_t seen_overflows_ = 0;
   float last_l_ = 0.0f, last_r_ = 0.0f; // the last two frames this channel added to the bus
   float prev_l_ = 0.0f, prev_r_ = 0.0f;

@@ -1,182 +1,99 @@
 // Adaptive resampling in simulation (docs/m2/05-windows-audio.md §9.3, §17, §19.1): device clocks drifting -500 ..
-// +500 ppm against the QPC, 10 ms capture packets arriving with +-3 ms of jitter, 2 simulated hours. Pass: from 60 s
-// on the ring fill stays at 40 +- 15 ms, no underrun or trim in the whole run, and the resampling ratio's standard
-// deviation is at most 30 ppm. Simulated time only (no wall clock): fast and the same on every runner.
-//
-// The two-hour runs (at -500, 0 and +500 ppm; the drifts in between run 20 simulated minutes) use the model resampler
-// (speexdsp's consumption to the frame, mix_resampler_test, without its 80-tap filter, which costs about 0.3 ms per
-// chunk in a debug build); a shorter run checks the same with speexdsp.
+// +500 ppm against the QPC, capture packets arriving with +-3 ms of jitter. Pass: from 60 s on the ring fill stays at
+// 40 +- 15 ms, no underrun or trim in the whole run, and the resampling ratio's standard deviation is at most 30 ppm
+// (mix_drift_support.h). This file has the 20-minute runs (drifts between the ends; packets that come late or are
+// long), speexdsp itself and the controller's own checks; the 2-hour runs at -500, 0 and +500 ppm are
+// mix_drift_long_test's, a ctest entry of their own with its own time budget.
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <cstdio>
 
 #include "im/audiomix/controller.h"
-#include "im/audiomix/mix_engine.h"
-#include "mix_test_support.h"
+#include "mix_drift_support.h"
 
 namespace im::audiomix {
 namespace {
 
-constexpr int64_t kMs = kNsPerMs;
-constexpr int64_t kSecond = kNsPerSecond;
-
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define IM_SANITIZED 1
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define IM_SANITIZED 1
-#endif
-#endif
-
-// Under a sanitizer the runs are shorter (the sanitizer build checks memory and threads, host-debug the numbers).
-#if defined(IM_SANITIZED)
-constexpr int64_t kTwoHours = 10 * 60 * kSecond;
-constexpr int64_t kTwentyMinutes = 5 * 60 * kSecond;
-#else
-constexpr int64_t kTwoHours = 2 * 3600 * kSecond;
-constexpr int64_t kTwentyMinutes = 20 * 60 * kSecond;
-#endif
-
-// A sink that checks the grid as the chunks come and keeps nothing.
-class GridSink final : public ChunkSink {
-public:
-  void OnChunk(const float *, int64_t t) noexcept override {
-    if (have_ && t - last_ != kChunkNs) {
-      ++off_grid;
-    }
-    have_ = true;
-    last_ = t;
-    ++chunks;
-  }
-  void OnGap(int64_t) noexcept override { ++gaps; }
-  uint64_t chunks = 0, gaps = 0, off_grid = 0;
-
-private:
-  bool have_ = false;
-  int64_t last_ = 0;
-};
-
-struct Stats {
-  double n = 0, sum = 0, sumsq = 0, min = 1e300, max = -1e300;
-  void Add(double v) {
-    n += 1;
-    sum += v;
-    sumsq += v * v;
-    min = std::min(min, v);
-    max = std::max(max, v);
-  }
-  double mean() const { return sum / n; }
-  double sd() const { return std::sqrt(std::max(0.0, sumsq / n - mean() * mean())); }
-};
-
-struct DriftResult {
-  Stats fill_ms; // the ring fill at each tick, before the pop, from 60 s on
-  Stats ppm;     // the ratio at each tick from 60 s on
-  uint64_t underruns = 0, trims = 0, zero_ppm = 0, gaps = 0, off_grid = 0;
-  double max_abs_ppm = 0;
-};
-
-DriftResult RunDrift(double drift_ppm, int64_t duration, bool speex, uint64_t seed) {
-  GridSink sink;
-  MixEngine engine(&sink);
-  CaptureRing ring;
-  test::Tone tone(1000, 0.5f); // sound throughout: no silent bypass
-  test::ProducerConfig pc;
-  pc.drift_ppm = drift_ppm;
-  pc.start_ns = -1 * kSecond; // playing before the first chunk
-  pc.latency_ns = 3 * kMs;
-  pc.jitter_ns = 3 * kMs;
-  pc.qpc_noise_ns = 200'000; // and +-0.2 ms on the reported QPC positions
-  pc.seed = seed;
-  test::Producer producer(&ring, &tone, pc);
-  ChannelOptions o;
-  o.ring = &ring;
-  if (!speex) {
-    o.resampler = NewModelResampler();
-  }
-  std::unique_ptr<Channel> ch;
-  EXPECT_EQ(Channel::Create(std::move(o), &ch), IM_OK);
-  EXPECT_TRUE(engine.Add(ch.get()));
-
-  DriftResult res;
-  engine.Begin(0);
-  int64_t now = 0;
-  while (now < duration) {
-    now = std::min(engine.next_due_ns(), producer.next_arrival());
-    producer.RunUntil(now);
-    if (engine.next_due_ns() <= now) {
-      if (now >= 60 * kSecond) {
-        res.fill_ms.Add(static_cast<double>(ring.Buffered()) / kFramesPerMs);
-        res.ppm.Add(ch->ppm());
-      }
-      res.zero_ppm += ch->ppm() == 0;
-      res.max_abs_ppm = std::max(res.max_abs_ppm, std::fabs(static_cast<double>(ch->ppm())));
-      engine.Pump(now);
-    }
-  }
-  res.underruns = ch->underruns();
-  res.trims = ch->trims();
-  res.gaps = sink.gaps;
-  res.off_grid = sink.off_grid;
-  return res;
-}
-
-void Report(const char *what, double drift, const DriftResult &r) {
-  std::printf("%s drift %+5.0f ppm: fill %.1f..%.1f ms (mean %.1f), ratio %.1f +- %.1f ppm (|max| %.0f), "
-              "underruns %llu, trims %llu\n",
-              what, drift, r.fill_ms.min, r.fill_ms.max, r.fill_ms.mean(), r.ppm.mean(), r.ppm.sd(), r.max_abs_ppm,
-              static_cast<unsigned long long>(r.underruns), static_cast<unsigned long long>(r.trims));
-}
-
-void ExpectMeetsSection17(double drift, const DriftResult &r) {
-  EXPECT_GE(r.fill_ms.min, 25.0) << drift;
-  EXPECT_LE(r.fill_ms.max, 55.0) << drift;
-  EXPECT_EQ(r.underruns, 0u) << drift;
-  EXPECT_EQ(r.trims, 0u) << drift;
-  EXPECT_LE(r.ppm.sd(), 30.0) << drift;
-  EXPECT_EQ(r.zero_ppm, 0u) << drift;
-  EXPECT_EQ(r.gaps, 1u) << drift; // the first chunk only
-  EXPECT_EQ(r.off_grid, 0u) << drift;
-}
-
-class TwoHourDrift : public ::testing::TestWithParam<double> {};
-
-TEST_P(TwoHourDrift, MeetsSection17) {
-  const double drift = GetParam();
-  const DriftResult r = RunDrift(drift, kTwoHours, /*speex=*/false, 1000 + static_cast<uint64_t>(drift + 1000));
-  Report("model ", drift, r);
-  ExpectMeetsSection17(drift, r);
-  // The ratio tracks the drift (a fast device needs a ratio above 1 to drain).
-  EXPECT_NEAR(r.ppm.mean(), drift, 8.0);
-}
-
-INSTANTIATE_TEST_SUITE_P(Drifts, TwoHourDrift, ::testing::Values(-500.0, 0.0, 500.0));
+using test::DriftResult;
+using test::DriftRun;
+using test::kMs;
+using test::kSecond;
+using test::Stats;
 
 class TwentyMinuteDrift : public ::testing::TestWithParam<double> {};
 
 TEST_P(TwentyMinuteDrift, MeetsSection17) {
-  const double drift = GetParam();
-  const DriftResult r = RunDrift(drift, kTwentyMinutes, /*speex=*/false, 2000 + static_cast<uint64_t>(drift + 1000));
-  Report("model ", drift, r);
-  ExpectMeetsSection17(drift, r);
-  EXPECT_NEAR(r.ppm.mean(), drift, 8.0);
+  DriftRun run;
+  run.drift_ppm = GetParam();
+  run.seed = 2000 + static_cast<uint64_t>(run.drift_ppm + 1000);
+  const DriftResult r = test::RunDrift(run);
+  test::Report("model ", run, r);
+  test::ExpectMeetsSection17(run, r);
+  EXPECT_NEAR(r.ppm.mean(), run.drift_ppm, 8.0); // a fast device needs a ratio above 1 to drain
 }
 
 INSTANTIATE_TEST_SUITE_P(Drifts, TwentyMinuteDrift, ::testing::Values(-250.0, -40.0, 40.0, 250.0));
 
-// The same with speexdsp itself, for 100 simulated seconds at both ends of the range.
+// Packets that reach the capture thread later than the 3 ms the other runs assume (a capture offset S1 never measured
+// on hardware), or that are 20 ms long: the fill floor (mix_engine.h) holds the fill at 40 ms on average, so §17 holds
+// at both ends of the drift range. The head age then sits above L0 (40 ms + the lag + half a packet).
+struct LatePackets {
+  double drift_ppm;
+  int64_t latency_ms;
+  uint32_t packet_ms;
+};
+
+class LateOrLongPackets : public ::testing::TestWithParam<LatePackets> {};
+
+TEST_P(LateOrLongPackets, MeetSection17) {
+  const LatePackets c = GetParam();
+  DriftRun run;
+  run.drift_ppm = c.drift_ppm;
+  run.latency_ns = c.latency_ms * kMs;
+  run.packet_frames = c.packet_ms * kFramesPerMs;
+  run.seed = 3000 + static_cast<uint64_t>(c.drift_ppm + 1000) + static_cast<uint64_t>(c.latency_ms * 10 + c.packet_ms);
+  const DriftResult r = test::RunDrift(run);
+  test::Report("model ", run, r);
+  test::ExpectMeetsSection17(run, r);
+  EXPECT_NEAR(r.ppm.mean(), c.drift_ppm, 8.0);
+  EXPECT_NEAR(r.fill_ms.mean(), 40.0, 2.0);
+  // The floor: 40 ms + the lag + half a packet, or L0 when that is higher.
+  const double floor_ms = 40.0 + static_cast<double>(c.latency_ms) + c.packet_ms / 2.0;
+  EXPECT_NEAR(r.target_ms, std::max(50.0, floor_ms), 1.0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Packets, LateOrLongPackets,
+                         ::testing::Values(LatePackets{-500.0, 15, 10}, LatePackets{500.0, 15, 10},
+                                           LatePackets{-500.0, 25, 10}, LatePackets{500.0, 25, 10},
+                                           LatePackets{-500.0, 3, 20}, LatePackets{500.0, 3, 20}));
+
+// The same with speexdsp itself at both ends of the range: 100 simulated seconds each, the statistics from 60 s on.
+// Under a sanitizer 20 s, the statistics from 10 s on, while the ratio still converges: everything but its spread.
 TEST(Drift, SpeexdspMeetsSection17AtTheEnds) {
+  constexpr bool kSettled = test::kSpeexRun > 60 * kSecond;
+  if (!kSettled) {
+    std::printf("note: a short run under a sanitizer; host-debug checks the ratio's spread with speexdsp\n");
+  }
   for (const double drift : {-500.0, 500.0}) {
-    const DriftResult r = RunDrift(drift, 100 * kSecond, /*speex=*/true, 7);
-    Report("speex ", drift, r);
-    ExpectMeetsSection17(drift, r);
+    DriftRun run;
+    run.drift_ppm = drift;
+    run.duration = test::kSpeexRun;
+    run.settle_ns = kSettled ? 60 * kSecond : run.duration / 2;
+    run.speex = true;
+    run.seed = 7;
+    const DriftResult r = test::RunDrift(run);
+    test::Report("speex ", run, r);
+    test::ExpectMeetsSection17(run, r, kSettled);
   }
 }
 
 // A drift of exactly 0 for 10 simulated minutes: the ratio is never 1:1 (§9.3, §19.1).
 TEST(Drift, ZeroDriftNeverGivesPpmZero) {
-  const DriftResult r = RunDrift(0.0, 10 * 60 * kSecond, false, 3);
+  DriftRun run;
+  run.duration = test::kTenMinutes;
+  run.seed = 3;
+  const DriftResult r = test::RunDrift(run);
   EXPECT_EQ(r.zero_ppm, 0u);
   EXPECT_GE(r.max_abs_ppm, 1.0);
   EXPECT_LE(r.ppm.sd(), 30.0);

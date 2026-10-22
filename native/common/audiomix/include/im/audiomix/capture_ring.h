@@ -6,6 +6,10 @@
 // drops the oldest frames: it moves the read index forward itself, so a consumer whose Peek raced with that learns it
 // from Consume's result. Each frame (left and right float) is one 64-bit word read and written atomically (relaxed),
 // so a raced read is stale, never undefined behaviour. Construction allocates; nothing else does.
+//
+// The ring also keeps how late its packets reach the capture thread and how long they are (arrival_lag_ns,
+// packet_ns): the mixer's fill floor (mix_engine.h) holds a stream's average fill at 05 §9.3's 40 ms from them,
+// whatever the hardware's capture offset is.
 #pragma once
 
 #include <atomic>
@@ -18,8 +22,10 @@ namespace im::audiomix {
 
 class CaptureRing {
 public:
-  static constexpr uint32_t kDefaultFrames = kRate / 2; // 500 ms (§8.3, §17: 192 KiB of float stereo)
-  static constexpr uint32_t kSideEntries = 1024;        // packets the side ring remembers (power of two)
+  static constexpr uint32_t kDefaultFrames = kRate / 2;          // 500 ms (§8.3, §17: 192 KiB of float stereo)
+  static constexpr uint32_t kSideEntries = 1024;                 // packets the side ring remembers (power of two)
+  static constexpr int64_t kTimingAverageNs = 10 * kNsPerSecond; // arrival_lag_ns and packet_ns average over ~10 s
+  static constexpr int64_t kMaxArrivalLagNs = 50 * kNsPerMs;     // a packet's lag counts as at most this
 
   // capacity_frames: 1 .. 2^24 (clamped). Not on a real-time thread: it allocates.
   explicit CaptureRing(uint32_t capacity_frames = kDefaultFrames);
@@ -31,10 +37,11 @@ public:
   // ---- producer (the capture thread)
 
   // Appends one captured packet: n interleaved stereo frames whose first frame the audio engine mixed at qpc_ns
-  // (pu64QPCPosition in ns, or the read time minus the frames already buffered when the position is missing, §8.3).
+  // (pu64QPCPosition in ns, or the read time minus the frames already buffered when the position is missing, §8.3),
+  // read by the capture thread at arrival_ns (its QPC time in ns when GetBuffer returned the packet).
   // frames == nullptr appends zeros (AUDCLNT_BUFFERFLAGS_SILENT). A packet longer than the ring keeps its last
   // capacity() frames. When the ring is full the oldest frames are dropped (overflows, overflow_frames).
-  void Write(const float *frames, uint32_t n, int64_t qpc_ns) noexcept;
+  void Write(const float *frames, uint32_t n, int64_t qpc_ns, int64_t arrival_ns) noexcept;
 
   // ---- consumer (the mixer)
 
@@ -54,6 +61,16 @@ public:
   // How many buffered frames lie before the first frame captured at or after qpc_ns: 0 when the head is already
   // that late, Buffered() when no buffered frame is.
   uint32_t FramesBefore(int64_t qpc_ns) noexcept;
+
+  // ---- the packets' timing (any thread)
+
+  // How long after its last frame was mixed a packet reached the capture thread (arrival_ns - qpc_ns - its length),
+  // averaged over about the last kTimingAverageNs of packets, each weighted by its length, a packet's lag clamped to
+  // 0 .. kMaxArrivalLagNs. A running mean until that much audio has come; 0 before the first packet.
+  int64_t arrival_lag_ns() const noexcept { return lag_pub_.load(std::memory_order_relaxed); }
+  // The packets' length averaged the same way. Weighted by length, half of it is the mean time since the newest
+  // packet arrived, seen at a random moment (packets arriving back to back). 0 before the first packet.
+  int64_t packet_ns() const noexcept { return packet_pub_.load(std::memory_order_relaxed); }
 
   // ---- counters (any thread)
   uint64_t overflows() const noexcept { return overflows_.load(std::memory_order_relaxed); }
@@ -82,7 +99,9 @@ private:
   std::atomic<uint64_t> sr_{0}; // the oldest live side entry (consumer; producer on overflow)
   std::atomic<uint64_t> overflows_{0};
   std::atomic<uint64_t> overflow_frames_{0};
-  uint64_t peek_r_ = 0; // consumer only: where the last Peek started
+  std::atomic<int64_t> lag_pub_{0}, packet_pub_{0};
+  double timing_weight_ = 0, lag_sum_ = 0, packet_sum_ = 0; // producer only: the decayed sums behind them
+  uint64_t peek_r_ = 0;                                     // consumer only: where the last Peek started
   bool peeked_ = false;
 };
 

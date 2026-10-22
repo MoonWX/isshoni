@@ -114,7 +114,7 @@ TEST(Mixer, ACaptureThreadAndTheWatcherAtOnce) {
     int64_t next = clock.NowNs();
     while (!stop.load()) {
       tone.Fill(frame, kChunkFrames, buf.data());
-      ring.Write(buf.data(), kChunkFrames, next);
+      ring.Write(buf.data(), kChunkFrames, next, clock.NowNs());
       frame += kChunkFrames;
       next += kChunkNs;
       std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(next + kChunkNs)));
