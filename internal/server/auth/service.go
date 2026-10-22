@@ -27,20 +27,14 @@ import (
 // registration and the approval queue (register.go), and added UpdateSettings (settings.go). README S58 filled in
 // self-service (selfservice.go) on the revocation table of 03 §7.7 (revoke.go). README S64 filled in the admin's
 // user calls (admin.go) and the password resets (reset.go), and README S70 the janitor (janitor.go). M2's README
-// WA30 filled in the device flow (deviceflow.go, devicepassword.go, devicename.go). The methods still declared below
-// come with README WA39. Until then each one returns notImplemented(method): an error that names the method and
-// wraps *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented
-// code).
+// WA30 filled in the device flow (deviceflow.go, devicepassword.go, devicename.go), and README WA39 device tokens
+// (bearer.go, refresh.go, and the device calls of selfservice.go). Every method of 03 §7.13 and M2 02 §6.8 has its
+// body now, so no not-implemented stub is left.
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
 // table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
 // (internalErr). The one exception is ErrNoCookie, which only the /ws adapter sees (03 §7.6); AuthenticateCookie
 // returns *api.Error{unauthenticated} for an invalid, expired or non-active session.
-
-// notImplemented is the error of a Service method whose slice has not landed yet.
-func notImplemented(method string) error {
-	return fmt.Errorf("auth: %s not implemented: %w", method, api.NewError(api.CodeInternal))
-}
 
 // internalErr wraps an unexpected failure of op. The result is an *api.Error{internal} for errors.As (03 §7.13) and
 // keeps err for errors.Is and for the log line of httpapi.WriteError; the cause never reaches the client.
@@ -117,6 +111,7 @@ type Service struct {
 	csrf     *CSRFGuard
 	cookie   sessionCookie
 	sessions *sessionCache
+	bearers  *bearerCache // M2 02 §6.1: access tokens and devices (bearer.go)
 
 	// settingsMu serializes UpdateSettings, so that each call sees exactly its own change (settings.go).
 	settingsMu sync.Mutex
@@ -127,6 +122,10 @@ type Service struct {
 	// userCode draws a normalized device-flow user code (deviceflow.go): newUserCode. Tests of the collision rule
 	// replace it.
 	userCode func() string
+
+	// accessToken reads an unexpired access token with its device and user (bearer.go): readAccessToken. Tests
+	// wrap it to count the reads that the token shape and the bearer cache save.
+	accessToken func(ctx context.Context, hash []byte, now time.Time) (store.DeviceToken, store.Device, store.User, error)
 }
 
 // New builds the service (03 §7.13): it validates the keys and the origins, computes the dummy hash, then checks the
@@ -190,9 +189,11 @@ func New(ctx context.Context, db *store.DB, o Options) (*Service, error) {
 		csrf:     csrf,
 		cookie:   cookieFor(primary),
 		sessions: newSessionCache(),
+		bearers:  newBearerCache(),
 		prune:    db.Prune,
 		userCode: newUserCode,
 	}
+	s.accessToken = s.readAccessToken
 	rotated, err := s.syncKeyFingerprints(ctx)
 	if err != nil {
 		return nil, err
@@ -231,7 +232,7 @@ type Method uint8
 
 const (
 	MethodSession Method = 1 // web session cookie
-	MethodBearer  Method = 2 // M2: device access token (bearer authentication comes with README WA39)
+	MethodBearer  Method = 2 // M2: device access token (M2 02 §6.1)
 )
 
 // Principal is the authenticated caller of a REST request or WebSocket.
@@ -243,8 +244,8 @@ type Principal struct {
 	SessionID  store.SessionID // Method == MethodSession
 	DeviceID   store.DeviceID  // Method == MethodBearer (M2)
 	ClientKind string          // "web" for sessions; the device's kind ("desktop"|"mobile", 01 ClientKind) for bearer
-	// DeviceName is the device's current name for a bearer principal (M2 02 §6.1, §6.8), "" for sessions. It is user
-	// content and is never logged. README WA39 fills it in, from the device row.
+	// DeviceName is the device's current name for a bearer principal (M2 02 §6.1, §6.8), from the device row; "" for
+	// sessions. It is user content and is never logged.
 	DeviceName string
 }
 
@@ -338,7 +339,7 @@ const (
 	ReasonPasswordReset   = "password_reset"
 	ReasonAccountDisabled = "account_disabled"
 	ReasonAccountDeleted  = "account_deleted"
-	ReasonDeviceRevoked   = "device_revoked" // RevokeDevice; no device exists before M2
+	ReasonDeviceRevoked   = "device_revoked" // every device row of M2 02 §6.5: revoke, sign-out, cap, reuse
 )
 
 // ---- admin alerts (03 §7.11) ----
@@ -448,8 +449,8 @@ type LoginResult struct {
 
 // ---- HTTP integration (03 §7.4–7.6) ----
 //
-// Authenticate, AuthenticateCookie, Touch, MaybeRotate, SetSessionCookie, ClearSessionCookie and CSRF are in
-// session.go.
+// Authenticate, AuthenticateCookie, Touch, TouchPrincipal, MaybeRotate, SetSessionCookie, ClearSessionCookie and
+// CSRF are in session.go; AuthenticateBearerToken and the bearer cache are in bearer.go (M2 02 §6.1).
 
 // ---- setup (03 §7.8) ----
 //
@@ -483,8 +484,8 @@ type InviteInfo struct {
 
 // ---- self-service (03 §7.7) ----
 //
-// ChangePassword, DeleteSelf, RevokeSession, RevokeOtherSessions and RevokeDevice are in selfservice.go; the
-// revocation table they apply is in revoke.go.
+// ChangePassword, DeleteSelf, RevokeSession, RevokeOtherSessions, RevokeDevice and (M2) RenameDevice and
+// RevokeOwnDevice are in selfservice.go; the revocation table they apply is in revoke.go.
 
 // ---- invites (03 §7.9) ----
 //
@@ -523,28 +524,10 @@ type UserChange struct {
 //
 // README WA30 filled in the device authorization flow: StartDeviceFlow, LookupUserCode, DecideUserCode and the
 // device_code grant of DeviceToken in deviceflow.go, PasswordDeviceLogin in devicepassword.go, NormalizeDeviceName in
-// devicename.go and the device buckets with IPKey48 in limiter.go. README WA39 fills in device tokens: the
-// refresh_token grant of DeviceToken, AuthenticateBearerToken and the bearer path of Authenticate (with
-// Principal.DeviceName), RenameDevice, RevokeOwnDevice, and the bearer cases of Touch, RevokeDevice and
-// LogoutEverywhere. Until then the methods below, the refresh_token grant and those bearer cases return
-// notImplemented. (Touch's M2 signature, which returns the principal, comes with WA39 too: the wiring calls Touch.)
-
-// AuthenticateBearerToken checks a device access token: 01's hello.auth, and the REST bearer path through
-// Authenticate (M2 02 §6.1). The principal carries DeviceName from the device row. Errors: *api.Error{invalid_token};
-// any other failure wraps *api.Error{internal}. README WA39.
-func (s *Service) AuthenticateBearerToken(ctx context.Context, token string) (Principal, error) {
-	return Principal{}, notImplemented("AuthenticateBearerToken")
-}
-
-// RenameDevice renames one of the principal's devices (PATCH /api/v1/me/devices/{id}, M2 02 §7.2) with the rules of
-// NormalizeDeviceName, and writes device.renamed {from, to}; a name equal to the current one writes nothing.
-// README WA39.
-func (s *Service) RenameDevice(ctx context.Context, p Principal, id store.DeviceID, name string, m ReqMeta) (store.Device, error) {
-	return store.Device{}, notImplemented("RenameDevice")
-}
-
-// RevokeOwnDevice is the app's own sign-out (POST /api/v1/device/revoke, M2 02 §7.2): the bearer principal's device,
-// its tokens and push subscriptions go, with device.revoked {via: "app"}. README WA39.
-func (s *Service) RevokeOwnDevice(ctx context.Context, p Principal, m ReqMeta) error {
-	return notImplemented("RevokeOwnDevice")
-}
+// devicename.go and the device buckets with IPKey48 in limiter.go. README WA39 filled in device tokens: the
+// refresh_token grant of DeviceToken with RefreshReusedError (refresh.go), AuthenticateBearerToken, the bearer path
+// of Authenticate and the device half of TouchPrincipal (bearer.go, session.go), and RenameDevice, RevokeOwnDevice
+// and the bearer cases of RevokeSession, RevokeDevice and LogoutEverywhere (selfservice.go).
+//
+// Touch keeps M1's signature, because the wiring (internal/server/wire.go) calls it; TouchPrincipal is Touch as M2
+// 02 §6.8 has it, returning the principal, which README WA56 switches the wiring to.

@@ -109,7 +109,7 @@ func (l *lockedBuffer) String() string {
 // svcEnv is a Service over a real store in a temporary directory, with a manual clock, a counting hasher and fake
 // ConnCloser and AdminAlerter.
 type svcEnv struct {
-	t      *testing.T
+	t      testing.TB
 	clk    *fakeClock
 	dir    string
 	db     *store.DB
@@ -124,7 +124,7 @@ type svcEnv struct {
 func dbPath(dir string) string { return filepath.Join(dir, "isshoni.db") }
 
 // openStore opens the store of dir on the test clock; the test closes it at its end (Close is idempotent).
-func openStore(t *testing.T, dir string, clk *fakeClock) *store.DB {
+func openStore(t testing.TB, dir string, clk *fakeClock) *store.DB {
 	t.Helper()
 	db, err := store.Open(context.Background(), store.Options{
 		Path:       dbPath(dir),
@@ -152,7 +152,7 @@ func testOptions(clk *fakeClock, origin string) Options {
 }
 
 // newSvcEnv builds the environment; mods change the Options before New.
-func newSvcEnv(t *testing.T, mods ...func(*Options)) *svcEnv {
+func newSvcEnv(t testing.TB, mods ...func(*Options)) *svcEnv {
 	t.Helper()
 	e := &svcEnv{t: t, clk: newFakeClock(), dir: t.TempDir(), conns: &fakeConns{}, alerts: &fakeAlerts{},
 		logs: &lockedBuffer{}}
@@ -337,7 +337,7 @@ func (e *svcEnv) request(method, token string) *http.Request {
 }
 
 // wantCode fails the test unless err is an *api.Error with that code; it returns that error's fields.
-func wantCode(t *testing.T, err error, code string) api.Error {
+func wantCode(t testing.TB, err error, code string) api.Error {
 	t.Helper()
 	var ae *api.Error
 	if !errors.As(err, &ae) || ae.Code != code {

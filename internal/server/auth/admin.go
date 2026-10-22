@@ -290,7 +290,7 @@ func (s *Service) UpdateUser(ctx context.Context, a store.Actor, id store.UserID
 	if done.statusChanges() && done.status == store.StatusDisabled {
 		s.revocationCommitted(rv)
 	} else {
-		s.sessions.invalidateUser(id)
+		s.forgetUser(id)
 	}
 	if done.roleChanges() {
 		kind := AlertAdminRevoked

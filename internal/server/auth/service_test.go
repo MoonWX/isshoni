@@ -538,27 +538,3 @@ func TestInternalErrors(t *testing.T) {
 		t.Errorf("UpdateSettings on a closed store: %v", err)
 	}
 }
-
-// TestLaterMethodsSayNotImplemented: the methods of the later auth slices still answer with an error that names
-// the method and wraps internal.
-func TestLaterMethodsSayNotImplemented(t *testing.T) {
-	e := newSvcEnv(t)
-	ctx := context.Background()
-	var p Principal
-	var m ReqMeta
-	check := func(method string, err error) {
-		t.Helper()
-		if !api.IsCode(err, api.CodeInternal) || !strings.Contains(err.Error(), method+" not implemented") {
-			t.Errorf("%s: %v", method, err)
-		}
-	}
-	_, err := e.svc.AuthenticateBearerToken(ctx, "")
-	check("AuthenticateBearerToken", err)
-	_, err = e.svc.RenameDevice(ctx, p, "d1d1d1d1d1d1", "Gaming PC", m)
-	check("RenameDevice", err)
-	check("RevokeOwnDevice", e.svc.RevokeOwnDevice(ctx, p, m))
-	// README WA39 brings the refresh_token grant; the device_code grant is WA30's (deviceflow_test.go).
-	_, err = e.svc.DeviceToken(ctx, api.DeviceTokenRequest{GrantType: api.GrantTypeRefreshToken,
-		RefreshToken: refreshTokenPrefix + newToken(deviceTokenBytes)}, meta(ipA))
-	check("DeviceToken (refresh_token grant)", err)
-}

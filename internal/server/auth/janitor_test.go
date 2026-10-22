@@ -213,7 +213,7 @@ func TestJanitorScheduleUnderFakeClock(t *testing.T) {
 			t.Errorf("%d debug lines for 6 runs:\n%s", n, logs)
 		}
 		if !strings.Contains(logs, `level=DEBUG msg="janitor: pruned expired rows" component=auth sessions=1 tokens=0 `+
-			`invites=0 pending=1 device_codes=0 device_tokens=0 audit=0`) {
+			`invites=0 pending=1 device_codes=0 devices=0 device_tokens=0 audit=0`) {
 			t.Errorf("no debug line with the counts of the run at +2h:\n%s", logs)
 		}
 		if strings.Contains(logs, "level=WARN") || strings.Contains(logs, "Kim") {
@@ -239,7 +239,7 @@ func TestJanitorKeepsGoingAfterAFailedRun(t *testing.T) {
 		wantRuns(t, rec, t0, 0)
 		logs := e.logs.String()
 		if !strings.Contains(logs, `level=WARN msg="janitor: pruning expired rows failed; it runs again in an hour" `+
-			`component=auth sessions=0 tokens=0 invites=0 pending=0 device_codes=0 device_tokens=0 audit=0 `+
+			`component=auth sessions=0 tokens=0 invites=0 pending=0 device_codes=0 devices=0 device_tokens=0 audit=0 `+
 			`err="store: prune: disk I/O error"`) {
 			t.Fatalf("no warn line for the failed run:\n%s", logs)
 		}
@@ -287,4 +287,51 @@ func TestJanitorStopsWithItsContext(t *testing.T) {
 		}
 		wantRuns(t, rec, t0, 0, 0)
 	})
+}
+
+// TestJanitorLogsExpiredDevices: a run's debug line counts the devices the store's devices rule deleted (M2 02 §6.7,
+// PruneStats.Devices) next to the other counts, and names none of them: the device.expired rows in the audit log do.
+func TestJanitorLogsExpiredDevices(t *testing.T) {
+	e := newSvcEnv(t)
+	alex := e.addUser("Alex")
+	now := e.clk.now()
+	var gone, live store.Device
+	e.write(func(q *store.Q) error {
+		// Linked two hours ago; its only refresh token expired an hour ago: the janitor's rule deletes it.
+		gone = store.Device{UserID: alex.ID, Name: "Old Laptop", ClientKind: "desktop", OS: "windows", AppVersion: "0.2.0",
+			LinkedVia: "device_flow", CreatedAt: now.Add(-2 * time.Hour), LastIP: ipA}
+		if err := q.CreateDevice(&gone); err != nil {
+			return err
+		}
+		if err := q.InsertDeviceToken(store.DeviceToken{TokenHash: []byte("expired refresh"), DeviceID: gone.ID,
+			Kind: tokenKindRefresh, CreatedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-time.Hour)}); err != nil {
+			return err
+		}
+		// One with a live refresh token stays.
+		live = store.Device{UserID: alex.ID, Name: "Gaming PC", ClientKind: "desktop", OS: "windows", AppVersion: "0.2.0",
+			LinkedVia: "device_flow", CreatedAt: now.Add(-2 * time.Hour), LastIP: ipA}
+		if err := q.CreateDevice(&live); err != nil {
+			return err
+		}
+		return q.InsertDeviceToken(store.DeviceToken{TokenHash: []byte("live refresh"), DeviceID: live.ID,
+			Kind: tokenKindRefresh, CreatedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(time.Hour)})
+	})
+	e.svc.janitorRun(context.Background())
+
+	if devs := e.devices(alex.ID); len(devs) != 1 || devs[0].ID != live.ID {
+		t.Fatalf("devices after the run = %+v, want only %s", devs, live.ID)
+	}
+	if rows := e.audit("device.expired"); len(rows) != 1 || rows[0].TargetID != string(gone.ID) {
+		t.Fatalf("device.expired rows = %+v, want one for %s", rows, gone.ID)
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, `msg="janitor: pruned expired rows" component=auth sessions=0 tokens=0 invites=0 `+
+		`pending=0 device_codes=0 devices=1 device_tokens=0 audit=0`) {
+		t.Errorf("no debug line counting the expired device:\n%s", logs)
+	}
+	for _, name := range []string{"Old Laptop", "Gaming PC", string(gone.ID)} {
+		if strings.Contains(logs, name) {
+			t.Errorf("the janitor's log names %q:\n%s", name, logs)
+		}
+	}
 }

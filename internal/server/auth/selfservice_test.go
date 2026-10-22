@@ -714,10 +714,10 @@ func TestRevokeDevice(t *testing.T) {
 		t.Fatalf("%d device.revoked rows, want 1", len(rows))
 	}
 	if r := rows[0]; r.Actor != (store.Actor{Kind: store.ActorUser, UserID: f.alex.ID, Name: "Alex", IP: ipC}) ||
-		r.TargetKind != "device" || r.TargetID != string(alexDevice) || r.TargetName != "Alex-PC" || !r.At.Equal(now) ||
-		len(r.Detail) != 0 {
+		r.TargetKind != "device" || r.TargetID != string(alexDevice) || r.TargetName != "Alex-PC" || !r.At.Equal(now) {
 		t.Errorf("device.revoked row = %+v", r)
 	}
+	wantDetail(t, "device.revoked", rows[0].Detail, map[string]any{"via": "devices_page"}) // M2 02 §8
 	wantCode(t, f.svc.RevokeDevice(ctx, f.caller, alexDevice, meta(ipC)), api.CodeNotFound)
 	// The caller's sessions are as they were.
 	if _, err := f.svc.Authenticate(f.request(http.MethodGet, f.s[0].Token)); err != nil {
@@ -803,10 +803,26 @@ func TestSelfServiceCaller(t *testing.T) {
 			}
 			wantCode(t, err, api.CodeUnauthenticated)
 		}
-		// A device's principal (M2) is told so.
-		err := run(Principal{Method: MethodBearer, UserID: f.alex.ID, DeviceID: alexDevice})
-		if !api.IsCode(err, api.CodeInternal) || !strings.Contains(err.Error(), call+" for a device not implemented") {
-			t.Errorf("%s for a device: %v", call, err)
+		// A device's principal (M2 02 §6.4): the calls only a web session makes refuse it with forbidden
+		// {credential: session}; the calls of User routes take one, and one whose device is not its user's live
+		// device is unauthenticated. (devices_test.go has the calls that succeed for a device.)
+		for _, p := range []Principal{
+			{Method: MethodBearer, UserID: f.alex.ID, DeviceID: samDevice},
+			{Method: MethodBearer, UserID: f.alex.ID, DeviceID: "aaaaaaaaaaaa"},
+			{Method: MethodBearer, UserID: "aaaaaaaaaaaa", DeviceID: alexDevice},
+			{Method: MethodBearer, UserID: f.alex.ID},
+		} {
+			err := run(p)
+			switch call {
+			case "Logout", "RevokeOtherSessions", "ChangePassword", "DeleteSelf":
+				if ae := wantCode(t, err, api.CodeForbidden); ae.Params[api.ParamCredential] != "session" {
+					t.Errorf("%s for a device: %+v, want forbidden {credential: session}", call, ae)
+				}
+			default:
+				if !api.IsCode(err, api.CodeUnauthenticated) {
+					t.Errorf("%s for the device principal %+v: %v, want unauthenticated", call, p, err)
+				}
+			}
 		}
 	}
 	if after := f.rowCounts(); fmt.Sprint(after) != fmt.Sprint(before) || len(f.conns.take()) != 0 {

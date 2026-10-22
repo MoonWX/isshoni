@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,9 +16,12 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// The revocation matrix of 03 §15 and README S58: for every row of 03 §7.7 that M1 has, a fake ConnCloser records
-// the exact selector and reason, the rows the table names are gone and no others, and the session cache is
-// invalidated before the connections are closed.
+// The revocation matrix of 03 §15 and README S58: for every row of 03 §7.7, a fake ConnCloser records the exact
+// selector and reason, the rows the table names are gone and no others, and the session cache is invalidated before
+// the connections are closed. With M2 (README WA39) every device of the fixture holds real tokens: the bearer cache
+// holds them when an event starts, a row that takes the device forgets it before the connections are closed and its
+// access token is refused afterwards, and the M2 rows (revoking a device, the app's own sign-out, a refresh-token
+// reuse) are in the table.
 
 // IDs of the devices the fixture links (the store's own IDs are 12 characters too).
 const (
@@ -25,17 +29,54 @@ const (
 	samDevice  store.DeviceID = "d5a5d5a5d5a5"
 )
 
-// seedDevice inserts, on the closed database, what a linked app leaves behind (linking is M2, so the store has no
-// writers for it): the device, an access token, the device's push subscription and the device code the user
-// approved for it.
+// seededTokens is how many device_tokens rows seedDevice gives a device.
+const seededTokens = 3
+
+// seededToken is a fixed token of the fixture's devices: prefix and 43 characters of the byte b (b's high nibble
+// names the device, its low nibble the token).
+func seededToken(prefix string, b byte) string {
+	return prefix + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{b}, deviceTokenBytes))
+}
+
+// deviceAccess is the live access token the fixture gives a device.
+func deviceAccess(id store.DeviceID) string {
+	return seededToken(accessTokenPrefix, deviceByte(id)|1)
+}
+
+// deviceRefresh is the live refresh token the fixture gives a device.
+func deviceRefresh(id store.DeviceID) string {
+	return seededToken(refreshTokenPrefix, deviceByte(id)|2)
+}
+
+// deviceSpent is a spent refresh token of the device whose child is unknown: presenting it is a reuse.
+func deviceSpent(id store.DeviceID) string {
+	return seededToken(refreshTokenPrefix, deviceByte(id)|3)
+}
+
+func deviceByte(id store.DeviceID) byte {
+	if id == alexDevice {
+		return 0xa0
+	}
+	return 0xb0
+}
+
+// seedDevice inserts, on the closed database, what a linked app leaves behind: the device, its tokens
+// (deviceAccess, deviceRefresh, deviceSpent, hashed with the service's key), the device's push subscription and the
+// device code the user approved for it.
 func (e *svcEnv) seedDevice(user store.UserID, id store.DeviceID) {
 	e.t.Helper()
 	ms := e.clk.now().UnixMilli()
+	k := e.svc.keys
 	e.rawExec(`INSERT INTO devices (id, user_id, name, client_kind, os, app_version, linked_via, created_at,
 		last_seen_at, last_ip) VALUES (?, ?, 'Alex-PC', 'desktop', 'windows', '0.2.0', 'device_flow', ?, ?, '203.0.113.7')`,
 		string(id), string(user), ms, ms)
 	e.rawExec(`INSERT INTO device_tokens (token_hash, device_id, kind, created_at, expires_at)
-		VALUES (?, ?, 'access', ?, ?)`, []byte("token-"+id), string(id), ms, ms+900_000)
+		VALUES (?, ?, 'access', ?, ?)`, k.deviceHash(deviceAccess(id)), string(id), ms, ms+900_000)
+	e.rawExec(`INSERT INTO device_tokens (token_hash, device_id, kind, created_at, expires_at)
+		VALUES (?, ?, 'refresh', ?, ?)`, k.deviceHash(deviceRefresh(id)), string(id), ms, ms+7_776_000_000)
+	e.rawExec(`INSERT INTO device_tokens (token_hash, device_id, kind, created_at, expires_at, spent_at, replaced_by)
+		VALUES (?, ?, 'refresh', ?, ?, ?, x'0badc0de')`, k.deviceHash(deviceSpent(id)), string(id), ms-3_600_000,
+		ms+7_000_000_000, ms-3_000_000)
 	e.rawExec(`INSERT INTO push_subscriptions (id, user_id, device_id, endpoint, p256dh, auth_secret, name, created_at)
 		VALUES (?, ?, ?, ?, 'p', 'a', 'isshoni for Windows', ?)`,
 		"p"+string(id[1:]), string(user), string(id), "https://push.example/device/"+string(id), ms)
@@ -61,6 +102,8 @@ type revFixture struct {
 	s          [3]LoginResult
 	caller     Principal // of s[0]
 	samSession LoginResult
+	// alexApp is the principal of Alex's device (its access token, deviceAccess(alexDevice)).
+	alexApp Principal
 	// newToken is the token the event gave the caller's session, for a row that rotates it.
 	newToken string
 	// admin is the admin who acts in an admin's row: Kim, from address C (withAdmin).
@@ -111,6 +154,16 @@ func newRevFixture(t *testing.T, mods ...func(*store.User)) *revFixture {
 			t.Fatal(err)
 		}
 	}
+	// Both devices' access tokens are in the bearer cache too.
+	for _, id := range []store.DeviceID{alexDevice, samDevice} {
+		p, err := e.svc.AuthenticateBearerToken(context.Background(), deviceAccess(id))
+		if err != nil || p.DeviceID != id {
+			t.Fatalf("the seeded device %s: %+v, %v", id, p, err)
+		}
+		if id == alexDevice {
+			f.alexApp = p
+		}
+	}
 	f.caller = principalOf(f.s[0].Session, f.s[0].User)
 	e.conns.take()
 	e.hashes.Store(0)
@@ -149,8 +202,11 @@ type revRow struct {
 	rotated bool
 	// others is how many session rows Alex has afterwards besides the fixture's three.
 	others int
-	// device: Alex's device stays, with its token and the approved device code ("Devices and tokens").
+	// device: Alex's device stays, with its tokens and the approved device code ("Devices and tokens").
 	device bool
+	// codesStay: the device goes but the device code Alex approved stays (the M2 rows that take one device; 03 §7.7:
+	// another app may be waiting for its approval).
+	codesStay bool
 	// resetLink: Alex has a pending reset link afterwards ("Pending reset link").
 	resetLink bool
 	// deleted: the account itself is gone.
@@ -176,6 +232,11 @@ func everything(reason string) func(f *revFixture) []closedConn {
 // nothing is the row that closes no connection.
 func nothing(*revFixture) []closedConn { return nil }
 
+// alexsDevice is the call that closes the connections of Alex's device (M2 02 §6.5).
+func alexsDevice(f *revFixture) []closedConn {
+	return []closedConn{{ConnSelector{UserID: f.alex.ID, DeviceID: alexDevice}, ReasonDeviceRevoked}}
+}
+
 // everySessionSees is the after of a row that changes Alex's account and keeps the sessions: the session cache
 // was invalidated, so the next request of each session gets the account as it is now.
 func everySessionSees(what string, ok func(p Principal) bool) func(t *testing.T, f *revFixture) {
@@ -191,10 +252,11 @@ func everySessionSees(what string, ok func(p Principal) bool) func(t *testing.T,
 
 var all3 = []int{0, 1, 2}
 
-// revMatrix is the table of 03 §7.7, in its order. Not in it:
-//   - "Revoke device" and "Refresh-token reuse" (M2). TestRevokeDevice covers the path that exists;
+// revMatrix is the table of 03 §7.7, in its order, with the rows M2 02 §6.5 adds after it. Not in it:
 //   - "session key rotated": the startup purge of TestKeyFingerprints, which closes nothing (no connection exists
-//     yet).
+//     yet);
+//   - M2's device cap eviction and device expiry: TestDeviceCap and TestBearerForgottenBeforeConnCloser cover the
+//     first, the janitor's tests the second (it closes nothing).
 //
 // "Role change or rename" is two rows here, one per change. Neither takes a session, a device or a connection: the
 // hub is told by httpapi (Signal.UserChanged), and auth invalidates the session cache.
@@ -424,6 +486,38 @@ var revMatrix = []revRow{
 		calls: nothing,
 		after: everySessionSees("the new name", func(p Principal) bool { return p.Username == "Alexandra" }),
 	},
+	{
+		name: "Revoke device (M2)",
+		run: func(t *testing.T, f *revFixture) {
+			if err := f.svc.RevokeDevice(context.Background(), f.caller, alexDevice, meta(ipA)); err != nil {
+				t.Fatal(err)
+			}
+		},
+		codesStay: true, resetLink: true,
+		calls: alexsDevice,
+	},
+	{
+		name: "The app's own sign-out (M2)",
+		run: func(t *testing.T, f *revFixture) {
+			if err := f.svc.RevokeOwnDevice(context.Background(), f.alexApp, meta(ipA)); err != nil {
+				t.Fatal(err)
+			}
+		},
+		codesStay: true, resetLink: true,
+		calls: alexsDevice,
+	},
+	{
+		name: "Refresh-token reuse (M2)",
+		run: func(t *testing.T, f *revFixture) {
+			_, err := f.refreshFrom(deviceSpent(alexDevice), "", ipC)
+			var re *RefreshReusedError
+			if !errors.As(err, &re) || re.DeviceID != alexDevice {
+				t.Fatalf("replaying a spent refresh token: %v, want a reuse", err)
+			}
+		},
+		codesStay: true, resetLink: true,
+		calls: alexsDevice,
+	},
 }
 
 func TestRevocationMatrix(t *testing.T) {
@@ -447,6 +541,18 @@ func TestRevocationMatrix(t *testing.T) {
 					}
 					if _, _, ok := f.svc.sessions.byID(id, f.clk.now()); ok {
 						early = append(early, fmt.Sprintf("s[%d] was still in the session cache", i))
+					}
+				}
+				if !row.device {
+					if f.rawInt("SELECT count(*) FROM devices WHERE id = ?", string(alexDevice)) != 0 {
+						early = append(early, "Alex's device was still in the database")
+					}
+					hash := f.svc.keys.deviceHash(deviceAccess(alexDevice))
+					if _, _, hit := f.svc.bearers.byToken(hash, f.clk.now()); hit != cacheMiss {
+						early = append(early, "Alex's access token was still in the bearer cache")
+					}
+					if _, _, ok := f.svc.bearers.byDevice(alexDevice, f.clk.now()); ok {
+						early = append(early, "Alex's device was still in the bearer cache")
 					}
 				}
 			}
@@ -502,8 +608,9 @@ func TestRevocationMatrix(t *testing.T) {
 			for what, got := range map[string][2]int{
 				"devices": {count("SELECT count(*) FROM devices WHERE user_id = ?", alex), b2i[row.device]},
 				"device tokens": {count("SELECT count(*) FROM device_tokens WHERE device_id = ?", string(alexDevice)),
-					b2i[row.device]},
-				"approved device codes": {count("SELECT count(*) FROM device_codes WHERE user_id = ?", alex), b2i[row.device]},
+					seededTokens * b2i[row.device]},
+				"approved device codes": {count("SELECT count(*) FROM device_codes WHERE user_id = ?", alex),
+					b2i[row.device || row.codesStay]},
 				// Each one goes with its session or its device, and only with it.
 				"push subscriptions": {count("SELECT count(*) FROM push_subscriptions WHERE user_id = ?", alex),
 					len(f.s) - len(row.gone) + b2i[row.device]},
@@ -518,9 +625,10 @@ func TestRevocationMatrix(t *testing.T) {
 			// Nothing of anybody else's went: Sam's rows, and the device code nobody decided.
 			sam := string(f.sam.ID)
 			for what, got := range map[string][2]int{
-				"sessions":           {count("SELECT count(*) FROM sessions WHERE user_id = ?", sam), 1},
-				"devices":            {count("SELECT count(*) FROM devices WHERE user_id = ?", sam), 1},
-				"device tokens":      {count("SELECT count(*) FROM device_tokens WHERE device_id = ?", string(samDevice)), 1},
+				"sessions": {count("SELECT count(*) FROM sessions WHERE user_id = ?", sam), 1},
+				"devices":  {count("SELECT count(*) FROM devices WHERE user_id = ?", sam), 1},
+				"device tokens": {count("SELECT count(*) FROM device_tokens WHERE device_id = ?", string(samDevice)),
+					seededTokens},
 				"device codes":       {count("SELECT count(*) FROM device_codes WHERE user_id = ?", sam), 1},
 				"push subscriptions": {count("SELECT count(*) FROM push_subscriptions WHERE user_id = ?", sam), 2},
 				"reset links":        {count("SELECT count(*) FROM password_resets WHERE user_id = ?", sam), 1},
@@ -532,6 +640,23 @@ func TestRevocationMatrix(t *testing.T) {
 			}
 			if p, err := f.svc.Authenticate(f.request(http.MethodGet, f.samSession.Token)); err != nil || p.UserID != f.sam.ID {
 				t.Errorf("Sam's session afterwards: %+v, %v", p, err)
+			}
+
+			// The devices' bearers, right away: Alex's is refused exactly when the row took the device.
+			p, err := f.svc.AuthenticateBearerToken(ctx, deviceAccess(alexDevice))
+			switch {
+			case row.device && (err != nil || p.DeviceID != alexDevice):
+				t.Errorf("Alex's device stays, but its bearer gets %+v, %v", p, err)
+			case !row.device && !api.IsCode(err, api.CodeInvalidToken):
+				t.Errorf("Alex's device is gone, but its bearer gets %+v, %v; want invalid_token", p, err)
+			}
+			_, touchErr := f.svc.TouchPrincipal(ctx, Principal{UserID: f.alex.ID, Method: MethodBearer, DeviceID: alexDevice},
+				netip.MustParseAddr(ipA))
+			if row.device != (touchErr == nil) {
+				t.Errorf("Touch for Alex's device afterwards: %v (device stays: %v)", touchErr, row.device)
+			}
+			if p, err := f.svc.AuthenticateBearerToken(ctx, deviceAccess(samDevice)); err != nil || p.UserID != f.sam.ID {
+				t.Errorf("Sam's device afterwards: %+v, %v", p, err)
 			}
 			if row.after != nil {
 				row.after(t, f)
