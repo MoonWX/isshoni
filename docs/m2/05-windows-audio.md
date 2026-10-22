@@ -1193,7 +1193,7 @@ type AudioConfig struct {
 // reinstall text). An error never quotes the document, which names apps.
 type AudioReport struct { /* fields of §12.1 */ }
 
-// AudioStatus is 01's name for "What friends hear" (Session.AudioStatus, core events).
+// AudioStatus is 01's name for "What friends hear" (AudioController.AudioReport, core events).
 type AudioStatus = AudioReport
 
 // AudioApp is one apps[] row of §12.1, its fields in §12.1's key order (Detail after Streams). 01 relies on ID,
@@ -1316,7 +1316,9 @@ two sides can't drift.
   never sets it, so the pump and the publisher never see PCM.
 - **Start-time mapping**: WA35 folds WA23's `startAudioConfig` and `startExclusions` (`bridge.go`) into this file's
   single mode mapping and `buildExclusions`, so `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode` share one
-  mapping.
+  mapping. The folded `buildExclusions` applies §13.1's rule checks on every path (`Start`, `WatchAudio`,
+  `SetExclusions`): a NUL in a value, app id or name, or a value of 520 bytes or more, is `CodeInvalid` with the rule's
+  index in `Detail`. Until WA35, `bridge.go`'s `startExclusions` refuses only a NUL, without the index.
 - **`AudioTestHooks`** (in `audio.go`, so it compiles everywhere; it answers only the engine `native.Open` returned,
   which exists only on Windows; `cmd/isshoni-audiotest/driver_windows.go` is its one user):
 

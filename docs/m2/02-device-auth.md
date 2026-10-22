@@ -388,13 +388,11 @@ and the handler sends the decided error after the commit):
 | `pending` | 400 `authorization_pending` | `last_poll_at = now` |
 | `denied` | 400 `access_denied` | `last_poll_at = now` |
 | `approved`, but the approver is no longer `active` | 400 `access_denied` | `last_poll_at = now` |
-
-  The `access_denied` row for an approver who is no longer active is reached only when the status changed without M1
-  03 §7.7's cleanup: a real admin disable (`UpdateUser`) deletes the codes the user decided
-  (`DeleteDeviceCodesOf`), so the next poll finds an unknown hash and gets `invalid_grant` (WA30-R2; both paths are
-  tested, §16.1).
 | `approved` | 200 token pair (below) | device, tokens, `consumed`, audit |
 
+- The `access_denied` row for an approver who is no longer active is reached only when the status changed without M1
+  03 §7.7's cleanup: a real admin disable (`UpdateUser`) deletes the codes the user decided (`DeleteDeviceCodesOf`),
+  so the next poll finds an unknown hash and gets `invalid_grant` (WA30-R2; both paths are tested, §16.1).
 - The 1 s tolerance absorbs network jitter between two polls sent exactly `interval` apart; RFC 8628 §3.5 has the
   client add 5 s per `slow_down`, and `params.interval` says the new value outright.
 - **Success**, in the same `Write`: `TrimDevices(user, 19)` (the cap of 20, §6.7) with one `device.revoked {via: "cap"}`

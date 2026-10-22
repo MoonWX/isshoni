@@ -834,10 +834,10 @@ export type SignalStopAction = 'redial' | 'relink' | 'version' | 'wait' | 'none'
 not required, because a required member would break the M1 test platforms in `web/src/test/platform.ts`, `rooms/`,
 `viewer/` and `account/`; `BrowserPlatform` sets it to `null` explicitly and callers read `platform.desktop ?? null`.
 `PickedSource.preview` stays `MediaStream` until WA65's `DesktopSharing`, which makes it `MediaStream | null` together
-with its readers in `share/` (`BrowserSharing`, `BrowserShare`, `shareStore`, `SharePanel`) and `rooms/RoomPage` (README
-WA65's row lists them). `DesktopFeatures` has three members beyond the first draft, `sessionEnded`, `helloRefused` and
-`signalStopped`, which bind the page's `serverOrigin` (02 §11.8) and keep §7.3's C1-stop rules inside `platform/`,
-where they are tested; the room runtime calls `signalStopped` (WA42, in `web/src/rooms/`).
+with its readers in `share/` (`BrowserSharing`, `BrowserShare`, `shareStore`; README WA65's row). `DesktopFeatures` has
+three members beyond the first draft, `sessionEnded`, `helloRefused` and `signalStopped`, which bind the page's
+`serverOrigin` (02 §11.8) and keep §7.3's C1-stop rules inside `platform/`, where they are tested; the room runtime
+calls `signalStopped` (WA42, in `web/src/rooms/`).
 
 `ActiveShare.setPaused` works for a native share when C2's `core.Status().Features` lists `share.pause`
 (01-client-core); `LocalShareState` `'paused'` is now used.
@@ -977,9 +977,9 @@ export type PromptAnswer = 'keep-out' | 'include';        // decide; dismissing 
   `internal`). Events: an `EventSource` on `/__bridge/events`, opened at once, each message's data `{"name":
   "isshoni:<event>", "data": <payload>}`.
 - **The DTO types** (`AuthState`, `ShareView`, `FriendsHear`, `SettingsView`, `UpdateStatus`, …) are written by hand in
-  `platform/desktop/bridge.ts` from 02 §11.7, §6.2–§6.3 and §14.2, 05 §14.5 and 06 §8.9 until WA48's generated
-  bindings exist. `share.stats` and its event follow §6.3's `ShareStatsSample`, with `at` set by the transport on
-  receipt (`performance.now()`).
+  `platform/desktop/bridge.ts` from 02 §11.7, this doc's §6.2–§6.3 and §14.2, 05 §14.5 and 06 §8.9 until WA48's
+  generated bindings exist. `share.stats` and its event follow §6.3's `ShareStatsSample`, with `at` set by the
+  transport on receipt (`performance.now()`).
 - *Later (M4)*: a `RelayBridge` over 01's same-user relay (`share.request`, `share.status`, `exclusions.*`) lets a
   browser page drive the Linux agent through the same `DesktopSharing` code. Nothing of it is built now; the interface
   is shaped so its `share` and `audio` parts can be implemented over messages.

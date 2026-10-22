@@ -1945,7 +1945,10 @@ func (s *session) SetAudioBitrate(bps int) error                  // im_set_audi
   `PCMTap` and `PCMChunk`.)
 - **Start-time audio mapping**: `bridge.go`'s `startAudioConfig` and `startExclusions` (WA23) build the start's
   `im_audio_config` and `im_exclusions`; WA35 folds them into `audio.go`'s single mode mapping and `buildExclusions`
-  (05 §13.2), so one place maps modes and rules for `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode`.
+  (05 §13.2), so one place maps modes and rules for `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode`. The
+  folded `buildExclusions` applies 05 §13.1's rule checks on every path (`Start`, `WatchAudio`, `SetExclusions`): a NUL
+  in a value, app id or name, or a value of 520 bytes or more, is `CodeInvalid` with the rule's index in `Detail`. Until
+  WA35, `bridge.go`'s `startExclusions` refuses only a NUL, without the index.
 
 **`media.Config` → `im_start_config`**
 
