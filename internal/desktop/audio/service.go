@@ -115,17 +115,23 @@ type viewerFamily struct {
 }
 
 // New returns a Service over eng with the settings of st (05 §14.1, read once, normalized) and the app's SelfInfo.
+// The zero Settings (nil AppRules and DismissedTips, which neither UnmarshalJSON nor DefaultSettings gives) is a
+// store without an "audio" section: New reads it as DefaultSettings(), since 05 owns the defaults (03 §14.2).
 // eng and st must not be nil. It starts nothing: Run polls, Close stops. log nil discards; the service logs with
 // component=audio.
 func New(eng media.AudioController, st SettingsStore, self SelfInfo, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	settings := st.AudioSettings()
+	if settings.AppRules == nil && settings.DismissedTips == nil {
+		settings = DefaultSettings()
+	}
 	base, cancel := context.WithCancel(context.Background())
 	s := &Service{
 		eng: eng, st: st, self: self, log: log.With("component", "audio"), ducking0: readDucking,
 		base: base, cancel: cancel, wake: make(chan struct{}, 1),
-		settings: st.AudioSettings().normalized(),
+		settings: settings.normalized(),
 		viewers:  map[string]viewerTab{}, families: map[string]*viewerFamily{}, overrides: map[string]bool{},
 		names: map[string]string{}, prompted: map[string]bool{}, subs: map[int]func(Event){},
 	}
@@ -135,9 +141,9 @@ func New(eng media.AudioController, st SettingsStore, self SelfInfo, log *slog.L
 }
 
 // Run is the polling loop (05 §14.4) and applies the debounced rule changes (05 §14.3). While the watcher runs (the
-// share sheet watches or a share is live) it reads AudioLevels every 100 ms with a level meter on screen and every
-// 250 ms otherwise, and fetches the report when its ReportSeq changes; with nothing watched it does not poll. It
-// returns nil when ctx ends or Close is called. Run can be called once.
+// share sheet watches) or a share is live it reads AudioLevels every 100 ms with a level meter on screen and every
+// 250 ms otherwise, fetches the report when its ReportSeq changes, and sends the changed rules; with nothing watched
+// and no share it does neither. It returns nil when ctx ends or Close is called. Run can be called once.
 func (s *Service) Run(ctx context.Context) error {
 	if !s.running.CompareAndSwap(false, true) {
 		return errors.New("audio: Run called more than once")
@@ -169,7 +175,7 @@ func (s *Service) nextDue(now time.Time) (time.Duration, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var due time.Time
-	if s.dirty && s.watcherOn {
+	if s.dirty && s.activeLocked() {
 		due = s.dirtySince.Add(rulesDebounce)
 	}
 	if s.activeLocked() {
@@ -188,7 +194,7 @@ func (s *Service) nextDue(now time.Time) (time.Duration, bool) {
 func (s *Service) work(ctx context.Context) {
 	now := time.Now()
 	s.mu.Lock()
-	applyDue := s.dirty && s.watcherOn && !now.Before(s.dirtySince.Add(rulesDebounce))
+	applyDue := s.dirty && s.activeLocked() && !now.Before(s.dirtySince.Add(rulesDebounce))
 	pollDue := s.activeLocked() && !now.Before(s.lastPoll.Add(s.intervalLocked()))
 	s.mu.Unlock()
 	if applyDue {
@@ -199,7 +205,10 @@ func (s *Service) work(ctx context.Context) {
 	}
 }
 
-// activeLocked reports whether the service polls: the watcher runs or a share is live (05 §14.4).
+// activeLocked reports whether the service polls (05 §14.4) and sends rule changes to the engine (05 §14.3): the
+// watcher runs or a share is live. A live share counts without the watcher too (WatchAudio failed): the engine
+// reports for a running share, and im_set_exclusions replaces its rules, or stores them for the share's start
+// (05 §4.3).
 func (s *Service) activeLocked() bool { return (s.watcherOn || s.live) && !s.closed }
 
 // intervalLocked is the polling interval for the levels watch count (05 §14.4).
@@ -321,13 +330,13 @@ func (s *Service) exclusionsLocked() media.Exclusions {
 		viewerExes: s.viewerExesLocked()})
 }
 
-// applyRules sends a changed rule set to the engine (SetExclusions), unless the watcher is off: then the rules go with
-// the next WatchAudio or AudioConfig.
+// applyRules sends a changed rule set to the engine (SetExclusions), unless neither the watcher runs nor a share is
+// live: then the rules go with the next WatchAudio or AudioConfig.
 func (s *Service) applyRules(ctx context.Context) {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
-	if !s.dirty || !s.watcherOn {
+	if !s.dirty || !s.activeLocked() {
 		s.mu.Unlock()
 		return
 	}

@@ -91,12 +91,17 @@ func TestPollingRates(t *testing.T) {
 			t.Errorf("%d engine calls after the watch ended", n)
 		}
 
-		// Live without the sheet: polling again.
+		// Live without the sheet: polling again, from the watcher's start. A shared window (a rule change, which
+		// wakes Run before the watcher starts) doesn't add a poll.
 		before = polls()
-		s.OnShareStarted(0, false)
+		s.OnShareStarted(77, false)
+		synctest.Wait()
+		if n := polls() - before; n != 1 {
+			t.Fatalf("%d polls when the share started", n)
+		}
 		settle(time.Second)
 		if n := polls() - before; n != 5 {
-			t.Errorf("%d polls in a live second", n)
+			t.Errorf("%d polls in a live second, want 1 + 4", n)
 		}
 		s.OnShareStopped()
 		stop()

@@ -123,6 +123,33 @@ func TestSettingsPersisted(t *testing.T) {
 	}
 }
 
+// noSectionStore is a store that reads a settings.json without an "audio" section as the zero Settings (what
+// json.Unmarshal into a Settings never gives), as `var s Settings; if raw != nil { json.Unmarshal(raw, &s) }` does.
+type noSectionStore struct{}
+
+func (noSectionStore) AudioSettings() Settings          { return Settings{} }
+func (noSectionStore) SaveAudioSettings(Settings) error { return nil }
+
+// TestSettingsMissingSection: a store that returns the zero Settings for a settings.json without an "audio"
+// section gets 05's defaults (03 §14.2), not mic users heard and the fast path off; an explicit section that turns
+// them off is kept.
+func TestSettingsMissingSection(t *testing.T) {
+	s := New(newStub(), noSectionStore{}, testSelf, nil)
+	defer func() { _ = s.Close() }()
+	if ex := s.Exclusions(); !ex.KeepOutMicUsers || !ex.FastPath || !s.FriendsHear().KeepOutMicUsers {
+		t.Errorf("zero Settings: KeepOutMicUsers %v, FastPath %v", ex.KeepOutMicUsers, ex.FastPath)
+	}
+	var off Settings
+	if err := json.Unmarshal([]byte(`{"keepOutMicUsers": false, "fastPath": false}`), &off); err != nil {
+		t.Fatal(err)
+	}
+	s2 := New(newStub(), newStore(off), testSelf, nil)
+	defer func() { _ = s2.Close() }()
+	if ex := s2.Exclusions(); ex.KeepOutMicUsers || ex.FastPath {
+		t.Errorf("explicit off: KeepOutMicUsers %v, FastPath %v", ex.KeepOutMicUsers, ex.FastPath)
+	}
+}
+
 // FuzzSettingsJSON: settings.json is hand-editable, so any audio section reads without a panic, and what the
 // service writes back reads back to the same bytes; normalizing never keeps more than 256 decisions or a locked or
 // invalid one.

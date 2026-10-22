@@ -12,16 +12,17 @@ import (
 // and the share's life, pause and Share sound.
 
 // AudioConfig is the audio start config for a share with sound (core.Options.AudioConfig, 01): Mode
-// media.AudioExcludeApps and the current rules with SharedPID. It first flushes the 50 ms debounce (a pending change
-// reaches SetExclusions at once), so the engine's watcher and the start config agree. BitrateBPS stays 0: the core
-// fills it from ShareParams.AudioBitrate.
+// media.AudioExcludeApps and the current rules with SharedPID. While the watcher runs or a share is live it first
+// flushes the 50 ms debounce (a pending change reaches SetExclusions at once), so the engine and the start config
+// agree. BitrateBPS stays 0: the core fills it from ShareParams.AudioBitrate.
 func (s *Service) AudioConfig() media.AudioConfig {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
 	ex := s.exclusionsLocked()
-	apply := s.watcherOn && !sameExclusions(ex, s.applied)
-	if s.watcherOn {
+	target := s.activeLocked()
+	apply := target && !sameExclusions(ex, s.applied)
+	if target {
 		s.dirty = false
 	}
 	s.mu.Unlock()
@@ -60,9 +61,11 @@ func (s *Service) setSharedPIDLocked(pid uint32, now time.Time) {
 }
 
 // OnShareStarted is called by 03's share controller right before core.StartShare (05 §14.2): it sets SharedPID, Share
-// sound to withAudio (a share started without sound has no track to turn on) and not paused, and starts the watcher
-// if the sheet hasn't. From here until OnShareStopped the share is live: FriendsHear.live, the sound-off banner, and
-// audio.alert for an error banner (also one that shows as the share starts).
+// sound to withAudio (a share started without sound has no track to turn on) and not paused, keeps out again the
+// browsers of the viewer tabs that still play (05 §5.9), and starts the watcher if the sheet hasn't. From here until
+// OnShareStopped the share is live: polling and rule changes go on even if the watcher didn't start (the engine
+// replaces a running share's rules, 05 §4.3), and FriendsHear.live, the sound-off banner, and audio.alert for an
+// error banner (also one that shows as the share starts).
 func (s *Service) OnShareStarted(sharedPID uint32, withAudio bool) {
 	s.mu.Lock()
 	if s.closed {
@@ -70,20 +73,30 @@ func (s *Service) OnShareStarted(sharedPID uint32, withAudio bool) {
 		return
 	}
 	now := time.Now()
+	if !s.watcherOn {
+		// syncWatcher below starts the watcher and then polls at once. A wake of Run before that (a rule change
+		// kicks it) must not poll the engine, which watches nothing yet: the share would start with two polls.
+		s.lastPoll = now
+	}
 	s.live, s.withAudio, s.soundOn, s.paused, s.modePending = true, withAudio, withAudio, false, false
 	s.alerted = map[string]time.Time{}
 	s.setSharedPIDLocked(sharedPID, now)
+	s.restartViewersLocked(now)
 	s.refreshLocked(now)
-	s.kickLocked()
 	s.mu.Unlock()
 	s.deliver()
 	s.log.Info("audio share started", "audio", withAudio)
 	_ = s.syncWatcher() // logged; the share goes on without the watcher
+	s.mu.Lock()
+	s.kickLocked() // live polling starts, also when the watcher didn't
+	s.mu.Unlock()
 }
 
 // OnShareStopped is called when the share ends, whoever ended it (03: when Share.Done() closes, and when StartShare
 // fails): it drops the viewer rules (05 §5.9), sets SharedPID to 0 and stops the watcher unless Watch(true) holds
-// it. The per-run viewer overrides stay until the app quits.
+// it. The per-run viewer overrides stay until the app quits, and so do the tabs that play (SetViewerBrowser): a tab
+// reports only when its playback starts or stops (03 §12.2), so the next share keeps out a browser whose tab still
+// plays.
 func (s *Service) OnShareStopped() {
 	s.mu.Lock()
 	now := time.Now()
@@ -93,13 +106,15 @@ func (s *Service) OnShareStopped() {
 	s.dropViewersLocked(now)
 	s.setSharedPIDLocked(0, now)
 	s.refreshLocked(now)
-	s.kickLocked()
 	s.mu.Unlock()
 	s.deliver()
 	if wasLive {
 		s.log.Info("audio share stopped")
 	}
 	_ = s.syncWatcher()
+	s.mu.Lock()
+	s.kickLocked() // Run re-plans: polling and the rules continue only if the watcher still runs
+	s.mu.Unlock()
 }
 
 // SetPaused records the share's pause (05 §14.2): 03 calls it on every pause and resume, including screen lock and a

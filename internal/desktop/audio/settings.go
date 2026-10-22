@@ -11,7 +11,8 @@ import (
 
 // SettingsStore keeps the device-wide audio settings: 03's settings store, under the settings.json key "audio" (03
 // §14.2, 05 §14.1). AudioSettings returns what json.Unmarshal of the section into a Settings gives, and
-// DefaultSettings() when there is no section; SaveAudioSettings writes json.Marshal of s back.
+// DefaultSettings() or the zero Settings when there is no section (New reads both as the defaults);
+// SaveAudioSettings writes json.Marshal of s back.
 type SettingsStore interface {
 	AudioSettings() Settings
 	SaveAudioSettings(s Settings) error

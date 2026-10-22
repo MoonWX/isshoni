@@ -1,8 +1,10 @@
 package audio
 
 import (
+	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -201,8 +203,8 @@ func TestAudioConfigFlushesDebounce(t *testing.T) {
 	})
 }
 
-// TestRulesWithoutWatcher: without a watcher no rule change reaches the engine; Watch(true) brings the current rules,
-// and AudioConfig returns them without a call.
+// TestRulesWithoutWatcher: without a watcher or a share no rule change reaches the engine; Watch(true) brings the
+// current rules, and AudioConfig returns them without a call.
 func TestRulesWithoutWatcher(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctl := newStub()
@@ -220,6 +222,59 @@ func TestRulesWithoutWatcher(t *testing.T) {
 		settle(time.Second)
 		if w := ctl.ops("watch"); len(w) != 1 || w[0].ex.SharedPID != 5 || len(ctl.ops("exclusions")) != 0 {
 			t.Fatalf("calls %+v", ctl.ops())
+		}
+		stop()
+	})
+}
+
+// TestRulesLiveWithoutWatcher: a share whose WatchAudio failed still polls and still gets every rule change within
+// 50 ms (05 §14.3): im_set_exclusions replaces a running share's rules, or stores them for its start (05 §4.3).
+func TestRulesLiveWithoutWatcher(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctl := newStub()
+		ctl.set(func(r *media.AudioReport) { r.Sessions = []media.AudioSession{session("chrome.exe", 100, "active")} })
+		ctl.fail("watch", errors.New("watch failed"))
+		s := New(ctl, newStore(DefaultSettings()), testSelf, nil)
+		stop := runService(t, s)
+		defer stop()
+		s.OnShareStarted(7, true)
+		cfg := s.AudioConfig() // the core's start config, right after
+		if calls := ctl.ops("exclusions"); len(calls) != 1 || !reflect.DeepEqual(calls[0].ex, cfg.Exclusions) ||
+			cfg.Exclusions.SharedPID != 7 {
+			t.Fatalf("AudioConfig with SharedPID %d, %d exclusions calls (want 1 with its rules)",
+				cfg.Exclusions.SharedPID, len(calls))
+		}
+		settle(time.Second)
+		if n := len(ctl.ops("levels")); n != 4 {
+			t.Errorf("%d polls in a live second without the watcher, want 4", n)
+		}
+
+		n := len(ctl.ops("exclusions"))
+		if err := s.SetAppDecision("exe:kook.exe", DecisionKeepOut); err != nil {
+			t.Fatal(err)
+		}
+		s.SetViewerBrowser("c1", "chrome", "windows", true)
+		settle(rulesDebounce)
+		calls := ctl.ops("exclusions")[n:]
+		if len(calls) != 1 || !hasRule(calls[0].ex, media.RuleAppExclude, media.SourceUser, "kook.exe") ||
+			!hasRule(calls[0].ex, media.RuleAppExclude, media.SourceViewer, "chrome.exe") {
+			t.Fatalf("%d exclusions calls after the changes, want 1 with both rules", len(calls))
+		}
+		s.SetSharedPID(9)
+		settle(rulesDebounce)
+		if ex := ctl.lastEx(t); ex.SharedPID != 9 {
+			t.Errorf("SharedPID %d reached the engine", ex.SharedPID)
+		}
+
+		// The share ends: nothing watches and nothing is live, so the rules wait for the next WatchAudio.
+		s.OnShareStopped()
+		n = len(ctl.ops())
+		if err := s.SetAppDecision("exe:kook.exe", DecisionInclude); err != nil {
+			t.Fatal(err)
+		}
+		settle(time.Second)
+		if calls := ctl.ops()[n:]; len(calls) != 0 {
+			t.Errorf("%d engine calls after the share, the first %q", len(calls), calls[0].op)
 		}
 		stop()
 	})

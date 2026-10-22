@@ -178,7 +178,7 @@ func TestFriendsHearSorting(t *testing.T) {
 // TestFriendsHearRows: a row's reason (05 §12.1's spelled with dashes), detail, control, decision and warning.
 func TestFriendsHearRows(t *testing.T) {
 	st := DefaultSettings().withDecision("exe:kook.exe", DecisionKeepOut).withDecision("exe:chrome.exe",
-		DecisionInclude)
+		DecisionInclude).withDecision("exe:obs64.exe", DecisionInclude)
 	tree := app("launcherx.exe", "LauncherX", verdictNotCaptured, "tree")
 	tree.Detail = "Discord"
 	reuse := app("game.exe", "Game", verdictNotCaptured, "pid_reuse")
@@ -197,8 +197,11 @@ func TestFriendsHearRows(t *testing.T) {
 	ptb := app("discordptb.exe", "Discord PTB", verdictKeptOut, "builtin")
 	odd := app("odd.exe", "Odd", verdictKeptOut, "something-new")
 	failed := app("cf.exe", "CF", verdictNotCaptured, "capture_failed")
+	// The DLL's rows (no warnings): a mic user included by a saved decision gets included-uses-mic from the service.
+	nativeIncluded := app("obs64.exe", "OBS", verdictHeard, "")
+	nativeIncluded.UsesMic = true
 	fh := buildFriendsHear(fhInput{report: okReport(tree, reuse, other, shared, sharedOut, included, discord, self,
-		ptb, odd, failed), haveReport: true, settings: st})
+		ptb, odd, failed, nativeIncluded), haveReport: true, settings: st})
 	for _, tc := range []struct {
 		id                      string
 		reason, detail, control string
@@ -217,12 +220,46 @@ func TestFriendsHearRows(t *testing.T) {
 		{"isshoni", "isshoni", "", ControlLocked, DecisionAuto, "", "keptOut"},
 		{"exe:discordptb.exe", "builtin", "", ControlLocked, DecisionAuto, "", "keptOut"},
 		{"exe:odd.exe", "", "", ControlToggle, DecisionAuto, "", "keptOut"},
+		{"exe:obs64.exe", "", "", ControlToggle, DecisionInclude, WarningIncludedUsesMic, "heard"},
 	} {
 		r, g := rowByID(fh, tc.id)
 		if g != tc.group || r.Reason != tc.reason || r.Detail != tc.detail || r.Control != tc.control ||
 			r.Decision != tc.decision || r.Warning != tc.warning {
 			t.Errorf("%s: %s %+v, want %+v", tc.id, g, r, tc)
 		}
+	}
+
+	// "Keep out apps that use my microphone" off (05 §14.6): a mic user the DLL reports heard without warnings gets
+	// included-uses-mic; one that doesn't use the mic, the shared app and a locked app don't, nor any row of the
+	// endpoint engine (which hears everything).
+	micUser := app("mictool.exe", "Mic tool", verdictHeard, "")
+	micUser.UsesMic = true
+	quiet := app("spotify.exe", "Spotify", verdictHeard, "")
+	sharedMic := app("game.exe", "Game", verdictHeard, "")
+	sharedMic.UsesMic, sharedMic.Shared, sharedMic.Warnings = true, true, []string{"shared_app_uses_mic"}
+	lockedMic := media.AudioApp{ID: "discord", Name: "Discord", Exe: "discord.exe", Verdict: verdictHeard,
+		UsesMic: true}
+	off := DefaultSettings()
+	off.KeepOutMicUsers = false
+	for _, engine := range []string{"include-set", "exclude-self", "endpoint"} {
+		r := okReport(micUser, quiet, sharedMic, lockedMic)
+		r.Engine = engine
+		fh := buildFriendsHear(fhInput{report: r, haveReport: true, settings: off})
+		want := map[string]string{"exe:mictool.exe": WarningIncludedUsesMic, "exe:spotify.exe": "",
+			"exe:game.exe": WarningSharedUsesMic, "discord": ""}
+		if engine == "endpoint" {
+			want["exe:mictool.exe"] = ""
+		}
+		for id, w := range want {
+			if row, g := rowByID(fh, id); g != "heard" || row.Warning != w {
+				t.Errorf("flag off, %s: %s %s %+v, want warning %q", engine, id, g, row, w)
+			}
+		}
+	}
+	// The flag on and no decision: a heard mic user (one the DLL hasn't classified as such) gets no warning.
+	if row, _ := rowByID(buildFriendsHear(fhInput{report: okReport(micUser), haveReport: true,
+		settings: DefaultSettings()}), "exe:mictool.exe"); row.Warning != "" {
+		t.Errorf("flag on: %+v", row)
 	}
 }
 

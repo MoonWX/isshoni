@@ -21,7 +21,8 @@ func viewerRules(ex media.Exclusions) []string {
 }
 
 // TestViewerBrowser is 05 §5.9 steps 3–4 with active and inactive sessions, two tabs of one family, the 30 s
-// re-check, families without a rule, tabs on other OSes, and the end of the share.
+// re-check, families without a rule, tabs on other OSes, the end of the share, and the next share with tabs that
+// still play.
 func TestViewerBrowser(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctl := newStub()
@@ -106,6 +107,30 @@ func TestViewerBrowser(t *testing.T) {
 		if got := viewerRules(ctl.lastEx(t)); len(got) != 0 {
 			t.Errorf("the engine's viewer rules after the share: %v", got)
 		}
+
+		// The next share: the tabs that still play (c2 Firefox, c3 Edge, whose session is active by now) report
+		// nothing new (03 §12.2), and their browsers are kept out again, matched in the latest report.
+		s.OnShareStarted(0, true)
+		if got := viewerRules(s.Exclusions()); !slices.Equal(got, []string{"msedge.exe", "firefox.exe"}) {
+			t.Errorf("the next share's viewer rules %v", got)
+		}
+		settle(time.Second)
+		if got := viewerRules(ctl.lastEx(t)); !slices.Equal(got, []string{"msedge.exe", "firefox.exe"}) {
+			t.Errorf("the engine's viewer rules in the next share %v", got)
+		}
+		// … with a fresh 30 s re-check (c2's own ended long ago): Brave's session (Chrome's family, whose tabs all
+		// stopped) adds nothing, Firefox's fork LibreWolf does.
+		settle(5 * time.Second)
+		ctl.set(func(r *media.AudioReport) {
+			r.Sessions = append(r.Sessions, session("librewolf.exe", 116, "active"), session("brave.exe", 120,
+				"active"))
+		})
+		settle(time.Second)
+		if got := viewerRules(s.Exclusions()); !slices.Equal(got, []string{"msedge.exe", "firefox.exe",
+			"librewolf.exe"}) {
+			t.Errorf("viewer rules after the re-check %v", got)
+		}
+		s.OnShareStopped()
 		stop()
 	})
 }

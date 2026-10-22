@@ -24,7 +24,8 @@ const sessionActive = "active"
 // re-checked for 30 s. A family stays kept out while any tab of it plays; playing false clears only that connection.
 // Family safari, other or an unknown value adds no rule and shows the viewer-unknown-browser banner while the tab
 // plays. The rules also end with the share (OnShareStopped) and, for one exe, with "Include" on its viewer row
-// (SetAppDecision), which lasts until the app quits.
+// (SetAppDecision), which lasts until the app quits. What the tabs reported outlives the share: the next one
+// (OnShareStarted) keeps out again the families whose tabs still play.
 func (s *Service) SetViewerBrowser(connID, family, os string, playing bool) {
 	defer s.deliver()
 	now := time.Now()
@@ -41,19 +42,28 @@ func (s *Service) SetViewerBrowser(connID, family, os string, playing bool) {
 			delete(s.families, fam)
 		}
 	}
-	if _, known := audiorules.BrowserByFamily(family); playing && known && os == viewerOS {
-		f := s.families[family]
-		if f == nil {
-			f = &viewerFamily{}
-			s.families[family] = f
-		}
-		f.recheckUntil = now.Add(viewerRecheck)
-		s.matchFamilyLocked(family, f)
+	if playing {
+		s.startFamilyLocked(family, os, now)
 	}
 	if !slices.Equal(before, s.viewerExesLocked()) {
 		s.markDirtyLocked(now)
 	}
 	s.refreshLocked(now)
+}
+
+// startFamilyLocked starts the viewer rules of a playing tab's family (05 §5.9 step 3): for chrome, edge or firefox
+// on Windows, the family's exes active in the latest report, and a 30 s re-check of the reports for more.
+func (s *Service) startFamilyLocked(family, os string, now time.Time) {
+	if _, known := audiorules.BrowserByFamily(family); !known || os != viewerOS {
+		return
+	}
+	f := s.families[family]
+	if f == nil {
+		f = &viewerFamily{}
+		s.families[family] = f
+	}
+	f.recheckUntil = now.Add(viewerRecheck)
+	s.matchFamilyLocked(family, f)
 }
 
 // familyPlaysLocked reports whether a tab of family on Windows plays.
@@ -128,11 +138,24 @@ func (s *Service) unknownViewerLocked() bool {
 	return false
 }
 
-// dropViewersLocked ends every viewer rule (the share ended); the per-run overrides stay.
+// dropViewersLocked ends every viewer rule (the share ended, 05 §5.9 step 4). The per-run overrides stay, and so do
+// the playing tabs: a tab reports again only when its playback starts or stops (03 §12.2), so restartViewersLocked
+// needs them for the next share.
 func (s *Service) dropViewersLocked(now time.Time) {
 	if len(s.viewerExesLocked()) > 0 {
 		s.markDirtyLocked(now)
 	}
-	clear(s.viewers)
 	clear(s.families)
+}
+
+// restartViewersLocked starts the viewer rules of a new share for the tabs that still play, as if each had just
+// reported (a fresh 30 s re-check).
+func (s *Service) restartViewersLocked(now time.Time) {
+	before := s.viewerExesLocked()
+	for _, t := range s.viewers {
+		s.startFamilyLocked(t.family, t.os, now)
+	}
+	if !slices.Equal(before, s.viewerExesLocked()) {
+		s.markDirtyLocked(now)
+	}
 }

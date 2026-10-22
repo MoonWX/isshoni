@@ -71,7 +71,7 @@ func buildFriendsHear(in fhInput) FriendsHear {
 		fh.Muted = r.Muted
 		fh.Paused = r.Paused
 		for _, a := range r.Apps {
-			row := appRow(a, in.settings)
+			row := appRow(a, in.settings, r.Engine)
 			switch a.Verdict {
 			case verdictHeard:
 				fh.Heard = append(fh.Heard, row)
@@ -110,8 +110,8 @@ func buildFriendsHear(in fhInput) FriendsHear {
 // soundOff reports whether the live share has no sound: started without, or Share sound off.
 func soundOff(in fhInput) bool { return in.live && (!in.withAudio || !in.soundOn) }
 
-// appRow is the FriendsHear row of a report row.
-func appRow(a media.AudioApp, st Settings) AppRow {
+// appRow is the FriendsHear row of a report row from a report with engine.
+func appRow(a media.AudioApp, st Settings, engine string) AppRow {
 	row := AppRow{
 		ID: a.ID, Name: a.Name, Reason: reasonOf(a.Reason), Playing: a.Playing, UsesMic: a.UsesMic,
 		Browser: a.Browser, Shared: a.Shared, Control: ControlToggle, Decision: st.decision(a.ID),
@@ -123,6 +123,14 @@ func appRow(a media.AudioApp, st Settings) AppRow {
 	if lockedApp(a.ID) || (a.Exe != "" && lockedApp(exePrefix+a.Exe)) || row.Reason == "builtin" ||
 		row.Reason == "isshoni" {
 		row.Control, row.Decision = ControlLocked, DecisionAuto
+	}
+	// 05 §14.6: a heard mic user carries included-uses-mic when the user included it, and also when it is heard
+	// because "Keep out apps that use my microphone" is off. The DLL sets included_uses_mic only for a matched allow
+	// rule, so the service works it out itself. Not for the shared app (shared-uses-mic), nor on the endpoint engine,
+	// which hears every app whatever the rules.
+	if row.Warning == "" && a.Verdict == verdictHeard && a.UsesMic && !a.Shared && engine != engineEndpoint &&
+		row.Control == ControlToggle && (row.Decision == DecisionInclude || !st.KeepOutMicUsers) {
+		row.Warning = WarningIncludedUsesMic
 	}
 	return row
 }
