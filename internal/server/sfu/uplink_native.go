@@ -18,10 +18,11 @@ import (
 // passing (internal/server/itest's desktop_congestion_test.go). README WA54 tuned one of them: nativeGrowth is 1.151,
 // not §10.1's 1.10. A step of just over 15 % is a hint of its own (nativeHintMinChange) that the sharer's ramp
 // follows in one of its steps (ratectl.RampFactor, 115); steps of 10 % went out in pairs, +21 % about every 5 s, and
-// after a backoff right at the end of D9's 3 Mbit/s limit the way back to 8 Mbit/s took more than D9's 60 s. The
-// extra 0.1 % keeps every step a hint whatever the rounding: with exactly 1.15, 2.3 % of the estimates (some of those
-// ≡ 10 mod 20 bit/s) grew by round(1.15 e) − e, one bit/s short of congestionDue's round(0.15 e) (655 370 → 753 675
-// is 98 305 against 98 306), and that step waited for the next one.
+// after a backoff right at the end of D9's 3 Mbit/s limit the way back to 8 Mbit/s took more than D9's 60 s (its
+// bound then; README WF5 made it 75 s, because ratectl.RampEvery had to be 3 s for D19). The extra 0.1 % keeps every
+// step a hint whatever the rounding: with exactly 1.15, 2.3 % of the estimates (some of those ≡ 10 mod 20 bit/s) grew
+// by round(1.15 e) − e, one bit/s short of congestionDue's round(0.15 e) (655 370 → 753 675 is 98 305 against
+// 98 306), and that step waited for the next one.
 const (
 	nativeLossHigh        = 10.0                   // percent of raw loss that backs off on one tick
 	nativeLossMid         = 3.0                    // percent of raw loss that backs off on two consecutive ticks
@@ -83,7 +84,10 @@ const HintReasonCongestion = "congestion"
 //   - rate below nativeMinRate, the sharer's own pause (Share.sharerPaused), or within nativeResumeGrace of a layer
 //     resume: unchanged. Such a tick has no verdict, so it also ends every streak of consecutive ticks below.
 //   - loss ≥ nativeLossHigh on this tick, or ≥ nativeLossMid on two consecutive ticks: max(nativeMinCap,
-//     nativeBackoff × rate × (1 − loss/100)), growth held for nativeHold.
+//     nativeBackoff × rate), growth held for nativeHold. The rate is what arrived (each Layer's Bitrate counts the
+//     packets it received), so the lost packets are already out of it: §10.1's row as first written, nativeBackoff ×
+//     rate × (1 − loss/100), counted the loss a second time (README WF5), and 20 % loss with 5 Mbit/s arriving gave
+//     3.2 Mbit/s instead of 4.
 //   - delay ≥ nativeDelayHigh on two consecutive ticks: max(nativeMinCap, nativeDelayBackoff × rate), growth held.
 //   - an estimate set, loss < nativeLossLow and delay < nativeDelayLow (or unknown) on two consecutive ticks each,
 //     rate ≥ nativeGrowthRate × the estimate, nativeGrowthEvery since the last growth and not held: the estimate ×
@@ -163,7 +167,7 @@ func (p *nativeUplink) step(s ShareUplinkStats, now int64) {
 	streak(&p.delayLow, delay < nativeDelayLow) // unknown (−1) counts as low
 	switch {
 	case loss >= nativeLossHigh || p.lossMid >= 2:
-		p.backOff(max(nativeMinCap, int(math.Round(nativeBackoff*float64(rate)*(1-loss/100)))), now)
+		p.backOff(max(nativeMinCap, int(math.Round(nativeBackoff*float64(rate)))), now) // rate is after the loss
 	case p.delayHigh >= 2:
 		p.backOff(max(nativeMinCap, int(math.Round(nativeDelayBackoff*float64(rate)))), now)
 	case p.estimate > 0 && p.lossLow >= 2 && p.delayLow >= 2 &&

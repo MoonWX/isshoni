@@ -102,7 +102,7 @@ func TestNativeUplinkRows(t *testing.T) {
 		}
 		// The low ticks had no verdict: one tick of 3 % loss after them is the first of a streak, not the fourth.
 		r.want(0, "", f(4_000_000, 3, unknown))
-		r.want(3_104_000, cong, f(4_000_000, 3, unknown))
+		r.want(3_200_000, cong, f(4_000_000, 3, unknown))
 	})
 
 	t.Run("sharer paused", func(t *testing.T) {
@@ -123,22 +123,24 @@ func TestNativeUplinkRows(t *testing.T) {
 
 	t.Run("loss", func(t *testing.T) {
 		r := newNativeRig(t, s, "s_loss")
-		r.want(2_880_000, cong, f(4_000_000, 10, unknown)) // ≥ 10 % on one tick: 0.8 × 4 Mbit/s × 0.9
-		r.want(2_880_000, cong, f(4_000_000, 10, unknown))
-		r.want(2_880_000, cong, f(5_000_000, 10, unknown)) // 3.6 Mbit/s would raise it: a backoff never does
-		r.want(2_160_000, cong, f(3_000_000, 10, unknown))
-		r.want(nativeMinCap, cong, f(600_000, 50, unknown)) // 240 kbit/s: never below the floor
+		// The rate is what arrived, so the row's value is 0.8 × the rate, whatever the loss (TestNativeUplinkLossOnce).
+		r.want(3_200_000, cong, f(4_000_000, 10, unknown)) // ≥ 10 % on one tick: 0.8 × 4 Mbit/s
+		r.want(3_200_000, cong, f(4_000_000, 10, unknown))
+		r.want(3_200_000, cong, f(5_000_000, 10, unknown)) // 4 Mbit/s would raise it: a backoff never does
+		r.want(2_400_000, cong, f(3_000_000, 10, unknown))
+		r.want(nativeMinCap, cong, f(600_000, 50, unknown)) // 480 kbit/s: never below the floor
 
 		r = newNativeRig(t, s, "s_loss3")
 		r.want(0, "", f(4_000_000, 3, unknown)) // 3 % on one tick: nothing
 		r.want(0, "", f(4_000_000, 2.9, unknown))
 		r.want(0, "", f(4_000_000, 3, unknown))
-		r.want(3_104_000, cong, f(4_000_000, 3, unknown)) // on two consecutive ticks: 0.8 × 4 Mbit/s × 0.97
+		r.want(3_200_000, cong, f(4_000_000, 3, unknown)) // on two consecutive ticks: 0.8 × 4 Mbit/s
 
-		// Loss is weighted by bitrate: 10 % on 3 Mbit/s and none on 300 kbit/s is 9.09 %, below the one-tick row.
+		// Loss is weighted by bitrate: 10 % on 3 Mbit/s and none on 300 kbit/s is 9.09 %, below the one-tick row; the
+		// rate is both layers'.
 		r = newNativeRig(t, s, "s_weighted")
 		r.want(0, "", f(3_000_000, 10, unknown), q(300_000, 0, unknown))
-		r.want(2_400_000, cong, f(3_000_000, 10, unknown), q(300_000, 0, unknown))
+		r.want(2_640_000, cong, f(3_000_000, 10, unknown), q(300_000, 0, unknown)) // 0.8 × 3.3 Mbit/s
 	})
 
 	t.Run("delay", func(t *testing.T) {
@@ -158,7 +160,7 @@ func TestNativeUplinkRows(t *testing.T) {
 		// The loss row comes first.
 		r = newNativeRig(t, s, "s_delay_loss")
 		r.want(0, "", f(4_000_000, 3, 40*time.Millisecond))
-		r.want(3_104_000, cong, f(4_000_000, 3, 40*time.Millisecond))
+		r.want(3_200_000, cong, f(4_000_000, 3, 40*time.Millisecond)) // 0.8 × the rate, not the delay row's 0.85
 
 		// The delay is the full layer's, even unknown, and the preview layer's only without a full layer.
 		r = newNativeRig(t, s, "s_delay_q")
@@ -172,7 +174,7 @@ func TestNativeUplinkRows(t *testing.T) {
 
 	t.Run("growth", func(t *testing.T) {
 		r := newNativeRig(t, s, "s_growth")
-		est := 2_880_000
+		est := 3_200_000
 		r.want(est, cong, f(4_000_000, 10, unknown))
 		// Held for 10 s, however good the ticks.
 		for range 9 {
@@ -221,7 +223,7 @@ func TestNativeUplinkRows(t *testing.T) {
 		}
 		// A cleared estimate stays clear on good ticks, and the next congestion sets it again.
 		r.want(0, "", f(9_000_000, 0, unknown))
-		r.want(3_200_000, cong, f(5_000_000, 20, unknown))
+		r.want(4_000_000, cong, f(5_000_000, 20, unknown))
 	})
 
 	t.Run("looks between ticks", func(t *testing.T) {
@@ -232,7 +234,7 @@ func TestNativeUplinkRows(t *testing.T) {
 			stats   LayerUplinkStats
 			wantCap int
 		}{
-			{"loss", f(4_000_000, 3, unknown), 3_104_000},
+			{"loss", f(4_000_000, 3, unknown), 3_200_000},
 			{"delay", f(4_000_000, 0, 50*time.Millisecond), 3_400_000},
 		} {
 			r := newNativeRig(t, s, ShareID("s_between_"+tc.name))
@@ -257,11 +259,11 @@ func TestNativeUplinkRows(t *testing.T) {
 		r := newNativeRig(t, s, "s_admin")
 		s.SetLimits(Limits{MaxShareKbps: 2000})
 		t.Cleanup(func() { s.SetLimits(Limits{}) })
-		r.want(2_000_000, "", f(4_000_000, 10, unknown)) // the estimate (2.88 Mbit/s) is above the admin's cap
+		r.want(2_000_000, "", f(4_000_000, 10, unknown)) // the estimate (3.2 Mbit/s) is above the admin's cap
 		s.SetLimits(Limits{MaxShareKbps: 5000})
-		r.want(2_880_000, cong, f(4_000_000, 0, unknown)) // now it binds
+		r.want(3_200_000, cong, f(4_000_000, 0, unknown)) // now it binds
 		// The ceilings are under the admin's cap: (5 + 0.3) Mbit/s × 1.1 = 5.83 Mbit/s clears the estimate.
-		est := 2_880_000
+		est := 3_200_000
 		for range 8 { // held until 10 s after the backoff
 			r.want(est, cong, f(est, 0, unknown))
 		}
@@ -274,7 +276,7 @@ func TestNativeUplinkRows(t *testing.T) {
 			r.want(wantCap, wantReason, f(est, 0, unknown))
 			r.want(wantCap, wantReason, f(est, 0, unknown))
 		}
-		// Two more steps (5.6 and 6.2 Mbit/s) pass 5.83 Mbit/s: none.
+		// The estimate is 5.62 Mbit/s now, and its next step (6.46 Mbit/s) passes 5.83 Mbit/s: none.
 		for range 4 {
 			r.want(5_000_000, "", f(5_000_000, 0, unknown))
 		}
@@ -282,6 +284,56 @@ func TestNativeUplinkRows(t *testing.T) {
 			t.Errorf("the estimate is %d, want none above the ceilings × 1.1", r.p.estimate)
 		}
 	})
+}
+
+// TestNativeUplinkLossOnce pins the loss row's value (README WF5): max(nativeMinCap, 0.8 × rate), whatever the loss.
+// The rate is what arrived, since a Layer's Bitrate counts only the packets it received, so the lost ones are out of
+// it already. 01 §10.1's row as first written, 0.8 × rate × (1 − loss/100), counted the loss a second time.
+func TestNativeUplinkLossOnce(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	const unknown = time.Duration(-1)
+
+	// The policy: 5 Mbit/s that arrived backs off to 4 Mbit/s at any loss that backs off (counted twice: 3.2 Mbit/s
+	// at 20 %, 500 kbit/s at 90 %), and the rate of two layers is the sum of both, at their weighted loss.
+	for _, loss := range []float64{3, 10, 20, 50, 90} {
+		r := newNativeRig(t, s, ShareID(fmt.Sprintf("s_once_%g", loss)))
+		r.tick(layerStat("f", 5_000_000, loss, unknown)) // 3 %: the first tick of its streak
+		r.want(4_000_000, HintReasonCongestion, layerStat("f", 5_000_000, loss, unknown))
+	}
+	r := newNativeRig(t, s, "s_once_two")
+	two := []LayerUplinkStats{layerStat("f", 4_000_000, 50, unknown), layerStat("q", 300_000, 0, unknown)}
+	r.want(3_440_000, HintReasonCongestion, two...) // 46.5 % of 4.3 Mbit/s; counted twice: 1.84 Mbit/s
+
+	// The Layer: of a second of 400 packets of 1000 bytes (3.2 Mbit/s sent), every fourth is lost. Its Bitrate is the
+	// 2.4 Mbit/s that arrived, its raw loss 25 %, and the sharer is told 0.8 × 2.4 Mbit/s, not that × 0.75.
+	s, _ = newTicklessSFU(t)
+	ctx := testCtx(t)
+	pub, pubSig := joinAs(t, s, "alice", "c-pub", RolePublisher, ClientDesktop)
+	startShare(t, pub, "s_once_layer")
+	sh := s.lookupShare("s_once_layer")
+	l, _ := testLayer(t, sh, SlotF, 0xf0)
+	payload := make([]byte, 1000)
+	payload[0] = 0x41 // a non-IDR slice
+	l.tick(t0)        // the baseline
+	for i := range 400 {
+		if i%4 == 1 {
+			continue // lost; the last packet arrives, so the second's sequence space is all 400
+		}
+		l.handleRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: uint16(100 + i), Timestamp: 3000 * uint32(i/10),
+			PayloadType: 96}, Payload: payload}, ProfileHigh, at(float64(i)*2.5))
+	}
+	l.tick(t0 + int64(time.Second))
+	st := sh.uplinkStats(ClientDesktop).Layers[0]
+	if st.Bitrate != 2_400_000 || st.RawLossPct != 25 {
+		t.Fatalf("the layer's stats = %+v, want 2.4 Mbit/s that arrived and 25 %% raw loss", st)
+	}
+	s.uplinkGen.Add(1) // the ticker's next second
+	if err := pub.CheckUplink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := pubSig.hints(); len(got) != 1 || got[0].Reason != HintReasonCongestion || got[0].MaxBitrate != 1_920_000 {
+		t.Fatalf("hints = %+v, want one congestion hint of 1.92 Mbit/s (0.8 × what arrived)", got)
+	}
 }
 
 // TestNativeUplinkLayerPausing: the native policy keeps M1's layer pausing (it embeds m1Uplink). A layer it paused
@@ -297,7 +349,7 @@ func TestNativeUplinkLayerPausing(t *testing.T) {
 	if d := r.tick(both(0, 0)...); !reflect.DeepEqual(d.Active, map[string]bool{"f": false}) || d.MaxBitrate != 0 {
 		t.Fatalf("10 s without a request for high: %+v, want f paused", d)
 	}
-	// Only q counts now: 50 % loss on its 300 kbit/s is the floor; with f's 4 Mbit/s it would be 1.72 Mbit/s.
+	// Only q counts now: 50 % loss on its 300 kbit/s is the floor; with f's 4 Mbit/s it would be 3.44 Mbit/s.
 	r.want(nativeMinCap, HintReasonCongestion, both(50, 50)...)
 	// A request for high resumes f: no verdict for 3 s, then the estimate follows the stats again.
 	st := ShareUplinkStats{Client: ClientDesktop, HighRequests: 1, Layers: both(0, 0)}
@@ -802,7 +854,7 @@ func TestNativeUplinkLooksBetweenTicks(t *testing.T) {
 		delay   time.Duration
 		wantCap int
 	}{
-		{"loss", 3, -1, 3_104_000},
+		{"loss", 3, -1, 3_200_000},
 		{"delay", 0, 50 * time.Millisecond, 3_400_000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
