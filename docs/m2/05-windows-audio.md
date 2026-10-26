@@ -2025,9 +2025,14 @@ SelfWebView\msedgewebview2.exe  (started as the harness's own child)
 disturb the checks (they are per fixture pid), as long as they play nothing.
 
 Frequencies (Hz, all at −18 dBFS, ≥ 90 Hz apart): game **1000**, voice **440** (the plan's pair), second voice 571,
-late game 683 (also the late child of case 25), browser tab 797, isshoni self 907 (also the late isshoni child of
-case 26), browser voice 440. Case 27 alone uses the sound check's chime partials, 880 and 1320 (§11.3). The closest
-pair, 907 and 1000 Hz (93 Hz), stays separable in the 50 ms windows of §18.6 (main lobe ±40 Hz).
+late game 683 (also the late child of case 25), browser tab 797, isshoni self **S** (also the late isshoni child of
+case 26), browser voice 440. Case 27 alone uses the sound check's chime partials, 880 and 1320 (§11.3), and case 20
+the 2000 Hz bursts of `im_test_render_bursts`. **The isshoni-self tone S** (README §3 item 40) is at least 200 Hz
+from 1000 Hz and from every other fixture tone: WA62a's 907 Hz, 93 Hz from the game, stays separable from a steady
+1000 Hz tone in the 50 ms windows of §18.6 (main lobe ±40 Hz), but not from its onsets and cuts (§18.6). With the
+tones above, S lies at or below 240 Hz, in 1520–1800 Hz or at or above 2200 Hz: 1250 Hz, the decision's first choice,
+is 70 Hz from case 27's 1320 Hz. WA62b picks S and changes `freqSelf` and the analyzer's expectations, and the
+write-back after it puts the number here (§18.5's table says S); until WA62b merges, the harness plays 907 Hz.
 
 ### 18.4 Preconditions (checked, recorded in the report)
 
@@ -2054,13 +2059,13 @@ configuration has the fast path on (§18.10), INFO otherwise.
 | 1 | `baseline-endpoint` | endpoint engine via `IM_AUDIOF_TEST_FAIL_PROBE`; game 1000 + discord.exe 440 under explorer | both present. If this fails, every later case is INCONCLUSIVE ("the audio setup is broken, not isshoni") | yes |
 | 2 | `builtin-voice` | built-in rules only; `Discord\app-1.0.9999\discord.exe` tone 440; game 1000 | 440 absent, 1000 present; Discord row `kept_out`/`builtin` | yes |
 | 3 | `two-voice-apps` | discord.exe 440, `TeamSpeak\teamspeak.exe` 571, game 1000 | 440 and 571 absent, 1000 present; engine `include-set` throughout | yes |
-| 4 | `fast-path` | game 1000, game2 683, harness itself plays 907 | 1000, 683 present; 907 absent; engine `exclude-self` throughout | yes (fast path) |
-| 5 | `fast-path-late-voice` | as 4 (without 907); at t = 3 s discord.exe starts and plays 440 at once (its `firstRenderNs` logged, §18.3) | 440 absent over [1.5, end], whose short-window rule covers every 50 ms window from Discord's `firstRenderNs` to the end (the leak this case exists for); 1000 present; `fastpath_exit` ≤ 15 ms after Discord's `session_created`; `fastpathLateCuts` = 0; **session lag** = `session_created` time − `firstRenderNs`, recorded, FAIL above 20 ms (the cut margin of §6.4) | yes (fast path) |
+| 4 | `fast-path` | game 1000, game2 683, harness itself plays S (§18.3) | 1000, 683 present; S absent; engine `exclude-self` throughout | yes (fast path) |
+| 5 | `fast-path-late-voice` | as 4 (without S); at t = 3 s discord.exe starts and plays 440 at once (its `firstRenderNs` logged, §18.3) | 440 absent over [1.5, end], whose short-window rule covers every 50 ms window from Discord's `firstRenderNs` to the end (the leak this case exists for); 1000 present; `fastpath_exit` ≤ 15 ms after Discord's `session_created`; `fastpathLateCuts` = 0; **session lag** = `session_created` time − `firstRenderNs`, recorded, FAIL above 20 ms (the cut margin of §6.4) | yes (fast path) |
 | 6 | `helper-tree` | discord.exe (spawn) → voicehelper.exe (spawn) → audiohelper.exe plays 440 (a grandchild whose own name matches no rule: the ancestor walk must catch it); ms-teams.exe (spawn) → WebView2Runtime\msedgewebview2.exe plays 571 (another folder: the shared-runtime rule must catch it); game 1000 | 440, 571 absent; 1000 present | yes |
 | 7 | `late-helper` | discord.exe from the start (`spawn -at 4`, i.e. t = 3 s after the 1 s settle) → audiohelper.exe playing 440 at once (`firstRenderNs` logged) | 440 absent over [1.5, end], short windows included (in particular from the helper's `firstRenderNs`: the include set must never have captured it); 1000 present; no clicks | yes |
 | 8 | `late-app` | discord.exe idle (forces the include set); at t = 3 s game2 starts playing 683 for 3 s | 683 present in [3.5, 5.8]; measured onset (§18.6) ≤ 500 ms after its `session_created` (value recorded); no clicks in [1.5, end] (verifies the onset fade) | yes |
 | 9 | `steam-game` | mic flag on; `Steam\steam.exe` (`spawn -mic`) → `steamapps\common\TestGame\game.exe` 1000 (a subfolder of Steam's: only the launcher stop separates them) | 1000 present; Steam row `kept_out`/`mic`; game row heard | yes (mic) |
-| 10 | `isshoni-self` | harness plays 797 itself; harness's child `SelfWebView\msedgewebview2.exe` → its child `msedgewebview2.exe` plays 907; game 1000 | 797, 907 absent; 1000 present; rows `isshoni` | yes |
+| 10 | `isshoni-self` | harness plays 797 itself; harness's child `SelfWebView\msedgewebview2.exe` → its child `msedgewebview2.exe` plays S; game 1000 | 797, S absent; 1000 present; rows `isshoni` | yes |
 | 11 | `viewer-browser` | `Service.SetViewerBrowser("c_test1", "edge", "windows", true)` as 03 calls it; `Microsoft\Edge\Application\msedge.exe` (spawn) → msedge.exe (`spawn -tone 440`, the "isshoni tab") → msedge.exe playing 797 ("other tab"); game 1000 | 440 and 797 absent (whole browser out, reason `viewer`); 1000 present | yes |
 | 12 | `browser-mic` | `Google\Chrome\Application\chrome.exe` (spawn) → chrome.exe (`spawn -tone 440 -mic`, Discord Web) → chrome.exe playing 797; game 1000 | both absent (reason `mic`, browser); a `browser-mic` prompt in `FriendsHear` | yes (mic) |
 | 13 | `mic-user` | `KOOK\kook.exe tone -mic` 440; at t = 5 s the case answers the prompt "include" through `Service.Decide`; game 1000 | 440 absent in [1.5, 5.0] (short windows included), present in [5.6, end]; measured onset (§18.6) ≤ 500 ms after the recorder's `SetExclusions` stamp that follows the decision (value recorded); the `mic` prompt existed; no clicks | yes (mic) |
@@ -2076,7 +2081,7 @@ configuration has the fast path on (§18.10), INFO otherwise.
 | 23 | `soak` (`-long`) | 30 min of a music-like fixture (1000 Hz + 683 Hz with slow AM) and discord idle with mic | zero underruns, trims and `mixerResyncs`; no clicks; `maxResamplePpm` ≤ 1000; 440 never present | release tier "minor" (§18.10) |
 | 24 | `viewer-browser-included` | as 11, with `appRules {"exe:msedge.exe": "include"}` in the settings store before the Service starts (a saved Include, e.g. from an earlier mic prompt) | 440 and 797 absent (reason `viewer`: the viewer row beats the saved allow, §5.3); 1000 present | yes |
 | 25 | `late-child-heard` | `Games\game.exe spawn -tone 1000 -at 4 Games\game.exe tone -f 683 -d 10`: the game plays 1000 from the start (heard, include target) and at t = 3 s starts a child in the same folder playing 683 (a normal descendant created after the game's stream was activated; `firstRenderNs` logged) | 683 present in [3.6, end]; measured onset ≤ 500 ms after the child's `session_created` (value recorded); the child's session `note` = `covered` and the game's app row heard (one row: same folder, same app). A FAIL triggers §6.2 step 3's fallback (later children get their own stream) | yes |
-| 26 | `fast-path-late-child` | as 4 without 907 (engine `exclude-self`); at t = 3 s the harness starts its own child `SelfWebView\msedgewebview2.exe tone -f 907` (an isshoni descendant, row 1 by the instance rule, created after the EXCLUDE stream was activated; `firstRenderNs` logged) | 907 absent over [1.5, end], short windows included (from its `firstRenderNs`); 1000 and 683 present. A FAIL triggers §6.4's re-plan on every new isshoni descendant | yes (fast path) |
+| 26 | `fast-path-late-child` | as 4 without S (engine `exclude-self`); at t = 3 s the harness starts its own child `SelfWebView\msedgewebview2.exe tone -f S` (an isshoni descendant, row 1 by the instance rule, created after the EXCLUDE stream was activated; `firstRenderNs` logged) | S absent over [1.5, end], short windows included (from its `firstRenderNs`); 1000 and 683 present. A FAIL triggers §6.4's re-plan on every new isshoni descendant | yes (fast path) |
 | 27 | `pid-reuse-tree` | `Games\game.exe` plays 1000; `LauncherX\launcherx.exe spawn -orphan-after 2 Discord\app-1.0.9999\discord.exe tone -f 880,1320` (B, a built-in voice app, plays the chime partials; its parent A exits at 2 s); the harness waits for A's exit, closes every handle it holds on A, then runs `fixture reuse-pid -target <A's pid> -parent <game's pid>`; on a match, `AudioController.SoundCheck(<game's pid>, 3 s)`, which opens an INCLUDE stream on the game's tree outside the policy (§11.3) | records `{matched, attempts, captured, gameReason}`: `captured` = Windows' tree follows the reused PID (B's chime in the game's stream); `gameReason` expected `pid_reuse` (§5.2), never `tree`. §5.2 decides the loose union from it | INFO |
 
 Timings in the table are relative to the recording start, which begins 1 s after the case's initial fixtures run
@@ -2095,10 +2100,17 @@ Analysis runs on the PCM tap (pre-Opus, what the Opus encoder gets), mono `(L + 
   ≤ −50 dBFS. Why: one Hann window over the whole check window barely moves for a short leak. A 30 ms leak at
   −18 dBFS, 17 % into an 8.5 s window (Hann weight ≈ 0.28), reads about −72 dBFS and would pass both the −50 limit
   and P_min − 40; S1's `analyze.go` has the same whole-window design. In a 50 ms window the same leak reads above
-  −25 dBFS, and even a 1 ms leak at −18 dBFS reads about −46 dBFS. A 50 ms Hann window's main lobe is ±40 Hz, so the
-  closest pair of the tone plan (907 and 1000 Hz, 93 Hz apart) stays separable: a −18 dBFS 1000 Hz tone with the
-  mixer's 5 ms onset or 10 ms fade leaks at most about −64 dBFS into the 907 Hz bin (asserted in the analyzer tests,
-  §19.1), and the fixtures' WAVs fade over 20 ms (§18.3). The check records `maxShortDb` and the time of that window.
+  −25 dBFS, and even a 1 ms leak at −18 dBFS reads about −46 dBFS. A 50 ms Hann window's main lobe is ±40 Hz, which
+  keeps steady tones 93 Hz apart separable, but a window that spans a tone's onset or cut also catches the step's
+  broadband splatter. WA62a measured it with the onset inside silence, at offsets between the 10 ms hops: a −18 dBFS
+  1000 Hz tone with the mixer's 5 ms linear onset or fade reads up to −44.3 dBFS at 907 Hz, over the −50 dBFS limit
+  (a 10 ms linear fade −57.2, a 5 ms raised-cosine one −42.8, a 20 ms raised-cosine one −65.4). This section's earlier
+  "at most about −64 dBFS" was wrong: an absent check at 907 Hz could fail on a correct engine whenever the game tone
+  started or stopped inside its window. So the isshoni-self tone moves at least 200 Hz from 1000 Hz and from every
+  other fixture tone (§18.3, README §3 item 40), and the analyzer tests assert that 5 ms and 10 ms onsets and cuts of
+  a 1000 Hz tone never trip a short-window check at S (§19.1; until WA62b, WA62a's 5 ms case at 907 Hz is a visible
+  `t.Skip`). The fixtures' WAVs fade over 20 ms (§18.3). The check records `maxShortDb` and the time of that window
+  (its start, `maxShortAtS`).
 - **Measured cut and onset.** For a check that follows an event (a rule change, a decision, a new session), the
   analyzer reports times from the same 50 ms windows, each window placed at its centre: the **cut** is the centre of
   the last window after the event whose level is above −50 dBFS, and the **onset** the centre of the first window
@@ -2152,7 +2164,7 @@ Analysis runs on the PCM tap (pre-Opus, what the Opus encoder gets), mono `(L + 
      "checks": [{"freq": 440, "from": 1.5, "to": 4.0, "expect": "present", "levelDb": -18.2, "pass": true},
                 {"freq": 440, "from": 4.153, "to": 0, "expect": "absent", "levelDb": -139.0, "maxShortDb": -61.7,
                  "maxShortAtS": 4.153, "pass": true}],
-     "measured": {"cutMs": 58, "budgetMs": 100},
+     "measured": {"cutMs": {"valueMs": 58, "budgetMs": 100}},
      "clicksAtS": [], "problems": [], "engine": ["include-set"], "counters": {"underruns": 0, "trims": 0},
      "events": []}
   ],
@@ -2162,9 +2174,13 @@ Analysis runs on the PCM tap (pre-Opus, what the Opus encoder gets), mono `(L + 
 
 `checks[].maxShortDb`/`maxShortAtS` are the short-window rule's maximum and where it was (absent checks only);
 `measured` holds the event-relative values of §18.6, each with its budget: `cutMs` (case 15, budget 100), `onsetMs`
-(cases 8, 13, 25, budget 500), `sessionLagMs` (case 5, budget 20) and `fastpathExitMs` (case 5, budget 15); `to: 0`
-means the end of the recording.
-`gateConfig` is §18.10's gate configuration.
+(cases 8, 13, 25, budget 500), `sessionLagMs` (case 5, budget 20) and `fastpathExitMs` (case 5, budget 15), each as
+`{valueMs, budgetMs}` (WA62a: case 5 records two values with two budgets, which one flat `budgetMs` couldn't hold);
+`to: 0` means the end of the recording.
+`gateConfig` is §18.10's gate configuration. An INFO case records what it found in `info` (case 27: `matched`,
+`attempts`, `captured`, `gameReason`). As built (WA62a): endpoints are recorded with `formFactor` and `bus`
+`unknown`, and `masterVolume` and `muted` are `null` (not read yet: they need WASAPI's endpoint calls); `harness` is
+the version the release build stamps (`-ldflags`), else the module's VCS revision, else `dev`.
 
 Redaction (default; `-no-redact` for local debugging only): no user, host or device friendly names; endpoint names
 become `{formFactor, bus}`; paths become relative to the work folder; app ids of fixtures become `fixture:<role>`, and
@@ -2172,8 +2188,10 @@ any non-fixture app appears as `other` with no name. WAVs are never written unle
 committed. The harness prints one summary line:
 
 ```
-isshoni-audiotest v0.2.0-14-g1a2b3c4 · DLL 0.2.0 sha256:3f9a1c0b7d2e · Windows 11 Pro 26200.6899 · 24/24 PASS · 0 FAIL · 0 INCONCLUSIVE · 0 SKIP · gate=PASS
+isshoni-audiotest v0.2.0-14-g1a2b3c4 · DLL 0.2.0 sha256:3f9a1c0b7d2e · Windows 11 Pro 26200.6899 · 24/24 PASS · 0 FAIL · 0 INCONCLUSIVE · 0 SKIP · 2 INFO · gate=PASS
 ```
+
+The total leaves INFO cases out, and ` · N INFO` follows when there are any (WA62a).
 
 ### 18.8 Where it runs and how results are recorded
 
@@ -2322,11 +2340,12 @@ Native tests use GoogleTest through 04's vcpkg `tests` feature and run with `tas
   call log; the harness analyzer and verdict logic on synthetic recordings (present/absent thresholds, P_min rule,
   clicks, gaps, INCONCLUSIVE causes), including the short-window rule of §18.6: **a 20 ms burst of 440 Hz at −18 dBFS
   inside a 10 s window FAILs absent** (the whole-window level alone would pass); a −18 dBFS 1000 Hz tone with 5 ms and
-  10 ms linear fade-ins and fade-outs, and with its onsets, never trips a short-window absent check at 907 Hz; a tone
-  with S1's 20 ms WAV fades doesn't either; measured cut and onset of a synthetic step lie within 20 ms of the true time
-  (cut late, onset early, as §18.6 says); event- relative windows resolve from `firstRenderNs` and recorder stamps; case
-  5's session-lag rule (21 ms → FAIL); the gate configuration (shipped `fastPath` false → cases 4, 5, 26 INFO, exit code
-  unaffected by their result).
+  10 ms linear fade-ins and fade-outs, its onsets and cuts inside silence, never trips a short-window absent check at
+  the isshoni-self tone S (§18.3, §18.6; at WA62a's 907 Hz the 5 ms case reads −44.3 dBFS, so that subtest skips
+  visibly until WA62b moves the tone); a tone with S1's 20 ms WAV fades doesn't either; measured cut and onset of a
+  synthetic step lie within 20 ms of the true time (cut late, onset early, as §18.6 says); event- relative windows
+  resolve from `firstRenderNs` and recorder stamps; case 5's session-lag rule (21 ms → FAIL); the gate configuration
+  (shipped `fastPath` false → cases 4, 5, 26 INFO, exit code unaffected by their result).
 
 ### 19.2 Integration
 

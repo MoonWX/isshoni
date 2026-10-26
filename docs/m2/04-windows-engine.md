@@ -115,7 +115,8 @@ native/
    ├─ src/session/                 session state machine, video thread, supervisor, the source registry
    │                               (picks), the encoder catalog (encoder.h), stats; the session's
    │                               audio wiring (05's AudioEngine/Mixer, §10.2); test:pattern drawn
-   │                               by gpu/'s TestPattern (WF2, §6.1)                                 04
+   │                               by gpu/'s TestPattern; frames (the GPU path, or frame_times for
+   │                               IM_ENC_FAKE) and pattern_grid (WF2, §6.1)                         04
    ├─ src/testhooks/               IM_TEST_HOOKS builds: IM_ENC_FAKE, fault injection, the fake picker 04
    ├─ src/capture/                 picker, wgc, dd, monitor_map, window_match, sources              04
    ├─ src/gpu/                     device, triple_buffer and slots, frame, geometry, converter (the
@@ -847,7 +848,9 @@ is 0/90/180/270; `adapter` indexes `im_caps.adapters`.
 ```
 `audio.state` is `off`, `starting`, `ok`, `degraded` or `no-device` (`IM_AUDIO_STATE_*`, the strings of 05's report
 `state`).
-`fpsIn` counts captured frames, `fpsOut` encoded ones over the last 2 s. `latencyMs` is capture time → packet in
+`fpsIn` counts captured frames, `fpsOut` encoded ones over the last 2 s. `fpsIn` keeps counting while paused: the
+video thread takes no frame then (§8.5), so the session counts the frames the capture side published itself, not the
+frames the pacer saw (WF2; `session_fake_test`'s pause case checks it). `latencyMs` is capture time → packet in
 the ring. `limit` is `none`, `cpu` (a software encoder can't keep up), `gpu` (a hardware encoder or the GPU path
 can't) or `source` (the source delivers fewer frames, for example a static screen). The fields match the SPA's
 `ShareStatsSample` (`encoder`, `hw`, `limit`), which 03 fills from them.
@@ -998,12 +1001,22 @@ three `FrameSlots` and one `Converter` per layer in `Session::StartVideo`; on th
 pattern is drawn into the writer's slot (`FrameSlots::BeginWrite`, `TestPattern::Render`, `FrameSlots::Publish` with the
 frame's time); the video loop takes the latest slot, and each encode of layer l converts it with that layer's
 `Converter` into the encoder's input (an FFmpeg pool slice, or our own `Nv12Surface` read back for a CPU encoder, §8.3).
-WF2 removes WA23's CPU frame-time pattern (the session's `frame_ts_` ring and `kFrameSlots`). **`IM_ENC_FAKE` sessions
+WF2 removed WA23's CPU frame-time pattern (the session's `frame_ts_` ring and `kFrameSlots`). **`IM_ENC_FAKE` sessions
 stay off WARP**: the fake encoder ignores pixels, so a session whose encoders are `IM_ENC_FAKE` (test hooks) gets the
 pattern's frames on the same grid without a D3D device or any rendering (it still gets a new session device id, which
 `session_fake_test` compares across a device removal), and `session_fake_test`'s timing cases keep their bounds;
-`gpu_warp_test` covers the pattern's pixels on WARP. (Until WF2 merges, `test:pattern` is still WA23's CPU frame-time
-pattern in `src/session/`.)
+`gpu_warp_test` covers the pattern's pixels on WARP.
+
+As built (WF2, `src/session/frames.h`, `frame_times.h`, `pattern_grid.h`): `Session::StartFrames` creates the device,
+before any encoder opens (FFmpeg wraps it, §9.2), on the adapter of the session's first candidate whose encoder takes
+pixels (`FrameInput::kNv12`, every real encoder), and its later candidates use the same device; it also assigns the
+session device id, for every session. A session none of whose candidates takes pixels (the test hooks' `IM_ENC_FAKE`,
+`FrameInput::kNone`) creates no device: its frames are **capture times only** (`FrameTimes`), through the same
+triple-buffer index as the slots (`gpu/triple_buffer.h`), so the newest frame wins and the skipped count is the GPU
+path's. `PatternGrid` is the supervisor's pattern clock: frame k's capture time is exact at whole seconds (the tone's
+beeps) and rounded down between; under test hooks two of every three frames may be due late, below half an interval,
+with their capture times unchanged. `VideoFrames` (`frames.h`) holds either path: `PublishPattern` on the capture side,
+`Take`, `Convert` and `Configure` on the video thread.
 
 **Audio**: with `IM_AUDIO_MODE_EXCLUDE_APPS` the session drives 05's `AudioEngine` itself in
 `src/session/session_object.cpp` (`SetRules` with the start's exclusions, `NewMixer`, the mixer's `Start`, `Stop`,
@@ -1306,9 +1319,11 @@ Unidentified windows simply lack these extras; capture is unaffected.
 - **One device per session**, on the adapter of the chosen encoder (§9.1): for DD that is the output's adapter by
   construction; for WGC any adapter works (WGC copies across adapters itself). On an Optimus or hybrid laptop the
   internal panel is on the iGPU, whose QSV/AMF encoder then wins; that keeps the path zero-copy. A `test:pattern`
-  session takes the same path, its frames drawn by gpu/'s `TestPattern` (README §3 item 37, §6.1; until WF2 merges,
-  the session still draws WA23's CPU frame-time pattern); only a session whose encoders are `IM_ENC_FAKE` (test
-  hooks) creates no D3D device, so the fake-encoder tests never render on WARP.
+  session takes the same path, its frames drawn by gpu/'s `TestPattern` (README §3 item 37, §6.1); only a session
+  whose encoders are `IM_ENC_FAKE` (test hooks) creates no D3D device, so the fake-encoder tests never render on WARP.
+  As built (WF2): the session creates the device in `StartFrames`, before its encoders open, on the adapter of its
+  first candidate whose encoder takes pixels (`EncoderEntry::device`; WA44's probe sets that LUID), and later
+  candidates reuse it (WA44 decides a cross-adapter one's copy, §9.1).
 - **The context lock**: a `CRITICAL_SECTION` (recursive, like FFmpeg's own default D3D11 lock, because FFmpeg may
   take it again while holding it) around every use of the immediate context, by the capture copy, the video thread
   and FFmpeg. The FFmpeg D3D11 device context gets the same lock through `AVD3D11VADeviceContext.lock`/`unlock`
@@ -1318,7 +1333,11 @@ Unidentified windows simply lack these extras; capture is unaffected.
   polls (at most 3 s), maps with `D3D11_MAP_FLAG_DO_NOT_WAIT` the same way and copies the rows out with the lock
   released, so the capture copy and FFmpeg's submissions go on while the GPU works through its queue (WA33).
 - **Device loss**: any `DXGI_ERROR_DEVICE_REMOVED`/`_RESET`, or an encoder error with
-  `GetDeviceRemovedReason() != S_OK`, ends the session (§9.8).
+  `GetDeviceRemovedReason() != S_OK`, ends the session (§9.8). As built (WF2): now that the session owns the device,
+  every ordinary failure on the GPU path asks it (`Session::DeviceLost`, `gpu::Device::Removed`): an encode or
+  conversion error, a re-init's failed open, a recovery whose re-opens fail or run out, and a failed pattern render
+  end the session as `device_removed` (and mark the probe's cache stale) when the device is gone, instead of falling
+  back or ending as a plain `encoder_lost`.
 
 ### 8.2 Frame slots
 
@@ -1383,6 +1402,16 @@ test pattern draws straight into a slot (`TestPattern::Render`).
   don't fall back to BT.601 and shift colors.
 - The output NV12 textures come from the encoder's hardware frame pool (§9.2); for CPU encoders from our own pool,
   read back through a staging texture (`CopyResource`, `Map` with `D3D11_MAP_READ`).
+- **The encoder's side, as built (WF2, `src/session/encoder.h`)**: an `EncoderEntry` says what its encoder takes per
+  frame (`input`: `FrameInput::kNv12` for every real encoder, `kNone` for `IM_ENC_FAKE`) and on which adapter its
+  session's device must be (`device`, a `gpu::DeviceRequest`); `EncoderParams::device` hands the session's device to
+  `Open`. Before each `Encode` the video thread calls `VideoEncoder::NextTarget` for the NV12 target of the next frame
+  (a slice of the encoder's FFmpeg pool for a zero-copy encoder, or its own `gpu::Nv12Surface` that a CPU encoder
+  reads back in `Encode`; the default, for encoders that take nothing, is `IM_ERR_NOT_IMPLEMENTED`), converts the
+  frame (or black, §6.3) into it with the layer's `Converter`, and passes it as `EncodeInput::picture`. A failed
+  conversion is followed by no `Encode`: the layer is recovered (§9.8) or the session ends. After every (re)open of a
+  `kNv12` encoder, the layer's converter drops its cached target views (`Converter::ClearViews`), so the previous
+  encoder's pool textures are freed; a VideoProcessor's input views are rebuilt on the next frame.
 
 ### 8.4 Pacer
 
@@ -1442,7 +1471,12 @@ advance(l):                           the nominal schedule
   IDRs of it. Audio: `im_set_paused(s, p)` calls `Mixer::SetPaused(p)`; the effective mute is the user's mute
   (`im_audio_set_muted`, 05) OR pause, so un-pausing never clears a user's "Sound off". Muted audio fades out in
   10 ms and encoded digital silence keeps flowing every 20 ms on the unbroken grid (§10.3). No new screen content or
-  captured sound leaves the engine while paused. Resume: the next captured frame is encoded at once.
+  captured sound leaves the engine while paused. Resume: the next captured frame is encoded at once. As built (WF2,
+  for every session, `IM_ENC_FAKE` included): the video thread takes no frame from the slots while paused, so the
+  reader's slot keeps the frozen frame and no refresh or IDR of a paused session shows content captured after the
+  pause took effect; on resume it takes the newest frame before the pacer resumes, with no frames counted as skipped,
+  so the frames of the pause are not pacer drops, and the pacer encodes it at once. `fpsIn` keeps counting captured
+  frames meanwhile (§5.6).
 - **Inactive layer** (`im_set_layer_active(l, 0)`, M1 layer pausing): no encodes at all for that layer; its first
   frame after reactivation is an IDR (`KEYFRAME`, no `REINIT`).
 
@@ -1630,7 +1664,7 @@ guards the expensive case:
 |---|---|---|
 | `avcodec_open2` fails at start | next candidate (§9.1) | none (logged) |
 | Encoder error mid-session (`avcodec_send_frame`/`receive_packet` < 0 and not `EAGAIN`), device fine | reopen the same encoder once; if that fails, the next candidate for that layer | `ENCODER_CHANGED` (when the kind changed), queued **before** the new encoder's first packet; packets `REINIT\|KEYFRAME` |
-| Device removed or reset (TDR, driver update, GPU unplugged) | **ends the session** (M2): capture stops, the session's encoders, frame pools, VideoProcessors, WGC frame pool or DD duplication and device are released; the engine marks its probe cache stale. The next `im_start` re-enumerates adapters (the LUID may change after a driver update), creates a new device and re-probes the candidates it needs first (lazily); "Share again" is a new pick, since the ended session consumed its token (§7.2) | `ENDED{IM_ERR_ENCODER_LOST}`, detail token `device_removed`; 03 offers "Share again" (§5.7) |
+| Device removed or reset (TDR, driver update, GPU unplugged), also when it first shows as an ordinary encode, conversion, re-open or pattern-render error on a device that reports removed (§8.1, WF2) | **ends the session** (M2): capture stops, the session's encoders, frame pools, VideoProcessors, WGC frame pool or DD duplication and device are released; the engine marks its probe cache stale. The next `im_start` re-enumerates adapters (the LUID may change after a driver update), creates a new device and re-probes the candidates it needs first (lazily); "Share again" is a new pick, since the ended session consumed its token (§7.2) | `ENDED{IM_ERR_ENCODER_LOST}`, detail token `device_removed`; 03 offers "Share again" (§5.7) |
 | A layer's candidates exhausted | session ends | `ENDED{IM_ERR_ENCODER_LOST}` |
 
 **Event order for a fallback**: the video thread queues `ENCODER_CHANGED` itself, before it writes the new encoder's
@@ -2570,7 +2604,9 @@ and `dll_search_test` runs with the engine's delay-load hook; the DLL's real exp
 | Test | Asserts |
 |---|---|
 | `exports_test` | every export with null and invalid arguments returns its documented code, and `im_last_error` starts with the §5.7 token where one applies; `struct_size` below v1.0 → `IM_ERR_ABI`, above → accepted; JSON functions follow snprintf; `im_clock` is monotonic and within 50 ms of the system time; `im_abi_layout` equals the golden file; `isshoni-media.def` lists exactly the header's `IM_API` functions (both parsed); a hook that stalls the worker makes a posted call return `IM_ERR_TIMEOUT` (`engine_timeout`) after its bound + 1 s |
-| `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone (no D3D device: `IM_ENC_FAKE` sessions stay off WARP, §6.1, so the timing bounds hold; "a new device" below is the session's device id): first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s; `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired` |
+| `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone (no D3D device: `IM_ENC_FAKE` sessions stay off WARP, §6.1, so the timing bounds hold; "a new device" below is the session's device id): first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s, while the stats' `fpsIn` stays above 40 (§5.6, WF2); `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired` |
+| `session_gpu_test` (WF2) | a session's GPU path through the C ABI on WARP, with the test hooks: the test lists an encoder of its own first in the catalog (`session::SetCatalogPrefixForTest`; `testhooks::Reset` doesn't clear it, the test does), one that takes pixels on a WARP device, reads every converted picture back and leaves the access unit to `IM_ENC_FAKE`. Such a session runs the GPU path (`session::GpuPathOf`; an `IM_ENC_FAKE` one doesn't); each layer's first packet `KEYFRAME\|REINIT` within 500 ms; every picture of a new frame shows that frame's counter and flash box (the frame whose grid instant is its `capture_ts_ns`) on `f` (1:1) and `q` (2:1); on a static screen refreshes and keyframes show the one frame again; with no frame at all the first keyframe is black (Y 16, Cb/Cr 128); while paused every picture shows one frame captured before the pause, and resuming shows new frames; device loss that first shows as an ordinary error (a conversion's target, a recovery's re-opens, a re-init's open; `session::SetDeviceRemovedForTest` stands in, since WARP can't be removed) ends the session `ENDED{IM_ERR_ENCODER_LOST}` `device_removed` with the probe's cache stale, while the same failure on a sound device is an encode error the session recovers from. The two 500 ms first-keyframe bounds on WARP may be tight in the nightly `win-x64-asan` run |
+| `session_frames_test` (WF2) | the session's two portable frame pieces, without a GPU or the test hooks (every test build): `PatternGrid` (frame times exact at whole seconds and WA23's arithmetic for 1 to 240 Hz, late frames below half an interval with every third on time, `NewestDue` the newest due frame and never one before `next`) and `FrameTimes` (fresh, skipped and the newest time; across two threads every published frame is taken or skipped and the times taken only grow, bounded by a 10 s deadline). Being portable it also builds on the Mac against the host preset's GoogleTest (group 5's integration ran it plain, under TSan and under ASan+UBSan), though no host target lists it |
 | `audio_bridge_test` | with a fake `AudioEngine`: `im_init`/`im_shutdown` call `Init`/`Shutdown`; every audio export forwards its arguments (rules, flags, `shared_pid` copied); `im_start_config.exclusions` → `SetRules` before `Mixer::Start`; modes OFF and TEST_TONE create no mixer; after `im_init(IM_INIT_NO_AUDIO)`, `im_start` with `IM_AUDIO_MODE_EXCLUDE_APPS` and exclusions calls neither `SetRules` nor `NewMixer` (05 §4.3, README §3 item 35); `im_start` with `audio.mode` `IM_AUDIO_MODE_EVERYTHING` and `im_audio_set_mode(IM_AUDIO_MODE_EVERYTHING)` → `IM_ERR_INVALID_ARG`, no mixer created and the fake's mode unchanged; `im_set_paused` → `Mixer::SetPaused`; the fake mixer's chunks come out as Opus packets every 20 ms and, with `IM_AUDIOF_TAP_PCM`, PCM packets every 10 ms |
 | `window_match_test` | §7.6's matcher over a fake window list: one match gives `window` and `pid`; two matches or none give 0; cloaked windows skipped; an `applicationframehost.exe` match takes its `Windows.UI.Core.CoreWindow` child's pid, and 0 without one |
 | `gpu_warp_test` | on WARP: the shader converter against a CPU BT.709 limited-range reference (≤ 1 code value on flat areas, ≤ 2 on edges); the VideoProcessor against the shader output (≤ 2) when WARP offers one, else skipped with the reason; letterbox geometry; rotation 90/180/270; cursor blending of color, masked and monochrome shapes against golden images, and no blend with `IM_START_HIDE_CURSOR`; the GPU test pattern renders (pixel for pixel against `pattern_layout.h`'s model, and through slots and converters on two threads, the frame counter decoded from the NV12); slot growth steps, one VideoProcessor per slot size, the planar readback and its refused sources, the context lock free while the readback waits (test hook). The goldens are text pictures in `tests/testdata/gpu/`, and the portable `tests/gpu_warp_support.h` checks them on any OS; both belong to this test (§4). With `IM_GPU_TEST_HARDWARE=1`, `GpuHardware.*` compares the VideoProcessor with the shader on every hardware adapter (the owner's-PC check) |
