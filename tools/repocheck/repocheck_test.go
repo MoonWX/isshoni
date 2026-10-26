@@ -153,11 +153,24 @@ func readmeWith(release, backup string) string {
 	return strings.NewReplacer("^", "`", "RELEASE", release, "BACKUP", backup).Replace(readmeTemplate)
 }
 
-// keyTree returns the files of the keys check: install.sh, allowed_signers and a README.md that lists the
-// fingerprints of releaseKey and backupKey.
+// ps1With returns a deploy/install-desktop.ps1 whose key block holds the lines of signers, as `repocheck ps1-keys`
+// writes it.
+func ps1With(signers string) string {
+	block := ""
+	if signers != "" {
+		block = strings.TrimSuffix(signers, "\n") + "\n"
+	}
+	return "# isshoni desktop installer for Windows.\n$IsshoniServer  = ''\n$IsshoniVersion = '@VERSION@'\n" +
+		ps1BlockOpen + "\n" + keysBegin + " (generated from deploy/keys/allowed_signers; do not edit here)\n" + block +
+		keysEnd + "\n" + ps1BlockClose + "\n& {\n    Write-Host 'hi'\n}\n"
+}
+
+// keyTree returns the files of the keys check: install.sh, allowed_signers, an install-desktop.ps1 whose key block
+// holds allowed_signers, and a README.md that lists the fingerprints of releaseKey and backupKey.
 func keyTree(script, signers string) map[string]string {
 	return map[string]string{
 		"deploy/install.sh":           script,
+		"deploy/install-desktop.ps1":  ps1With(strings.ReplaceAll(signers, "\r\n", "\n")),
 		"deploy/keys/allowed_signers": signers,
 		"README.md":                   goodReadme,
 	}

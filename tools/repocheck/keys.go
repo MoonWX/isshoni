@@ -32,7 +32,8 @@ var (
 // checkKeys checks the signing keys' copies against their sources of truth and reports the problems of all checks
 // at once:
 //   - the release keys (M1 06 §10.3; checkReleaseKeys): the block embedded in deploy/install.sh equals
-//     deploy/keys/allowed_signers byte for byte, and the file uses only options that OpenSSH 8.1 parses;
+//     deploy/keys/allowed_signers byte for byte, so do the lines of the key block in deploy/install-desktop.ps1
+//     (M2 06 §7.1; ps1keys.go), and the file uses only options that OpenSSH 8.1 parses;
 //   - the desktop app's update keys (M2 06 §8.3; checkUpdateKeys): deploy/keys/update_signers has the fixed line
 //     format, exactly one backup line and at least one other, and the block in internal/update/signers.go equals
 //     what `task release:update-keys` writes from it;
@@ -42,7 +43,7 @@ var (
 //     fails: release.yml's `[ -s … ]` guard takes it for one with keys.
 //
 // While a key file does not exist yet, its checks are skipped with a note and no error (the embedded update block
-// must then be empty). The notes are joined with "; ".
+// and the key block of deploy/install-desktop.ps1 must then be empty). The notes are joined with "; ".
 func checkKeys(root string) (note string, err error) {
 	release, releaseNote, releaseErr := checkReleaseKeys(root)
 	update, updateNote, updateErr := checkUpdateKeys(root)
@@ -85,8 +86,9 @@ const (
 	updatePrefix  = "isshoni-update"
 )
 
-// checkReleaseKeys checks deploy/keys/allowed_signers and its copy in deploy/install.sh. It returns the file's keys:
-// nil while the file does not exist, and a keyFile without keys when it is empty or can't be read.
+// checkReleaseKeys checks deploy/keys/allowed_signers and its copies in deploy/install.sh and
+// deploy/install-desktop.ps1 (ps1keys.go). It returns the file's keys: nil while the file does not exist (the
+// script's block must then be empty), and a keyFile without keys when it is empty or can't be read.
 func checkReleaseKeys(root string) (file *keyFile, note string, err error) {
 	haveScript, err := exists(filepath.Join(root, installScript))
 	if err != nil {
@@ -99,9 +101,13 @@ func checkReleaseKeys(root string) (file *keyFile, note string, err error) {
 	switch {
 	case !haveScript && !haveSigners:
 		return nil, "skipped: " + filepath.ToSlash(installScript) + " and " + filepath.ToSlash(allowedSigners) +
-			" do not exist yet", nil
+			" do not exist yet", checkPS1Unkeyed(root)
 	case !haveSigners:
-		return nil, "skipped: " + filepath.ToSlash(allowedSigners) + " does not exist yet", nil
+		return nil, "skipped: " + filepath.ToSlash(allowedSigners) + " does not exist yet", checkPS1Unkeyed(root)
+	}
+	havePS1, err := exists(filepath.Join(root, desktopScript))
+	if err != nil {
+		return nil, "", err
 	}
 
 	data, err := os.ReadFile(filepath.Join(root, allowedSigners))
@@ -112,16 +118,35 @@ func checkReleaseKeys(root string) (file *keyFile, note string, err error) {
 	// files, and so the installer that ships, have LF. Compare the content, not the checkout's line ends.
 	signers := strings.ReplaceAll(string(data), "\r\n", "\n")
 
-	var errs []error
+	var (
+		errs  []error
+		notes []string
+		shErr error
+	)
 	if haveScript {
 		script, err := os.ReadFile(filepath.Join(root, installScript))
 		if err != nil {
 			return nil, "", err
 		}
-		errs = append(errs, compareBlock(strings.ReplaceAll(string(script), "\r\n", "\n"), signers))
+		shErr = compareBlock(strings.ReplaceAll(string(script), "\r\n", "\n"), signers)
+		errs = append(errs, shErr)
 	} else {
-		note = "skipped the key block: " + filepath.ToSlash(installScript) + " does not exist yet"
+		notes = append(notes, "skipped the key block: "+filepath.ToSlash(installScript)+" does not exist yet")
 	}
+	if havePS1 {
+		script, err := os.ReadFile(filepath.Join(root, desktopScript))
+		if err != nil {
+			return nil, "", err
+		}
+		// Both blocks report a key file without its final newline the same way; once is enough.
+		if ps1Err := comparePS1Block(strings.ReplaceAll(string(script), "\r\n", "\n"), signers); ps1Err != nil &&
+			(shErr == nil || ps1Err.Error() != shErr.Error()) {
+			errs = append(errs, ps1Err)
+		}
+	} else {
+		notes = append(notes, "skipped the key block of "+filepath.ToSlash(desktopScript)+": it does not exist yet")
+	}
+	note = strings.Join(notes, "; ")
 	file = &keyFile{path: filepath.ToSlash(allowedSigners), prefix: releasePrefix}
 	// An empty file has no key whose fingerprint README.md could list (the block check still wants a final newline).
 	// Any other file holds keys, or it is an error that it holds none.
