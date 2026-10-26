@@ -90,10 +90,12 @@ BeforeAll {
         return $fake
     }
 
-    # Invoke-Install: Install-IsshoniDesktop with the preferences the script sets, returning the lines it printed.
-    # Anything else it emits, an error record above all, fails the test.
+    # Invoke-Install: Install-IsshoniDesktop with the strict mode and the preferences the script's & { } block sets,
+    # returning the lines it printed. Anything else it emits, an error record above all, fails the test. Set here,
+    # strict mode covers the function and the mocks it calls, and ends when Invoke-Install returns.
     function Invoke-Install {
         param([string]$Server = '', [string]$StampedVersion = '0.2.0', [string]$Signers = $TestSigners)
+        Set-StrictMode -Version 3
         $ErrorActionPreference = 'Stop'
         $ProgressPreference = 'SilentlyContinue'
         $records = @(Install-IsshoniDesktop -Server $Server -StampedVersion $StampedVersion -AllowedSigners $Signers 2>&1 6>&1)
@@ -113,6 +115,17 @@ BeforeAll {
             if ($record -isnot [System.Management.Automation.InformationRecord]) { throw "unexpected output: $record" }
             [string]$record
         }
+    }
+
+    # Write-TestStandardInput: writes Text (UTF-8 without BOM) as the file that Test-IsshoniSignature hands
+    # ssh-keygen as its standard input, so that ssh-keygen reads Text exactly. Start-Process on Windows (5.1 and pwsh,
+    # where the script runs) passes that file's bytes unchanged; pwsh elsewhere reads the file and writes it to the
+    # process with WriteLine, which adds one LF, so there the file goes without its last LF.
+    function Write-TestStandardInput {
+        param([string]$Path, [string]$Text)
+        if (-not $OnWindows -and $Text.EndsWith("`n")) { $Text = $Text.Substring(0, $Text.Length - 1) }
+        $utf8 = New-Object -TypeName Text.UTF8Encoding -ArgumentList $false
+        [IO.File]::WriteAllText($Path, $Text, $utf8)
     }
 
     # Get-TestSshKeygen: a real ssh-keygen, or '' (the tests that need one are then skipped).
@@ -449,7 +462,7 @@ Describe 'Test-IsshoniSignature (7.2)' {
         $FakeDir = Join-Path -Path $TestDrive -ChildPath ('A Folder With Spaces ' + [guid]::NewGuid().ToString())
         $null = New-Item -ItemType Directory -Path $FakeDir
         $utf8 = New-Object -TypeName Text.UTF8Encoding -ArgumentList $false
-        [IO.File]::WriteAllText((Join-Path -Path $FakeDir -ChildPath 'checksums.txt'), $TestChecksums, $utf8)
+        Write-TestStandardInput -Path (Join-Path -Path $FakeDir -ChildPath 'checksums.txt') -Text $TestChecksums
         [IO.File]::WriteAllText((Join-Path -Path $FakeDir -ChildPath 'checksums.txt.sig'), $TestSignature, $utf8)
     }
 
@@ -491,7 +504,8 @@ Describe 'Test-IsshoniSignature (7.2)' {
             Set-ItResult -Skipped -Because 'there is no ssh-keygen here'
             return
         }
-        [IO.File]::WriteAllText((Join-Path -Path $FakeDir -ChildPath 'checksums.txt'), $TestChecksums.Replace('bad1', 'bad2'))
+        $changed = $TestChecksums.Replace('bad1', 'bad2')
+        Write-TestStandardInput -Path (Join-Path -Path $FakeDir -ChildPath 'checksums.txt') -Text $changed
         $result = Test-IsshoniSignature -SshKeygen $sk -Directory $FakeDir -Signer @($TestSignerLine)
         $result.ExitCode | Should -Not -Be 0
     }
