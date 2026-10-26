@@ -81,6 +81,9 @@ func stepArgs(step *fixtureStep, work string, caseDur, parentStart float64) []st
 	switch step.verb {
 	case verbTone:
 		args = append(args, "-f", joinFreqs(step.freqs), "-d", fmtSec(life))
+		if step.am > 0 {
+			args = append(args, "-am", strconv.FormatFloat(step.am, 'g', -1, 64))
+		}
 	case verbIdle:
 		args = append(args, "-d", fmtSec(life))
 	case verbSpawn:
@@ -133,7 +136,8 @@ func planSpans(cs caseSpec, caseDur float64) map[string]planSpan {
 	return out
 }
 
-// fixtureRoles lists every role of cs's fixture tree, plus selfRole when the harness plays a tone itself.
+// fixtureRoles lists every role of cs's fixture tree, the roles of the fixtures the driver starts itself, and
+// selfRole when the harness plays a tone itself.
 func fixtureRoles(cs caseSpec) []string {
 	var out []string
 	var walk func(s *fixtureStep)
@@ -146,6 +150,7 @@ func fixtureRoles(cs caseSpec) []string {
 	for i := range cs.fixtures {
 		walk(&cs.fixtures[i])
 	}
+	out = append(out, cs.driverRoles...)
 	if cs.selfTone > 0 {
 		out = append(out, selfRole)
 	}

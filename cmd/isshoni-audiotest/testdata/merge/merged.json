@@ -1,0 +1,154 @@
+{
+  "v": 1,
+  "harness": "v0.2.0-14-g1a2b3c4",
+  "dll": {
+    "version": "0.2.0",
+    "sha256": "3f9a1c0b3f9a1c0b3f9a1c0b3f9a1c0b3f9a1c0b3f9a1c0b3f9a1c0b3f9a1c0b"
+  },
+  "os": {
+    "product": "win11",
+    "build": 26200,
+    "ubr": 6899,
+    "edition": "Professional"
+  },
+  "machine": {
+    "cpu": "AuthenticAMD",
+    "renderEndpoints": [
+      {
+        "formFactor": "Headphones",
+        "bus": "usb"
+      }
+    ],
+    "mic": true,
+    "masterVolume": 0.42,
+    "muted": false,
+    "duckingPreference": 3
+  },
+  "gate": true,
+  "gateConfig": {
+    "fastPath": true
+  },
+  "summary": {
+    "pass": 2,
+    "fail": 0,
+    "inconclusive": 0,
+    "skip": 0,
+    "info": 1,
+    "exit": 0
+  },
+  "cases": [
+    {
+      "name": "two-voice-apps",
+      "required": true,
+      "result": "PASS",
+      "checks": [
+        {
+          "freq": 1000,
+          "from": 1.5,
+          "to": 0,
+          "expect": "present",
+          "levelDb": -18.1,
+          "pass": true
+        },
+        {
+          "freq": 440,
+          "from": 1.5,
+          "to": 0,
+          "expect": "absent",
+          "levelDb": -141.7,
+          "maxShortDb": -128.4,
+          "maxShortAtS": 6.31,
+          "pass": true
+        }
+      ],
+      "measured": {},
+      "clicksAtS": [],
+      "problems": [],
+      "engine": [
+        "include-set"
+      ],
+      "counters": {
+        "trims": 0,
+        "underruns": 0
+      },
+      "events": [
+        {
+          "tMs": 1210,
+          "code": "stream_running",
+          "app": "fixture:game"
+        },
+        {
+          "tMs": 1500,
+          "code": "session_created",
+          "app": "other"
+        }
+      ]
+    },
+    {
+      "name": "runtime-rule",
+      "required": true,
+      "result": "PASS",
+      "checks": [
+        {
+          "freq": 440,
+          "from": 1.5,
+          "to": 4,
+          "expect": "present",
+          "levelDb": -18.2,
+          "pass": true
+        },
+        {
+          "freq": 440,
+          "from": 4.153,
+          "to": 0,
+          "expect": "absent",
+          "levelDb": -139,
+          "maxShortDb": -61.7,
+          "maxShortAtS": 4.178,
+          "pass": true
+        }
+      ],
+      "measured": {
+        "cutMs": {
+          "valueMs": 58,
+          "budgetMs": 100
+        }
+      },
+      "clicksAtS": [],
+      "problems": [],
+      "engine": [
+        "include-set"
+      ],
+      "counters": {},
+      "events": []
+    },
+    {
+      "name": "pid-reuse-tree",
+      "required": false,
+      "result": "INFO",
+      "checks": [],
+      "measured": {},
+      "clicksAtS": [],
+      "problems": [],
+      "engine": [],
+      "counters": {},
+      "events": [],
+      "info": {
+        "attempts": 37,
+        "captured": false,
+        "gameReason": "pid_reuse",
+        "matched": true
+      }
+    }
+  ],
+  "manual": [
+    {
+      "label": "R1",
+      "pass": true
+    },
+    {
+      "label": "R3",
+      "pass": true
+    }
+  ]
+}

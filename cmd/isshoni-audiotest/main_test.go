@@ -63,18 +63,30 @@ func TestRunWithoutEngine(t *testing.T) {
 }
 
 func TestSelectCases(t *testing.T) {
-	all, err := selectCases(runOptions{})
+	all, err := selectCases(runOptions{long: true})
 	if err != nil || len(all) != len(cases()) {
-		t.Fatalf("default selection: %d cases, err %v", len(all), err)
+		t.Fatalf("default selection with -long: %d cases, err %v", len(all), err)
 	}
-	sel, err := selectCases(runOptions{cases: []string{"2", "fast-path"}})
-	if err != nil || len(sel) != 2 || sel[0].num != 2 || sel[1].name != "fast-path" {
+	sel, err := selectCases(runOptions{cases: []string{"2", "fast-path", "9"}})
+	if err != nil || len(sel) != 3 || sel[0].num != 2 || sel[1].name != "fast-path" || sel[2].name != "steam-game" {
 		t.Fatalf("explicit selection: %+v err %v", sel, err)
 	}
-	if _, err := selectCases(runOptions{cases: []string{"9"}}); err == nil {
-		t.Fatal("case 9 (WA62b) should not resolve in this build")
+	if _, err := selectCases(runOptions{cases: []string{"28"}}); err == nil {
+		t.Fatal("case 28 doesn't exist and should not resolve")
 	}
 	if _, err := selectCases(runOptions{cases: []string{"nope"}}); err == nil {
 		t.Fatal("an unknown case name should error")
+	}
+}
+
+func TestRecordAndMergeUsage(t *testing.T) {
+	var b strings.Builder
+	if got := cmdMerge(&b, []string{"only-a-report.json"}); got != exitSetup || !strings.Contains(b.String(), "usage") {
+		t.Fatalf("merge with one argument: exit %d\n%s", got, b.String())
+	}
+	b.Reset()
+	if got := cmdRecord(&b, strings.NewReader(""), []string{"-d", "5"}); got != exitSetup ||
+		!strings.Contains(b.String(), "-label") {
+		t.Fatalf("record without -label: exit %d\n%s", got, b.String())
 	}
 }

@@ -60,8 +60,16 @@ func walkFixture(t *testing.T, caseName string, s *fixtureStep, roles map[string
 	if s.exe == "" {
 		t.Errorf("%s: fixture %q needs an exe path", caseName, s.role)
 	}
-	if s.amp < 0 || s.dur < 0 || s.at < 0 || s.orphanAfter < 0 {
+	if s.amp < 0 || s.dur < 0 || s.at < 0 || s.orphanAfter < 0 || s.am < 0 {
 		t.Errorf("%s: fixture %q has a negative amp or time", caseName, s.role)
+	}
+	if s.am > 0 {
+		if s.verb != verbTone {
+			t.Errorf("%s: fixture %q loops an AM tone but is a %s (only tone has -am)", caseName, s.role, s.verb)
+		}
+		if _, err := loopToneWAV(s.freqs, 0.125, s.am); err != nil {
+			t.Errorf("%s: fixture %q's loop: %v", caseName, s.role, err)
+		}
 	}
 	if s.child != nil {
 		if s.child.underExplorer {
@@ -136,6 +144,25 @@ func TestFixtureArgs(t *testing.T) {
 			`fixture spawn -role game -at 4 -tone 1000 -d 13 C:\work\Games\game.exe ` +
 				`fixture tone -role gameChild -f 683 -d 9`,
 		}},
+		// The mic cases: Steam holds the mic itself (`spawn -mic`) and its game sits in Steam's folder; Discord Web
+		// is a chrome.exe tab that plays and holds the mic; KOOK and the shared game play and hold it.
+		{9, 8, []string{
+			`fixture spawn -role steam -d 10 -mic C:\work\Steam\steamapps\common\TestGame\game.exe ` +
+				`fixture tone -role game -f 1000 -d 10`,
+		}},
+		{12, 8, []string{
+			`fixture tone -role game -f 1000 -d 10`,
+			`fixture spawn -role chrome -d 10 C:\work\Google\Chrome\Application\chrome.exe ` +
+				`fixture spawn -role discordWeb -tone 440 -d 10 -mic C:\work\Google\Chrome\Application\chrome.exe ` +
+				`fixture tone -role otherTab -f 797 -d 10`,
+		}},
+		{13, 8, []string{
+			`fixture tone -role game -f 1000 -d 10`,
+			`fixture tone -role kook -f 440 -d 10 -mic`,
+		}},
+		{14, 8, []string{
+			`fixture tone -role game -f 1000 -d 10 -mic`,
+		}},
 	}
 	for _, tc := range tests {
 		cs, ok := caseByNum(tc.num)
@@ -152,6 +179,23 @@ func TestFixtureArgs(t *testing.T) {
 		if !slices.Equal(got, tc.want) {
 			t.Errorf("case %d argv:\n got  %q\n want %q", tc.num, got, tc.want)
 		}
+	}
+}
+
+// TestSoakFixtureArgs: the soak's music loops 1000 + 683 Hz with the slow AM for the whole 30 minutes, and its
+// voice app idles with the mic as long (05 §18.5 case 23).
+func TestSoakFixtureArgs(t *testing.T) {
+	cs, _ := caseByName("soak")
+	var got []string
+	for i := range cs.fixtures {
+		got = append(got, strings.Join(fixtureArgs(&cs.fixtures[i], `C:\work`, soakSec), " "))
+	}
+	want := []string{`fixture tone -role music -f 1000,683 -d 1802 -am 0.1`, `fixture idle -role discord -d 1802 -mic`}
+	if !slices.Equal(got, want) {
+		t.Fatalf("soak argv:\n got  %q\n want %q", got, want)
+	}
+	if !cs.needsMic() {
+		t.Fatal("the soak's voice app holds the mic: the case needs one")
 	}
 }
 
@@ -174,7 +218,7 @@ func TestPlanSpans(t *testing.T) {
 // TestCaseFreqs: the silence pre-check listens for every frequency a case plays, its own tone included.
 func TestCaseFreqs(t *testing.T) {
 	cs, _ := caseByNum(10)
-	if got := caseFreqs(cs); !slices.Equal(got, []float64{freqBrowserTab, freqSelf, freqGame}) {
+	if got := caseFreqs(cs); !slices.Equal(got, []float64{freqBrowserTab, freqGame, freqSelf}) {
 		t.Errorf("case 10 freqs %v", got)
 	}
 	cs, _ = caseByNum(20)

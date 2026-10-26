@@ -71,19 +71,39 @@ func TestShippedFastPathDefault(t *testing.T) {
 	}
 }
 
-// TestCaseTableCoverage checks the WA62a case table holds exactly the cases this slice owns.
+// TestCaseTableCoverage checks the case table holds every case of 05 §18.5, in number order, with §18.5's name and
+// "Required" column: 24 required (three of them with the fast path, four needing a mic), two INFO, the soak a
+// minor-release tier case. With the shipped fastPath on, the 24 count toward the exit code, as §18.7's example
+// summary (pass 24, info 2) says.
 func TestCaseTableCoverage(t *testing.T) {
-	want := []int{1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 27}
+	want := []struct {
+		name string
+		req  requirement
+	}{
+		{"baseline-endpoint", reqYes}, {"builtin-voice", reqYes}, {"two-voice-apps", reqYes},
+		{"fast-path", reqFastPath}, {"fast-path-late-voice", reqFastPath}, {"helper-tree", reqYes},
+		{"late-helper", reqYes}, {"late-app", reqYes}, {"steam-game", reqMic}, {"isshoni-self", reqYes},
+		{"viewer-browser", reqYes}, {"browser-mic", reqMic}, {"mic-user", reqMic}, {"shared-app-mic", reqMic},
+		{"runtime-rule", reqYes}, {"app-boundary", reqYes}, {"tree-contains-excluded", reqYes}, {"orphan", reqYes},
+		{"probe-fallback", reqYes}, {"timestamps", reqYes}, {"opus", reqYes}, {"multi-endpoint", reqInfo},
+		{"soak", reqTierMinor}, {"viewer-browser-included", reqYes}, {"late-child-heard", reqYes},
+		{"fast-path-late-child", reqFastPath}, {"pid-reuse-tree", reqInfo},
+	}
 	got := cases()
 	if len(got) != len(want) {
-		t.Fatalf("case table has %d cases, want %d (WA62b adds 9, 12–14, 22, 23)", len(got), len(want))
+		t.Fatalf("case table has %d cases, want %d", len(got), len(want))
 	}
+	required := 0
 	for i, cs := range got {
-		if cs.num != want[i] {
-			t.Fatalf("case %d is %d, want %d (table must be in number order)", i, cs.num, want[i])
+		if cs.num != i+1 || cs.name != want[i].name || cs.req != want[i].req {
+			t.Fatalf("case at %d is %d %q (req %d), want %d %q (req %d)", i, cs.num, cs.name, cs.req, i+1,
+				want[i].name, want[i].req)
 		}
-		if cs.name == "" {
-			t.Fatalf("case %d has no name", cs.num)
+		if cs.requiredUnder(gateConfig{FastPath: true}) {
+			required++
 		}
+	}
+	if required != 24 {
+		t.Fatalf("%d required cases with the fast path on, want 24", required)
 	}
 }

@@ -38,8 +38,9 @@ import (
 // the capture bookkeeping, the verdict and the report are the portable core's; this file only produces their input.
 //
 // It builds on Windows only (the native engine exists only there, 04 §12.1). The Mac and CI ubuntu/macOS use
-// driver_other.go and run the analyzer and verdict tests. This driver's cases run on the owner's PC right after
-// group 6 merges (README WA62a).
+// driver_other.go and run the analyzer and verdict tests. This driver's cases run on the owner's PC: WA62a's right
+// after group 6 merged, every case of 05 §18.5 (`run -gate`) and the `record`/`merge` of R1 after WA62b (group 7).
+// The render endpoints come from mmdevice_windows.go.
 
 const (
 	reportEverySec = 0.25 // the report sample period (05 §18.6)
@@ -54,6 +55,44 @@ type winDriver struct {
 	hooks  *native.AudioTest
 	log    *slog.Logger
 	closed bool
+
+	// What the report's redaction needs (05 §18.7): the work folders of the cases so far, and the app and exe names
+	// the engine's reports showed.
+	redactMu sync.Mutex
+	workDirs []string
+	names    map[string]bool
+}
+
+// noteRedaction remembers a work folder and names for the report's redaction.
+func (d *winDriver) noteRedaction(workDir string, names ...string) {
+	d.redactMu.Lock()
+	defer d.redactMu.Unlock()
+	if workDir != "" {
+		d.workDirs = append(d.workDirs, workDir)
+	}
+	if d.names == nil {
+		d.names = map[string]bool{}
+	}
+	for _, n := range names {
+		if n != "" {
+			d.names[n] = true
+		}
+	}
+}
+
+// redaction is what the report's redaction needs (05 §18.7): the work folders (and the temp folder they live in),
+// the harness's folder, and the names seen.
+func (d *winDriver) redaction() redactInfo {
+	d.redactMu.Lock()
+	defer d.redactMu.Unlock()
+	info := redactInfo{workDirs: append([]string(nil), d.workDirs...)}
+	if exe, err := os.Executable(); err == nil {
+		info.harnessDir = filepath.Dir(exe)
+	}
+	for n := range d.names {
+		info.names = append(info.names, n)
+	}
+	return info
 }
 
 // newDriver loads the engine (native.Open) and resolves its test hooks (05 §18.1). Any failure (the DLL missing, the
@@ -127,7 +166,9 @@ func dllSHA256(dir string) (string, error) {
 }
 
 // readMachine is the report's machine (05 §18.4, recorded, not enforced). An empty RenderEndpoints list (none
-// active, or no report) makes every case SKIP with exit 3 (05 §18.4, §18.8).
+// active, or no report) makes every case SKIP with exit 3 (05 §18.4, §18.8). The endpoints are {formFactor, bus}
+// (05 §18.7: no friendly names), the default first, with the default's master volume and mute; Mic is a capture
+// endpoint with desktop-app access (05 §18.4: the mic cases SKIP without one).
 func (d *winDriver) readMachine() machineInfo {
 	m := machineInfo{RenderEndpoints: []endpointInfo{}, CPU: readCPUVendor(), DuckingPreference: readDuckingPref()}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -137,11 +178,59 @@ func (d *winDriver) readMachine() machineInfo {
 		d.say("note: no audio report (%v): no render endpoint is known", err)
 		return m
 	}
-	m.Mic = r.Device.CaptureEndpoints > 0
-	for range r.Device.RenderEndpoints {
-		m.RenderEndpoints = append(m.RenderEndpoints, endpointInfo{FormFactor: "unknown", Bus: "unknown"})
+	eps, err := listRenderEndpoints()
+	switch {
+	case err == nil && len(eps.endpoints) == r.Device.RenderEndpoints:
+		for _, e := range eps.endpoints {
+			m.RenderEndpoints = append(m.RenderEndpoints, endpointInfo{FormFactor: e.formFactor, Bus: e.bus})
+		}
+		m.MasterVolume, m.Muted = eps.volume, eps.muted
+	default:
+		if err != nil {
+			d.say("note: the render endpoints could not be listed (%v): recorded as unknown", err)
+		}
+		for range r.Device.RenderEndpoints {
+			m.RenderEndpoints = append(m.RenderEndpoints, endpointInfo{FormFactor: "unknown", Bus: "unknown"})
+		}
+	}
+	if r.Device.CaptureEndpoints > 0 {
+		access, why := micDesktopAccess()
+		m.Mic = access
+		if !access {
+			d.say("note: %s: the mic cases will SKIP", why)
+		}
 	}
 	return m
+}
+
+// The microphone privacy switches (Settings → Privacy & security → Microphone): "Microphone access" for the
+// device, "Let apps access your microphone" for the user, and "Let desktop apps access your microphone".
+const (
+	consentStoreMic   = `SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone`
+	consentStoreMicNP = consentStoreMic + `\NonPackaged`
+)
+
+// micDesktopAccess reports whether desktop apps may use the microphone (05 §18.4), from the consent store's three
+// switches; a missing value is the default, allowed. why names the switch that is off.
+func micDesktopAccess() (ok bool, why string) {
+	denied := func(root registry.Key, path string) bool {
+		k, err := registry.OpenKey(root, path, registry.QUERY_VALUE)
+		if err != nil {
+			return false
+		}
+		defer func() { _ = k.Close() }()
+		v, _, err := k.GetStringValue("Value")
+		return err == nil && strings.EqualFold(v, "Deny")
+	}
+	switch {
+	case denied(registry.LOCAL_MACHINE, consentStoreMic):
+		return false, "microphone access is off for this device"
+	case denied(registry.CURRENT_USER, consentStoreMic):
+		return false, "apps may not use the microphone"
+	case denied(registry.CURRENT_USER, consentStoreMicNP):
+		return false, "desktop apps may not use the microphone"
+	}
+	return true, ""
 }
 
 // selfCheck loads the DLL (done in newDriver), checks the probe, and starts and stops the watcher without sound
@@ -183,6 +272,22 @@ func (d *winDriver) probe(w io.Writer) error {
 	fmt.Fprintf(w, "engine: %s · audio backend: %s\n", d.eng.Info().Name, p.Audio.Backend)
 	fmt.Fprintf(w, "probe: result=%s osBuild=%d renderEndpoints=%d captureEndpoints=%d duckingPreference=%d\n",
 		r.Probe.Result, r.Probe.OSBuild, r.Device.RenderEndpoints, r.Device.CaptureEndpoints, readDuckingPref())
+	// The endpoints as the report names them (05 §18.7: {formFactor, bus}, no friendly names).
+	eps, err := listRenderEndpoints()
+	if err != nil {
+		fmt.Fprintf(w, "render endpoints: not listed (%v)\n", err)
+		return nil
+	}
+	for _, e := range eps.endpoints {
+		def := ""
+		if e.isDefault {
+			def = " (default)"
+		}
+		fmt.Fprintf(w, "render endpoint: formFactor=%s bus=%s%s\n", e.formFactor, e.bus, def)
+	}
+	if access, why := micDesktopAccess(); !access {
+		fmt.Fprintf(w, "microphone: %s\n", why)
+	}
 	return nil
 }
 
@@ -301,6 +406,7 @@ func (d *winDriver) prepare(cs caseSpec, cfg gateConfig, extra ...string) (*case
 		return nil, err
 	}
 	s.work = work
+	d.noteRedaction(work)
 	s.cleanup = append(s.cleanup, func() { removeAllRetry(work) })
 	if s.self, err = os.Executable(); err != nil {
 		s.close()
@@ -324,6 +430,9 @@ func (d *winDriver) prepare(cs caseSpec, cfg gateConfig, extra ...string) (*case
 	r, err := rec.AudioReport(ctx)
 	cancel()
 	if err == nil {
+		for _, a := range r.Apps {
+			d.noteRedaction("", a.Name, a.Exe)
+		}
 		if others := keptOutNames(r); len(others) > 0 {
 			s.keptOutPre = true
 			if cs.forceFastPath {
@@ -397,18 +506,37 @@ func (d *winDriver) silencePreCheck(svc *audio.Service, freqs []float64) string 
 // imAudiofTestFailProbe is IM_AUDIOF_TEST_FAIL_PROBE (05 §4.1): the engine behaves as if the startup probe failed.
 const imAudiofTestFailProbe = 0x80000000
 
-// runCase runs one tone case and returns its recording (05 §18.5): the preparation (copies, watcher,
-// preconditions), the fixtures under explorer, the harness's own tone, an audio-only session with the tap, the late
-// fixtures and mid-run calls timed from the recording's first tap chunk, the report samples, and the recording.
+// caseRun configures runCaseWith beyond the case itself.
+type caseRun struct {
+	dur      float64                     // the recording's length (s); 0 = caseDuration(cs)
+	sink     func(left, right []float64) // non-nil: stream the timeline here and keep no audio (the soak)
+	extra    []string                    // more exes to copy into the work folder before anything plays
+	start    func(fx *fixtureRun, work string, dur float64)
+	progress func(t float64) // called about once a second of the recording
+}
+
+// runCase runs one tone case and returns its recording (05 §18.5).
 func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
-	setup, err := d.prepare(cs, cfg)
+	return d.runCaseWith(cs, cfg, caseRun{})
+}
+
+// runCaseWith runs a case (05 §18.5): the preparation (copies, watcher, preconditions), the fixtures under explorer,
+// the harness's own tone, a fixture the driver starts itself (cr.start: case 22's endpoint tone), the settle, the
+// shared app's pid (case 14), an audio-only session with the tap, the late fixtures and mid-run calls timed from the
+// recording's first tap chunk (case 13's Decide, case 15's SetAppDecision, case 21's bitrate), the report samples,
+// and the recording.
+func (d *winDriver) runCaseWith(cs caseSpec, cfg gateConfig, cr caseRun) (recording, error) {
+	setup, err := d.prepare(cs, cfg, cr.extra...)
 	if err != nil {
 		return recording{}, err
 	}
 	defer setup.close()
 	svc, rec := setup.svc, setup.rec
 
-	caseDur := caseDuration(cs)
+	caseDur := cr.dur
+	if caseDur <= 0 {
+		caseDur = caseDuration(cs)
+	}
 	fx := newFixtureRun(setup.work, d.engineNow)
 	defer fx.killAll()
 	if cs.selfTone > 0 {
@@ -424,7 +552,22 @@ func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
 			fx.start(step, fixtureArgs(step, setup.work, caseDur))
 		}
 	}
+	if cr.start != nil {
+		cr.start(fx, setup.work, caseDur)
+	}
 	time.Sleep(secs(settleSec))
+
+	// The shared app (case 14): its pid goes into the rules before the session starts, as 03's share controller
+	// passes the pick's pid (05 §14.2).
+	var sharedPID uint32
+	if cs.sharedRole != "" {
+		pid, ok := fx.pidOf(cs.sharedRole)
+		if !ok {
+			return recording{}, errors.New("the shared app's fixture did not start")
+		}
+		sharedPID = pid
+		svc.SetSharedPID(pid)
+	}
 
 	// The audio-only session with the service's rules plus the tap and the test flags (05 §18.1).
 	ac := svc.AudioConfig()
@@ -434,7 +577,7 @@ func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc.OnShareStarted(0, true)
+	svc.OnShareStarted(sharedPID, true)
 	defer svc.OnShareStopped()
 	sess, err := d.eng.Start(ctx, media.Config{Audio: &ac})
 	if err != nil {
@@ -443,31 +586,21 @@ func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
 	defer func() { _ = sess.Stop() }()
 	offset := d.clockOffset(sess)
 	capt := newCapture(offset, setup.watchNS)
+	if cr.sink != nil {
+		capt = newStreamCapture(offset, setup.watchNS, cr.sink)
+	}
 
 	tSetIndex := int64(-1)
-	scheduled := false
-	deadline := time.Now().Add(secs(caseDur + 5))
-	nextReport := time.Now()
-	for capt.now() < caseDur && time.Now().Before(deadline) {
-		if capt.haveTap && !time.Now().Before(nextReport) {
-			d.sample(capt, svc, rec, fx)
-			nextReport = nextReport.Add(secs(reportEverySec))
+	lastProgress := 0.0
+	d.pull(ctx, sess, capt, caseDur, func() {
+		d.sample(capt, svc, rec, fx)
+		if t := capt.now(); cr.progress != nil && t-lastProgress >= 1 {
+			lastProgress = t
+			cr.progress(t)
 		}
-		pctx, pcancel := context.WithTimeout(ctx, 60*time.Millisecond)
-		pkt, err := sess.Next(pctx)
-		pcancel()
-		if err != nil {
-			continue // a pull timeout between packets
-		}
-		capt.packet(pkt)
-		if !scheduled && capt.haveTap {
-			nextReport = time.Now()
-			// t = 0 is the first tap chunk's capture time; its wall time is now minus how long ago that was.
-			scheduled = true
-			lag := max(d.engineNow()-(capt.tap0+offset), 0)
-			go fx.schedule(ctx, cs, time.Now().Add(-time.Duration(lag)), caseDur, svc, rec, sess, &tSetIndex)
-		}
-	}
+	}, func(origin time.Time) {
+		go fx.schedule(ctx, cs, origin, caseDur, svc, rec, sess, &tSetIndex)
+	})
 	d.sample(capt, svc, rec, fx)
 	cancel()
 	fx.killAll()
@@ -481,8 +614,9 @@ func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
 		d.say("  %s: kept out during the case, quit it for the fast-path cases: %s", cs.name,
 			strings.Join(others, ", "))
 	}
+	d.noteRedaction("", capt.seenNames()...)
 	out := capt.finish(cs, end)
-	if d.opt.keepWAV != "" {
+	if d.opt.keepWAV != "" && cr.sink == nil {
 		if err := os.MkdirAll(d.opt.keepWAV, 0o750); err == nil {
 			_ = writeWAV(filepath.Join(d.opt.keepWAV, cs.name+".wav"), interleave(out.left, out.right))
 		}
@@ -490,8 +624,45 @@ func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
 	return out, nil
 }
 
-// sample takes one report sample: the engine report, FriendsHear's banners and the app levels, with the fixtures'
-// pids as known now (05 §18.6).
+// pull reads the session's packets into capt until the recording is dur seconds long, a wall-clock deadline
+// passes or the session ends. From the first tap chunk on it calls onSample every 250 ms (05 §18.6); onStart, if
+// set, runs once at the first tap chunk with the wall time of the recording's t = 0.
+func (d *winDriver) pull(ctx context.Context, sess media.Session, capt *capture, dur float64, onSample func(),
+	onStart func(origin time.Time)) {
+	deadline := time.Now().Add(secs(dur + 5))
+	var next time.Time
+	for capt.now() < dur && time.Now().Before(deadline) {
+		if capt.haveTap && !time.Now().Before(next) {
+			onSample()
+			if next = next.Add(secs(reportEverySec)); next.Before(time.Now()) {
+				next = time.Now().Add(secs(reportEverySec)) // a slow sample: no burst of samples to catch up
+			}
+		}
+		pctx, pcancel := context.WithTimeout(ctx, 60*time.Millisecond)
+		pkt, err := sess.Next(pctx)
+		pcancel()
+		switch {
+		case err == nil:
+		case errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
+			continue // a pull timeout between packets
+		default:
+			return // the session ended, or the case was cancelled
+		}
+		hadTap := capt.haveTap
+		capt.packet(pkt)
+		if !hadTap && capt.haveTap {
+			next = time.Now()
+			if onStart != nil {
+				// t = 0 is the first tap chunk's capture time; its wall time is now minus how long ago that was.
+				lag := max(d.engineNow()-(capt.tap0+capt.offset), 0)
+				onStart(time.Now().Add(-time.Duration(lag)))
+			}
+		}
+	}
+}
+
+// sample takes one report sample: the engine report, FriendsHear's banners and prompts and the app levels, with
+// the fixtures' pids as known now (05 §18.6).
 func (d *winDriver) sample(capt *capture, svc *audio.Service, rec *recorder, fx *fixtureRun) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -503,7 +674,16 @@ func (d *winDriver) sample(capt *capture, svc *audio.Service, rec *recorder, fx 
 	if l, err := rec.AudioLevels(ctx); err == nil {
 		levels = &l
 	}
-	capt.sample(r, bannerCodesOf(svc.FriendsHear()), levels, fx.pidMap())
+	capt.sample(r, fhStateOf(svc.FriendsHear()), levels, fx.pidMap())
+}
+
+// fhStateOf is what a report sample reads from FriendsHear: the banner codes and the pending prompts.
+func fhStateOf(fh audio.FriendsHear) fhState {
+	st := fhState{banners: bannerCodesOf(fh)}
+	for _, p := range fh.Prompts {
+		st.prompts = append(st.prompts, promptState{kind: p.Kind, appID: p.AppID})
+	}
+	return st
 }
 
 // interleave merges two channels into interleaved stereo float32 for writeWAV.
@@ -523,18 +703,144 @@ func (d *winDriver) clockOffset(sess media.Session) int64 {
 	return eng - sess.Now()
 }
 
-// runSpecial runs a case the driver scores itself: timestamps (case 20), opus (case 21) and pid-reuse (case 27).
+// runSpecial runs a case the driver scores itself: timestamps (case 20), opus (case 21), multi-endpoint (case 22),
+// soak (case 23) and pid-reuse (case 27).
 func (d *winDriver) runSpecial(cs caseSpec, cfg gateConfig) (caseReport, error) {
 	switch cs.special {
 	case "timestamps":
 		return d.runTimestamps(cs, cfg)
 	case "opus":
 		return d.runOpus(cs, cfg)
+	case "multi-endpoint":
+		return d.runMultiEndpoint(cs, cfg)
+	case "soak":
+		return d.runSoak(cs, cfg)
 	case "pid-reuse":
 		return d.runPIDReuse(cs, cfg)
 	default:
 		return caseReport{}, fmt.Errorf("unknown special case %q", cs.special)
 	}
+}
+
+// runMultiEndpoint (case 22, INFO) records whether a tone on a second render endpoint is captured (05 §18.5): the
+// game plays 1000 Hz on the default endpoint, and a reparented copy (`fixture endpoint-tone`, Games2\game2.exe)
+// renders 683 Hz with im_test_render_tone on the first active render endpoint that isn't the default.
+func (d *winDriver) runMultiEndpoint(cs caseSpec, cfg gateConfig) (caseReport, error) {
+	eps, err := listRenderEndpoints()
+	if err != nil {
+		return caseReport{}, fmt.Errorf("list the render endpoints: %w", err)
+	}
+	other := ""
+	for _, e := range eps.endpoints {
+		if !e.isDefault {
+			other = e.id
+			break
+		}
+	}
+	if other == "" {
+		return skipped(cs, cfg, "no active render endpoint besides the default"), nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return caseReport{}, err
+	}
+	dllDir := filepath.Dir(exe)
+	rec, err := d.runCaseWith(cs, cfg, caseRun{extra: []string{exeGame2},
+		start: func(fx *fixtureRun, work string, dur float64) {
+			fx.startExe("game2", filepath.Join(work, exeGame2), []string{"fixture", verbEndpointTone, "-role", "game2",
+				"-dll", dllDir, "-endpoint", other, "-f", joinFreqs([]float64{freqLateGame}),
+				"-d", fmtSec(dur + settleSec + 1)}, true)
+		}})
+	if err != nil {
+		return caseReport{}, err
+	}
+	return scoreMultiEndpoint(cs, cfg, rec, len(eps.endpoints)), nil
+}
+
+// runSoak (case 23, `run -long`) records 30 minutes of the music-like fixture with the idle voice app holding the
+// mic, streaming the tap into the soak analyzer (soak.go) instead of keeping it, and prints its progress each
+// minute.
+func (d *winDriver) runSoak(cs caseSpec, cfg gateConfig) (caseReport, error) {
+	all, short := soakFreqs(cs)
+	sa := newSoakAnalyzer(1.5, all, short)
+	lastMin := 0
+	rec, err := d.runCaseWith(cs, cfg, caseRun{dur: soakSec, sink: sa.feed, progress: func(t float64) {
+		if m := int(t / 60); m > lastMin {
+			lastMin = m
+			d.say("  soak: %d of %d min", m, int(soakSec/60))
+		}
+	}})
+	if err != nil {
+		return caseReport{}, err
+	}
+	return scoreSoak(cs, cfg, rec, sa.result()), nil
+}
+
+// record is `record`'s recording (05 §18.2): the built-in rules plus -exclude's keep-out rules, a share-like audio
+// session with the tap, every chunk to sink, and every second the apps friends hear and those kept out. Names are
+// printed by the sink on the console only.
+func (d *winDriver) record(ro recordOptions, sink recordSink) error {
+	svc, _, stop, err := d.newService(audio.DefaultSettings(), nil)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	for _, exe := range ro.exclude {
+		if err := svc.SetAppDecision("exe:"+exe, audio.DecisionKeepOut); err != nil {
+			d.say("note: -exclude %s: %v", exe, err)
+		}
+	}
+	if err := svc.Watch(true); err != nil {
+		return err
+	}
+	ac := svc.AudioConfig()
+	ac.TapPCM = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.OnShareStarted(0, true)
+	defer svc.OnShareStopped()
+	sess, err := d.eng.Start(ctx, media.Config{Audio: &ac})
+	if err != nil {
+		return fmt.Errorf("start the audio session: %w", err)
+	}
+	defer func() { _ = sess.Stop() }()
+	var sinkErr error
+	capt := newStreamCapture(d.clockOffset(sess), d.engineNow(), func(l, r []float64) {
+		if sinkErr == nil {
+			sinkErr = sink.pcm(l, r)
+		}
+	})
+	lastStatus := -1.0
+	d.pull(ctx, sess, capt, ro.dur, func() {
+		if t := capt.now(); t-lastStatus >= 1 {
+			lastStatus = t
+			sink.status(hearStatusOf(t, svc.FriendsHear()))
+		}
+	}, nil)
+	if capt.nSamples == 0 {
+		return errors.New("no audio was captured")
+	}
+	return sinkErr
+}
+
+// hearStatusOf is one second of `record`'s status: the playing apps friends hear, and every app kept out.
+func hearStatusOf(t float64, fh audio.FriendsHear) hearStatus {
+	st := hearStatus{t: t}
+	name := func(r audio.AppRow) string {
+		if r.Name != "" {
+			return r.Name
+		}
+		return r.ID
+	}
+	for _, r := range fh.Heard {
+		if r.Playing {
+			st.heard = append(st.heard, name(r))
+		}
+	}
+	for _, r := range fh.KeptOut {
+		st.keptOut = append(st.keptOut, namedReason{name: name(r), reason: r.Reason})
+	}
+	return st
 }
 
 // ---------------------------------------------------------------- fixtures
@@ -565,6 +871,7 @@ type fixtureRun struct {
 	started       map[string]int64
 	exit          map[string]int64
 	onsets        []int64
+	micFail       bool // a fixture reported that it could not open the microphone
 	wg            sync.WaitGroup
 }
 
@@ -670,7 +977,8 @@ func (f *fixtureRun) track(role string, pid uint32) *trackedProc {
 }
 
 // scan reads the fixtures' JSON lines until every process holding the pipe exited: a hello registers the pid of a
-// child the harness didn't start itself; a first render, a start or the bursts' onsets are recorded.
+// child the harness didn't start itself; a first render, a start, a microphone failure or the bursts' onsets are
+// recorded.
 func (f *fixtureRun) scan(r io.ReadCloser) {
 	defer func() { _ = r.Close() }()
 	sc := bufio.NewScanner(r)
@@ -693,6 +1001,9 @@ func (f *fixtureRun) scan(r io.ReadCloser) {
 		}
 		if len(l.OnsetNS) > 0 {
 			f.onsets = append([]int64(nil), l.OnsetNS...)
+		}
+		if l.MicError != "" {
+			f.micFail = true
 		}
 		f.mu.Unlock()
 	}
@@ -726,8 +1037,9 @@ func (f *fixtureRun) pidOf(role string) (uint32, bool) {
 }
 
 // schedule starts the late fixtures and makes the mid-run calls (05 §18.5), each at its time after origin, the wall
-// time of the recording's t = 0: case 15's SetAppDecision at 4 s (its T_set is the first recorder stamp after the
-// call) and case 21's bitrate change at 4 s. It returns when ctx ends.
+// time of the recording's t = 0: case 13's Decide at 5 s and case 15's SetAppDecision at 4 s (T_set is the first
+// recorder stamp after the call), and case 21's bitrate change at 4 s. It registers them and returns; they end with
+// ctx.
 func (f *fixtureRun) schedule(ctx context.Context, cs caseSpec, origin time.Time, caseDur float64,
 	svc *audio.Service, rec *recorder, sess media.Session, tSetIndex *int64) {
 	at := func(s float64, fn func()) {
@@ -756,6 +1068,39 @@ func (f *fixtureRun) schedule(ctx context.Context, cs caseSpec, origin time.Time
 	case cs.special == "opus":
 		at(4, func() { _ = sess.SetBitrate(media.LayerAudio, 256000) })
 	}
+	if dc := cs.decide; dc != nil {
+		at(dc.at, func() { f.decide(*dc, svc, rec, tSetIndex) })
+	}
+}
+
+// decide answers the pending prompt of dc.role's app (case 13, 05 §18.5): the app id is that of the fixture's
+// sessions in a fresh report; the recorder's stamp count is taken right before Service.Decide, so the next stamp is
+// T_set. Without a pending prompt it does nothing: T_set never comes, and the verdict reports the missing prompt.
+func (f *fixtureRun) decide(dc decideCall, svc *audio.Service, rec *recorder, tSetIndex *int64) {
+	pid, ok := f.pidOf(dc.role)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := rec.AudioReport(ctx)
+	if err != nil {
+		return
+	}
+	appID := ""
+	for _, s := range r.Sessions {
+		if s.PID == pid && s.AppID != "" {
+			appID = s.AppID
+			break
+		}
+	}
+	for _, p := range svc.FriendsHear().Prompts {
+		if appID != "" && p.AppID == appID {
+			atomic.StoreInt64(tSetIndex, int64(rec.stampCount()))
+			_ = svc.Decide(p.ID, audio.Decision(dc.decision))
+			return
+		}
+	}
 }
 
 // end is what the fixture run knows for the capture's finish (05 §18.3, §18.6).
@@ -764,7 +1109,7 @@ func (f *fixtureRun) end(cs caseSpec, caseDur float64) captureEnd {
 	defer f.mu.Unlock()
 	return captureEnd{
 		dur: caseDur, plan: planSpans(cs, caseDur), reparented: f.allReparented,
-		firstRender: cloneNS(f.firstRender), start: cloneNS(f.started), exit: cloneNS(f.exit),
+		firstRender: cloneNS(f.firstRender), start: cloneNS(f.started), exit: cloneNS(f.exit), micFail: f.micFail,
 	}
 }
 

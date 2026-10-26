@@ -3,12 +3,13 @@ package main
 import (
 	"fmt"
 	"math"
+	"slices"
 	"testing"
 )
 
 // These tests are 05 §19.1's analyzer tests on synthetic recordings: Goertzel levels, the present/absent rule, the
-// short-window rule (a 20 ms 440 Hz burst FAILs absent; a faded 1000 Hz tone never trips 907 Hz), clicks, and the
-// measured cut and onset. They run on every OS.
+// short-window rule (a 20 ms 440 Hz burst FAILs absent; a faded 1000 Hz tone never trips isshoni's tone), clicks,
+// and the measured cut and onset. They run on every OS.
 
 func TestToneLevelMeasuresAmplitude(t *testing.T) {
 	x := sineAt(sampleRate, freqGame, 0.25) // −12.04 dBFS
@@ -62,41 +63,67 @@ func TestShortWindowBurstFailsAbsent(t *testing.T) {
 	}
 }
 
-// TestFadedToneNeverTrips907 is 05 §19.1's "a −18 dBFS 1000 Hz tone with 5 ms and 10 ms linear fade-ins and
-// fade-outs, and with its onsets, never trips a short-window absent check at 907 Hz; a tone with S1's 20 ms WAV
-// fades doesn't either". The tone sits inside silence, so the 50 ms windows span its onset and its cut, at every
-// offset of the 10 ms hop (7-sample steps).
+// TestFadedToneNeverTripsSelf is 05 §19.1's "a −18 dBFS 1000 Hz tone with 5 ms and 10 ms linear fade-ins and
+// fade-outs, and with its onsets, never trips a short-window absent check" at isshoni's own frequency; "a tone with
+// S1's 20 ms WAV fades doesn't either". The tone sits inside silence, so the 50 ms windows span its onset and its
+// cut, at every offset of the 10 ms hop (7-sample steps). The same holds for 683 Hz, the other tone heard in the
+// cases where isshoni plays (4 and 26), and for the 797 Hz tab of case 10.
 //
-// The 5 ms linear fade (the mixer's onset ramp, 05 §9.5) measures about −44 dBFS at 907 Hz, over the −50 dBFS limit:
-// 05 §18.6's "at most about −64 dBFS" doesn't hold, so an absent check at 907 Hz can FAIL on a correct engine when a
-// 1000 Hz onset or cut lands in its window. That needs a spec decision (the integrator's write-back: move isshoni's
-// tone at least 200 Hz from 1000 Hz, or leave windows that overlap a present tone's onset or cut out of the
-// short-window maximum); until then the 5 ms case is skipped with its measured value, and the 10 ms and 20 ms fades
-// must pass.
-func TestFadedToneNeverTrips907(t *testing.T) {
-	for _, fadeMs := range []float64{5, 10, 20} {
-		t.Run(fmt.Sprintf("%.0fms", fadeMs), func(t *testing.T) {
-			tone := fadedTone(freqGame, dbToAmp(-18), 1.0, fadeMs/1000)
-			worst, worstAt := silenceFloorDB, 0.0
-			for k := range int(shortHopSec*sampleRate) / 7 {
-				m := make([]float64, 3*sampleRate)
-				copyInto(m, tone, sampleRate+k*7)
-				if whole := toneLevelDB(m, sampleRate, freqSelf); whole > absentMaxDB {
-					t.Fatalf("907 Hz whole-window %.1f dB trips absent", whole)
+// The self check runs at freqSelf (1700 Hz), not 05 §18.6's 907 Hz: there a 5 ms linear onset of 1000 Hz reads about
+// −44 dBFS, over the −50 dBFS limit (WA62a's measurement, the integrator's decision for group 6; cases.go). The
+// whole-window and short-window maxima must stay below the limit with a margin of 10 dB.
+func TestFadedToneNeverTripsSelf(t *testing.T) {
+	for _, src := range []float64{freqGame, freqLateGame, freqBrowserTab} {
+		for _, fadeMs := range []float64{5, 10, 20} {
+			t.Run(fmt.Sprintf("%.0fHz-%.0fms", src, fadeMs), func(t *testing.T) {
+				t.Parallel()
+				// 200 ms of tone inside 400 ms: every 50 ms window spans silence, the onset, the steady tone or
+				// the cut.
+				tone := fadedTone(src, dbToAmp(-18), 0.2, fadeMs/1000)
+				worst, worstAt := silenceFloorDB, 0.0
+				for k := range int(shortHopSec*sampleRate) / 7 {
+					m := make([]float64, int(0.4*sampleRate))
+					copyInto(m, tone, int(0.1*sampleRate)+k*7)
+					if whole := toneLevelDB(m, sampleRate, freqSelf); whole > absentMaxDB-10 {
+						t.Fatalf("%d Hz whole-window %.1f dB is within 10 dB of the absent limit", freqSelf, whole)
+					}
+					if maxShort, atS := shortWindow(m, sampleRate, freqSelf); maxShort > worst {
+						worst, worstAt = maxShort, atS
+					}
 				}
-				if maxShort, atS := shortWindow(m, sampleRate, freqSelf); maxShort > worst {
-					worst, worstAt = maxShort, atS
+				if worst > absentMaxDB-10 {
+					t.Fatalf("%d Hz short-window max %.1f dB at %.3f s is within 10 dB of the absent limit %.0f",
+						freqSelf, worst, worstAt, absentMaxDB)
 				}
+			})
+		}
+	}
+}
+
+// TestSelfToneSpacing pins the group 6 decision: isshoni's own tone lies at least 200 Hz from the engine's 1000 Hz
+// test tone and from every other tone a fixture plays or a case checks, and every other pair stays 05 §18.3's 90 Hz
+// apart.
+func TestSelfToneSpacing(t *testing.T) {
+	tones := []float64{freqGame, 997 /* the startup probe's tone, 05 §11.2 */, freqBursts}
+	for _, cs := range cases() {
+		for _, f := range caseFreqs(cs) {
+			if f != freqSelf && !slices.Contains(tones, f) {
+				tones = append(tones, f)
 			}
-			if worst > absentMaxDB && fadeMs == 5 {
-				t.Skipf("05 §18.6 spec issue (escalated): a 5 ms linear onset/cut reads %.1f dB at 907 Hz (window "+
-					"at %.3f s), over %.0f dB", worst, worstAt, absentMaxDB)
+		}
+	}
+	for _, f := range tones {
+		if d := math.Abs(f - freqSelf); d < selfSpacingHz {
+			t.Errorf("isshoni's tone %d Hz is %.0f Hz from %.0f Hz, want ≥ %d", freqSelf, d, f, selfSpacingHz)
+		}
+	}
+	plan := []float64{freqGame, freqLateGame, freqVoice, freqVoice2, freqBrowserTab, freqSelf}
+	for i, a := range plan {
+		for _, b := range plan[i+1:] {
+			if math.Abs(a-b) < 90 {
+				t.Errorf("tones %.0f and %.0f Hz are closer than 90 Hz", a, b)
 			}
-			if worst > absentMaxDB {
-				t.Fatalf("907 Hz short-window max %.1f dB at %.3f s trips absent (want ≤ %.0f)", worst, worstAt,
-					absentMaxDB)
-			}
-		})
+		}
 	}
 }
 

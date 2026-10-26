@@ -5,8 +5,8 @@ package main
 // as INFO and never change the exit code.
 
 // requiredUnder reports whether cs counts toward the gate exit code under cfg (05 §18.10). A fast-path case counts
-// only when the gate ships audio.fastPath on; INFO and tier cases never count; a mic case counts but SKIPs without a
-// microphone (WA62b).
+// only when the gate ships audio.fastPath on; INFO and tier cases never count; a mic case counts, and SKIPs (exit 3,
+// the gate incomplete) without a microphone with desktop-app access.
 func (cs caseSpec) requiredUnder(cfg gateConfig) bool {
 	switch cs.req {
 	case reqYes, reqMic:
@@ -19,9 +19,13 @@ func (cs caseSpec) requiredUnder(cfg gateConfig) bool {
 }
 
 // effectiveResult is cs's result as it counts for the gate: a fast-path case that the gate does not require is
-// reported as INFO whatever it measured (05 §18.10: "they still run … as INFO and never change the exit code").
+// reported as INFO whatever it measured (05 §18.10: "they still run … as INFO and never change the exit code"), and
+// so is an INFO case (22, 27) unless it was SKIPPED (case 22 with one endpoint, 05 §18.5).
 func effectiveResult(cs caseSpec, cfg gateConfig, result string) string {
-	if !cs.requiredUnder(cfg) && cs.req == reqFastPath {
+	switch {
+	case !cs.requiredUnder(cfg) && cs.req == reqFastPath:
+		return resultInfo
+	case cs.req == reqInfo && result != resultSkip:
 		return resultInfo
 	}
 	return result
