@@ -31,8 +31,6 @@ var (
 	procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
 )
 
-var errStopped = errors.New("winos: stopped")
-
 // SingleInstance is the single-instance lock and its pipe. Safe for concurrent use.
 type SingleInstance struct {
 	mutexName string
@@ -131,52 +129,38 @@ func (s *SingleInstance) serve(onArgs func([]string), sa *windows.SecurityAttrib
 	if err != nil {
 		return
 	}
-	// The first instance of the pipe must be ours (FILE_FLAG_FIRST_PIPE_INSTANCE: nobody squats the name).
-	h, err := s.createPipe(name, sa, true)
+	serveLoop(winPipeServer{s: s, name: name, sa: sa}, onArgs, s.log)
+}
+
+// winPipeServer is serveLoop's pipe: instances of the named pipe, in byte mode. A client may connect to an instance
+// as soon as it exists (it is listening from CreateNamedPipe on), and what the client wrote stays readable after it
+// closed its end, until the instance is disconnected.
+type winPipeServer struct {
+	s    *SingleInstance
+	name *uint16
+	sa   *windows.SecurityAttributes
+}
+
+func (p winPipeServer) create(first bool) (pipeInstance, error) {
+	h, err := p.s.createPipe(p.name, p.sa, first)
 	if err != nil {
-		if !errors.Is(err, errStopped) {
-			s.log.Warn("winos: the single-instance pipe can't be created; second launches can't reach this one",
-				"err", err)
-		}
-		return
+		return nil, err
 	}
-	for {
-		if s.stopped() { // Close ran while onArgs handled the last command line
-			_ = windows.CloseHandle(h)
-			return
-		}
-		data, err := s.accept(h)
-		quit := errors.Is(err, errStopped)
-		// The next instance is created before this one is closed, so the name is never free for another account to
-		// create while this process serves; a launch that comes while onArgs runs connects to it and waits there.
-		var next windows.Handle
-		var nextErr error
-		if !quit {
-			next, nextErr = s.createPipe(name, sa, false)
-		}
-		_ = windows.DisconnectNamedPipe(h)
-		_ = windows.CloseHandle(h)
-		if quit {
-			return
-		}
-		var args []string
-		if err == nil {
-			args, err = decodeArgs(data)
-		}
-		if err != nil {
-			s.log.Info("winos: a second launch's message was dropped", "err", err)
-		} else {
-			onArgs(args)
-		}
-		if nextErr != nil {
-			if !errors.Is(nextErr, errStopped) {
-				s.log.Warn("winos: the single-instance pipe can't be created; second launches can't reach this one",
-					"err", nextErr)
-			}
-			return
-		}
-		h = next
-	}
+	return winPipe{s: p.s, h: h}, nil
+}
+
+func (p winPipeServer) stopped() bool { return p.s.stopped() }
+
+type winPipe struct {
+	s *SingleInstance
+	h windows.Handle
+}
+
+func (p winPipe) accept() ([]byte, error) { return p.s.accept(p.h) }
+
+func (p winPipe) close() {
+	_ = windows.DisconnectNamedPipe(p.h) // ERROR_PIPE_NOT_CONNECTED when no client connected: nothing to do
+	_ = windows.CloseHandle(p.h)
 }
 
 // stopped reports whether Close has set the stop event.

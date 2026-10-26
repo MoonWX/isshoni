@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,19 +244,23 @@ func TestForwardChecksTheServer(t *testing.T) {
 }
 
 // TestServesWhileHandling: while onArgs handles one command line, the pipe's name stays served (the next instance
-// exists before the last one closes), so another launch's forward succeeds at once and arrives afterwards.
+// exists before the last one closes), so another launch's forward succeeds at once, while the first is still being
+// handled, and arrives afterwards: the client wrote and closed its end before the server accepted it (ERROR_NO_DATA).
 func TestServesWhileHandling(t *testing.T) {
-	entered, release := make(chan struct{}, 1), make(chan struct{})
+	// Only the first call is held: a later one that took the same path would wait for a release nobody sends.
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
 	got := make(chan []string, 2)
 	_, b := serving(t, func(args []string) {
-		select {
-		case entered <- struct{}{}:
+		if calls.Add(1) == 1 {
+			close(entered)
 			<-release
-		default:
 		}
 		got <- args
 	})
-	defer close(release)
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	if err := b.Forward([]string{"one"}); err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +276,10 @@ func TestServesWhileHandling(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Errorf("the forward waited %v for a pipe instance", d)
 	}
-	release <- struct{}{}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("onArgs was called %d times while the first call ran", n)
+	}
+	unblock()
 	for _, want := range []string{"one", "two"} {
 		select {
 		case g := <-got:
