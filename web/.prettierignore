@@ -1,6 +1,9 @@
 # Build output and generated files are never reformatted (05 §2): `task gen:check` compares tygo's raw output.
 dist/
 src/protocol/*.gen.ts
+# The desktop bridge's codes (tygo) and Wails bindings (`task gen:bindings`): their drift checks compare raw output.
+src/platform/desktop/*.gen.ts
+src/platform/desktop/bindings/
 build-report.json
 playwright-report/
 test-results/

@@ -23,3 +23,7 @@ packages:
       # The relay's payloads use protocol's enums; relay.gen.ts imports them from types.gen.ts (the frontmatter).
       protocol.ClientOS: "ClientOS"
     frontmatter: "// Source: internal/protocol/relay. Regenerate with \"task gen\".\nimport type { ClientOS } from './types.gen';\n"
+  - path: "github.com/MoonWX/isshoni/internal/desktop/bridge/codes" # the desktop bridge's error codes (docs/m2/03-desktop-app.md §6.4)
+    output_path: "web/src/platform/desktop/codes.gen.ts"
+    enum_style: "union"
+    frontmatter: "// Source: internal/desktop/bridge/codes. Regenerate with \"task gen\".\n"

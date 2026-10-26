@@ -22,6 +22,12 @@
 // The network. `link` is a SOCKS5 proxy that a browser context can reach the server through, and that the test cuts
 // and restores (rooms.spec, reconnect.spec): Chrome's own offline emulation (context.setOffline) is no cut for a
 // WebSocket that is already open (05 §19.3).
+//
+// The desktop app in Chrome (M2 03 §22.4 A). `startDesktop()` starts the harness internal/desktop/e2ehost (the app's
+// real Go parts on the fake engine: DESKTOP_E2E_BIN, or a build of it with the Go toolchain) and a Chrome of its own
+// that reaches it at the desktop app's origin http://wails.localhost (--host-resolver-rules), so the page runs the
+// desktop SPA over the HTTP transport. `desktop.state()` reads what the app did of the window, the browser, toasts
+// and the OS (GET /__e2e/state); `desktop.call()` calls a bound method as the page would.
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import dgram from 'node:dgram';
@@ -37,6 +43,7 @@ import {
   request,
   type APIRequestContext,
   type APIResponse,
+  type Browser,
   type BrowserContext,
   type Page,
   type Video,
@@ -167,11 +174,15 @@ export interface TestFixtures {
    * `browser.newContext({ proxy: { server: link.proxy } })` reaches the server through it. Closed when the test ends.
    */
   link: Link;
+  /** Starts the desktop app in Chrome (see DesktopApp); it is stopped when the test ends. */
+  startDesktop: (options?: StartDesktopOptions) => Promise<DesktopApp>;
 }
 
 export interface WorkerFixtures {
   /** This worker's server: set up, with an admin. Don't restart it or change its server-wide settings. */
   server: E2EServer;
+  /** The desktop e2e harness's binary: DESKTOP_E2E_BIN, or a build of internal/desktop/e2ehost. */
+  desktopBin: string;
 }
 
 // ---- Names, passwords, addresses ----
@@ -766,6 +777,276 @@ async function launch(
   return server;
 }
 
+// ---- The desktop app in Chrome (M2 03 §22.4 A) ----
+
+/** The environment variable that names a built desktop e2e harness (internal/desktop/e2ehost). */
+export const DESKTOP_BIN_ENV = 'DESKTOP_E2E_BIN';
+
+/** The desktop app's asset origin on Windows (protocol.DesktopAssetOriginWindows): the harness serves the page here. */
+export const DESKTOP_ORIGIN = 'http://wails.localhost';
+
+/** A cold build downloads the toolchain and the modules first. */
+const DESKTOP_BUILD_TIMEOUT_MS = 10 * 60_000;
+const DESKTOP_READY_TIMEOUT_MS = 30_000;
+
+export interface StartDesktopOptions {
+  /** A server origin the harness adds and makes active before the page loads (-server), as the add step would. */
+  server?: string;
+  /** How long Shell.Reload waits before it counts (-reload-delay), so a spec can act in the moment before it. */
+  reloadDelayMs?: number;
+  /** The app's command line, as the first instance's own (App.Boot). */
+  args?: string[];
+  /** 05's fake audio scenario (05 §13.3; ISSHONI_FAKE_AUDIO); default normal. */
+  fakeAudio?: string;
+}
+
+/** What the harness's recording Shell and OSHooks saw (GET /__e2e/state; e2ehost's hostState). */
+export interface DesktopState {
+  origin: string;
+  windowVisible: boolean;
+  showWindowCalls: number;
+  fullscreen: boolean;
+  reloads: number;
+  /** The URLs the app opened in the system browser (Shell.OpenURL, after its check). */
+  openedUrls: string[];
+  refusedUrls: number;
+  toasts: unknown[];
+  quit: boolean;
+  /** Registered hotkeys: id → combination. */
+  hotkeys: Record<string, string>;
+  keepAwake: boolean;
+  pill: unknown;
+  excludedWindows: number;
+  autostart: boolean;
+  osPages: string[];
+  /** Each access token handed to the page: the origin asked for, the active origin, the first 8 bytes of its SHA-256. */
+  tokens: { origin: string; activeOrigin: string; sha256: string }[];
+  /** The runtime requests that passed the Guard and reached the stub /wails/runtime: W21's object and method ids. */
+  runtimeCalls: { object: number; method: number }[];
+  tray: unknown;
+}
+
+/** A bound method's rejection: 03 §6.4's {code, params} with the HTTP status. */
+export class DesktopCallError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly params: Readonly<Record<string, unknown>>,
+  ) {
+    super(`bridge call failed: ${String(status)} ${code}`);
+  }
+}
+
+export interface DesktopApp {
+  /** http://wails.localhost: the page's origin in this app's Chrome. */
+  readonly origin: string;
+  /** The harness itself, http://127.0.0.1:<port>, for the spec's own requests (Node can't resolve wails.localhost). */
+  readonly hostUrl: string;
+  /** The harness's log (debug level, JSON lines). */
+  readonly logPath: string;
+  /** A Chrome of its own whose wails.localhost is the harness, its context, and a page that has not navigated yet. */
+  readonly browser: Browser;
+  readonly context: BrowserContext;
+  readonly page: Page;
+  state(): Promise<DesktopState>;
+  /** Calls a bound method (03 §6.2) as the page would; rejects with a DesktopCallError. */
+  call<T = unknown>(service: string, method: string, ...args: unknown[]): Promise<T>;
+  /** Delivers a command line as a second instance would forward it (POST /__e2e/args). */
+  args(args: string[]): Promise<void>;
+  /** A hotkey press (POST /__e2e/hotkey). */
+  hotkey(id: 'pause' | 'stop'): Promise<void>;
+  /** An OS event (POST /__e2e/system). */
+  system(event: 'lock' | 'unlock' | 'suspend' | 'resume' | 'end-session' | 'display-change'): Promise<void>;
+  stop(): Promise<void>;
+}
+
+/** The harness's environment: this process's without ISSHONI_* variables, plus the fake audio scenario. */
+function desktopEnv(fakeAudio: string | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!name.startsWith('ISSHONI_')) env[name] = value;
+  }
+  if (fakeAudio !== undefined) env['ISSHONI_FAKE_AUDIO'] = fakeAudio;
+  return env;
+}
+
+/** Builds internal/desktop/e2ehost into dir; it embeds web/dist, so the web app must be built (task build:web). */
+async function buildDesktopHarness(dir: string): Promise<string> {
+  if (!fs.existsSync(path.join(REPO_ROOT, 'web', 'dist', 'index.html'))) {
+    throw new Error(`web/dist/index.html is missing: run \`task build\` (or \`task e2e\`), or set ${DESKTOP_BIN_ENV}`);
+  }
+  const bin = path.join(dir, process.platform === 'win32' ? 'e2ehost.exe' : 'e2ehost');
+  try {
+    await execFileAsync('go', ['build', '-o', bin, './internal/desktop/e2ehost'], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, CGO_ENABLED: '0' },
+      timeout: DESKTOP_BUILD_TIMEOUT_MS,
+    });
+  } catch (err) {
+    const stderr = (err as { stderr?: unknown }).stderr;
+    throw new Error(
+      `building ./internal/desktop/e2ehost failed; set ${DESKTOP_BIN_ENV} to a built binary, or put Go on the PATH: ` +
+        (typeof stderr === 'string' && stderr !== '' ? stderr.trim() : String(err)),
+      { cause: err },
+    );
+  }
+  return bin;
+}
+
+let desktops = 0;
+
+/** Starts one harness and its Chrome. */
+async function launchDesktop(
+  bin: string,
+  options: StartDesktopOptions,
+  launch: (args: string[]) => Promise<Browser>,
+  where: { readonly project: { readonly outputDir: string }; readonly workerIndex: number },
+): Promise<DesktopApp & { readonly failed: () => string | null }> {
+  await fsp.mkdir(where.project.outputDir, { recursive: true });
+  const logPath = path.join(where.project.outputDir, `desktop-${String(where.workerIndex)}-${String(++desktops)}.log`);
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'isshoni-e2e-desktop-'));
+  const flags = ['-data', dataDir];
+  if (options.server !== undefined) flags.push('-server', options.server);
+  if (options.reloadDelayMs !== undefined) flags.push(`-reload-delay=${String(options.reloadDelayMs)}ms`);
+  const log = fs.openSync(logPath, 'a');
+  let child: ChildProcess;
+  try {
+    child = spawn(bin, [...flags, '--', ...(options.args ?? [])], {
+      cwd: REPO_ROOT,
+      env: desktopEnv(options.fakeAudio),
+      stdio: ['ignore', 'pipe', log],
+    });
+  } finally {
+    fs.closeSync(log);
+  }
+  running.add(child);
+  /** How the harness ended when the spec didn't stop it; null while it runs and after a stop the spec asked for. */
+  let exitedBy: string | null = null;
+  let stopping = false;
+  const gone = new Promise<void>((resolve) => {
+    child.once('exit', (code, signal) => {
+      running.delete(child);
+      if (!stopping) exitedBy = signal ?? `exit code ${String(code)}`;
+      resolve();
+    });
+    child.once('error', (err) => {
+      running.delete(child);
+      exitedBy = err.message;
+      resolve();
+    });
+  });
+  const stopHarness = async (): Promise<void> => {
+    stopping = true;
+    if (alive(child)) {
+      child.kill('SIGTERM');
+      const exited = await Promise.race([gone.then(() => true), sleep(STOP_TIMEOUT_MS).then(() => false)]);
+      if (!exited) {
+        child.kill('SIGKILL');
+        await gone;
+      }
+    }
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  };
+
+  // The first line of its stdout: {"addr": "127.0.0.1:<port>", "origin": …, "log": …}.
+  let addr: string;
+  try {
+    addr = await new Promise<string>((resolve, reject) => {
+      let out = '';
+      const timer = setTimeout(() => {
+        reject(new Error(`the desktop harness didn't start within ${String(DESKTOP_READY_TIMEOUT_MS / 1000)} s`));
+      }, DESKTOP_READY_TIMEOUT_MS);
+      child.stdout?.on('data', (chunk: Buffer) => {
+        out += chunk.toString('utf8');
+        const nl = out.indexOf('\n');
+        if (nl < 0) return;
+        clearTimeout(timer);
+        try {
+          resolve((JSON.parse(out.slice(0, nl)) as { addr: string }).addr);
+        } catch (err) {
+          reject(new Error(`the desktop harness printed ${out.slice(0, nl)}`, { cause: err }));
+        }
+      });
+      void gone.then(() => {
+        clearTimeout(timer);
+        reject(new Error(`the desktop harness exited before it was ready (${exitedBy ?? '?'}); see ${logPath}`));
+      });
+    });
+  } catch (err) {
+    await stopHarness();
+    throw err;
+  }
+  child.stdout?.resume();
+
+  const hostUrl = `http://${addr}`;
+  let browser: Browser;
+  try {
+    // The page's origin is http://wails.localhost, which Chrome resolves to the harness: the server then sees a
+    // desktop origin, and the page runs as in the app (03 §22.4 A).
+    browser = await launch([...chromeArgs(), `--host-resolver-rules=MAP wails.localhost ${addr}`]);
+  } catch (err) {
+    await stopHarness();
+    throw err;
+  }
+  const context = await browser.newContext();
+  await enableDebug(context);
+  const page = await context.newPage();
+
+  const post = async (pathname: string, body?: unknown): Promise<void> => {
+    const res = await fetch(hostUrl + pathname, {
+      method: 'POST',
+      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+      body: body === undefined ? null : JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`POST ${pathname}: ${String(res.status)} ${await res.text()}`);
+  };
+
+  return {
+    origin: DESKTOP_ORIGIN,
+    hostUrl,
+    logPath,
+    browser,
+    context,
+    page,
+    failed: () => exitedBy,
+    async state() {
+      const res = await fetch(`${hostUrl}/__e2e/state`);
+      if (!res.ok) throw new Error(`GET /__e2e/state: ${String(res.status)}`);
+      return (await res.json()) as DesktopState;
+    },
+    async call<T>(service: string, method: string, ...args: unknown[]): Promise<T> {
+      const res = await fetch(`${hostUrl}/__bridge/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service, method, args }),
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        let e: { code?: unknown; params?: unknown } = {};
+        try {
+          e = JSON.parse(text) as typeof e;
+        } catch {
+          // not the error JSON
+        }
+        throw new DesktopCallError(
+          res.status,
+          typeof e.code === 'string' ? e.code : 'internal',
+          typeof e.params === 'object' && e.params !== null ? (e.params as Record<string, unknown>) : {},
+        );
+      }
+      return (text === '' ? null : JSON.parse(text)) as T;
+    },
+    args: (args) => post('/__e2e/args', { args }),
+    hotkey: (id) => post(`/__e2e/hotkey?id=${id}`),
+    system: (event) => post(`/__e2e/system?event=${event}`),
+    async stop() {
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+      await stopHarness();
+    },
+  };
+}
+
 // ---- Fixtures ----
 
 export const test = base.extend<TestFixtures, WorkerFixtures>({
@@ -840,6 +1121,47 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     const link = await startLink();
     await use(link);
     await link.close();
+  },
+
+  desktopBin: [
+    // eslint-disable-next-line no-empty-pattern -- as above
+    async ({}, use) => {
+      const given = process.env[DESKTOP_BIN_ENV];
+      if (given !== undefined && given !== '') {
+        await use(path.resolve(REPO_ROOT, given));
+        return;
+      }
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'isshoni-e2ehost-'));
+      try {
+        await use(await buildDesktopHarness(dir));
+      } finally {
+        await fsp.rm(dir, { recursive: true, force: true });
+      }
+    },
+    { scope: 'worker', timeout: DESKTOP_BUILD_TIMEOUT_MS + 30_000 },
+  ],
+
+  startDesktop: async ({ desktopBin, playwright, headless }, use, testInfo) => {
+    const own: Awaited<ReturnType<typeof launchDesktop>>[] = [];
+    const launch = (args: string[]): Promise<Browser> =>
+      playwright.chromium.launch({ channel: 'chrome', headless, args });
+    await use(async (options = {}) => {
+      const desktop = await launchDesktop(desktopBin, options, launch, testInfo);
+      own.push(desktop);
+      return desktop;
+    });
+    const failed = testInfo.status !== testInfo.expectedStatus;
+    for (const desktop of own) {
+      await desktop.stop();
+      const exited = desktop.failed();
+      if (exited !== null) {
+        const description = `${path.basename(desktop.logPath)}: the desktop harness exited (${exited})`;
+        testInfo.annotations.push({ type: 'e2e desktop', description });
+      }
+      if (failed && fs.existsSync(desktop.logPath)) {
+        await testInfo.attach(path.basename(desktop.logPath), { path: desktop.logPath, contentType: 'text/plain' });
+      }
+    }
   },
 
   serverLogs: [

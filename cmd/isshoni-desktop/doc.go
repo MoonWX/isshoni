@@ -22,7 +22,9 @@
 //	firstaction_*.go     main's first action (SetDefaultDllDirectories, SetDllDirectory) and --version's stdout
 //	engine_release.go    the engine of every release: native.Open (01 §7.1)
 //	engine_fake.go       the engine of dev and e2e builds: 01's fake with 05's audio scenarios (03 §4.5, §22.4)
-//	shell.go             internal/desktop/app's Shell over Wails (03 §6.1; the tray and toasts come with WA68)
+//	shell.go             internal/desktop/app's Shell over Wails (03 §6.1; the tray and toasts come with WA68), its
+//	                     validated OpenURL (03 §5.5), and registerServices: the bound services of
+//	                     internal/desktop/bridge (03 §6.2) registered with Wails, which `task gen:bindings` reads
 //	webview2.go          the WebView2 runtime minimum and its message box text (03 §5.4)
 //	platform_windows.go  Windows facts: the asset origin and its Guard, the data root and the profile folder from
 //	                     the shell's known folders, the WebView2 profile folder, the OS build
@@ -34,12 +36,13 @@
 //	checklist_test.go    03 §3.2's Wails checklist in the real webview (-tags isshoni_hw: the owner's PC, a Mac)
 //	main_windows_test.go 03 §22.2's Windows tests of main: the DLL search-order marker, single instance (W6), the
 //	                     running mutex and --version of the real exe
+//	bindings_test.go     the services as the pinned Wails binds them: W11, W12 and the committed bindings' method ids
 //
 // Build tags: production (every release, and Wails' own release mode: no DevTools), dev (`task desktop:dev`: Vite's
 // dev server, http loopback servers, the fake engine) and e2e (the CDP build: http loopback servers, the WEBVIEW2_*
 // variables kept, the fake engine). A release has exactly production (06 §5.2).
 //
-// Still to come, by README slice: the bound services and their generated bindings (WA48), the tray and
-// notifications (WA68), the one-shot modes --self-check, --forget-credentials and --purge-data with the installer
-// handover (WA59), the shell relaunch and --sound-check-helper (WA77), the start-time update (WA84).
+// Still to come, by README slice: the tray and notifications (WA68), the one-shot modes --self-check,
+// --forget-credentials and --purge-data with the installer handover (WA59), the shell relaunch and
+// --sound-check-helper (WA77), the start-time update (WA84).
 package main
