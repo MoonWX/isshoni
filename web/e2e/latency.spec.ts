@@ -10,9 +10,9 @@
 // - without it (Chrome gives no captureTime until it can estimate the sender's clock, which a receive-only
 //   connection may never let it do) the spec asserts the receive → display leg, median
 //   expectedDisplayTime − receiveTime < 100 ms, and annotates the test that the capture leg was not measured.
-// Either way it catches timestamp mistakes that make Chrome's jitter buffer grow, and through the lip-sync hold
-// (below) sender-report mistakes too. The values are logged and annotated, pass or fail, and the frames' metadata and
-// the receivers' stats are attached to the report.
+// Either way it catches timestamp mistakes that make Chrome's jitter buffer grow, and through the A/V offset (below)
+// sender-report mistakes too. The values are logged and annotated, pass or fail, and the frames' metadata and the
+// receivers' stats are attached to the report.
 //
 // The lip-sync hold. A share's audio and video have one msid stream (M1 02 §9.6), so Chrome shows a frame no earlier
 // than the audio captured with it (01 §12.1): when the audio path (NetEq, then the audio output) takes longer than the
@@ -26,20 +26,40 @@
 //
 // Chrome's stats give the hold: the video receiver's jitterBufferTargetDelay − jitterBufferMinimumDelay per emitted
 // frame (webrtc-stats: the minimum leaves out A/V sync and jitterBufferTarget, which this app never sets). While it
-// records, the spec samples the stage's receivers every 250 ms and gives each frame the hold, NetEq's delay, the
-// output's delay and the video's own delay (its minimum) of the interval it was shown in. Then:
-// - the hold must be the audio path's: its p95 over the frames may exceed max(0, NetEq + output − the video's own
-//   delay) by less than 60 ms. Chrome's sync (webrtc's StreamSynchronization) aims the hold at that difference plus
-//   the offset of the audio's and the video's arrivals against their sender reports, leaves a difference under 30 ms
-//   alone and closes a part of the rest each second. With the stamps right the excess stayed at or below +29 ms at
-//   the p95 in 13 runs on the Mac (HDMI and Bluetooth outputs, CPU load, Playwright's video recording, a 250 ms
-//   stall of the tool, the audio's jitterBufferTarget held at 250 ms), and at most +37 ms, while the hold lagged a
-//   NetEq that fell after the stall. An offset between the share's audio and video sender reports or capture stamps,
-//   or a publisher that sends one of them late, is a hold the audio path doesn't explain: with the tool's audio
-//   sender reports 150 ms early the excess came out at p95 113 and 95 ms, and 300 ms early at 264 ms (playing to
-//   Bluetooth, where the hold has the longest way to climb);
-// - the hold's p95 must be under 400 ms. A frame's hold is part of its leg, so CI's legs as shown bound the hold there
-//   from above (p95 279.8 and 266.0 ms), and an audio path broken by seconds still fails.
+// records, the spec samples the stage's receivers every 250 ms and gives each frame the hold of the interval it was
+// shown in. The hold's p95 must be under 400 ms: a frame's hold is part of its leg, so CI's legs as shown bound the
+// hold there from above (p95 279.8 and 266.0 ms), and an audio path broken by seconds still fails.
+//
+// The A/V offset. Chrome lines a share's audio and video up by their sender reports (webrtc's RtpStreamsSynchronizer):
+// each track's RTP → NTP mapping says when the audio it plays and the frame it shows were captured, and Chrome holds
+// the video (or the audio) until the two match. getStats gives both instants, each inbound-rtp's
+// estimatedPlayoutTimestamp: the sender's NTP time of what plays now, which here is the tool's wall clock, this
+// machine's. So now − estimatedPlayoutTimestamp is a track's age by its sender reports. The receiver measures the
+// same age without them: the audio's is NetEq's delay plus the output's, the video's the frame's receive → display
+// leg (the loopback network adds next to nothing to either). A track's age by its reports less its measured age is
+// what its capture stamps, its reports and its sending add; the audio's less the video's is the share's A/V offset,
+// by which Chrome holds the video beyond what the paths need (or the audio, when negative), and a clock error common
+// to both tracks drops out. Per interval, the spec takes the reports' ages at its two ends against NetEq's and the
+// output's delay over it and the median leg of the frames shown in it, and the offset's median over the recording
+// must be under 60 ms. (An offset the other way makes Chrome delay the audio, which takes nothing off the legs.) The
+// median, because the receiver's side lags in a transient: NetEq times its packets' wait in ticks of its own playout,
+// so packets that came before Chrome's audio output started pulling count only from then on (the first second or two
+// of the audio's measured age then falls short by up to seconds), and a frame shown on arrival after a keyframe has a
+// short leg. With the stamps right the median was −13 to −22 ms in 10 runs on the Mac (playing to Bluetooth
+// headphones; 4 of the runs at once), and −16 and −14 ms with the stage's audio element started 1.5 and 2.5 s late,
+// which gives the backlog of PR #42's e2e job (below). With the tool's audio sender reports 100 ms early it was
+// +80 ms, and +89 ms with the late start; 150 ms early, +127 ms. It shows from the first interval on.
+//
+// Why not the hold against the audio path, as PR #41 had it (the hold's p95 beyond max(0, NetEq + output − the video's
+// own delay) < 60 ms)? Chrome's sync (webrtc's StreamSynchronization) moves the hold once a second by half of a 4-tap
+// average of the difference, at most 80 ms and not at all under 30 ms, and starts the average again after a move: it
+// takes a hold back by about an eighth of the excess per second. In PR #42's e2e job Chrome's audio output started
+// pulling about 1.5 s after the share's audio arrived; NetEq played that backlog out (its delay per emitted sample
+// peaked at 1.3 s), Chrome raised the hold to 249 and 226 ms at 80 ms a second, and 12 s after NetEq had drained the
+// hold was still 43–54 ms above the audio path: that check failed at p95 138 and 135 ms, although that controller,
+// fitted to both recordings once NetEq had drained (2.9 ms RMS), puts their offset 10–15 ms below the Mac's. An
+// offset, conversely, shows in the hold only as fast as the hold climbs (the tool's reports 150 ms early gave PR #41
+// a p95 of 95–113 ms).
 //
 // The tool: LOADTEST_BIN names a built binary (a relative path counts from the repository root); without it this
 // spec builds ./cmd/isshoni-loadtest once per worker, as decodable.spec does (that spec's fixture is its own, so
@@ -87,8 +107,18 @@ const RECEIVE_MEDIAN_MS = 100;
 const MIN_FRAMES = 300;
 /** How often the recording samples the stage's receivers for the lip-sync hold (Chrome's sync moves it each second). */
 const STATS_EVERY_MS = 250;
-/** The bound on the hold's p95 beyond what the audio path explains (the top of the file). */
-const UNEXPLAINED_HOLD_P95_MS = 60;
+/** The bound on the median of the share's A/V offset by its sender reports (the top of the file). */
+const AV_OFFSET_MS = 60;
+/**
+ * The fewest intervals the A/V offset is judged on: half of the recording's. Chrome gives estimatedPlayoutTimestamp
+ * once it has both tracks' sender reports, a second or two into the audio.
+ */
+const MIN_OFFSET_INTERVALS = RECORD_MS / STATS_EVERY_MS / 2;
+/**
+ * From the NTP epoch (1900) to the Unix one (1970), ms. Chrome gives estimatedPlayoutTimestamp on the NTP epoch
+ * (webrtc-stats has it on the Unix one); reportAge reads either.
+ */
+const NTP_UNIX_OFFSET_MS = 2_208_988_800_000;
 /** The bound on the hold's p95 (the top of the file: CI's legs as shown had p95 279.8 and 266.0 ms). */
 const HOLD_P95_MS = 400;
 
@@ -110,14 +140,24 @@ interface FrameSample {
   height: number;
 }
 
+/**
+ * When the media that a track plays now was captured, by its sender reports: the inbound-rtp's
+ * estimatedPlayoutTimestamp, and the stats' own timestamp (ms, as getStats has them). A receiver's `playout` is null
+ * while Chrome gives no estimatedPlayoutTimestamp.
+ */
+interface Playout {
+  timestamp: number;
+  estimatedPlayoutTimestamp: number;
+}
+
 /** The stage's receivers at one moment of the recording: getStats' cumulative counters, in s as getStats has them. */
 interface ReceiverSample {
   /** performance.now() when the stats came back: the clock of the frames' times. */
   at: number;
   /** The inbound-rtp of the stage's video track; null when getStats has no such stream or lacks these counters. */
-  video: { emitted: number; targetDelay: number; minimumDelay: number } | null;
+  video: { emitted: number; targetDelay: number; minimumDelay: number; playout: Playout | null } | null;
   /** The inbound-rtp of the audible audio track (NetEq) and its media-playout (the output). */
-  audio: { emitted: number; jitterBufferDelay: number } | null;
+  audio: { emitted: number; jitterBufferDelay: number; playout: Playout | null } | null;
   playout: { samples: number; playoutDelay: number } | null;
 }
 
@@ -139,15 +179,29 @@ interface HoldInterval {
   audioJitterBuffer: number | null;
   audioOutput: number | null;
   /**
-   * The hold less what the audio path explains, max(0, NetEq + output − videoDelay), ms. Without NetEq's delay the
-   * audio path explains nothing, and without the output's it counts as 0.
+   * The hold less what the audio path asks for now, max(0, NetEq + output − videoDelay), ms; without NetEq's delay
+   * the audio path asks for nothing, and without the output's it counts as 0. Logged, not asserted: Chrome's sync
+   * takes a hold back slowly when the audio path falls (the top of the file).
    */
-  unexplained: number;
+  beyondAudioPath: number;
+  /**
+   * Each track's age by its sender reports over the interval, ms: now − estimatedPlayoutTimestamp, the mean of the
+   * interval's two ends; null where Chrome gave none.
+   */
+  audioReportAge: number | null;
+  videoReportAge: number | null;
+  /** The median receive → display leg of the frames shown in the interval, ms; null without any. */
+  videoLeg: number | null;
+  /**
+   * The share's A/V offset by its sender reports, ms: the audio's report age less NetEq + output, less the video's
+   * report age less videoLeg (the top of the file); null without any of them.
+   */
+  avOffset: number | null;
 }
 
-/** A leg's distribution in ms; the percentiles are nearest-rank. */
+/** A distribution in ms over `count` frames (a leg, the hold) or intervals (the A/V offset); nearest-rank percentiles. */
 interface Summary {
-  frames: number;
+  count: number;
   min: number;
   median: number;
   p95: number;
@@ -249,7 +303,7 @@ function keepPeerConnections(): void {
  * after the other, each with its metadata. A stage that presents nothing returns no frames when the time is up.
  * Meanwhile, every `statsEveryMs` and once more at the end, it samples the receivers of the page's PeerConnections
  * (keepPeerConnections): the inbound-rtp of the stage's video track, and that of the audio track the page plays (its
- * one <audio> element, 05 §10.2) with its media-playout.
+ * one <audio> element, 05 §10.2) with its media-playout; with each inbound-rtp, its estimatedPlayoutTimestamp.
  */
 function recordFrames(page: Page, shareId: string, ms: number, statsEveryMs: number): Promise<Recording> {
   return page.evaluate(
@@ -284,6 +338,13 @@ function recordFrames(page: Page, shareId: string, ms: number, statsEveryMs: num
         const v = s[key];
         return typeof v === 'number' ? v : undefined;
       };
+      const playoutOf = (s: Record<string, unknown>): Playout | null => {
+        const timestamp = num(s, 'timestamp');
+        const estimatedPlayoutTimestamp = num(s, 'estimatedPlayoutTimestamp');
+        return timestamp !== undefined && estimatedPlayoutTimestamp !== undefined
+          ? { timestamp, estimatedPlayoutTimestamp }
+          : null;
+      };
       const sample = async (): Promise<void> => {
         const videoTracks = trackIds(video, 'video');
         const audioTracks = [...document.querySelectorAll('audio')].flatMap((el) => trackIds(el, 'audio'));
@@ -303,12 +364,14 @@ function recordFrames(page: Page, shareId: string, ms: number, statsEveryMs: num
               const targetDelay = num(s, 'jitterBufferTargetDelay');
               const minimumDelay = num(s, 'jitterBufferMinimumDelay');
               if (emitted !== undefined && targetDelay !== undefined && minimumDelay !== undefined) {
-                got.video = { emitted, targetDelay, minimumDelay };
+                got.video = { emitted, targetDelay, minimumDelay, playout: playoutOf(s) };
               }
             } else if (s['kind'] === 'audio' && audioTracks.includes(track)) {
               const emitted = num(s, 'jitterBufferEmittedCount');
               const jitterBufferDelay = num(s, 'jitterBufferDelay');
-              if (emitted !== undefined && jitterBufferDelay !== undefined) got.audio = { emitted, jitterBufferDelay };
+              if (emitted !== undefined && jitterBufferDelay !== undefined) {
+                got.audio = { emitted, jitterBufferDelay, playout: playoutOf(s) };
+              }
               playoutId = s['playoutId'];
             }
           }
@@ -339,15 +402,28 @@ function recordFrames(page: Page, shareId: string, ms: number, statsEveryMs: num
 }
 
 /**
+ * A track's age by its sender reports at one sample, ms: the stats' timestamp less estimatedPlayoutTimestamp, the
+ * latter moved to the Unix epoch when it is on the NTP one (70 years ahead); null without it.
+ */
+function reportAge(p: Playout | null | undefined): number | null {
+  if (!p) return null;
+  const { timestamp, estimatedPlayoutTimestamp: played } = p;
+  return timestamp - (played - timestamp > NTP_UNIX_OFFSET_MS / 2 ? played - NTP_UNIX_OFFSET_MS : played);
+}
+
+/**
  * The intervals between consecutive receiver samples, each with the lip-sync hold on the frames emitted in it:
  * Δ(jitterBufferTargetDelay − jitterBufferMinimumDelay) / ΔjitterBufferEmittedCount, never below 0; the video's own
  * delay, ΔjitterBufferMinimumDelay / ΔjitterBufferEmittedCount; the audio path over it, NetEq's ΔjitterBufferDelay /
- * ΔjitterBufferEmittedCount and the output's ΔtotalPlayoutDelay / ΔtotalSamplesCount; and the part of the hold that
- * the audio path doesn't explain. An interval in which the video emitted no frame is left out.
+ * ΔjitterBufferEmittedCount and the output's ΔtotalPlayoutDelay / ΔtotalSamplesCount; the part of the hold beyond what
+ * the audio path asks for; each track's age by its sender reports, the mean of its reportAge at the two ends; the
+ * median receive → display leg of the frames shown in it; and the share's A/V offset from those (the top of the
+ * file). An interval in which the video emitted no frame is left out.
  */
-function holdIntervals(receivers: ReceiverSample[]): HoldInterval[] {
+function holdIntervals(receivers: ReceiverSample[], frames: FrameSample[]): HoldInterval[] {
   const intervals: HoldInterval[] = [];
   const msPer = (delta: number, count: number): number | null => (count > 0 ? (delta / count) * 1000 : null);
+  const mean = (x: number | null, y: number | null): number | null => (x === null || y === null ? null : (x + y) / 2);
   for (const [i, b] of receivers.entries()) {
     const a = receivers[i - 1];
     if (!a?.video || !b.video) continue;
@@ -366,7 +442,25 @@ function holdIntervals(receivers: ReceiverSample[]): HoldInterval[] {
       a.playout && b.playout
         ? msPer(b.playout.playoutDelay - a.playout.playoutDelay, b.playout.samples - a.playout.samples)
         : null;
-    const explained = audioJitterBuffer === null ? 0 : Math.max(0, audioJitterBuffer + (audioOutput ?? 0) - videoDelay);
+    const asked = audioJitterBuffer === null ? 0 : Math.max(0, audioJitterBuffer + (audioOutput ?? 0) - videoDelay);
+    const audioReportAge = mean(reportAge(a.audio?.playout), reportAge(b.audio?.playout));
+    const videoReportAge = mean(reportAge(a.video.playout), reportAge(b.video.playout));
+    const videoLeg =
+      summarize(
+        frames.flatMap((f) =>
+          f.receiveTime !== null && f.expectedDisplayTime >= a.at && f.expectedDisplayTime < b.at
+            ? [f.expectedDisplayTime - f.receiveTime]
+            : [],
+        ),
+      )?.median ?? null;
+    const avOffset =
+      audioReportAge === null ||
+      audioJitterBuffer === null ||
+      audioOutput === null ||
+      videoReportAge === null ||
+      videoLeg === null
+        ? null
+        : audioReportAge - (audioJitterBuffer + audioOutput) - (videoReportAge - videoLeg);
     intervals.push({
       from: a.at,
       to: b.at,
@@ -374,7 +468,11 @@ function holdIntervals(receivers: ReceiverSample[]): HoldInterval[] {
       videoDelay,
       audioJitterBuffer,
       audioOutput,
-      unexplained: Math.max(0, hold) - explained,
+      beyondAudioPath: Math.max(0, hold) - asked,
+      audioReportAge,
+      videoReportAge,
+      videoLeg,
+      avOffset,
     });
   }
   return intervals;
@@ -401,7 +499,7 @@ function summarize(values: number[]): Summary | null {
   const sorted = [...values].sort((a, b) => a - b);
   const rank = (p: number): number => sorted[Math.max(Math.ceil((sorted.length * p) / 100), 1) - 1] ?? NaN;
   return {
-    frames: sorted.length,
+    count: sorted.length,
     min: sorted[0] ?? NaN,
     median: rank(50),
     p95: rank(95),
@@ -410,11 +508,11 @@ function summarize(values: number[]): Summary | null {
 }
 
 /** A summary for the log: "600 frames, median 41.2 ms, p95 52.3 ms (min 30.1, max 70.4)". */
-function describeLeg(s: Summary | null): string {
-  if (!s) return 'no frames';
+function describeLeg(s: Summary | null, unit = 'frames'): string {
+  if (!s) return `no ${unit}`;
   const ms = (v: number): string => v.toFixed(1);
   return (
-    `${String(s.frames)} frames, median ${ms(s.median)} ms, p95 ${ms(s.p95)} ms ` +
+    `${String(s.count)} ${unit}, median ${ms(s.median)} ms, p95 ${ms(s.p95)} ms ` +
     `(min ${ms(s.min)}, max ${ms(s.max)})`
   );
 }
@@ -431,6 +529,23 @@ function describeAudio(intervals: HoldInterval[]): string {
   return (
     `${part('NetEq', (iv) => iv.audioJitterBuffer)}, ${part('output', (iv) => iv.audioOutput)}, ` +
     part("the video's own delay", (iv) => iv.videoDelay)
+  );
+}
+
+/**
+ * The share's A/V offset over the recording, and what each track adds to it (medians over the same intervals):
+ * "78 intervals, median -11.9 ms, p95 -7.1 ms (min -33.3, max 1.7); the audio's report age less NetEq + output
+ * median -8.1 ms, the video's less its leg median 3.4 ms".
+ */
+function describeOffset(intervals: HoldInterval[], offset: Summary | null): string {
+  const judged = intervals.filter((iv) => iv.avOffset !== null);
+  const median = (pick: (iv: HoldInterval) => number): string =>
+    `median ${(summarize(judged.map(pick))?.median ?? NaN).toFixed(1)} ms`;
+  if (!offset) return describeLeg(offset, 'intervals');
+  return (
+    `${describeLeg(offset, 'intervals')}; the audio's report age less NetEq + output ` +
+    `${median((iv) => (iv.audioReportAge ?? NaN) - (iv.audioJitterBuffer ?? NaN) - (iv.audioOutput ?? NaN))}, ` +
+    `the video's less its leg ${median((iv) => (iv.videoReportAge ?? NaN) - (iv.videoLeg ?? NaN))}`
   );
 }
 
@@ -485,10 +600,9 @@ test('Chrome shows the Go publisher’s frames soon after they were captured', a
 
     // 20 s of presented frames, and the receivers' stats over them.
     const { frames, receivers } = await recordFrames(friend.page, share.id, RECORD_MS, STATS_EVERY_MS);
-    const intervals = holdIntervals(receivers);
+    const intervals = holdIntervals(receivers, frames);
     const measuredHold = intervals.length > 0;
     const holdOf = (f: FrameSample): number => intervalAt(intervals, f.expectedDisplayTime)?.hold ?? 0;
-    const unexplainedOf = (f: FrameSample): number => intervalAt(intervals, f.expectedDisplayTime)?.unexplained ?? 0;
     // A frame's leg less the hold it was shown under. A frame that came after its held render time (behind a
     // keyframe) was shown on arrival, so the hold didn't delay it: the hold takes off at most what the leg has above
     // 0, so such a frame counts as 0 and stays below the median and the p95, where it was.
@@ -508,10 +622,13 @@ test('Chrome shows the Go publisher’s frames soon after they were captured', a
     const capture = measuredHold ? captureLegs.lessHold : captureLegs.asShown;
     const receive = measuredHold ? receiveLegs.lessHold : receiveLegs.asShown;
     const hold = measuredHold ? summarize(frames.map(holdOf)) : null;
-    const unexplained = measuredHold ? summarize(frames.map(unexplainedOf)) : null;
-    const withCapture = (captureLegs.asShown?.frames ?? 0) >= MIN_FRAMES;
-    await testInfo.attach('latency.json', {
-      body: JSON.stringify(
+    const avOffset = summarize(intervals.flatMap((iv) => iv.avOffset ?? []));
+    const withCapture = (captureLegs.asShown?.count ?? 0) >= MIN_FRAMES;
+    // The numbers go to the test's output folder too, so that a passing run keeps them (CI uploads that folder).
+    const jsonPath = testInfo.outputPath('latency.json');
+    await fsp.writeFile(
+      jsonPath,
+      JSON.stringify(
         {
           recordMs: RECORD_MS,
           statsEveryMs: STATS_EVERY_MS,
@@ -520,7 +637,7 @@ test('Chrome shows the Go publisher’s frames soon after they were captured', a
           captureLessHold: captureLegs.lessHold,
           receiveLessHold: receiveLegs.lessHold,
           hold,
-          unexplained,
+          avOffset,
           intervals,
           frames,
           receivers,
@@ -528,8 +645,8 @@ test('Chrome shows the Go publisher’s frames soon after they were captured', a
         null,
         2,
       ),
-      contentType: 'application/json',
-    });
+    );
+    await testInfo.attach('latency.json', { path: jsonPath, contentType: 'application/json' });
     const asserted = measuredHold ? 'less the lip-sync hold' : 'as shown (the hold not measured)';
     const captureLine = `expectedDisplayTime − captureTime ${asserted}: ${describeLeg(capture)}`;
     const receiveLine = `expectedDisplayTime − receiveTime ${asserted}: ${describeLeg(receive)}`;
@@ -537,26 +654,32 @@ test('Chrome shows the Go publisher’s frames soon after they were captured', a
       `as shown: expectedDisplayTime − captureTime ${describeLeg(captureLegs.asShown)}; ` +
       `expectedDisplayTime − receiveTime ${describeLeg(receiveLegs.asShown)}`;
     const holdLine = hold
-      ? `the lip-sync hold: ${describeLeg(hold)}; beyond what the audio path explains: ${describeLeg(unexplained)}; ` +
-        describeAudio(intervals)
+      ? `the lip-sync hold: ${describeLeg(hold)}; ${describeAudio(intervals)}`
       : `the lip-sync hold: not measured (no video receiver stats in ${String(receivers.length)} samples)`;
+    const offsetLine = `the A/V offset by the sender reports: ${describeOffset(intervals, avOffset)}`;
     console.log(
       `latency.spec: ${String(frames.length)} frames in ${String(RECORD_MS)} ms; ${captureLine}; ${receiveLine}; ` +
-        `${shownLine}; ${holdLine}`,
+        `${shownLine}; ${holdLine}; ${offsetLine}`,
     );
     testInfo.annotations.push({ type: 'measured', description: captureLine });
     testInfo.annotations.push({ type: 'measured', description: receiveLine });
     testInfo.annotations.push({ type: 'measured', description: shownLine });
     testInfo.annotations.push({ type: measuredHold ? 'measured' : 'not measured', description: holdLine });
+    testInfo.annotations.push({ type: avOffset ? 'measured' : 'not measured', description: offsetLine });
 
-    // The hold that comes off the legs is the audio path's, within bounds (the top of the file): more than the audio
-    // path explains is an offset between the share's audio and video.
-    if (hold && unexplained) {
+    // With the receivers' stats: the share's audio and video line up by their sender reports, and the hold that
+    // comes off the legs stays within its bound (the top of the file).
+    if (hold) {
       expect(
-        unexplained.p95,
-        `${holdLine}: a lip-sync hold that the audio path doesn't explain (the share's audio and video sender ` +
-          'reports or capture stamps disagree, or the publisher sends one of them late)',
-      ).toBeLessThan(UNEXPLAINED_HOLD_P95_MS);
+        avOffset?.count ?? 0,
+        `${offsetLine}: intervals with both tracks' estimatedPlayoutTimestamp, NetEq's and the output's delay and a ` +
+          'shown frame',
+      ).toBeGreaterThanOrEqual(MIN_OFFSET_INTERVALS);
+      expect(
+        avOffset?.median ?? NaN,
+        `${offsetLine}: the share's audio and video sender reports or capture stamps disagree, or the publisher ` +
+          'sends its audio late: Chrome holds the video for it',
+      ).toBeLessThan(AV_OFFSET_MS);
       expect(hold.p95, `${holdLine}: the lip-sync hold`).toBeLessThan(HOLD_P95_MS);
     }
 
@@ -571,11 +694,11 @@ test('Chrome shows the Go publisher’s frames soon after they were captured', a
       testInfo.annotations.push({
         type: 'not measured',
         description:
-          `the capture leg: Chrome gave captureTime on ${String(captureLegs.asShown?.frames ?? 0)} of ` +
+          `the capture leg: Chrome gave captureTime on ${String(captureLegs.asShown?.count ?? 0)} of ` +
           `${String(frames.length)} frames (fewer than ${String(MIN_FRAMES)}), so the receive leg is asserted instead`,
       });
       expect(
-        receive?.frames ?? 0,
+        receive?.count ?? 0,
         `presented frames with a receiveTime in ${String(RECORD_MS)} ms`,
       ).toBeGreaterThanOrEqual(MIN_FRAMES);
       expect(receive?.median ?? NaN, receiveLine).toBeLessThan(RECEIVE_MEDIAN_MS);

@@ -2151,11 +2151,22 @@ The component the client core owns, capture → last packet sent, is measured on
    receiver's `jitterBufferTargetDelay − jitterBufferMinimumDelay` per frame). When `captureTime` is present (Chrome
    estimates it from our SRs; sender and viewer share the machine's clock), asserts median
    `expectedDisplayTime − captureTime` < 150 ms and p95 < 250 ms; otherwise asserts median
-   `expectedDisplayTime − receiveTime` < 100 ms and annotates the test that the capture leg was not measured. The hold
-   has bounds of its own: its p95 is < 400 ms and exceeds what the audio path explains, max(0, NetEq + output − the
-   video's own delay), by < 60 ms. Without the receivers' stats the legs are asserted as shown. This catches timestamp
-   mistakes that make Chrome's jitter buffer grow, and SR or capture-stamp offsets between a share's audio and video
-   (a hold the audio path doesn't explain).
+   `expectedDisplayTime − receiveTime` < 100 ms and annotates the test that the capture leg was not measured. The
+   hold's p95 is < 400 ms. The share's A/V offset by its SRs, which Chrome holds the video (or the audio) by beyond
+   what the paths need, is bounded directly: each inbound-rtp's `estimatedPlayoutTimestamp` is the sender's NTP time
+   of what plays now, so now minus it is a track's age by its SRs; less the age the receiver measures (audio: NetEq's
+   delay plus the output's; video: the receive → display leg) it is what the track's stamps, SRs and sending add, and
+   the audio's less the video's must have a median under 60 ms over the recording's 250 ms intervals (the other way,
+   Chrome delays the audio, which takes nothing off the legs; on the Mac the median is −13 to −22 ms). Without the
+   receivers' stats the legs are asserted as shown. This catches timestamp mistakes that make Chrome's jitter buffer
+   grow, and SR or capture-stamp offsets between a share's audio and video, or a publisher that sends one of them late.
+   PR #41 had bounded the hold beyond what the audio path asks for, max(0, NetEq + output − the video's own delay),
+   at the p95 (< 60 ms). PR #42's e2e job failed that with no offset: Chrome's audio output there starts pulling about
+   1.5 s after the share's audio arrives, NetEq plays out that backlog (its delay per emitted sample peaked at 1.3 s),
+   and Chrome's sync, which moves the hold once a second and takes it back by about an eighth of the excess per
+   second, was still 43–54 ms above the audio path at the end of the recording (p95 138 and 135 ms). Modelled on
+   webrtc's `StreamSynchronization`, both recordings' hold fits to 2.9 ms RMS with an A/V offset 10–15 ms below the
+   Mac's.
    As built (WA43): the loadtest also gets `-duration 45s` (smoke's default 30 s would leave the 20 s recording
    only what remains after the stage and decoder start), and the capture leg's median must be above 0, so a
    sender report that puts `captureTime` in the future can't pass the bounds trivially.
