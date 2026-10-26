@@ -1127,11 +1127,24 @@ become:
 - **Which variant**: only `same` skips the checkbox; any other value, including one the page doesn't know, shows the
   `unknown` note at least and requires the checkbox (the check fails closed).
 - **Accessibility**: the heading takes focus on each state change; the result states are announced (`aria-live
-  polite`); the code is read letter by letter (`aria-label="W D J B, M J H T"`); the checkbox is a labeled native
-  input, and the warning or note is its `aria-describedby`.
+  polite`); the code is read letter by letter ("W D J B, M J H T"); the checkbox is a labeled native input, and the
+  warning or note is its `aria-describedby`. As built (WA63): the spoken code is visually hidden text next to the large
+  visible code, which is `aria-hidden`, not an `aria-label`: ARIA 1.2 forbids naming a paragraph or a generic element,
+  and axe's `aria-prohibited-attr` flags it as serious. Screen readers hear the same text.
+- **Failures** (WA63, `useDeviceLink.ts`): a failed **decide** (offline, 5xx, `csrf_failed` and the like) keeps the
+  confirm card and shows the reason with its request id in a Notice under it; clicking Link again is the retry. Only a
+  failed **lookup** switches to the `error` state with Try again. Answers that change the state either way: 404 →
+  `invalid`, 429 → `rate_limited`, 422 `{deviceName}` → the error under the name field, 401 → the session is gone.
+- **The session ends under the page** (a 401, or "Not you? Sign out"): the page puts the code back into the address
+  bar and waits until that location is committed before it ends the session (clears `['me']`, or logs out), so the
+  login page's `next=` brings the friend back to this card with the code. The navigation runs without `flushSync`:
+  with it, react-router 8 ran the effects inside its own update and `RequireAuth`'s redirect lost its
+  `history.replace`, leaving `/link?code=…` in the address bar (WA63-R2).
 - **i18n**: namespace `link` in `web/src/i18n/lazy/link.en.json` (the shared-files rule of README §5: only a lazy page
   folder uses it); `errors.device_code_invalid` and `errors.invalid_token` in `en.json`. App names come from
-  `link.app.<clientKind>.<os>` ("isshoni for Windows", "isshoni for macOS", "isshoni Linux helper").
+  `link.app.<clientKind>.<os>` ("isshoni for Windows", "isshoni for macOS", "isshoni Linux helper"). As built (WA63):
+  `errors.invalid_token` reads "This app's sign-in expired. Link the app again." (M1's "Log in again" doesn't fit the
+  bearer clients that get this code).
 - No GET ever approves: approval is the Link button's POST, under 04's `frame-ancestors 'none'` and 03's CSRF check.
 
 ### 10.2 Devices page
@@ -1145,8 +1158,20 @@ become:
   all. So `current` is always false in M2, and there is no desktop variant of AccountPage or DevicesPage. `/me.device`
   and `DeviceInfo.current` (§7.2) stay as room for clients that show these pages with a bearer (*later*: the mobile
   apps, M4's agent).
+- As built (WA63): the app rows' own texts are `link.devices.*` in `lazy/link.en.json` (rename, remove, the badge,
+  "Linked {date}", "Last seen …", the empty list's `link.devices.empty`), next to the `link.app.<kind>.<os>` names, so
+  `account/index.ts` loads the `link` namespace with the account chunk; no `account.*` key changed (group 7's
+  integration deleted the unused `account.devices.linked.empty`). Remove closes its dialog (`flushSync`) before the row
+  goes, so focus reaches the "Linked devices" heading rather than `<body>` (WA63-R1; `link.spec` asserts it in
+  Chrome).
 - `web/src/lib/appLink.ts`: `appLinkFor(serverOrigin: string, roomId?: string): string` builds the deep link of §12
-  for 03-desktop-app's and 05's "Open in the app" buttons.
+  for 03-desktop-app's and 05's "Open in the app" buttons. As built (WA63): it follows Go's `NormalizeOrigin` where
+  §12.1 is silent (an origin without a scheme counts as https) and Go's `canonicalHost` beyond the URL parser: STD3
+  LDH labels, the hyphen rules (`xn--` labels decoded, by bytes as x/net/idna reads them), 63-byte labels and
+  253-byte names, no empty label, no `%` or `\` in the host, a bare IPv6 literal bracketed, an IPv4-mapped address
+  dotted as `netip` writes it; it returns `''` for a trailing dot, numeric hosts the URL parser would rewrite,
+  unspecified and multicast addresses, ports with leading zeros and an empty `?` or `#`. The bidi rule is left to
+  `Parse` (WA63-R3); WA74, its first caller, makes it refuse what Go refuses if its page needs that.
 
 ---
 
@@ -2115,6 +2140,32 @@ preflight (204, `Max-Age` 600) and a bearer request's answer with `Access-Contro
 and with a cookie gets 403; 21 bearer sockets of two users from one address, one after another, all pass (the pre-auth
 refund, §6.3 item 4), while 21 sockets whose hello fails get 429 at the 21st upgrade.
 
+As built (WA64): cases 1–7 also run with the real `deviceauth.Manager` and 01's Go signal client on the manager's
+tokens, in `TestDeviceManagerLink` (cases 1–4 and 7) and `TestDeviceManagerPassword` (cases 6 and 5), beside WA56's
+raw-HTTP `TestDeviceLink` and `TestDeviceClientOutdated`, which keep the step-by-step checks (case 3's 4401 close and
+its 100 ms bound stay there). `device_helpers_test.go` gains `newManager` (a caller's store) and `linkManager`, which
+`linkedManager` is built on with the one-value signature above; `linkedManager` itself has no caller until WA73 (a
+`nolint:unused` directive until then), because these cases read the app's store. Where the cases depart from the text:
+- Case 1: the Manager's poll waits use real timers (`ManagerOptions.Clock` only reads the time), so the server's
+  clock hook can't shorten them: each Manager link takes one real 5 s interval, and "within one poll interval" is
+  checked in case 1 only, as linked less than two intervals after `Link` (the first poll got the pair). `linkManager`
+  asserts no timing, so later callers carry no wall-clock check.
+- Case 4: the spent refresh token presented from outside takes the restart grace path (`P` spent, its child unused,
+  under 120 s), the only reading under which the manager's next refresh gets `invalid_grant {reason: reused}`: the
+  device is revoked when the manager presents the superseded child. The manager's next refresh is triggered with
+  `SessionEnded(unauthenticated)`, as 01's core does after a second `unauthenticated`.
+- Case 6: no REST field exposes `linked_via`, so the test reads the running server's SQLite file read-only
+  (`mode=ro`, WAL). The wrong password goes once as raw HTTP, where the 401 `invalid_credentials` is checked; the
+  Manager's error is checked for the code only, since `*api.Error` carries no HTTP status.
+- Case 7: the hub's 5-minute revalidation is a real-time ticker that `servertest` can't reach, so the test cuts both
+  sockets and the resume handshake runs the same `Authenticator.Revalidate`: after the rename both connections resume
+  and `user.connections` shows the new name on both. The 5-minute tick itself is not exercised end to end; a test
+  seam for the hub's `RevalidateEvery` (in `internal/server` and `servertest`) would let it be (WA64's suggestion, no
+  slice yet).
+
+`TestCompatServerDeviceFlow` creates the Manager before `/info`, so its `Close` also closes the deviceauth `Client`'s
+idle connection on the 0.1.x (`no_device_flow`) branch, which goleak would catch against a keep-alive server.
+
 ### 16.3 Web
 
 - **Vitest** (`web/src/link/*.test.tsx`, MSW): every state of §10.1; `?code=` normalized and removed from the URL;
@@ -2134,7 +2185,11 @@ refund, §6.3 item 4), while 21 sockets whose hello fails get 429 at the 21st up
   (`POST /device/code`), opens `verificationUriComplete` signed in as a fixture user, checks the code on the page,
   renames and links; Node's poll gets 200 with an `isa_` token; a Node WebSocket with `hello.auth` gets `welcome`; the
   Devices page lists the device; Remove closes Node's socket with 4401. A second case: signed out → `/login?next=…` →
-  back on the confirm card. `a11y.spec` gains `/link`'s states. Where: Mac, CI ubuntu.
+  back on the confirm card. `a11y.spec` gains `/link`'s states. Where: Mac, CI ubuntu. As built (WA63): `link.spec`
+  also covers a session that ends under the card (cookies cleared, Link → the login's `next=` has the code → back on
+  the card), the different- and unknown-network notes, and the focus after Remove; its addresses come from
+  198.18.0.0/16 (a11y.spec's are 198.19.0.0/16); `a11y.spec` checks every `/link` state (enter, confirm with each
+  network value, linked, denied, invalid, rate_limited, error).
 
 ### 16.4 Manual (the owner's Windows PC; needs 03-desktop-app's and 06-windows-release's builds)
 

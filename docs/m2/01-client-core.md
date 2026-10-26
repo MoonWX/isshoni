@@ -989,12 +989,27 @@ send time just before `WriteRTCP`, so the computed RTT never comes out lower tha
 
 Pure logic, owned by one goroutine (the share's actor, §11.4); no Pion, no I/O. Time comes in as arguments, so tests
 drive it with fixed instants. **One clock** (README §3 item 43, WF4): every instant the core passes (`Tick`, `Hint`,
-`Live`, `SetLimit`, …) is `time.Now()` when the actor handles the event, never a ticker channel's value, which since
-Go 1.23 is the instant the tick was due, not when the actor took it (`case <-rate.C: s.rateTick(time.Now())`; until WF4
-merges, the actor passes the ticker's value: README §3 item 43). With both clocks mixed, a `Tick` taken late recorded
-its change up to that lag (0.54 s seen under `-race`) before the engine call, while a hint's change was recorded at
-`time.Now()`, so the next change could reach the engine sooner than the guards' interval (§9.4) allows (WA54-R2; D10,
-§14).
+`Live`, `SetLimit`, …) is `time.Now()` when the actor handles the event, never a timer channel's value, which since
+Go 1.23 is the instant the tick was due, not when the actor took it. With both clocks mixed, a `Tick` taken late
+recorded its change up to that lag (0.54 s seen under `-race`) before the engine call, while a hint's change was
+recorded at `time.Now()`, so the next change could reach the engine sooner than the guards' interval (§9.4) allows
+(WA54-R2; D10, §14). As built (WF4, `share.go`'s actor): the rate timer is a `time.Timer` re-armed after each `Tick`'s
+engine calls (`case <-rate.C: s.rateTick(time.Now()); rate.Reset(ratectl.TickEvery)`), not a ticker on a fixed
+schedule, so the next `Tick` reads the clock `TickEvery` after those calls, not after the clock read they followed.
+The `Tick` that lets a layer's next change through (`MinInterval` or `ReinitMinInterval` after the last one by
+ratectl's clock) then comes no sooner than that long after the last change reached the engine, as long as a `Tick`'s
+engine calls take less than `TickEvery`. On a fixed schedule, two Ticks exactly 20 periods apart passed a re-init
+change 10 s after a `Tick` whose engine call came microseconds after its clock read (D10 saw 9.999895 s). A hint's
+change is dated by the hint's own clock read, microseconds before its engine calls, and the next `Tick` comes at no
+fixed phase after it.
+
+**Known limit** (PR #44's CI): ratectl dates a change when it decides it, not when the engine call returns, so a slow
+engine call shortens the spacing the engine sees by the call's duration. What WF4 makes true is the spacing of the
+calls the core *issues*; `TestRateTickClock` holds one engine call for 0.4 s and measures the next change from the
+held call's issue (`fake.Call.At` less the hold), since `windows-go` saw it 1.617 s after the held call's return for a
+2 s interval. A native engine call returns in microseconds (`im_set_bitrate` doesn't block: the encoder takes the new
+rate before its next frame, 04 §5.3, §9.5), so this is fine in M2; if a slow call path ever appears, ratectl needs the
+applied instant fed back (an `Applied(layer, at)` call after the engine returns).
 
 ### 9.1 API
 
@@ -1022,7 +1037,7 @@ func (c *Controller) SetLive(layer string, live bool, now time.Time)     // a la
 // and one layer's "none" must not clear the CPU hint while another is still limited). Other values count as none.
 func (c *Controller) SetLimit(limit string, now time.Time)
 func (c *Controller) SetTargetHeight(h int)
-func (c *Controller) Tick(now time.Time) []Action                        // every 500 ms
+func (c *Controller) Tick(now time.Time) []Action                        // TickEvery after the last Tick's calls
 func (c *Controller) State() State
 func (c *Controller) Upload(now time.Time) UploadHint
 func (c *Controller) CPU(now time.Time) bool                             // the CPU hint (§9.5)
@@ -1113,7 +1128,7 @@ For each layer, `Wanted` becomes `Applied` (an `OpBitrate`) when (chosen **per l
 | The layer's encoder | Applies when |
 |---|---|
 | live (`Live[layer]`) | `wanted` differs from `applied` by ≥ 15 % of `applied` (either way), and ≥ 2 s since the layer's last change; otherwise the change waits and the latest `wanted` is applied at the next `Tick` that passes |
-| re-init | `wanted` differs from `applied` by ≥ 30 % of `applied` (either way), and ≥ 10 s since the layer's last change (plan); smaller changes are not applied at all until they grow to 30 % |
+| re-init | `wanted` differs from `applied` by ≥ 30 % of `applied` (either way), and ≥ 10 s since the layer's last change (plan); smaller changes are not applied at all until they grow to 30 %, unless a cap or the ceiling forces them (the waivers below; WF6) |
 
 - **Exceptions**: a layer turned active or inactive (`OpActive`) applies at once, with the resumed layer's target in
   the same step; the first targets (`Initial`) apply at once; a `share.update` (`Params`) applies at once only for the
@@ -1126,7 +1141,16 @@ For each layer, `Wanted` becomes `Applied` (an `OpBitrate`) when (chosen **per l
   ceiling (the preview's way back once a cap is lifted); and a decrease of a layer applied above its ceiling, whatever
   its encoder, since the ceilings carry the admin's cap, which the layer must come down to however small the step
   (without it an admin cap of 7500 kbit/s would leave `f` at 8 Mbit/s for good). So for a re-init encoder only the
-  admin's cap ever passes a step below 30 %.
+  admin's cap ever passes a step below 30 %, as merged in group 7.
+- **The change floor doesn't block a forced move** (README §3 item 47, WF6, group 8): the minimum change applies to
+  optional moves only, not to one that a cap or the ceiling forces. For a re-init layer, a decrease to a cap (the
+  layer's split of the server's cap, §9.2, below the applied value) is always allowed, and the last step up to the
+  ceiling is allowed when it is under 30 %; the interval (`ReinitMinInterval`) still holds, so a layer still
+  changes at most once per 10 s. Why (WF5-R3): once §10.1's loss row counted the loss once, WF5's review saw a re-init
+  `f` at 2.72 Mbit/s behind D10's 3 Mbit/s policer want 1.98 Mbit/s (−27 %) and stay above the policer for the whole
+  limit (3 of 4 runs, 47–52 k datagrams dropped against D9's 14–17 k, before WF5's last fixes), and a re-init `f`
+  less than 30 % below its ceiling after the limit lifted never stepped up to it (2 of 3 runs with WF5's fixes ended
+  at 6.57 or 7.00 Mbit/s); D10 asserts neither. Until WF6 merges, the guard is as above.
 - A switch of a layer from a live to a re-init encoder (`SetLive`) counts as that layer's change at that moment: the
   new encoder just started, so the 10 s run from then.
 - Audio: `OpAudioBitrate` at once when `ShareParams.AudioBitrate` changes (Opus changes bitrate live).
@@ -1169,7 +1193,7 @@ For each layer, `Wanted` becomes `Applied` (an `OpBitrate`) when (chosen **per l
 | `ReinitMinChange`, `ReinitMinInterval` | 30 (percent), 10 s |
 | `FloorF`, `FloorQ`, `QShare` | 250 kbit/s, 150 kbit/s, 0.3 |
 | Engine ranges (04 §6.4) | `MinBitrateF`–`MaxBitrateF` 100 kbit/s–50 Mbit/s; `MinBitrateLayer`–`MaxBitrateLayer` 50 kbit/s–2 Mbit/s; `MinBitrateAudio`–`MaxBitrateAudio` 32–510 kbit/s |
-| `TickEvery` | 500 ms |
+| `TickEvery` | 500 ms, from the last `Tick`'s engine calls to the next `Tick` (the actor re-arms its timer, §9's one clock) |
 | `UploadOn` / `UploadOff`, `UploadBelow` | 6 s (3 samples 2 s apart) / 10 s, 95 (percent of `TargetHeight`) |
 | `BitsPerPixel` | 0.05 |
 
@@ -1184,11 +1208,15 @@ M1 02 §11's "Later (M2), native publishers" item.
 - **Selection**: at `StartShare`, a share whose publishing Conn's `ClientKind` is `desktop` or `mobile` gets
   `nativeUplink`; every other kind keeps `m1Uplink`. `nativeUplink` embeds `m1Uplink`, so the admin's cap and layer
   pausing behave exactly as in M1, and adds an estimate.
-- **Input**: `ShareUplinkStats` once a second (the existing ticker), plus two new fields per layer:
+- **Input**: `ShareUplinkStats` once a second (the existing ticker), plus new fields per layer:
   - `LayerUplinkStats.RawLossPct float64`: the share of sequence numbers missing when a later one arrived, over the
     last 2 s, **before** any retransmission (the Layer's RTP loop counts each gap at the new highest sequence number;
     padding counts as received). M1's `LossPct` is after repair and hides congestion that NACKs fix.
   - `LayerUplinkStats.QueueDelay time.Duration`: the layer's queueing-delay trend (next item); −1 when unknown.
+  - `LayerUplinkStats.arrived int` (unexported, WF5): the payload bit/s that arrived in the ticker's last second
+    alone, from the Layer's `layerStats.arrived`, which `Layer.tick` (`layer.go`) stores next to the 2 s average it
+    feeds into `Bitrate`. The loss row backs off from it (below): `Bitrate`'s 2 s average still carries some of what
+    the sharer sent before the bottleneck began losing it.
 - **Queueing delay** (the delay-trend signal). A native publisher's RTP timestamps come from capture times (§8.2), so
   arrival time minus RTP time changes only with the path's queue, plus clock drift between the two machines:
   - **Sample**: the first packet of each video frame, which is the packet `sampleJitter` already takes (a new RTP
@@ -1210,22 +1238,31 @@ M1 02 §11's "Later (M2), native publishers" item.
     samples (a static screen sends few frames) and during the Layer's first 2 s.
   - A new Layer (republish, new SSRC) starts a new baseline. A layer pause keeps it, because the clocks don't change.
     An encoder re-init or a profile switch keeps the Publisher's RTP timeline (§8.2), so the baseline stays too.
-- **Per tick**, over the active video layers: `rate = Σ Bitrate`, `loss = Σ(RawLossPct × Bitrate) / rate`,
-  `delay` = the `f` layer's `QueueDelay` (else `q`'s; −1 = unknown). The rows are checked top-down and the first
-  that matches decides:
+- **Per tick**, over the active video layers: `rate = Σ Bitrate` (2 s averages), `arrived = Σ arrived` (the last
+  second's), `loss = Σ(RawLossPct × Bitrate) / rate`, `delay` = the `f` layer's `QueueDelay` (else `q`'s; −1 =
+  unknown). The rows are checked top-down and the first that matches decides:
 
 | Condition | Estimate |
 |---|---|
 | `rate < 250 kbit/s` (too few packets for a verdict), a sharer-paused share (§10.3), or within 3 s of a layer resume or of the end of the sharer's pause (which resumes every layer at once) | unchanged, and every consecutive-tick streak below starts again (a tick without a verdict breaks the run of ticks around it) |
-| `loss ≥ 10 %` on this tick, or `loss ≥ 3 %` on 2 consecutive ticks | `max(500 kbit/s, 0.8 × rate)`; growth held for 10 s |
+| `loss ≥ 10 %` on this tick, or `loss ≥ 3 %` on 2 consecutive ticks | `max(500 kbit/s, 0.8 × arrived)`; growth held for 10 s |
 | `delay ≥ 40 ms` on 2 consecutive ticks | `max(500 kbit/s, 0.85 × rate)`; growth held for 10 s |
-| estimate set, `loss < 1 %` on 2 consecutive ticks, `delay < 15 ms` (or unknown) on 2 consecutive ticks, `rate ≥ 0.85 × estimate`, ≥ 2 s since the last growth, not held | `estimate × 1.151`; when it reaches the sum of the preset ceilings × 1.1, the estimate is cleared (none) |
+| estimate set, `loss < 1 %` on 2 consecutive ticks, `delay < 15 ms` (or unknown) on 2 consecutive ticks, `rate ≥ 0.75 × estimate`, ≥ 2 s since the last growth, not held | `estimate × 1.151`; when it reaches the sum of the preset ceilings × 1.1, the estimate is cleared (none) |
 
   A backoff row never raises a set estimate: the new estimate is the smaller of the row's value and the current one.
   "Never above ~80 % of measured uplink" (plan) is the 0.8 factor: the estimate after loss is 80 % of what got
-  through. `rate` already is what got through (each layer's `Bitrate` is the SFU's receive rate, a 2 s average of what
-  arrived), so the loss row has no `(1 − loss/100)` factor: an earlier draft's `0.8 × rate × (1 − loss/100)` counted
-  the loss twice (README §3 item 44; WF5 drops the factor from `uplink_native.go`).
+  through. What arrived already is what got through (the SFU's receive rate), so the loss row has no
+  `(1 − loss/100)` factor: an earlier draft's `0.8 × rate × (1 − loss/100)` counted the loss twice, and 20 % loss with
+  5 Mbit/s arriving gave 3.2 Mbit/s instead of 4 (README §3 item 44, WF5; `TestNativeUplinkLossOnce` pins the value,
+  through the policy and through a Layer that loses every fourth packet). As built (WF5's review, WF5-R1), the row
+  takes the last second's arrivals, not `rate`'s 2 s average: from the average, the backoffs at D9's 3 Mbit/s policer
+  came down to 0.8 × what passes in steps, and the last step, less than a hint's 15 % below what the sharer had been
+  told (`nativeHintMinChange`), never went out, so `f` stayed above D9's 2.3 Mbit/s in about one run of five. The
+  growth row's 0.75 (`nativeGrowthRate`; first written 0.85) is WF5's too (WF5-R2), for the re-init encoders, whose
+  layers take only changes of 30 % or more (§9.4): at 0.85 the estimate could stop growing at as little as
+  1/0.85 ≈ 1.18 × the rate, where the full layer's step up to it (the estimate less the preview's share) was under
+  30 %, and from then on neither moved (D10). At or below 1/1.3 an estimate that stops growing is always a step of
+  30 % or more for the full layer: with `rate = f + q`, `(rate/0.75 − q) / f = 1.33 + 0.33 q/f`.
 - **Why a delay rule** (the plan's "loss and receive-rate estimator" doesn't exclude one). A home router's uplink
   buffer often holds 0.5–2 s, and loss starts only when it overflows. A loss-only estimator therefore lets latency
   grow to seconds before it reacts, and then growth (this estimator's +15 % per 2 s, or the client's 4 → 8 Mbit/s
@@ -1273,9 +1310,12 @@ M1 02 §11's "Later (M2), native publishers" item.
 - Constants live in `uplink_native.go` (`nativeLossHigh` 10, `nativeLossMid` 3, `nativeLossLow` 1, `nativeBackoff`
   0.8, `nativeDelayHigh` 40 ms, `nativeDelayLow` 15 ms, `nativeDelayBackoff` 0.85, `nativeDelayWindow` 500 ms,
   `nativeBaselineRise` 0.5 ms per s, `nativeDelayMinSamples` 3, `nativeGrowth` 1.151, `nativeHold` 10 s,
-  `nativeMinCap` 500 kbit/s, `nativeMinRate` 250 kbit/s, `nativeHintMinChange` 0.15, `nativeHintMinGap` 2 s). They
+  `nativeMinCap` 500 kbit/s, `nativeMinRate` 250 kbit/s, `nativeHintMinChange` 0.15, `nativeHintMinGap` 2 s; and,
+  in a second block of the numbers above that the list didn't name, `nativeResumeGrace` 3 s, `nativeGrowthEvery` 2 s,
+  `nativeGrowthRate` 0.75, `nativeCeilingSlack` 1.1, `nativeDelayWarmup` 2 s, `nativeDelaySlots` 256). They
   are tuned only with §14's integration cases D9, D10 and D19 passing. WA54 tuned `nativeGrowth` from 1.10 (README
-  WA54), together with ratectl's `RampEvery` (§9.3); the other values are pinned by WA28's estimator tests. A growth
+  WA54), together with ratectl's `RampEvery` (§9.3), and WF5 `nativeGrowthRate` from 0.85 (above); the other values
+  are pinned by WA28's estimator tests. A growth
   step of just over 15 % is a hint of its own (`nativeHintMinChange`), which the sharer's ramp (+15 % a step) follows
   in one step; steps of 10 % went out to the sharer in pairs (+21 %) about every 5 s, and D9's way back took longer
   than its bound. The extra 0.1 % keeps every step a hint whatever the rounding: with exactly 1.15, about 2.3 % of the
@@ -1697,10 +1737,9 @@ Session.Next ──► pump goroutine ──► per-kind queues ──► consum
   - `EventSourceResized`, `EventCaptureInterrupted` / `EventCaptureResumed`, `EventDeviceReset`: logged (new sizes
     reach the snapshot with the `EventLayer` of a re-init).
   - Reserved codes (2–5) and unknown codes: dropped (debug log). Audio events never come through `Next` (05).
-- A fatal error from `Next` ends the share with its code and its `Reason` (`EndInfo.Media` and `MediaReason`, §11.9;
-  `MediaReason` from WF4; until then it is empty, README §3 item 43), `encoder_lost` included (the engine already tried
-  every candidate, D15), so 03 can tell `device_removed` from a lost encoder (03 §10.5). It is never audio-caused
-  (§5.2).
+- A fatal error from `Next` ends the share with its code and its `Reason` (`EndInfo.Media` and `MediaReason`, §11.9,
+  README §3 item 43; `engineEnd`, WF4), `encoder_lost` included (the engine already tried every candidate, D15), so 03
+  can tell `device_removed` from a lost encoder (03 §10.5). It is never audio-caused (§5.2).
 
 ### 11.6 Negotiation and PeerConnection recovery
 
@@ -1794,8 +1833,10 @@ so 3 s without inbound traffic is a real outage); `LoggerFactory = logx.NewPionL
   `Session.SetBitrate(LayerAudio)`; then `Publisher.SetPacingTargets`. A failed engine call is logged and the share
   goes on with what the engine has. Hints for other share ids are ignored. Hints are re-sent after a resume (01
   §8.10); applying the same values again changes nothing.
-- `ratectl.Tick` runs every 500 ms on the share actor while the share is live and not paused (WA46: the ramp doesn't
-  climb while nothing is sent); the upload hint is still read then, and clears 10 s after the last Tick.
+- `ratectl.Tick` runs on the share actor while the share is live and not paused (WA46: the ramp doesn't climb while
+  nothing is sent), `TickEvery` (500 ms) after the last `Tick`'s engine calls: the actor re-arms a `time.Timer` after
+  each and passes `time.Now()`, never the timer's value (§9's one clock, WF4); the upload hint is still read then, and
+  clears 10 s after the last Tick.
 - **The codec switch's check** (§8.6, as built by WA46): the send loop's `ProfileSource.SetProfile` records the
   profile it asked for per video layer, with the number of engine events the pump had read, so only that layer's
   `EventLayer` of that re-init answers it: neither another layer's (layers may run different encoders, 04 §9.7) nor
@@ -1895,6 +1936,13 @@ type EndInfo struct {
 | `server` | `Server` = the server's `EndReason` (empty when the share vanished from `room.state` without a `room.event` naming it); `ByThisApp` false (for example a `share.stop` from a web tab of the user, which 03 shows as "stopped elsewhere") |
 | `server-unreachable` | nothing |
 | `unlinked` | `Protocol` = the stop's code (`session_revoked`, `account_disabled`, `unauthenticated`) when there is one; "" for an `Auth` error's stop (`RelinkRequired`) |
+
+As built (WF4): `engineEnd` maps a live share's engine error and `startEnd` a failed start's `*media.Error` the same
+way (`source_gone` → `source-gone`, any other code → `error`), each with the error's `Reason` as `MediaReason`; an
+error that isn't a `*media.Error`, or one with an empty `Code`, is `error`/`internal` without a token, so
+`MediaReason` never comes without `Media`. It is the fixed detail token, never the error's `Detail` (logs only, §5.2);
+the "share ended" log line carries it as `media_reason`. 03's share controller passes it on as the media error's
+`Reason` (`endError`), which the bridge sends as `params.reason` (03 §10.1, §10.5).
 
 - **Engine stats**: while a share is live the share actor calls `Session.Stats()` every 1 s and copies each layer's
   `Encoder`, `HW` (`f`'s also as the share's), `Limit`, `FPSIn` and `LatencyP50`/`P95` (as `EngineLatency`) into its
@@ -2267,7 +2315,12 @@ The component the client core owns, capture → last packet sent, is measured on
    half of them: those with both tracks' `estimatedPlayoutTimestamp`, NetEq's and the output's delay and a shown frame
    (Chrome gives the timestamp once it has both tracks' SRs). The other way, Chrome delays the audio, which takes
    nothing off the legs; on the Mac the median is −13 to −22 ms. The hold beyond what the audio path explains stays in
-   `latency.json`, not asserted. Without the receivers' stats the legs are asserted as shown. This catches timestamp
+   `latency.json`, not asserted. **CI's baseline is still to be read** (PR #42's review): a passing run keeps
+   `latency.json` (the test's output folder, uploaded in the `e2e` job's `e2e-results` artifact for 7 days), and its
+   `avOffset` median is the e2e job's offset with correct stamps. No WB slice can read it (they don't use GitHub), so it
+   is an owner action (README §8). If it sits near −40 ms, a stamp error of 100 ms would only reach the 60 ms bound,
+   and a later fix tightens the check (the p75 of the intervals, or a bound relative to that baseline); near the Mac's
+   −13 to −22 ms the bound stands. Without the receivers' stats the legs are asserted as shown. This catches timestamp
    mistakes that make Chrome's jitter buffer grow, and SR or capture-stamp offsets between a share's audio and video, or
    a publisher that sends one of them late.
    PR #41 had bounded the hold beyond what the audio path asks for, max(0, NetEq + output − the video's own delay),
@@ -2331,13 +2384,13 @@ self-hosted runner (06 names its labels).
 | `internal/media/fake` | `fake.Engine` passes `mediatest.Conformance` (Synthetic; Decodable minus check 5, skipped in coverage builds, §6.4); single-use picks, `Release`, `Listed` enforcement; `SetBitrate(0)` is `invalid`; `SetLayerActive` pause and resume (keyframe, no `Reinit`); `SetPaused` stops video only; re-init mode marks `Reinit`; `Reconfigure{Profile}` swaps the SPS and emits `EventLayer`; audio-only and `TapPCM` sessions; `Pick` cancel, timeout and ctx; `Fail`, `Emit`, `Calls` (incl. `audio_muted`); the `AudioController` scenarios are 05's tests; M1's tests unchanged except reading flags from Markers | Mac, CI ubuntu, macos; CI windows (06's `windows-go`) |
 | `internal/media/native` | 04 §12 and §18.3: the binding's fake-caller tests (04 owns them); among their assertions, §7.1's requirements: ABI major/minor and export checks (all 39 exports required, 05's audio and the `im_test_*` exports included), the status and event tables of §5.2, `Next` honors ctx within 50 ms, the copy rule, packet validation (audio layer value, PCM size), `EventLayer` before every `REINIT` | Mac, CI ubuntu (logic); CI windows (`windows-go`; with the DLL, `windows-desktop`, 04 §18.2) |
 | `internal/client/publish` | M1 suite unchanged (pacing off by default); SR NTP equals `wall(now) − (Now − capture)` within 1 ms with a `Clock` Source whose packets are 25 ms old; pacer at 24 Mbit/s: a 300 KB frame's last packet leaves after 55–70 ms from a full bucket and 95–110 ms from an empty one, and audio written meanwhile is not delayed > 2 ms; backpressure blocks `Next` and never drops; responder size 4096 (a NACK for a packet 3000 back is answered, with a receiver whose SRTP replay window is 4096 like the SFU's, §8.4); RTT from a crafted RR; `CaptureToSend`; `KindPCM` dropped | Mac, CI |
-| `internal/client/ratectl` | table tests at fixed instants: initial targets per preset; split examples of §9.2; clamps to 04 §6.4's ranges; ramp 4 → 8 Mbit/s in 5 steps, the last 14 s after live (`RampEvery` 3 s); congestion hold; live guards (15 %, 2 s, latest wins) and re-init guards (30 %, 10 s, one-step ramp) chosen per layer, `SetLive` switching a layer mid-share; `OpActive` at once with the resume target; admin cap; upload hint on after 6 s with a binding cap, never during the ramp, off after 10 s; `SetLimit` cpu/gpu → `CPU` true and the ramp held for 10 s after `none` | Mac, CI |
+| `internal/client/ratectl` | table tests at fixed instants: initial targets per preset; split examples of §9.2; clamps to 04 §6.4's ranges; ramp 4 → 8 Mbit/s in 5 steps, the last 14 s after live (`RampEvery` 3 s); congestion hold; live guards (15 %, 2 s, latest wins) and re-init guards (30 %, 10 s, one-step ramp) chosen per layer, `SetLive` switching a layer mid-share; with WF6 (README §3 item 47), a re-init layer's decrease of less than 30 % to a cap and its last step of less than 30 % up to the ceiling, each still 10 s after the last change; `OpActive` at once with the resume target; admin cap; upload hint on after 6 s with a binding cap, never during the ramp, off after 10 s; `SetLimit` cpu/gpu → `CPU` true and the ramp held for 10 s after `none` | Mac, CI |
 | `internal/protocol` | fixtures for `share.update{paused}`, `room.state` with `paused`, `user.connections` with `deviceName`; compat replay of v1 fixtures; validation ignores nothing new | Mac, CI |
 | `internal/protocol/relay` | round-trip fixtures for `playback.stop` (`{v: 1, roomId}`) and `playback.state`; tygo drift check covers `relay.gen.ts` | Mac, CI |
-| `internal/server/sfu` | `nativeUplink` table tests per §10.1 row (fixed stats sequences → decisions), including the delay rows: `delay ≥ 40 ms` on one tick doesn't back off, on two it does (to 0.85 × rate, never above the current estimate); growth blocked at `delay ≥ 15 ms`, allowed when unknown; `RawLossPct` counts gaps before repair; queueing delay at fixed instants: samples only at a frame's first packet (not retransmissions, padding or an older timestamp), unwrap across the 32-bit timestamp wrap, 500 ms window minimum, baseline rising ≤ 0.5 ms per s under a simulated +300 ppm sender drift (`QueueDelay` stays < 5 ms) and dropping at once when a queue drains, −1 with < 3 samples and in the first 2 s; hint spacing 15 %/2 s; `sharerPaused` swallows keyframe requests and requests one per watched layer on unpause; web and tool kinds keep `m1Uplink`; a native publisher behind M1's 3 Mbit/s policer gets a congestion hint within 6 s, and behind a 3 Mbit/s queueing link with a 1 s buffer (`TestNativeUplinkQueue`, started about 150 and 420 ms after a tick) gets it before any datagram is lost at the queue, with the rate into the link at most 4.05 Mbit/s, measured over the link's first 2 s or up to the hint when that comes sooner, but over at least 1 s (one 30 fps frame of the 3.5 Mbit/s layer is about 117 kbit, so a 1 s window moved by a frame's worth with where it ended); `FuzzDelayTrend`; the publish PCs' SRTP replay window (§8.4): a plain retransmission more than 64 and up to 4096 packets behind the newest is accepted, through `sfutest.FaultConn` (README WA28) | Mac, CI |
+| `internal/server/sfu` | `nativeUplink` table tests per §10.1 row (fixed stats sequences → decisions; the loss row from the last second's `arrived` and the growth row's 75 %, WF5), `TestNativeUplinkLossOnce` (20 % loss with 5 Mbit/s arriving gives 4 Mbit/s, through the policy and through a Layer that loses every fourth packet), including the delay rows: `delay ≥ 40 ms` on one tick doesn't back off, on two it does (to 0.85 × rate, never above the current estimate); growth blocked at `delay ≥ 15 ms`, allowed when unknown; `RawLossPct` counts gaps before repair; queueing delay at fixed instants: samples only at a frame's first packet (not retransmissions, padding or an older timestamp), unwrap across the 32-bit timestamp wrap, 500 ms window minimum, baseline rising ≤ 0.5 ms per s under a simulated +300 ppm sender drift (`QueueDelay` stays < 5 ms) and dropping at once when a queue drains, −1 with < 3 samples and in the first 2 s; hint spacing 15 %/2 s; `sharerPaused` swallows keyframe requests and requests one per watched layer on unpause; web and tool kinds keep `m1Uplink`; a native publisher behind M1's 3 Mbit/s policer gets a congestion hint within 6 s, and behind a 3 Mbit/s queueing link with a 1 s buffer (`TestNativeUplinkQueue`, started about 150 and 420 ms after a tick) gets it before any datagram is lost at the queue, with the rate into the link at most 4.05 Mbit/s, measured over the link's first 2 s or up to the hint when that comes sooner, but over at least 1 s (one 30 fps frame of the 3.5 Mbit/s layer is about 117 kbit, so a 1 s window moved by a frame's worth with where it ended); `FuzzDelayTrend`; the publish PCs' SRTP replay window (§8.4): a plain retransmission more than 64 and up to 4096 packets behind the newest is accepted, through `sfutest.FaultConn` (README WA28) | Mac, CI |
 | `internal/server/sfu/sfutest` | `NewQueueLink`: departures at the capacity in FIFO order, `Queued()` grows by `size × 8 / capacity` per datagram, RTP lost only beyond `limit`, STUN/DTLS/RTCP never lost; `ReadFrom` delivers at the departure time; other peers pass at once; `Close` ends the reader goroutine (goleak); `SetLink` with a queueing Link panics; M1's `Link` tests unchanged | Mac, CI |
 | `internal/server/signal` | `paused` ignored without the feature, on the sending connection and on the share's publishing connection (§10.3); status precedence stalled > paused > live; pause of a starting share (`paused` at once, its start timeout suspended while paused and a fresh 30 s from the resume; WF3, §10.3); any same-user connection may pause; `user.connections` on welcome, open, close, detach, room change, and after a `Revalidate` that changed `DeviceName`; coalesced ≤ 1/200 ms, only to feature holders of the same user | Mac, CI |
-| `internal/client/core` (unit, with `signaltest`-style fake server where cheap) | stop table of §11.3: forced refresh once; `Auth.SessionEnded` called (bounded 15 s) before `Run` returns on `session_revoked`, `account_disabled` and a second `unauthenticated`; `RelinkRequired` → `unlinked`; `UpdateRequired` → `update_required`; `StopError.Err` carries the server error's params; `Run` after return or `Close` → `ErrClosed`; `Close` waits ≤ 3 s; `StartShare` → `ErrNotReady` when not online, ctx cancel aborts cleanly; `Status.ConnectionID` and its `EventStatus`; `playback.state` rules 1–3; `EventShare` not fired by live counters; subscriber overflow → `EventResync`. A check of an exact message sequence after a `Stop`, an aborted start, `StopOther` or `Close` reads the fake server's log once it has settled (`fakeServer.settledTypes`: nothing new for 100 ms), because those calls return once their last message is queued, not read (PR #39) | Mac, CI |
+| `internal/client/core` (unit, with `signaltest`-style fake server where cheap) | stop table of §11.3: forced refresh once; `Auth.SessionEnded` called (bounded 15 s) before `Run` returns on `session_revoked`, `account_disabled` and a second `unauthenticated`; `RelinkRequired` → `unlinked`; `UpdateRequired` → `update_required`; `StopError.Err` carries the server error's params; `Run` after return or `Close` → `ErrClosed`; `Close` waits ≤ 3 s; `StartShare` → `ErrNotReady` when not online, ctx cancel aborts cleanly; `Status.ConnectionID` and its `EventStatus`; `playback.state` rules 1–3; `EventShare` not fired by live counters; subscriber overflow → `EventResync`; `TestRateTickClock` (WF4, §9's one clock: a `Tick` taken 0.75 s late and an engine call held 0.4 s, after which the core issues no change of a layer sooner than ratectl's interval after the last one, measured from the held call's issue, PR #44); `EndInfo.MediaReason` for a live share's engine end and a failed start (WF4). A check of an exact message sequence after a `Stop`, an aborted start, `StopOther` or `Close` reads the fake server's log once it has settled (`fakeServer.settledTypes`: nothing new for 100 ms), because those calls return once their last message is queued, not read (PR #39) | Mac, CI |
 
 **Integration** (`internal/server/itest/desktop_*_test.go`: an in-process server, the core on `fake.Engine`, M1's
 viewer clients and `sfutest.Viewer`, fault injection; cookie auth via `Options.Header` until WA73 switches them to a
@@ -2355,8 +2408,8 @@ app.)
 | D6 | Hold expiry | server stopped for 35 s → share ends `server-unreachable` at 30 s ± 1 s; engine stopped |
 | D7 | Codec switch | a CB-only viewer joins → `quality.hint{codec: h264/42e0}` → `Reconfigure{Profile: 42e0}` and re-offer; viewer gets CB from a `Reinit` keyframe, whose SPS is Constrained Baseline (profile_idc 66 with constraint_set1), not only the payload type; back to High 60 s after it leaves, the first keyframe after the switch back carrying a High SPS (WA46) |
 | D8 | Layer pausing | no high request for 10 s → `f` inactive: `SetLayerActive(f, false)` in `Calls`, no `f` packets; a high request resumes with a keyframe ≤ 1 s (`SetLayerActive(f, true)` and `SetBitrate(f, target)` in one step, in either order; the core calls `SetBitrate` first, §11.8) |
-| D9 | Uplink congestion | `SetInboundLink` with M1's policer (`NewLink`) at 3 Mbit/s on the publisher: congestion hint ≤ 6 s; applied `f` settles ≤ 2.3 Mbit/s within 15 s; unrecovered loss < 2 % after settling; upload hint "540p" or "720p" event; capacity to 20 Mbit/s → ramps back to 8 Mbit/s ≤ 75 s (README §3 item 44; 60 s until WF5 merges), hint clears. As built (WA54): the script runs the share at its 8 Mbit/s ceiling for 5 s first (longer than the live guard's 2 s, so the core takes the first hint at once, as a share that ramped a while ago does), then the policer limits the uplink for 30 s, then allows 20 Mbit/s. "Settles" means that `f`'s applied target (the engine's call) first comes down to 2.3 Mbit/s or less within 15 s of the limit, and the unrecovered loss is measured from then until the lift; it can't mean "stays there for the rest of the limit": a policer gives no delay signal, so after the 10 s hold the estimate probes upward and passes 2.3 Mbit/s again 13–17 s after its backoff (also with 1.10). "Back" means `f` at its ceiling, the upload hint off and a last congestion hint that lifts the cap; under `-race` on the Mac that took 30–57 s (least when the estimate was growing at the lift, most after a backoff right at it), so the 60 s first written had too little margin (WA54-R1). The Link sits at the core's end of the uplink (§10.1's `sfutest` bullet) |
-| D10 | Re-init encoder | probe `LiveBitrate: false`: during D9's script no two bitrate changes < 10 s apart, none < 30 %; every change is followed by a `Reinit` keyframe. The spacing is measured on the engine's calls (`fake.Call.At`). With the rate tick on the actor's clock (§9, README §3 item 43, WF4), ratectl's guards bound the engine's calls too, and D10 allows them at most Windows' clock step (20 ms) of slack; until WF4 merges it allows 1 s (`callSlack`: 9 s); a change that no viewer saw (the SFU forwarded another layer meanwhile) is logged and skipped, and a keyframe counts as the change's only when neither the GOP nor a keyframe request made it (WA54) |
+| D9 | Uplink congestion | `SetInboundLink` with M1's policer (`NewLink`) at 3 Mbit/s on the publisher: congestion hint ≤ 6 s; applied `f` settles ≤ 2.3 Mbit/s within 15 s; unrecovered loss < 2 % after settling; upload hint "540p" or "720p" event; capacity to 20 Mbit/s → ramps back to 8 Mbit/s ≤ 75 s (README §3 item 44, WF5: the 60 s first written had too little margin), hint clears. As built (WA54): the script runs the share at its 8 Mbit/s ceiling for 5 s first (longer than the live guard's 2 s, so the core takes the first hint at once, as a share that ramped a while ago does), then the policer limits the uplink for 30 s, then allows 20 Mbit/s. "Settles" means that `f`'s applied target (the engine's call) first comes down to 2.3 Mbit/s or less within 15 s of the limit, and the unrecovered loss is measured from then until the lift; it can't mean "stays there for the rest of the limit": a policer gives no delay signal, so after the 10 s hold the estimate probes upward and passes 2.3 Mbit/s again 13–17 s after its backoff (also with 1.10). "Back" means `f` at its ceiling, the upload hint off and a last congestion hint that lifts the cap; under `-race` on the Mac that took 30–57 s with WA54's loss row (least when the estimate was growing at the lift, most after a backoff right at it), so the 60 s first written had too little margin (WA54-R1). With WF5's row (the loss counted once, from the last second's arrivals, §10.1) D9 passed 5 of 5 under `-race` on the Mac: `f` at 2.3 Mbit/s or less 2.4–3.9 s after the limit, final loss 0–0.56 %, back at 8 Mbit/s 29–54 s after the lift. Each time the policer loses, the estimate backs off to 80 % of what arrived in the last second (about 2.2 Mbit/s) and, in every such run, 2–3 s later once more (to about 1.7 Mbit/s, which restarts the hold); the longest way back is the hold, 12–14 ramp steps and the upload hint's `UploadOff` after the last. The Link sits at the core's end of the uplink (§10.1's `sfutest` bullet) |
+| D10 | Re-init encoder | probe `LiveBitrate: false`: during D9's script no two bitrate changes < 10 s apart, none < 30 %; every change is followed by a `Reinit` keyframe. The spacing is measured on the engine's calls (`fake.Call.At`) against the full `ReinitMinInterval`, with no slack: the share's actor gives ratectl `time.Now()` and re-arms its rate timer after each `Tick`'s engine calls (§9's one clock, README §3 item 43, WF4; WA54 had allowed 1 s, `callSlack`), and WF4's runs had gaps of 10.0047–10.0123 s. Every change is also a re-init in the core's log (`rate action … reinit=true`). As built (PR #43's CI fixes): the keyframe is checked **at the source** first: `startCongestion` gives the core the fake engine through `engineTap` (`recoveringDesktopOn`'s wrap in `desktop_recovery_test.go`), which records what `Session.Next` hands the core, and for every bitrate call the engine must hand it the layer's `EventLayer` and then, as the layer's next packet, a keyframe marked `Reinit`, within 1 s (`reinitWithin`), one per call. **At the viewers** the keyframe is identified by its `CaptureNS`, unique to its frame: a viewer that got frames of the layer within 1 s before and after it (`reinitWatched`) watched the change and must have got it, unless the policer lost RTP datagrams within 1 s after the core got it (`keyPassWithin`, the Link's loss count sampled with the queue: `linkSampler`), which is logged. A change no viewer watched is logged: under the policer the SFU's downlink allocator may move a viewer of `f` to `q` (M1 02 §10.2), and a run can have as few as two changes of `f`, so at least one change of `f` (the ramp's step) must be watched and seen, and when `q` changed, carol (who watches `q`) must have watched at least one of its changes. The earlier check by a capture-time window could only guess which keyframe was the re-init's, and once demanded it from a viewer that had been on `q` (PR #43's first failure). With WF6 (README §3 item 47) a decrease to a cap or the last step to the ceiling may be under 30 %; WF6 changes D10's 30 % check only if a run hits one |
 | D11 | Pause | `SetPaused(true)`: no media within 50 ms (viewer recorder); `Calls` show `paused true` and `audio_muted true`; `room.state` status `paused`; viewer PLIs swallowed; a viewer joining while paused gets no frame; resume → `audio_muted false` then `paused false` in `Calls`, keyframe ≤ 500 ms, status `live`; a pause set from a web-role connection is reconciled with the same calls |
 | D12 | Preset from another connection | a web-role connection of the user sends `share.update{preset: movie}` → the core reconciles: `share.update` with the same preset, Opus `SetBitrate(audio, 256000)` |
 | D13 | Encoder changed, then lost | `Emit(EventEncoderChanged{f, "mf-sw"})` and an `EventLayer` → `EventNotice{"encoder_fallback"}`, the snapshot's `f` encoder changes, same share id, viewer media continuous; then `Fail(encoder_lost)` ends the share `error`/`encoder_lost` |
@@ -2514,7 +2567,7 @@ In order; each is testable on its own. "Where" says where its acceptance runs.
 | C10 | Core: connection and start/stop | `core.go`, `conn.go`, `share.go` (`StartShare` semantics, stop, room join/leave, `StopOther`), `pump.go`, `events.go` (`Status.ConnectionID`, `EventShare` rule), stop table with `Auth.SessionEnded`, `Run` once and `Close`, cookie auth for tests | itest D1, D2, D14, D15, D17; core unit rows | C02, C05, C06 | Mac, CI |
 | C11 | Core: recovery | `pubdriver.go` (§11.6), §11.7 hold, resume, republish, reconcile | itest D3–D6 | C10 | Mac, CI |
 | C12 | Core: hints, codec, pause | `hints.go`: codec switch (with the actual-profile re-offer), ratectl wiring, layer pausing (`SetLayerActive`), pause/resume (`SetPaused`, `SetAudioMuted`), preset reconcile, `EventEncoderChanged` notice | itest D7, D8, D11–D13 | C10, C08, C09 | Mac, CI |
-| C13 | Core: congestion end to end | D9, D10, D19; tuning of §10.1 constants within their rows (as built, WA54: `nativeGrowth` 1.151 and ratectl's `RampEvery` 3 s, §9.3, §10.1) | itest D9, D10, D19 | C12 | Mac, CI |
+| C13 | Core: congestion end to end | D9, D10, D19; tuning of §10.1 constants within their rows (as built, WA54: `nativeGrowth` 1.151 and ratectl's `RampEvery` 3 s, §9.3, §10.1; then README WF4–WF6: the rate tick on the actor's clock, the loss row from the last second's arrivals, `nativeGrowthRate` 0.75 and the re-init guard's forced moves) | itest D9, D10, D19 | C12 | Mac, CI |
 | C14 | Core: stats, server stats, playback state, compat test | `stats.go` (engine `Stats` poll, `stats` messages), `WatchServerStats`, `relay.go` (`playback.state` only), `TestCompatServer` | itest D18; `stats` messages validate and reach the hub's metrics; `TestCompatServer` passes against a locally started current server and skips without the env var | C10, C07 | Mac, CI |
 | C15 | Bearer auth | core with 02's `Auth` and the server's bearer path; itests switch to a linked device; forced refresh once on `unauthenticated`; `SessionEnded` on scope-session stops | itest D1–D3 with bearer; `unauthenticated` → refresh → new connection → republish; revoked → `SessionEnded` then `StopUnlinked`, the manager unlinked | C10; 02 DA6 (bearer hello) and DA11 (`linkedManager`) | Mac, CI |
 | C16 | Latency proxies | itest D16; `web/e2e/latency.spec.ts` | both pass in CI; values logged | C10 (D16); C05 (spec) | CI ubuntu, Mac |
