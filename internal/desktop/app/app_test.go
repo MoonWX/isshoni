@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/client/core"
 	"github.com/MoonWX/isshoni/internal/client/credstore"
 	"github.com/MoonWX/isshoni/internal/client/deeplink"
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
@@ -838,6 +839,9 @@ func TestErrAttr(t *testing.T) {
 		{fmt.Errorf("session: %w", context.DeadlineExceeded), "context deadline exceeded"},
 		{errors.New(`Cookie: isshoni_session=s3cr3t`), "error"},
 		{fmt.Errorf(`open C:\Users\alex\settings.json: %w`, os.ErrPermission), "error"},
+		{fmt.Errorf("session: %w", &core.StopError{Reason: core.StopUnlinked, Code: protocol.ErrorCodeSessionRevoked,
+			Err: &protocol.Error{Code: protocol.ErrorCodeSessionRevoked, RoomID: "alexs-room"}}),
+			"core: stopped: unlinked (session_revoked)"},
 	} {
 		if a := errAttr(c.err); a.Key != "err" || a.Value.String() != c.want {
 			t.Errorf("errAttr(%q) = %s=%q, want err=%q", c.err, a.Key, a.Value.String(), c.want)

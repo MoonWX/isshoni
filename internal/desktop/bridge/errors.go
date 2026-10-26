@@ -14,6 +14,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/bridge/codes"
 	"github.com/MoonWX/isshoni/internal/desktop/servers"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
+	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -122,6 +123,9 @@ func isTimeout(err error) bool {
 
 // knownError is mapError's table; nil for an error it doesn't know.
 func knownError(err error) *Error {
+	if e := shareError(err); e != nil { // first: the controller's errors may wrap a wire or media error
+		return e
+	}
 	var (
 		srvErr   *servers.Error
 		apiErr   *api.Error
@@ -182,6 +186,29 @@ func knownError(err error) *Error {
 	case errors.Is(err, audio.ErrUnknownTip):
 		return invalidArgument("code")
 	case errors.Is(err, settings.ErrInvalid):
+		return newError(codes.CodeInvalidArgument, nil)
+	}
+	return nil
+}
+
+// shareError is the share controller's part of the table (03 §6.4, §10.5); nil for another error. The controller's
+// own pick_expired carries params.reason pick_expired like the engine's (engine.source_gone with that reason), so
+// the SPA's reason row (Pick again) matches both.
+func shareError(err error) *Error {
+	switch {
+	case errors.Is(err, share.ErrPickExpired):
+		return newError(codes.CodePickExpired, map[string]any{"reason": "pick_expired"})
+	case errors.Is(err, share.ErrAlreadySharing):
+		return newError(codes.CodeAlreadySharing, nil)
+	case errors.Is(err, share.ErrNotSharing):
+		return newError(codes.CodeNotSharing, nil)
+	case errors.Is(err, share.ErrPublisherOffline):
+		return newError(codes.CodePublisherOffline, nil)
+	case errors.Is(err, share.ErrFeatureDisabled):
+		return newError(codes.CodeFeatureDisabled, map[string]any{"feature": string(protocol.FeatureSharePause)})
+	case errors.Is(err, share.ErrBusy):
+		return newError(codes.CodeBusy, nil)
+	case errors.Is(err, share.ErrInvalid):
 		return newError(codes.CodeInvalidArgument, nil)
 	}
 	return nil
