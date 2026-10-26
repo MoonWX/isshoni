@@ -45,9 +45,6 @@ type auditAction struct {
 	// later is why the merged tree has no code that writes the action (the table marks it later); "" for the actions
 	// it writes.
 	later string
-	// inAuth marks a later action that auth already writes although no route reaches it yet (M2 README WA30). The
-	// route's slice produces it in TestAuditCoverage and drops later and inAuth: since WA47 no row has it.
-	inAuth bool
 }
 
 // Actor kinds of the table.
@@ -631,9 +628,6 @@ func TestAuditActionsInSource(t *testing.T) {
 			continue
 		}
 		for _, dir := range []string{".", "../auth"} {
-			if dir == "../auth" && a.inAuth {
-				continue
-			}
 			if where := writers[dir][a.action]; len(where) > 0 {
 				t.Errorf("%s names %s, which the table marks later (%s): produce it in TestAuditCoverage", where[0],
 					a.action, a.later)

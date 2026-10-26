@@ -51,8 +51,8 @@ func originSet(origins []string) map[string]struct{} {
 //   - every answer carries Vary: Origin, and none Access-Control-Allow-Credentials.
 //
 // A request from any other origin, or with no or several Origin headers, passes untouched; its preflight reaches
-// the route lookup and gets M1's 405. Answers of 04's global chain before the API (421, the shutdown 503) carry no
-// CORS headers: the SPA sees a network error and retries.
+// the route lookup and gets M1's 405. Answers of 04's global chain (421, the shutdown 503, a recovered 500) carry
+// no CORS headers: the SPA sees a network error and retries. The recover step drops the two this step set.
 func (a *API) cors(next http.Handler) http.Handler {
 	if len(a.desktop) == 0 {
 		return next

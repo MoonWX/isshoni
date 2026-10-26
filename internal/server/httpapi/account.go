@@ -54,7 +54,7 @@ func (a *API) postLogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
-	a.sessionChanged(p.UserID)
+	a.devicesChanged(p.UserID)
 	if p.Method == auth.MethodSession {
 		a.endSessionCookie(w)
 	}
@@ -87,7 +87,7 @@ func (a *API) postPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.useSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
-	a.sessionChanged(p.UserID) // the other sessions are gone: this browser's other tabs refetch the lists
+	a.devicesChanged(p.UserID) // the other sessions are gone: this browser's other tabs refetch the lists
 	WriteJSON(w, http.StatusOK, api.Empty{})
 }
 
@@ -194,7 +194,7 @@ func (a *API) deleteSession(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
-	a.sessionChanged(p.UserID)
+	a.devicesChanged(p.UserID)
 	if id == p.SessionID {
 		a.endSessionCookie(w)
 	}
@@ -217,7 +217,7 @@ func (a *API) postRevokeOthers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if n > 0 {
-		a.sessionChanged(p.UserID)
+		a.devicesChanged(p.UserID)
 	}
 	WriteJSON(w, http.StatusOK, api.RevokeOthersResponse{Revoked: n})
 }
@@ -266,6 +266,6 @@ func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
-	a.sessionChanged(p.UserID)
+	a.devicesChanged(p.UserID)
 	w.WriteHeader(http.StatusNoContent)
 }

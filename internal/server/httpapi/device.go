@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server/auth"
 	"github.com/MoonWX/isshoni/internal/server/store"
@@ -17,11 +16,6 @@ import (
 // was linked (a link may also evict the least recently seen device beyond the cap), renamed or revoked, and after a
 // refresh token's reuse revoked one. Approving and denying a code notify nothing: the approval page has the answer.
 // Every body is limited to 16 KiB (the chain's body limit for /api/v1/device/).
-
-// devicesChanged tells the user's SPAs that the Devices page changed: {UserID}: devices.
-func (a *API) devicesChanged(id store.UserID) {
-	a.d.Signal.Notify(NotifyTarget{UserID: id}, protocol.TopicDevices)
-}
 
 // postDeviceCode is POST /api/v1/device/code (#44, Public, M2 02 §5.2): {clientKind, deviceName, os, appVersion} →
 // 200 DeviceCodeResponse. Errors: 429 rate_limited (auth-ip, device-code-ip, device-code-ip48), 422

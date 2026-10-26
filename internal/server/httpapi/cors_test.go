@@ -189,7 +189,8 @@ func TestCORSPreflight(t *testing.T) {
 
 // TestCORSRequests: a desktop origin's requests carry Allow-Origin, Expose and Vary on every answer of the chain,
 // errors included (401, 403, 404, 405, 413, 429), never Allow-Credentials; their Cookie header is dropped, so only a
-// bearer gets in; other origins' answers carry no CORS header.
+// bearer gets in; other origins' answers carry no CORS header. A recovered panic's 500 is one of 04's global chain
+// and carries none: the desktop SPA sees a network error and retries (M2 02 §6.4).
 func TestCORSRequests(t *testing.T) {
 	f := newCORSFixture(t)
 	_, cookie := f.setupAdmin("Alex")
@@ -198,6 +199,9 @@ func TestCORSRequests(t *testing.T) {
 		WriteError(w, r, &api.Error{Code: api.CodeRateLimited, RetryAfter: 7})
 	}))
 	f.api.Handle("POST /api/v1/test/echo", User, echoPrincipal)
+	f.api.Handle("GET /api/v1/test/panic", Public, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("handler bug")
+	}))
 
 	for _, origin := range protocol.DesktopOrigins() {
 		desktop := fromDesktop(origin)
@@ -256,6 +260,15 @@ func TestCORSRequests(t *testing.T) {
 		rec = f.call(http.MethodOptions, "/api/v1/rooms", "", desktop...)
 		wantError(t, rec, http.StatusMethodNotAllowed, api.CodeMethodNotAllowed)
 		wantCORS(t, origin+" a plain OPTIONS", rec, origin)
+
+		// A recovered panic drops the CORS headers the step set before the handler ran.
+		rec = f.call(http.MethodGet, "/api/v1/test/panic", "", withDesktop(withBearer(app.AccessToken))...)
+		wantError(t, rec, http.StatusInternalServerError, api.CodeInternal)
+		for _, k := range []string{hACAO, hACAM, hACAH, hACMA, hACEH, hACAC} {
+			if got := rec.Header().Values(k); len(got) != 0 {
+				t.Errorf("%s a recovered 500: %s %q", origin, k, got)
+			}
+		}
 	}
 	f.wantSignedIn(cookie) // nothing from a desktop origin used the cookie
 
