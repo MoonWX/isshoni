@@ -196,6 +196,184 @@ func TestRampTicks(t *testing.T) {
 	waitCalls(t, sess, m, "bitrate f 1700000", "bitrate")
 }
 
+// The full layer's targets of TestRateTickClock: the ramp's first step (⌈4 Mbit/s × 1.15⌉), then what congestion
+// caps of 2 and 1 Mbit/s leave it beside the preview's 300 kbit/s ceiling, and a cap of 500 kbit/s beside the
+// preview's floor of 150 kbit/s.
+const (
+	rampStepF = 4_600_000
+	cap2MF    = 1_700_000
+	cap1MF    = 700_000
+	cap500kF  = 350_000
+)
+
+// congestionCap sends a congestion hint for s_1 that caps its video at bps.
+func congestionCap(fs *fakeServer, bps int64) {
+	fs.send(protocol.MessageTypeQualityHint, protocol.QualityHint{ShareID: "s_1", Reason: protocol.HintReasonCongestion,
+		Encodings: fakeParams("s_1").Encodings, MaxBitrate: bps})
+}
+
+// fCall waits for the engine's SetBitrate of the full layer to bps among the session's calls after the first n, and
+// returns it.
+func fCall(t *testing.T, sess *fake.Session, n, bps int) fake.Call {
+	t.Helper()
+	var got fake.Call
+	eventually(t, func() bool {
+		for _, c := range callsSince(sess, n, "bitrate") {
+			if c.Layer == "f" && c.Bps == bps {
+				got = c
+				return true
+			}
+		}
+		return false
+	}, func() string {
+		return fmt.Sprintf("the engine's calls are %q, want bitrate f %d", callList(callsSince(sess, n, "bitrate")),
+			bps)
+	})
+	return got
+}
+
+// checkSpacing fails the test when a change reached the engine less than ratectl's interval for a live encoder
+// (MinInterval) after the one before it, and when the full layer's changes after the first n calls aren't want.
+func checkSpacing(t *testing.T, sess *fake.Session, n int, want string, calls ...fake.Call) {
+	t.Helper()
+	for i := 1; i < len(calls); i++ {
+		if gap := calls[i].At.Sub(calls[i-1].At); gap < ratectl.MinInterval {
+			t.Errorf("f's change to %d bit/s reached the engine %v after its change to %d bit/s, want at least %v",
+				calls[i].Bps, gap, calls[i-1].Bps, ratectl.MinInterval)
+		}
+	}
+	var full []fake.Call
+	for _, c := range callsSince(sess, n, "bitrate") {
+		if c.Layer == "f" {
+			full = append(full, c)
+		}
+	}
+	if got := callList(full); got != want {
+		t.Errorf("the full layer's changes are %q, want %q", got, want)
+	}
+}
+
+// TestRateTickClock: ratectl and the engine see one clock (share.go's actor), so no change of a layer reaches the
+// engine sooner than ratectl's interval after the one before it (fake.Call.At). Times are from the ramp's first step,
+// which comes on a Tick, so the next Ticks fall due about every TickEvery from there:
+//
+//   - at 2.25 s a congestion hint lowers f at once (the step is 2 s old), and a second one wants f lower again, which
+//     waits for f's guard until 4.25 s, so for the Tick due at 4.5 s;
+//   - the actor is busy (on a call of its own) from 4.25 s to 5.25 s and takes that Tick 0.75 s late, and the engine
+//     takes another 0.4 s for its change;
+//   - a third hint wants f lower again, which waits for f's guard from that change.
+//
+// With the timer's value (when the Tick was due) as ratectl's now, ratectl dates the change 1.15 s before the engine
+// has it, and the next one reached the engine 0.85–1.35 s after it. With the clock read but on a ticker's fixed
+// schedule, the next Tick after the guard's 2 s came 1.85 s after the engine call. The timer re-armed after the Tick's
+// engine calls puts it 2 s after them.
+//
+// The second hint's change must be dated between the Ticks (2.1–2.4 s), and the busy call must start before the Tick
+// due at 4.5 s. When the test runs late for either, the run is tried again (three runs at most); the spacing is
+// checked in every run.
+func TestRateTickClock(t *testing.T) {
+	for run := 1; ; run++ {
+		if rateClockRun(t) {
+			return
+		}
+		t.Logf("run %d: the hint or the busy call came late", run)
+		if run == 3 {
+			t.Skip("the hint or the busy call came late in every run: no Tick was taken late")
+		}
+	}
+}
+
+// rateClockRun is a run of TestRateTickClock: it reports whether the run went as planned (the first hint's change
+// came between two Ticks, and the actor was busy when the Tick that let the second one through fell due).
+func rateClockRun(t *testing.T) bool {
+	t.Helper()
+	slow := &slowEngine{}
+	fs := newFakeServer(t)
+	e := newEnv(t, fs, envOptions{tweak: func(o *Options) {
+		fastTiming(nil)(o)
+		slow.Engine = o.Engine.(*fake.Engine)
+		o.Engine = slow
+	}})
+	sh := startedShare(t, e)
+	sess := sessionOf(t, e)
+	n := len(sess.Calls())
+	roomState(fs, 3, shareAs(protocol.ShareStatusLive, protocol.PresetAuto))
+	step := fCall(t, sess, n, rampStepF)
+	at := func(d time.Duration) time.Time { return step.At.Add(d) }
+	time.Sleep(time.Until(at(2250 * time.Millisecond)))
+	congestionCap(fs, 2_000_000)
+	first := fCall(t, sess, n, cap2MF)
+	congestionCap(fs, 1_000_000)
+	slow.holdNext("f", 400*time.Millisecond)
+	time.Sleep(time.Until(at(4250 * time.Millisecond)))
+	busyUntil := at(5250 * time.Millisecond)
+	if err := sh.call(ctxFor(t), func() error {
+		time.Sleep(time.Until(busyUntil))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := fCall(t, sess, n, cap1MF)
+	congestionCap(fs, 500_000)
+	third := fCall(t, sess, n, cap500kF)
+	checkSpacing(t, sess, n, fmt.Sprintf("bitrate f %d, bitrate f %d, bitrate f %d, bitrate f %d", rampStepF,
+		cap2MF, cap1MF, cap500kF), step, first, second, third)
+	if err := sh.Stop(ctxFor(t)); err != nil {
+		t.Fatal(err)
+	}
+	between := first.At.After(at(2100*time.Millisecond)) && first.At.Before(at(2400*time.Millisecond))
+	return between && !second.At.Before(busyUntil)
+}
+
+// slowEngine is a fake.Engine whose sessions can hold a layer's next SetBitrate for a while before the engine gets
+// it (fake.Call.At is when it does), as an engine call that takes that long.
+type slowEngine struct {
+	*fake.Engine
+	mu    sync.Mutex
+	layer string
+	hold  time.Duration
+}
+
+// holdNext holds the next SetBitrate of layer for d.
+func (e *slowEngine) holdNext(layer string, d time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.layer, e.hold = layer, d
+}
+
+// take returns how long to hold a SetBitrate of layer, once.
+func (e *slowEngine) take(layer string) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if layer != e.layer {
+		return 0
+	}
+	d := e.hold
+	e.layer, e.hold = "", 0
+	return d
+}
+
+func (e *slowEngine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
+	sess, err := e.Engine.Start(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &slowSession{Session: sess, e: e}, nil
+}
+
+// slowSession is a session of slowEngine.
+type slowSession struct {
+	media.Session
+	e *slowEngine
+}
+
+func (s *slowSession) SetBitrate(layer string, bps int) error {
+	if d := s.e.take(layer); d > 0 {
+		time.Sleep(d)
+	}
+	return s.Session.SetBitrate(layer, bps)
+}
+
 // TestSetPaused: a pause drops media at the pump, then pauses and mutes the engine, then sends share.update{paused:
 // true}; a resume unmutes first, then un-pauses, then sends share.update{paused: false}. The snapshot follows.
 func TestSetPaused(t *testing.T) {

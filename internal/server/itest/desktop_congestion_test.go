@@ -106,16 +106,6 @@ const (
 	gopSlack         = 100 * time.Millisecond
 	keyRequestBefore = 250 * time.Millisecond
 	keyRequestAfter  = 500 * time.Millisecond
-	// callSlack is how much closer together than ReinitMinInterval two engine calls (fake.Call.At) of a layer may
-	// be: D10 asserts ReinitMinInterval − callSlack between them, 9 s, not the 10 s of its acceptance. ratectl keeps
-	// its guards on the instants its Ticks carry, and the share's actor (internal/client/core's share.go) passes it
-	// the rate ticker's value, which since Go 1.23 is when the tick was due, not when the actor took it. A Tick taken
-	// late is recorded as a change up to that lag (0.54 s seen under -race) before the engine call, while a hint's
-	// change is recorded at time.Now(): so the next change can reach the engine less than 10 s after the last one.
-	// The native engine itself spaces bitrate re-inits 10 s apart (04 §6.4, latest value wins), so what users get
-	// keeps the 10 s; the fake applies each call at once. Once the actor passes time.Now() to rateTick, callSlack is
-	// Windows' clock step, 20 ms.
-	callSlack = time.Second
 )
 
 // The script and bounds of D19.
@@ -198,9 +188,11 @@ func TestDesktopUplinkCongestion(t *testing.T) {
 // or by less than 30 %, and each change is applied as a re-init: the core's rate action says so (ratectl's
 // Action.Reinit), the fake re-initializes the layer for the engine call (its EventLayer, then a Reinit keyframe), and
 // a viewer of the layer gets that keyframe, captured at the change (reinitKeyBefore, reinitKeyAfter) and made by
-// nothing else (sightOf). The intervals are measured on the engine's calls, which ratectl's guards don't bound to
-// the 10 s (callSlack). A change while the SFU forwards another layer is seen at no viewer; the full layer's ramp step
-// and its way back once the limit lifts are, and so is the preview's, which carol watches.
+// nothing else (sightOf). The intervals are measured on the engine's calls (fake.Call.At), against the full
+// ReinitMinInterval: the share's actor gives ratectl time.Now() and re-arms its rate timer after each Tick's engine
+// calls (internal/client/core's share.go), so ratectl's guards bound the engine's calls too. A change while the SFU
+// forwards another layer is seen at no viewer; the full layer's ramp step and its way back once the limit lifts are,
+// and so is the preview's, which carol watches.
 func TestDesktopReinitCongestion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D10 runs for about two minutes")
@@ -248,9 +240,13 @@ func TestDesktopReinitCongestion(t *testing.T) {
 				t.Errorf("%s's target changed by %.1f %% (%d → %d bit/s), want at least %d %%", rid, step, prev, c.Bps,
 					ratectl.ReinitMinChange)
 			}
-			if i > 0 && c.At.Sub(prevAt) < ratectl.ReinitMinInterval-callSlack {
-				t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval less "+
-					"callSlack)", rid, c.At.Sub(prevAt).Round(time.Millisecond), ratectl.ReinitMinInterval-callSlack)
+			if i > 0 {
+				gap := c.At.Sub(prevAt)
+				t.Logf("  %v after %s's last change", gap, rid)
+				if gap < ratectl.ReinitMinInterval {
+					t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval)",
+						rid, gap, ratectl.ReinitMinInterval)
+				}
 			}
 			action := fmt.Sprintf(`msg="rate action" op=bitrate layer=%s bps=%d active=false reinit=true`, rid, c.Bps)
 			if !strings.Contains(logs, action) {

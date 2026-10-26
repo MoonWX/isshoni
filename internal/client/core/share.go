@@ -93,11 +93,16 @@ type LayerSnapshot struct {
 
 // EndInfo says why a share ended (§11.9's table).
 type EndInfo struct {
-	Reason    string             // "user" | "source-gone" | "server" | "server-unreachable" | "unlinked" | "error"
-	Media     media.ErrorCode    // engine failures
-	Protocol  protocol.ErrorCode // server error replies
-	Server    protocol.EndReason // server-ended shares
-	ByThisApp bool               // true when this core sent the share.stop that ended it
+	Reason string          // "user" | "source-gone" | "server" | "server-unreachable" | "unlinked" | "error"
+	Media  media.ErrorCode // engine failures
+	// MediaReason is the engine failure's detail token (media.Error.Reason, 04 §5.7) next to Media: device_removed
+	// for an encoder_lost after the GPU was reset or removed, pick_expired for a start's source_gone, …; "" when the
+	// engine gave none, and always "" without Media. 03 §10.5 keys its texts on it (params.reason). Never the error's
+	// Detail, which is for logs only.
+	MediaReason string
+	Protocol    protocol.ErrorCode // server error replies
+	Server      protocol.EndReason // server-ended shares
+	ByThisApp   bool               // true when this core sent the share.stop that ended it
 }
 
 // The values of EndInfo.Reason.
@@ -396,16 +401,18 @@ func startEnd(err error) EndInfo {
 	return EndInfo{Reason: EndError, Protocol: protocol.ErrorCodeInternal}
 }
 
-// engineEnd is the EndInfo of an engine failure (§5.2's table): source-gone for source_gone, else error.
+// engineEnd is the EndInfo of an engine failure (§5.2's table): source-gone for source_gone, else error, with the
+// error's detail token as MediaReason (§11.9: 03 §10.5's device_removed row needs it). An error that isn't a
+// *media.Error is internal, without a token.
 func engineEnd(err error) EndInfo {
 	var merr *media.Error
-	if !errors.As(err, &merr) {
+	if !errors.As(err, &merr) || merr.Code == "" {
 		return EndInfo{Reason: EndError, Media: media.CodeInternal}
 	}
 	if merr.Code == media.CodeSourceGone {
-		return EndInfo{Reason: EndSourceGone, Media: media.CodeSourceGone}
+		return EndInfo{Reason: EndSourceGone, Media: media.CodeSourceGone, MediaReason: merr.Reason}
 	}
-	return EndInfo{Reason: EndError, Media: merr.Code}
+	return EndInfo{Reason: EndError, Media: merr.Code, MediaReason: merr.Reason}
 }
 
 // config returns the engine's start config from the share's params and probe (§11.4 step 3), and makes the share's
@@ -566,8 +573,8 @@ func (s *Share) over(info EndInfo) {
 	close(s.done)
 	s.events.flush()
 	s.log.Info("share ended", slog.String("share_id", s.params.ShareID), slog.String("reason", info.Reason),
-		slog.String("media", string(info.Media)), slog.String("protocol", string(info.Protocol)),
-		slog.String("server", string(info.Server)))
+		slog.String("media", string(info.Media)), slog.String("media_reason", info.MediaReason),
+		slog.String("protocol", string(info.Protocol)), slog.String("server", string(info.Server)))
 }
 
 // The messages the connection actor posts to the share's actor.
@@ -636,7 +643,18 @@ func (s *Share) actor() {
 	close(s.run)
 	tick := time.NewTicker(s.c.timing.pcPoll)
 	defer tick.Stop()
-	rate := time.NewTicker(ratectl.TickEvery)
+	// ratectl's Ticks (§9.1, §11.8) and the engine see one clock. rateTick gets time.Now(), not the timer's value:
+	// that is when the tick was due (Go 1.23 and later), not when the actor takes it, and a tick taken late (the
+	// actor was busy) would have ratectl date its changes before the engine gets them, so the next change could reach
+	// the engine less than ratectl's interval after them (itest D10 saw 9.455 s for 10 s). And the timer is re-armed
+	// after each tick's engine calls rather than kept on a ticker's fixed schedule, so the next Tick reads the clock
+	// TickEvery after them, not after the clock read they followed: the Tick that lets the layer's next change
+	// through, MinInterval (ReinitMinInterval) after the last one by ratectl's clock, then comes no sooner than that
+	// long after the last one reached the engine, as long as a Tick's engine calls take less than TickEvery. On a
+	// fixed schedule, Ticks exactly 20 periods apart passed a re-init change 10 s after a Tick whose engine call had
+	// come microseconds after its clock read (D10 saw 9.999895 s). A hint's change is dated by the hint's own clock
+	// read, microseconds before its engine calls, and the next Tick comes at no fixed phase after it.
+	rate := time.NewTimer(ratectl.TickEvery)
 	defer rate.Stop()
 	if req := s.begin(); req != nil {
 		s.finish(*req)
@@ -671,8 +689,9 @@ func (s *Share) actor() {
 				s.finish(*req)
 				return
 			}
-		case now := <-rate.C:
-			s.rateTick(now)
+		case <-rate.C:
+			s.rateTick(time.Now())
+			rate.Reset(ratectl.TickEvery)
 		case req := <-s.ends:
 			s.finish(req)
 			return

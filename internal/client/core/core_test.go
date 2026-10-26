@@ -717,10 +717,18 @@ func TestStartShareErrors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		events, unsub := e.c.Subscribe()
+		defer unsub()
 		e.engine.Release(src.ID) // the user backed out of the sheet, and something started it anyway
 		_, err = e.c.StartShare(ctxFor(t), ShareRequest{RoomID: "lounge", Source: src})
 		if !errors.Is(err, media.ErrSourceGone) {
 			t.Fatalf("StartShare = %v, want source_gone", err)
+		}
+		// The share's last event carries the engine's code and its detail token.
+		ev := nextEvent(t, events, func(ev Event) bool { return ev.Kind == EventShare && ev.Share.End != nil })
+		want := EndInfo{Reason: EndSourceGone, Media: media.CodeSourceGone, MediaReason: "pick_expired"}
+		if *ev.Share.End != want {
+			t.Errorf("the share ended with %+v, want %+v", *ev.Share.End, want)
 		}
 		if got := fs.settledTypes(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin,
 			protocol.MessageTypeShareStart, protocol.MessageTypeShareStop, protocol.MessageTypeRoomLeave}) {
@@ -730,6 +738,91 @@ func TestStartShareErrors(t *testing.T) {
 			t.Error("a share remains")
 		}
 	})
+}
+
+// TestEngineEndReason: a live share that the engine ends (Session.Next's fatal error) ends with the error's code and
+// its detail token in EndInfo (§11.9), so that 03 §10.5's reason rows apply: encoder_lost with device_removed after
+// the GPU was reset or removed. The error's Detail never gets there. The core sends share.stop for it.
+func TestEngineEndReason(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  *media.Error
+		want EndInfo
+	}{
+		{"device removed", &media.Error{Code: media.CodeEncoderLost, Op: "next", Reason: "device_removed",
+			Detail: "device_removed: the adapter was removed"},
+			EndInfo{Reason: EndError, Media: media.CodeEncoderLost, MediaReason: "device_removed"}},
+		{"no encoder left", &media.Error{Code: media.CodeEncoderLost, Op: "next"},
+			EndInfo{Reason: EndError, Media: media.CodeEncoderLost}},
+		{"permission denied", &media.Error{Code: media.CodePermissionDenied, Op: "next"},
+			EndInfo{Reason: EndError, Media: media.CodePermissionDenied}},
+		{"source gone", &media.Error{Code: media.CodeSourceGone, Op: "next"},
+			EndInfo{Reason: EndSourceGone, Media: media.CodeSourceGone}},
+		{"internal", &media.Error{Code: media.CodeInternal, Op: "next", Detail: "the encoder thread failed"},
+			EndInfo{Reason: EndError, Media: media.CodeInternal}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fs := newFakeServer(t)
+			e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
+			sh := startedShare(t, e)
+			roomState(fs, 3, shareAs(protocol.ShareStatusLive, protocol.PresetAuto))
+			eventually(t, func() bool { return sh.Snapshot().State == StateLive },
+				func() string { return fmt.Sprintf("the share is %+v, want live", sh.Snapshot()) })
+			sessionOf(t, e).Fail(c.err)
+			select {
+			case <-sh.Done():
+			case <-time.After(waitTimeout):
+				t.Fatal("the share runs on after the engine ended it")
+			}
+			if end := sh.Snapshot().End; end == nil || *end != c.want {
+				t.Errorf("the share ended with %+v, want %+v", end, c.want)
+			}
+			eventually(t, func() bool { return slices.Contains(fs.settledTypes(), protocol.MessageTypeShareStop) },
+				func() string { return fmt.Sprintf("the server got %v, want a share.stop", fs.settledTypes()) })
+		})
+	}
+}
+
+// TestEndInfoOf: startEnd and engineEnd (§11.9's table for a failed start and an engine failure): the engine's code
+// with its detail token (wrapped or not), a server error's code, a start the caller cut short, anything else as
+// internal.
+func TestEndInfoOf(t *testing.T) {
+	limit := protocol.NewError(protocol.ErrorCodeShareLimit, protocol.ErrorScopeRequest)
+	for _, c := range []struct {
+		err  error
+		want EndInfo
+	}{
+		{&media.Error{Code: media.CodeSourceGone, Op: "start", Reason: "pick_expired"},
+			EndInfo{Reason: EndSourceGone, Media: media.CodeSourceGone, MediaReason: "pick_expired"}},
+		{fmt.Errorf("start: %w", &media.Error{Code: media.CodeDependency, Op: "start", Reason: "blocked_by_policy",
+			Detail: "blocked_by_policy: isshoni-media.dll"}),
+			EndInfo{Reason: EndError, Media: media.CodeDependency, MediaReason: "blocked_by_policy"}},
+		{&media.Error{Code: media.CodeEncoderLost, Op: "next", Reason: "device_removed"},
+			EndInfo{Reason: EndError, Media: media.CodeEncoderLost, MediaReason: "device_removed"}},
+		{&media.Error{Code: media.CodeBusy, Op: "start"}, EndInfo{Reason: EndError, Media: media.CodeBusy}},
+		{&limit, EndInfo{Reason: EndError, Protocol: protocol.ErrorCodeShareLimit}},
+		{context.Canceled, EndInfo{Reason: EndUser, ByThisApp: true}},
+		{errors.New("something else"), EndInfo{Reason: EndError, Protocol: protocol.ErrorCodeInternal}},
+	} {
+		if got := startEnd(c.err); got != c.want {
+			t.Errorf("startEnd(%v) = %+v, want %+v", c.err, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		err  error
+		want EndInfo
+	}{
+		{&media.Error{Code: media.CodeEncoderLost, Op: "next", Reason: "device_removed"},
+			EndInfo{Reason: EndError, Media: media.CodeEncoderLost, MediaReason: "device_removed"}},
+		{&media.Error{Code: media.CodeSourceGone, Op: "next"},
+			EndInfo{Reason: EndSourceGone, Media: media.CodeSourceGone}},
+		{&media.Error{Op: "next", Reason: "device_removed"}, EndInfo{Reason: EndError, Media: media.CodeInternal}},
+		{errors.New("not the engine's"), EndInfo{Reason: EndError, Media: media.CodeInternal}},
+	} {
+		if got := engineEnd(c.err); got != c.want {
+			t.Errorf("engineEnd(%v) = %+v, want %+v", c.err, got, c.want)
+		}
+	}
 }
 
 // TestCloseBound: Close sends share.stop and stops the engine session at once, waits at most 3 s for the reply (here
