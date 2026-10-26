@@ -154,7 +154,7 @@ func TestAdminCap(t *testing.T) {
 		c.Live(at(0))
 		// The ramp stops at the ceiling: 4.6, then 5.0 (8.7 %, the step to the ceiling).
 		checkEvents(t, "ramp", tickRange(c, 0.5, 30),
-			[]event{{2, bitrate("f", 4_600_000)}, {4, bitrate("f", 5_000_000)}})
+			[]event{{2, bitrate("f", 4_600_000)}, {5, bitrate("f", 5_000_000)}})
 		if c.State().Ramping {
 			t.Error("Ramping at the ceiling")
 		}
@@ -176,16 +176,17 @@ func TestAdminCap(t *testing.T) {
 			t.Errorf("Cap %d, f ceiling %d", st.Cap, st.Ceiling["f"])
 		}
 		// The admin's cap holds no ramp, but f applied 4.7 under it, so the ramp starts again from there: once the cap
-		// is lifted, f ramps back up, 2 s per step, rather than jumping (§9.3: the ramp is the uplink's probe).
+		// is lifted, f ramps back up, a step every RampEvery, rather than jumping (§9.3: the ramp is the uplink's
+		// probe).
 		checkActions(t, "lifted", c.Hint(admin(0), at(14)))
 		if st := c.State(); st.Cap != 0 || !st.Ramping {
 			t.Errorf("Cap %d, Ramping %v", st.Cap, st.Ramping)
 		}
 		checkEvents(t, "the ramp back", tickRange(c, 14.5, 30), []event{
 			{14.5, bitrate("f", 5_405_000)},
-			{16.5, bitrate("f", 6_215_750)},
-			{18.5, bitrate("f", 7_148_113)},
-			{20.5, bitrate("f", 8_000_000)},
+			{17.5, bitrate("f", 6_215_750)},
+			{20.5, bitrate("f", 7_148_113)},
+			{23.5, bitrate("f", 8_000_000)},
 		})
 	})
 	t.Run("a raised cap is no ramp step", func(t *testing.T) {
@@ -194,13 +195,13 @@ func TestAdminCap(t *testing.T) {
 		// new cap's split, 6.2, in one step (8.8 %, the ramp's step clamped at the cap).
 		c := newController(bothLive, autoParams)
 		c.Live(at(0))
-		checkEvents(t, "the ramp", tickRange(c, 0.5, 6), []event{
-			{2, bitrate("f", 4_600_000)}, {4, bitrate("f", 5_290_000)}, {6, bitrate("f", 6_083_500)},
+		checkEvents(t, "the ramp", tickRange(c, 0.5, 8), []event{
+			{2, bitrate("f", 4_600_000)}, {5, bitrate("f", 5_290_000)}, {8, bitrate("f", 6_083_500)},
 		})
-		checkActions(t, "admin 6000 kbit/s, 0.2 s after a change", c.Hint(admin(6000), at(6.2)))
-		checkEvents(t, "down to the cap's split", tickRange(c, 6.5, 10), []event{{8, bitrate("f", 5_700_000)}})
-		checkActions(t, "admin 6500 kbit/s", c.Hint(admin(6500), at(10.2)))
-		checkEvents(t, "the ramp to the new cap", tickRange(c, 10.5, 20), []event{{10.5, bitrate("f", 6_200_000)}})
+		checkActions(t, "admin 6000 kbit/s, 0.2 s after a change", c.Hint(admin(6000), at(8.2)))
+		checkEvents(t, "down to the cap's split", tickRange(c, 8.5, 12), []event{{10, bitrate("f", 5_700_000)}})
+		checkActions(t, "admin 6500 kbit/s", c.Hint(admin(6500), at(12.2)))
+		checkEvents(t, "the ramp to the new cap", tickRange(c, 12.5, 22), []event{{12.5, bitrate("f", 6_200_000)}})
 	})
 	t.Run("a raised ceiling is no ramp step", func(t *testing.T) {
 		// A ceiling alone (no cap) lowers the ramp in the same way: from 7 back up to 9, f ramps 7 → 8.05 → 9, and
@@ -212,7 +213,7 @@ func TestAdminCap(t *testing.T) {
 		checkActions(t, "ceiling 7 Mbit/s", c.Hint(ceiling(7_000_000), at(12)), bitrate("f", 7_000_000))
 		checkActions(t, "ceiling 9 Mbit/s", c.Hint(ceiling(9_000_000), at(20)))
 		checkEvents(t, "the ramp to the new ceiling", tickRange(c, 20.5, 30),
-			[]event{{20.5, bitrate("f", 8_050_000)}, {22.5, bitrate("f", 9_000_000)}})
+			[]event{{20.5, bitrate("f", 8_050_000)}, {23.5, bitrate("f", 9_000_000)}})
 
 		// The same from the start: f starts at its ceiling of 3.6, below DefaultStartBps, and the ramp with it.
 		c = newController(bothLive, presetParams(protocol.PresetAuto, 3600))
@@ -221,7 +222,7 @@ func TestAdminCap(t *testing.T) {
 		checkEvents(t, "at the ceiling", tickRange(c, 0.5, 20), nil)
 		checkActions(t, "ceiling 5 Mbit/s", c.Hint(ceiling(5_000_000), at(20)))
 		checkEvents(t, "the ramp to the new ceiling", tickRange(c, 20.5, 30),
-			[]event{{20.5, bitrate("f", 4_140_000)}, {22.5, bitrate("f", 4_761_000)}, {24.5, bitrate("f", 5_000_000)}})
+			[]event{{20.5, bitrate("f", 4_140_000)}, {23.5, bitrate("f", 4_761_000)}, {26.5, bitrate("f", 5_000_000)}})
 	})
 	t.Run("a small step down to the cap", func(t *testing.T) {
 		// 7500 kbit/s: f must come down from 8 to 7.2, although that is only 10 %.

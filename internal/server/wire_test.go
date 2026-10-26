@@ -130,12 +130,18 @@ func upgradeRequest(t *testing.T, svc *auth.Service, token string) *http.Request
 
 // ---- signal.Authenticator ----
 
-// fakeSessions is a sessionService that answers what the test says and records what Touch was asked.
+// fakeSessions is a sessionService that answers what the test says and records what AuthenticateBearerToken and
+// TouchPrincipal were asked.
 type fakeSessions struct {
-	principal auth.Principal
+	principal auth.Principal // AuthenticateCookie's and AuthenticateBearerToken's answer
 	cookieErr error
+	bearerErr error
 	touchErr  error
+	// current is what TouchPrincipal returns: the principal as the rows have it now. nil returns the principal it
+	// was given, as auth does for a session.
+	current *auth.Principal
 
+	tokens  []string // the tokens AuthenticateBearerToken was given
 	touched []auth.Principal
 	touchIP netip.Addr
 }
@@ -147,9 +153,23 @@ func (f *fakeSessions) AuthenticateCookie(*http.Request) (auth.Principal, error)
 	return f.principal, nil
 }
 
-func (f *fakeSessions) Touch(_ context.Context, p auth.Principal, ip netip.Addr) error {
+func (f *fakeSessions) AuthenticateBearerToken(_ context.Context, token string) (auth.Principal, error) {
+	f.tokens = append(f.tokens, token)
+	if f.bearerErr != nil {
+		return auth.Principal{}, f.bearerErr
+	}
+	return f.principal, nil
+}
+
+func (f *fakeSessions) TouchPrincipal(_ context.Context, p auth.Principal, ip netip.Addr) (auth.Principal, error) {
 	f.touched, f.touchIP = append(f.touched, p), ip
-	return f.touchErr
+	switch {
+	case f.touchErr != nil:
+		return auth.Principal{}, f.touchErr
+	case f.current != nil:
+		return *f.current, nil
+	}
+	return p, nil
 }
 
 // errStoreDown stands for a failure of the store under the account service.
@@ -206,23 +226,80 @@ func TestAuthenticateRequest(t *testing.T) {
 	}
 }
 
+// The bearer adapter of M2 02 §6.3 item 2: auth.AuthenticateBearerToken with the revealed token; invalid_token and
+// unauthenticated are the hub's ErrInvalid, anything else passes through; the identity is the device's, its name and
+// the admin flag included.
 func TestAuthenticateBearer(t *testing.T) {
-	a := &authenticator{sessions: &fakeSessions{}}
-	if id, err := a.AuthenticateBearer(context.Background(), protocol.Secret("device-token")); !errors.Is(err, signal.ErrInvalid) || id != (signal.Identity{}) {
-		t.Errorf("AuthenticateBearer = %+v, %v; want ErrInvalid (no device tokens before M2)", id, err)
+	const token = "isa_" + "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+	admin := auth.Principal{UserID: "u1", Username: "Alex", Role: store.RoleAdmin, Method: auth.MethodBearer,
+		DeviceID: "d1", ClientKind: "desktop", DeviceName: "Gaming PC"}
+	member := admin
+	member.Role = store.RoleUser
+
+	for _, tc := range []struct {
+		name      string
+		principal auth.Principal
+		err       error
+		want      signal.Identity
+		wantErr   error // signal.ErrInvalid; nil with err set means "passed through"
+	}{
+		{name: "an admin's device", principal: admin,
+			want: signal.Identity{UserID: "u1", Name: "Alex", Admin: true, DeviceID: "d1", DeviceName: "Gaming PC"}},
+		{name: "a member's device", principal: member,
+			want: signal.Identity{UserID: "u1", Name: "Alex", DeviceID: "d1", DeviceName: "Gaming PC"}},
+		{name: "an unknown or expired token", err: api.NewError(api.CodeInvalidToken), wantErr: signal.ErrInvalid},
+		{name: "invalid_token, wrapped", err: fmt.Errorf("auth: %w", api.NewError(api.CodeInvalidToken)), wantErr: signal.ErrInvalid},
+		{name: "the credential went away meanwhile", err: api.NewError(api.CodeUnauthenticated), wantErr: signal.ErrInvalid},
+		{name: "the store fails", err: internalFailure()},
+		{name: "another api error", err: api.NewError(api.CodeServerBusy)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sessions := &fakeSessions{principal: tc.principal, bearerErr: tc.err}
+			a := &authenticator{sessions: sessions}
+			got, err := a.AuthenticateBearer(context.Background(), protocol.Secret(token))
+			switch {
+			case tc.err == nil:
+				if err != nil || got != tc.want {
+					t.Errorf("AuthenticateBearer = %+v, %v; want %+v", got, err, tc.want)
+				}
+			case tc.wantErr != nil:
+				if !errors.Is(err, tc.wantErr) || got != (signal.Identity{}) {
+					t.Errorf("AuthenticateBearer = %+v, %v; want %v", got, err, tc.wantErr)
+				}
+			default:
+				// Transient for the hub (it answers internal): not ErrInvalid, and the cause is still there.
+				if err == nil || errors.Is(err, signal.ErrInvalid) || !errors.Is(err, tc.err) || got != (signal.Identity{}) {
+					t.Errorf("AuthenticateBearer = %+v, %v; want %v passed through", got, err, tc.err)
+				}
+			}
+			if len(sessions.tokens) != 1 || sessions.tokens[0] != token {
+				t.Errorf("AuthenticateBearerToken was given %d tokens, want the revealed token once", len(sessions.tokens))
+			}
+		})
 	}
 }
 
 func TestRevalidate(t *testing.T) {
 	session := signal.Identity{UserID: "u1", Name: "Alex", Admin: true, SessionID: "s1"}
+	device := signal.Identity{UserID: "u1", Name: "Alex", Admin: true, DeviceID: "d1", DeviceName: "Gaming PC"}
 	active := func(name string, role store.Role) store.User {
 		return store.User{ID: "u1", Username: name, Role: role, Status: store.StatusActive}
+	}
+	// deviceNow is the bearer principal as auth.TouchPrincipal returns it: the device row's current name.
+	deviceNow := func(name string) *auth.Principal {
+		return &auth.Principal{UserID: "u1", Username: "Alex", Role: store.RoleAdmin, Method: auth.MethodBearer,
+			DeviceID: "d1", ClientKind: "desktop", DeviceName: name}
+	}
+	with := func(id signal.Identity, f func(*signal.Identity)) signal.Identity {
+		f(&id)
+		return id
 	}
 
 	for _, tc := range []struct {
 		name     string
 		id       signal.Identity
 		touchErr error
+		current  *auth.Principal // TouchPrincipal's principal; nil: the one it was given
 		user     store.User
 		userErr  error
 		want     signal.Identity
@@ -244,11 +321,27 @@ func TestRevalidate(t *testing.T) {
 		{name: "the user is pending", id: session,
 			user: store.User{ID: "u1", Username: "Alex", Status: store.StatusPending}, wantErr: signal.ErrInvalid},
 		{name: "the user can't be read", id: session, userErr: errStoreDown, passed: errStoreDown},
-		{name: "a device (M2)", id: signal.Identity{UserID: "u1", Name: "Alex", DeviceID: "d1"},
-			touchErr: api.NewError(api.CodeUnauthenticated), wantErr: signal.ErrInvalid, noRead: true},
+		// Devices (M2 02 §6.3 item 3): the device's current name comes from TouchPrincipal, the name and role from
+		// the user's row, as for a session.
+		{name: "a device, unchanged", id: device, current: deviceNow("Gaming PC"), user: active("Alex", store.RoleAdmin),
+			want: device},
+		{name: "a device renamed", id: device, current: deviceNow("Living room PC"), user: active("Alex", store.RoleAdmin),
+			want: with(device, func(id *signal.Identity) { id.DeviceName = "Living room PC" })},
+		{name: "a device whose user was renamed and demoted", id: device, current: deviceNow("Gaming PC"),
+			user: active("Alexandra", store.RoleUser),
+			want: with(device, func(id *signal.Identity) { id.Name, id.Admin = "Alexandra", false })},
+		{name: "a device gone", id: device, touchErr: api.NewError(api.CodeUnauthenticated), wantErr: signal.ErrInvalid,
+			noRead: true},
+		{name: "a device, touch fails for another reason", id: device, touchErr: internalFailure(), passed: errStoreDown,
+			noRead: true},
+		{name: "a device whose user was disabled", id: device, current: deviceNow("Gaming PC"),
+			user:    store.User{ID: "u1", Username: "Alex", Role: store.RoleAdmin, Status: store.StatusDisabled},
+			wantErr: signal.ErrInvalid},
+		{name: "a session never takes a device name", id: session, current: deviceNow("Gaming PC"),
+			user: active("Alex", store.RoleAdmin), want: session},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sessions := &fakeSessions{touchErr: tc.touchErr}
+			sessions := &fakeSessions{touchErr: tc.touchErr, current: tc.current}
 			reads := 0
 			a := &authenticator{sessions: sessions, user: func(_ context.Context, id store.UserID) (store.User, error) {
 				reads++
@@ -355,6 +448,85 @@ func TestAuthenticatorOverAuthService(t *testing.T) {
 	_, err = a.AuthenticateRequest(upgradeRequest(t, svc, login.Token))
 	if err == nil || errors.Is(err, signal.ErrInvalid) || errors.Is(err, signal.ErrNoCredentials) {
 		t.Errorf("AuthenticateRequest on a closed store: %v, want a transient error", err)
+	}
+}
+
+// TestAuthenticatorOverAuthServiceDevice runs the bearer half of the adapter against 03's real service (M2 02
+// §6.3): a device linked through the device flow says hello with its access token, and its identity carries the
+// device's ID and name; a rename reaches the next Revalidate, a revocation makes both calls say ErrInvalid.
+func TestAuthenticatorOverAuthServiceDevice(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	svc := newTestAccounts(t, db, nil)
+	a := &authenticator{sessions: svc, user: userReader(db)}
+	login := setUpAdmin(t, svc, "Alex")
+	browser := auth.Principal{UserID: login.User.ID, Username: "Alex", Role: store.RoleAdmin,
+		Method: auth.MethodSession, SessionID: login.Session.ID, ClientKind: "web"}
+	meta := auth.ReqMeta{IP: wireClientIP}
+
+	// The device flow (M2 02 §5): the app starts, the browser approves, the app polls.
+	code, err := svc.StartDeviceFlow(ctx, api.DeviceCodeRequest{ClientKind: "desktop", DeviceName: "Gaming PC",
+		OS: "windows", AppVersion: "0.2.0"}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideUserCode(ctx, browser, api.DeviceDecideRequest{UserCode: code.UserCode, Approve: true}, meta); err != nil {
+		t.Fatal(err)
+	}
+	pair, err := svc.DeviceToken(ctx, api.DeviceTokenRequest{GrantType: api.GrantTypeDeviceCode, DeviceCode: code.DeviceCode}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := a.AuthenticateBearer(ctx, protocol.Secret(pair.AccessToken))
+	want := signal.Identity{UserID: string(login.User.ID), Name: "Alex", Admin: true, DeviceID: pair.Device.ID,
+		DeviceName: "Gaming PC"}
+	if err != nil || id != want {
+		t.Fatalf("AuthenticateBearer = %+v, %v; want %+v", id, err, want)
+	}
+	if got, err := a.Revalidate(ctx, id, wireClientIP); err != nil || got != want {
+		t.Errorf("Revalidate = %+v, %v; want %+v", got, err, want)
+	}
+
+	// A rename on the Devices page reaches the next Revalidate (and a new hello).
+	if _, err := svc.RenameDevice(ctx, browser, store.DeviceID(pair.Device.ID), "Living room PC", meta); err != nil {
+		t.Fatal(err)
+	}
+	renamed := want
+	renamed.DeviceName = "Living room PC"
+	if got, err := a.Revalidate(ctx, id, wireClientIP); err != nil || got != renamed {
+		t.Errorf("Revalidate after the rename = %+v, %v; want %+v", got, err, renamed)
+	}
+	if got, err := a.AuthenticateBearer(ctx, protocol.Secret(pair.AccessToken)); err != nil || got != renamed {
+		t.Errorf("AuthenticateBearer after the rename = %+v, %v; want %+v", got, err, renamed)
+	}
+
+	// Tokens that are no access token of a live device: unknown, a refresh token, not a token at all.
+	for _, tok := range []string{"isa_" + strings.Repeat("A", 43), pair.RefreshToken, "device-token", ""} {
+		if got, err := a.AuthenticateBearer(ctx, protocol.Secret(tok)); !errors.Is(err, signal.ErrInvalid) || got != (signal.Identity{}) {
+			t.Errorf("AuthenticateBearer(a token of length %d) = %+v, %v; want ErrInvalid", len(tok), got, err)
+		}
+	}
+
+	// The device is removed on the Devices page: its connections are revoked at the next Revalidate, and its token no
+	// longer says hello.
+	if err := svc.RevokeDevice(ctx, browser, store.DeviceID(pair.Device.ID), meta); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Revalidate(ctx, id, wireClientIP); !errors.Is(err, signal.ErrInvalid) {
+		t.Errorf("Revalidate after the revocation: %v, want ErrInvalid", err)
+	}
+	if _, err := a.AuthenticateBearer(ctx, protocol.Secret(pair.AccessToken)); !errors.Is(err, signal.ErrInvalid) {
+		t.Errorf("AuthenticateBearer after the revocation: %v, want ErrInvalid", err)
+	}
+
+	// A store that does not answer is no verdict on the token: the error passes through (the hub answers internal).
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	other := "isa_" + strings.Repeat("B", 42) + "A" // well-formed (canonical base64url), not in the bearer cache
+	if _, err := a.AuthenticateBearer(ctx, protocol.Secret(other)); err == nil || errors.Is(err, signal.ErrInvalid) {
+		t.Errorf("AuthenticateBearer on a closed store: %v, want a transient error", err)
 	}
 }
 

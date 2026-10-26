@@ -1,0 +1,10 @@
+{
+  "label": "R3",
+  "pass": true,
+  "os": {
+    "product": "win11",
+    "build": 26200,
+    "ubr": 6899,
+    "edition": "Professional"
+  }
+}

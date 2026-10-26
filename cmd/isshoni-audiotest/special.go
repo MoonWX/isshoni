@@ -7,9 +7,10 @@ import (
 )
 
 // This file scores the special cases of docs/m2/05-windows-audio.md §18.5 that the tone verdict can't: case 20
-// (`timestamps`: PCM-tap onsets against im_test_render_bursts' predicted device-position times) and case 21 (`opus`:
-// the decoded Opus stream against the tap). The Windows driver records and decodes; the scoring is portable, so it
-// is tested on every OS.
+// (`timestamps`: PCM-tap onsets against im_test_render_bursts' predicted device-position times), case 21 (`opus`:
+// the decoded Opus stream against the tap) and case 22 (`multi-endpoint`: whether a tone on a second endpoint is
+// captured, INFO). The soak (case 23) is soak.go's. The Windows driver records and decodes; the scoring is portable,
+// so it is tested on every OS.
 
 // burstSearchSec is how far from a predicted burst time case 20 looks for the burst in the tap: the bursts are 1 s
 // apart, so ±400 ms finds the right one even when the timestamps are off by far more than the 15 ms budget (a FAIL,
@@ -135,7 +136,7 @@ func scoreOpus(cs caseSpec, cfg gateConfig, rec recording, decoded []float64, de
 	cr := newCaseReport(cs, cfg)
 	cr.Counters = cloneCounters(rec.counters)
 	cr.Engine = enginesSeen(rec)
-	cr.Events = redactEvents(rec.events, rec.roleApp)
+	cr.Events = reportEvents(rec.events, rec.roleApp)
 	fail := false
 	problem := func(format string, args ...any) {
 		cr.Problems = append(cr.Problems, fmt.Sprintf(format, args...))
@@ -209,4 +210,38 @@ func bitrateVisible(pkts []opusPkt, tap0 int64) bool {
 		return false
 	}
 	return afterSum/float64(afterN) > beforeSum/float64(beforeN)
+}
+
+// scoreMultiEndpoint is case 22's record (05 §18.5, INFO): the game plays 1000 Hz on the default endpoint and
+// `endpoint-tone` 683 Hz on another active one; it records whether 683 Hz is captured (present by §18.6's rule) and
+// its level, with the number of endpoints. The game's 1000 Hz must be present, else the premise failed (recorded as
+// a problem). The result is INFO whatever happened; with one endpoint the runner SKIPs the case before it runs.
+func scoreMultiEndpoint(cs caseSpec, cfg gateConfig, rec recording, endpoints int) caseReport {
+	cr := newCaseReport(cs, cfg)
+	info := map[string]any{"endpoints": endpoints, "captured": false, "levelDb": silenceFloorDB}
+	cr.Info = info
+	if p := premiseProblem(cs, rec); p != "" {
+		cr.Problems = append(cr.Problems, p)
+		return withResult(cs, cfg, cr, resultInfo)
+	}
+	cr.Counters = cloneCounters(rec.counters)
+	cr.Engine = enginesSeen(rec)
+	cr.Events = reportEvents(rec.events, rec.roleApp)
+	m := segment(mono(rec.left, rec.right), sampleRate, 1.5, rec.recordDur)
+	game := toneLevelDB(m, sampleRate, freqGame)
+	other := toneLevelDB(m, sampleRate, freqLateGame)
+	cr.Checks = append(cr.Checks,
+		checkReport{Freq: freqGame, From: 1.5, Expect: expectPresent, LevelDB: roundDB(game),
+			Pass: game >= presentMinDB},
+		checkReport{Freq: freqLateGame, From: 1.5, Expect: expectInfo, LevelDB: roundDB(other), Pass: true})
+	info["captured"] = other >= presentMinDB
+	info["levelDb"] = roundDB(other)
+	if game < presentMinDB {
+		cr.Problems = append(cr.Problems, fmt.Sprintf("the game on the default endpoint read %.1f dB: not heard, so "+
+			"the second endpoint's result proves nothing", game))
+	}
+	if p := rec.controlProblem(cs.checks[0], 1.5, rec.recordDur); p != "" {
+		cr.Problems = append(cr.Problems, p)
+	}
+	return withResult(cs, cfg, cr, resultInfo)
 }

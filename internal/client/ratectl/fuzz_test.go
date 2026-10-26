@@ -314,15 +314,15 @@ func TestFuzzModelSeesTheRamp(t *testing.T) {
 	c = newController(bothLive, autoParams)
 	m = newModel(c)
 	c.Live(at(0))
-	for s := 0.5; s <= 10; s += 0.5 {
+	for s := 0.5; s <= 14; s += 0.5 { // the ramp: f at 8 Mbit/s since 14 s
 		m.check("Tick", s, c.Tick(at(s)), guardAll, false)
 	}
-	m.check("Hint", 12, c.Hint(admin(6_000_000), at(12)), guardAll, false)     // f 5.7 at once
-	m.check("Hint", 12.7, c.Hint(admin(6_300_000), at(12.7)), guardAll, false) // its split 6.0
-	m.check("Tick", 13, c.Tick(at(13)), guardAll, false)                       // the ramp steps to 6.0; held 1 s
-	m.check("Hint", 13.5, c.Hint(admin(7_000_000), at(13.5)), guardAll, false) // its split 6.7
+	m.check("Hint", 16, c.Hint(admin(6_000_000), at(16)), guardAll, false)     // f 5.7 at once
+	m.check("Hint", 16.7, c.Hint(admin(6_300_000), at(16.7)), guardAll, false) // its split 6.0
+	m.check("Tick", 17, c.Tick(at(17)), guardAll, false)                       // the ramp steps to 6.0; held 1 s
+	m.check("Hint", 17.5, c.Hint(admin(7_000_000), at(17.5)), guardAll, false) // its split 6.7
 	var steps []int
-	for s := 14.0; s <= 30; s += 0.5 {
+	for s := 18.0; s <= 34; s += 0.5 {
 		acts := c.Tick(at(s))
 		m.check("Tick", s, acts, guardAll, false)
 		for _, a := range acts {

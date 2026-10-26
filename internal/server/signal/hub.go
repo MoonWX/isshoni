@@ -23,7 +23,7 @@ import (
 // and limit must be positive. Start from DefaultConfig.
 type Config struct {
 	PublicOrigin      string               // 04's Site.Origin, e.g. "https://watch.example.com"
-	AllowedOrigins    []string             // extra exact origins: none in M1 (no config key); M2 adds Wails origins in code
+	AllowedOrigins    []string             // extra exact origins, bearer only: the wiring passes protocol.DesktopOrigins() (no config key)
 	ServerVersion     string               // internal/version.Version() (04)
 	ResumeKey         []byte               // 32 bytes, secrets.json keys.resume (04 config.KeyResume)
 	ICEServers        []protocol.ICEServer // M1: nil (sent as [])

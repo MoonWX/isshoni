@@ -458,9 +458,9 @@ export class LogView {
 export type PendingLink = app$0.PendingLink;
 
 /**
- * Picked is a source picked in the OS picker and held by Go until Start or Release (03 §10.1): kind window or
- * monitor, label (the picker's name, shown on this PC only and never sent), border (Windows draws its yellow
- * capture border) and the one-time sheets to show first, in order (first-share, dnd).
+ * Picked is a source picked in the OS picker and held by Go until Start or Release, at most 300 s (03 §10.1): kind
+ * window or screen, label (the picker's name, shown on this PC only and never sent), border (Windows draws its
+ * yellow capture border) and the one-time sheets to show first, in order (first-share, dnd).
  */
 export class Picked {
     "pickId": string;
@@ -1069,7 +1069,9 @@ export class ShareStatsSample {
 /**
  * ShareView is the native share as the SPA sees it (03 §6.3): Share.Current() and the share.state event. state is
  * picking, starting, live, paused, reconnecting, unreachable, stopping, ended or failed; endReason user, hotkey,
- * tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; liveSince is RFC 3339.
+ * tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; liveSince is RFC 3339. server
+ * is {layers: protocol.ServerLayerStats[]} while WatchServerStats is on, else null: 03 §6.3's ShareSnapshot.Server
+ * (01's server view of this connection's layers), wrapped in an object by WA48's DTO type.
  */
 export class ShareView {
     "state": string;
@@ -1092,7 +1094,7 @@ export class ShareView {
     "layers": ShareLayer[];
 
     /**
-     * 01's server stats while WatchServerStats is on, else null
+     * {layers: protocol.ServerLayerStats[]} or null, as said above
      */
     "server": { [_ in string]?: any };
     "endReason": string | null;

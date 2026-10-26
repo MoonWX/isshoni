@@ -162,7 +162,7 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
 | vcpkg | the commit in `native/vcpkg.json` `builtin-baseline` (04 owns the file and `native/vcpkg-configuration.json`, both at the CMake root `native/`, 04 §2); its ports build with the MSVC toolset above through the overlay triplet `native/triplets/x64-windows-static.cmake` (`VCPKG_PLATFORM_TOOLSET_VERSION 14.44`, 04 §13.1) | 04; `task lint:pins` checks the triplet's toolset against `tools.json` | by hand, monthly with the tool pins |
 | NSIS | 3.13, portable zip from SourceForge with SHA-256 | `deploy/windows/tools.json` | by hand |
 | FFmpeg | `9.0.2` tarball, SHA-256, plus nv-codec-headers, AMF headers, libvpl (§4.1) | `native/ffmpeg/pins.json` | on an FFmpeg point release or a security fix (§4.7) |
-| Pester, PSScriptAnalyzer | newest 5.x / 1.x at slice time, exact versions | `deploy/windows/tools.json` | by hand |
+| Pester, PSScriptAnalyzer | newest 5.x / 1.x at slice time, exact versions; `lint:ps` and `test:ps` download each `.nupkg` from the PowerShell Gallery's package URL into `.deps/psmodules/` and check a SHA-256 kept in `Taskfile.yml` (WA49; no PowerShellGet, and the same code runs under 5.1), so a version bump fails with the URL whose hash to add | `deploy/windows/tools.json` | by hand |
 | syft, cosign | M1's | unchanged | M1 |
 
 `deploy/windows/tools.json`:
@@ -569,9 +569,10 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
     honored": with `/DEPENDENTLOADFLAG:0x800` the default delay-load helper still loaded the planted DLL from the
     current directory. So the DLL is linked without the flag, dll-check prints
     `load config: DependentLoadFlags 0x0000` with a note that it is not checked, and 04's delay-load hook is the guard
-    (04 §13.1). WF2 replaces the note's wording, which still calls WA11's verdict pending, with one that says the
-    verdict leaves the line unchecked. The test keeps writing the verdict to `dependentloadflag-verdict.txt` and the
-    job summary. The same run's
+    (04 §13.1). WF2 replaced the note's wording, which called WA11's verdict pending; the line now reads `load
+    config: DependentLoadFlags 0x0000 (not checked: the delay-load helper doesn't honor /DEPENDENTLOADFLAG, so the
+    engine's delay-load hook is the guard, 04 §13.1)`, and the flag's help says it is unused. The test keeps writing
+    the verdict to `dependentloadflag-verdict.txt` and the job summary. The same run's
     dll-check of the first real DLL (39 exports; static imports `KERNEL32.dll` and `ole32.dll` only; no delay imports;
     the version resource as below with `0.0.0-ci.77`) and its ctest results are recorded in 04 §18.2.
   - **Version resource**: `FILEVERSION` and `PRODUCTVERSION` = `<winver>`; the strings `ProductVersion` = `<v>`,
@@ -897,7 +898,12 @@ isshoni-release namespaces="isshoni-checksums" ssh-ed25519 AAAA... isshoni-relea
 `@VERSION@` is stamped by the release (`task release:prepare`, like `install.sh`'s `ISSHONI_INSTALLER_VERSION`), and
 the key block is written by `task release:keys` and checked by `task lint:keys`, exactly as for `install.sh` (M1 06
 §4.3). The release asset `install-desktop.ps1` is this file stamped; the server's copy is the same file with the
-prefill block rewritten (§7.4).
+prefill block rewritten (§7.4). As built (WA49 and group 5's integration): the block's writer is `repocheck
+ps1-keys`, which `release:keys` runs after it writes `install.sh` and before `lint:keys` (without it the owner's key
+PR would fail `lint:keys` and `TestCommittedReleaseKeyBlocks` on the empty ps1 block); `.gitattributes` has
+`deploy/install-desktop.ps1 text eol=lf`, so a Git for Windows checkout keeps the LF the server embeds and serves.
+Until the TLS measurement of step 2 (WA49-R4, the owner's), line 1 and the Pester test "starts with the usage line
+and the docs link" keep the bare `irm … | iex`; if TLS 1.2 is off by default, both switch to §7.5's prefixed form.
 
 Flow:
 1. **Checks**: `$PSVersionTable.PSVersion` ≥ 5.1; `[Environment]::OSVersion.Version.Build` ≥ 19041 (warn below
@@ -909,7 +915,13 @@ Flow:
    (on) → print "isshoni: Smart App Control is on, and this version of the app can't run on your PC yet: share from
    Chrome or Edge instead. More: https://moonwx.github.io/isshoni/download#windows-smart-app-control", then "Nothing
    was installed." and return; `2` (evaluation) and `0` (off) proceed. Why: Smart App Control blocks unsigned 0.x
-   builds with no override (§12.1), so saying so up front saves the friend the attempt.
+   builds with no override (§12.1), so saying so up front saves the friend the attempt. As built (WA49): a platform
+   check comes first (not Windows: its own `isshoni:` line); the architecture is `$env:PROCESSOR_ARCHITEW6432`, the
+   machine's under a 32-bit PowerShell, else `$env:PROCESSOR_ARCHITECTURE`; a registry read that fails counts as
+   Smart App Control off. **What verification needs** comes next, still before anything is downloaded, so a PC that
+   can't verify downloads nothing: a key block that holds no key is refused as a development copy ("This copy of the
+   script carries no release signing key (a development copy), so it can't check a download. Use the command on your
+   server's Download page."; `install.sh`'s `need_key` rule), and `ssh-keygen` must be found (§7.2).
 2. **TLS**: `[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor
    [Net.SecurityProtocolType]::Tls12`. This runs only after the user's own `irm https://<server>/install-desktop.ps1`
    has fetched the script from an isshoni server, whose Go TLS stack requires TLS 1.2. If a stock Windows PowerShell
@@ -919,11 +931,15 @@ Flow:
    either way, for the GitHub downloads.
 3. **Version**: `$env:ISSHONI_VERSION`, else `$IsshoniVersion` (when it is not the literal `@VERSION@`), else the
    latest release through the redirect of `$Base/latest` (`…/releases/tag/vX.Y.Z`), as `install.sh` does (no API).
-   Must match `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`.
+   Must match `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`. As built (WA49): `ISSHONI_VERSION` also takes `v0.2.0` and
+   `latest`, as `install.sh` does, and the regex ends in `\z`, since .NET's `$` also matches before a final newline.
 4. **Download** with `Invoke-WebRequest -UseBasicParsing -OutFile` (3 attempts, 2 s apart) from
    `$Base/download/v<v>/`, where `$Base` is `$env:ISSHONI_DOWNLOAD_BASE` or `https://github.com/MoonWX/isshoni/releases`:
    `isshoni-desktop_<v>_windows_amd64_setup.exe`, `checksums.txt`, `checksums.txt.sig`.
-5. **Verify the signature** (§7.2). Any failure: "Nothing was installed." and return.
+5. **Verify the signature** (§7.2). Any failure: "Nothing was installed." and return. As built (WA49): an invalid
+   signature prints "isshoni: The signature of checksums.txt is not valid: this is not a release the isshoni project
+   signed.", the first line `ssh-keygen` said, and "If this keeps happening, see
+   https://moonwx.github.io/isshoni/security#verify-desktop".
 6. **Verify the file**: exactly one line of `checksums.txt` is `<64 hex>  <name>` or `<64 hex> *<name>` for the whole
    name; it must equal `(Get-FileHash -Algorithm SHA256 $file).Hash` (case-insensitive).
 7. **Install**: `Start-Process -FilePath $setup -ArgumentList $a -Wait -PassThru`, inside `try { … } catch { … }`:
@@ -937,7 +953,18 @@ Flow:
    to messages (§6.4): 3 "Quit isshoni from its tray icon and run the command again", 4 "A newer isshoni is installed
    (set ISSHONI_ALLOW_DOWNGRADE=1 to replace it)", 5 "This Windows version is not supported", 7 "WebView2 could not be
    installed: <link>", 8 "Another isshoni setup is running; run the command again when it has finished".
-8. "isshoni <v> is installed." plus "It is starting now." or the Start menu hint.
+   **As built (WA49)**: the installer runs as `Start-Process -FilePath $setup -ArgumentList $a -PassThru` (no
+   redirection, so through ShellExecute, which matters for §16's "nothing on stderr" case), then `$null =
+   $process.Handle` and `$process.WaitForExit()`, not `-Wait`: in Windows PowerShell 5.1 and 7, `-Wait` waits for
+   every process the installer starts (a job object), so with `/LAUNCH` the one-liner would hang until the user quits
+   isshoni; reading `Handle` first keeps `ExitCode` readable in 5.1. `/SERVER=` is passed only when `$IsshoniServer`
+   matches `^https?://[!#-~]+\z` (otherwise a "Note: the server address in this script is not usable; the app will
+   ask." line). Exit code 1 says "The setup was cancelled."; 2, 6 and any other code get "The setup failed (exit
+   code N)."; 7's link is `https://moonwx.github.io/isshoni/troubleshooting#desktop-webview2`. The blocked-installer
+   link goes on a `More: <link>` line of its own; the script's text writes the arrows of Windows' settings paths as
+   `>`, to stay ASCII.
+8. "isshoni <v> is installed." plus "It is starting now." or the Start menu hint. An unexpected exception anywhere
+   still ends as an `isshoni:` line (with "Nothing was installed." while that is true), never an error record.
 
 `Start-Process -ArgumentList` in Windows PowerShell 5.1 joins arguments with spaces and quotes nothing, and `$env:TEMP`
 contains the user's name, which may have spaces: every path argument is passed through a helper that wraps it in
@@ -959,6 +986,11 @@ double quotes.
   Optional features → OpenSSH Client), or download the installer from your server's Download page", linking
   `/download#windows-verify`. An `ssh-keygen` older than 8.1 shows a usage error, which the script names ("your
   ssh-keygen is older than OpenSSH 8.1").
+- As built (WA49): the inbox path is also tried under `Sysnative` (the same folder seen from a 32-bit PowerShell);
+  the messages write the settings path with `>` (ASCII) and end with
+  `More: https://moonwx.github.io/isshoni/download#windows-verify`; and the `allowed_signers` file the script writes
+  holds only the block's key lines, without the marker comments and blank lines, so it doesn't depend on 8.1p1's
+  comment parsing (`ssh-keygen` reads it the same).
 - **Constraint from Windows 10's 8.1p1**: `deploy/keys/allowed_signers` may use only options that 8.1 parses
   (`namespaces=`, `cert-authority`). A rotation that would need `valid-before=` (OpenSSH 8.8+, M1 06 §9.4) adds the new
   key's line and deletes the old key's (at once after a leak, otherwise in a later change) instead; `repocheck keys`
@@ -1459,11 +1491,14 @@ The channel `ci` (§8.2) is the unexported `channelCI`: no app setting names it.
 
 ### 8.10 Error codes
 
-`network`, `rate_limited`, `bad_signature`, `bad_manifest`, `manifest_unsupported`, `manifest_expired`,
-`wrong_channel`, `no_artifact`, `download_failed`, `size_mismatch`, `hash_mismatch`, `disk`, `install_failed`,
-`not_installed`; for `disabled`: `no_keys`, `not_release`. Stable, snake_case, never renamed (M1 README §4). 03 maps
-them to `desktop.update.errors.<code>` in `web/src/i18n/lazy/desktop.en.json`. 03 adds these codes to
-`internal/desktop/bridge/codes`, so `check:i18n` fails when a code has no text (03 §6.4 and §18.1 get the same row).
+`network`, `rate_limited`, `bad_signature`, `bad_manifest`, `manifest_unsupported`, `manifest_expired`, `wrong_channel`,
+`no_artifact`, `download_failed`, `size_mismatch`, `hash_mismatch`, `disk`, `install_failed`, `not_installed`; for
+`disabled`: `no_keys`, `not_release`. Stable, snake_case, never renamed (M1 README §4). 03 maps them to
+`desktop.update.error.<code>` in `web/src/i18n/lazy/desktop.en.json` (singular `error`, as 03 §6.4 and the code spell
+it; README §3 item 42). 03 adds these codes to `internal/desktop/bridge/codes` as `update.<code>`, plus
+`update.not_ready` (WA48); their texts come with the update screens (WA82), and until then nothing asks for them (03
+§18.1: `codes.node.test.ts`, where the codes' text rule lives, exempts the `update.*` codes until WA82 drops the
+exemption, and `check:i18n` doesn't read `codes.gen.ts`).
 
 ### 8.11 Test hooks (`updatetest` build tag)
 
@@ -1634,15 +1669,15 @@ New `changes` filters:
 |---|---|---|---|---|---|
 | `lint-go` (changed) | go | ubuntu-24.04 | M1's steps plus `GOOS=windows golangci-lint run ./...` (Windows-only files: the x/sys/windows loader in `internal/media/native` (04 §12), `apply_windows.go`, 03's `winos`), `go vet` with `GOOS=darwin` and `GOOS=windows`, and `task lint:go:cross`: `GOOS=windows CGO_ENABLED=0 go build ./internal/... ./cmd/...` (the Windows app needs no cgo, so the cross-compile stays possible) and the gomobile check, package builds of `./internal/client/...` and `./internal/media` for `android` and `ios` on arm64 (01 §4); for the `tools/` module also `GOOS=windows go vet ./...` (g2g's GDI capture is Windows-only) | 10 | yes |
 | `test-go` (changed) | go | ubuntu-24.04 | `go test -race ./...`: the client core, `internal/update` and the app's non-Wails packages with the fake engine; the app main is the stub. Then `go test -race -count=1 -tags updatetest ./internal/update/` (group 4's integration): the whole package with §8.11's hooks, so `TestTestHooks` and the hooks' `init()` path run in CI | 20 | yes |
-| `protocol` (changed) | protocol | ubuntu-24.04 | M1's `task gen:check`, now also covering `web/src/platform/desktop/codes.gen.ts` (03's `tygo.yaml` entry for `internal/desktop/bridge/codes`); then builds `.bin/wails3` (`task release:wails3`) and runs `GOOS=windows .bin/wails3 generate bindings` into `web/src/platform/desktop/bindings/`, failing on any diff (with GOOS unset the generator sees only the D18 stub on linux, so no services) | 10 | yes |
-| `build` (changed) | as M1 | ubuntu-24.04 | M1's steps plus `go build -o bin/isshoni-desktop-e2ehost ./internal/desktop/e2ehost`, uploaded with M1's binaries for `e2e` (like `isshoni-loadtest`) | 10 | yes |
-| `e2e` (changed) | run-e2e | ubuntu-24.04 | M1's steps with `DESKTOP_E2E_BIN` = the downloaded `bin/isshoni-desktop-e2ehost` (`chmod +x`), so 03's desktop specs (03 §22.4 A) run in the same `npm run e2e` | as M1 | yes |
+| `protocol` (changed) | protocol | ubuntu-24.04 | M1's `task gen:check`, now also covering `web/src/platform/desktop/codes.gen.ts` (03's `tygo.yaml` entry for `internal/desktop/bridge/codes`); then builds `.bin/wails3` (`task release:wails3`) and runs `GOOS=windows .bin/wails3 generate bindings` into `web/src/platform/desktop/bindings/`, failing on any diff (with GOOS unset the generator sees only the D18 stub on linux, so no services). As built (group 5's integration): `task gen:bindings:check`, with a cache of its own for `.bin/wails3` and `.task/checksum/release-wails3` keyed on `tools/wails3/go.{mod,sum}` (the shared tools cache stays as it is) | 15 | yes |
+| `build` (changed) | as M1 | ubuntu-24.04 | M1's steps plus the desktop e2e harness, which embeds `web/dist` (only this job has it): `CGO_ENABLED=0 go build -trimpath -o bin/e2ehost ./internal/desktop/e2ehost`, uploaded as the artifact `e2ehost-linux-amd64` (kept 7 days) for `e2e`, like `isshoni-loadtest` (group 5's integration) | 10 | yes |
+| `e2e` (changed) | run-e2e | ubuntu-24.04 | M1's steps with `DESKTOP_E2E_BIN` = `${{ github.workspace }}/bin/e2ehost` downloaded from `e2ehost-linux-amd64` (`chmod +x` with M1's binaries), so 03's desktop specs (03 §22.4 A) run in the same `npm run e2e` | as M1 | yes |
 | `desktop-macos` | desktop | macos-15 | `go test -race` of `./internal/client/... ./internal/media/... ./internal/update/...` and the app's packages; `go build ./cmd/isshoni-desktop` (darwin, cgo, fake engine until M3); `go-licenses check ./cmd/isshoni-desktop` | 20 | yes |
 | `native-host` | native | ubuntu-24.04, macos-15 (matrix) | `task native:test PRESET=host-debug` and `PRESET=host-tsan` with `VCPKG_DIR=$RUNNER_TEMP/vcpkg` (the task clones vcpkg at `native/vcpkg.json`'s baseline, bootstraps it with metrics off, then runs `cmake --preset`, `cmake --build --preset` and `ctest --preset`; 04 §18.1: `native/common` tests, the libopus host build of 04 E3/E4), with vcpkg's `files` binary cache keyed by OS, image and manifest (no restore keys); on ubuntu `vm.mmap_rnd_bits=28` before `host-tsan` (TSan's fixed shadow layout fails with Ubuntu 24.04's 32-bit mmap randomization), and `task lint:native CLANG_FORMAT=clang-format-18` (`clang-format --dry-run --Werror` over the tracked `native/**/*.{h,c,cpp}` with `native/.clang-format`). The clang-format version is the ubuntu image's `clang-format-18` (installed with apt if the image lacks it), not pinned in a repository file | 20 | yes |
 | `windows-go` | desktop | windows-2025 | no `needs`, no DLL: `go test -race ./internal/client/... ./internal/update/... ./internal/media/...` with the image's MinGW gcc (as M1's nightly), the fake engine (04's DLL tests skip without `ISSHONI_TEST_ENGINE_DLL`), then `CGO_ENABLED=0 go test ./internal/client/... ./internal/update/...` (the shipped build mode; this is the Windows job 02 §16.1 expects, on `windows-2025` rather than `windows-latest`, which moves). Runs 02's credstore and deviceauth tests (DA9, DA10) and this document's R7/R8 on Windows from R1 on | 15 | yes |
 | `windows-native` | desktop | windows-2025 | §5.1 with the vcpkg cache: FFmpeg from the lock (and its staleness check, §4.1), the MSVC environment, `win-x64-ci` build and `ctest` (outbound network for 04's `openh264_test`), `win-x64-release` build, the DLL checks on the release output; uploads `windows-native` (`release\` and `ci\`, kept 1 day) and `isshoni-native-tools` (§17 `native:dist`, kept 7 days) | 30 | yes |
 | `windows-desktop` | desktop | windows-2025 | needs `windows-native` and `web`: only the DLL-dependent Go tests, `go test -race ./internal/media/...` with `ISSHONI_TEST_ENGINE_DLL=<artifact>\ci\isshoni-media.dll` (04 §18.2, `TestNativeIntoPublisher`; everything else is in `windows-go`); `task desktop:exe:windows`; NSIS (pinned zip); desktop notices and the native gate (§9.3); `stage -release`, prebuilt uninstaller, installer; `deploy/test/windows/smoke.ps1` (§16); Pester under Windows PowerShell 5.1 (`ps` filter); the updater e2e (`update` filter, §8.11, §16); the server-rendered ps1 test (§16); then, before the CDP spec, a step that reads the WebView2 `pv` from §6.5's keys and, when it is missing or below 120.0, runs the checked `MicrosoftEdgeWebview2Setup.exe /silent /install` from the `windows-native` artifact (so the CDP spec doesn't depend on `smoke.ps1`'s install having run first); **03's CDP spec** (03 §22.4 B): `task desktop:exe:windows TAGS=e2e`, `go build ./cmd/isshoni`, `npm ci` in `web/`, then the CDP Playwright config (`connectOverCDP`, no browser download); uploads `isshoni-desktop-windows-pr` (installer and symbols, kept 7 days, for manual tests on the owner's PC) | 50 | yes |
-| `lint-deploy` (changed) | deploy, readme, repocheck, ps, pins | ubuntu-24.04 | M1's tasks plus `lint:ps` (PSScriptAnalyzer at Warning and Error and the ASCII check over `deploy/install-desktop.ps1`, `deploy/test/windows/*.ps1`, `deploy/windows/msvc-env.ps1` and `native/windows/tools/*.ps1`; the PowerShell 5.1 grammar check is in `windows-desktop`) and `test:ps` (Pester under `pwsh`); `lint:keys` now also checks the ps1 key block, `internal/update/signers.go` and the update keys' README rows; `lint:pins` (§3) | 10 | yes |
+| `lint-deploy` (changed) | deploy, readme, repocheck, ps, pins | ubuntu-24.04 | M1's tasks plus `lint:ps` (PSScriptAnalyzer at Warning and Error and the ASCII check over `deploy/install-desktop.ps1`, `deploy/test/windows/*.ps1`, `deploy/windows/msvc-env.ps1` and `native/windows/tools/*.ps1`; the PowerShell 5.1 grammar check is in `windows-desktop`) and `test:ps` (Pester under `pwsh`). As built (WA49): `lint:ps` also ASCII-checks `deploy/test/install-desktop.Tests.ps1`, fails on CRLF in `deploy/install-desktop.ps1` and enables `PSUseCompatibleSyntax` for 5.1; both tasks take `PWSH=<binary>` (like `lint:native`'s `CLANG_FORMAT`) and fetch their module at `tools.json`'s version into `.deps/psmodules/` (§3), which the job caches by `tools.json`'s hash; `lint:keys` now also checks the ps1 key block, `internal/update/signers.go` and the update keys' README rows; `lint:pins` (§3) | 10 | yes |
 | `goreleaser-check` (changed) | as M1 | ubuntu-24.04 | `task release:snapshot` creates stub desktop files (`ISSHONI-DESKTOP-STUB`) when `dist-desktop/` has none, so the goreleaser config's desktop `extra_files` are checked by name; `release:assets` checks the names; `FULL=true` refuses stubs | 20 | yes |
 | `ci-ok` | always | | needs the new jobs too (`native-host`, `windows-go`, `windows-native`, `windows-desktop`, `desktop-macos`) | 2 | the only required check |
 
@@ -1652,7 +1687,9 @@ Windows jobs: every third-party action pinned by SHA (M1 06 §8.1), `persist-cre
 ### 10.2 Caches
 
 CI only (release.yml and the nightly use none, M1 06 §9.3): Go modules and build cache per job (M1's), the vcpkg
-binary cache (§5.1), the pinned NSIS zip keyed by its SHA-256, `.bin/wails3` keyed by `tools/wails3/go.{mod,sum}`.
+binary cache (§5.1), the pinned NSIS zip keyed by its SHA-256, `.bin/wails3` keyed by `tools/wails3/go.{mod,sum}`
+(with Task's checksum of it, so `release:wails3` is up to date on a hit; `protocol`'s own cache), and
+`.deps/psmodules` keyed by `deploy/windows/tools.json` (`lint-deploy`).
 The FFmpeg zip is not cached: it is a 1-second download from the deps release, verified each time.
 
 ### 10.3 `nightly.yml` additions
@@ -2233,7 +2270,7 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
   required banner, "Restart and update" through `Ready()` + `Apply`, the `not_installed` and `install_failed` notices)
   bound to `internal/update`; applying at start before the window opens (`PendingAtStartup(autostart)`, never at an
   `--autostart` start, where the tray offers "Update to X and restart") and never during a live share; the error-code
-  texts `desktop.update.errors.<code>` in `desktop.en.json` with the codes in `internal/desktop/bridge/codes` (§8.10).
+  texts `desktop.update.error.<code>` in `desktop.en.json` with the codes in `internal/desktop/bridge/codes` (§8.10).
 - What 03 reads and writes in the registry: reads `UpdateChecks` (once, as the initial setting), `InstallDir` (via
   the updater), `PendingServer` and `PendingRoom` (read and deleted at start, validated with 02's
   `deeplink.NormalizeOrigin` and handled under 02 §12.3, §2.3); writes `PendingServer` and `PendingRoom` before a

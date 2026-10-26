@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
@@ -26,8 +27,9 @@ import (
 // bursts or an endpoint tone. It is ported from spike S1 (spikes/s1-win-audio/winapi_windows.go). Windows only.
 //
 // Every fixture prints JSON lines on stdout that the harness reads (fixtureplan.go): {"role","pid","startNs"} when
-// it starts, {"role","firstRenderNs"} right before its first PlaySoundW. A spawn's children inherit its stdout, so
-// their lines reach the harness through it, also after the spawn exits (the orphan cases).
+// it starts, {"role","firstRenderNs"} right before its first PlaySoundW, and {"role","micError"} when -mic could not
+// open the microphone (the mic cases then SKIP, 05 §18.4). A spawn's children inherit its stdout, so their lines
+// reach the harness through it, also after the spawn exits (the orphan cases).
 
 // winmm's waveIn procs (loaded from System32 only).
 var (
@@ -52,6 +54,19 @@ type fixtureLine struct {
 	Matched       *bool   `json:"matched,omitempty"`
 	Attempts      int     `json:"attempts,omitempty"`
 	Error         string  `json:"error,omitempty"`
+	MicError      string  `json:"micError,omitempty"`
+}
+
+// holdMic opens the microphone for a -mic fixture; on failure it tells the harness ({"role","micError"}) and
+// stderr, and the fixture exits.
+func (v *fixtureVerb) holdMic(role string) (func(), bool) {
+	closeMic, err := v.openMic()
+	if err != nil {
+		emit(fixtureLine{Role: role, MicError: err.Error()})
+		fmt.Fprintln(os.Stderr, "mic:", err)
+		return nil, false
+	}
+	return closeMic, true
 }
 
 // emit prints one fixture line (a single write, so lines of processes sharing the pipe don't interleave).
@@ -81,34 +96,51 @@ func startTone(role string, freqs []float64, amp, seconds float64) error {
 	return playTone(freqs, amp, seconds)
 }
 
-// tone is `fixture tone -role R -f HZ[,HZ…] -d SEC [-amp A] [-mic]`: play a generated WAV of the summed partials,
-// with 20 ms fades, optionally holding the mic, then exit.
+// tone is `fixture tone -role R -f HZ[,HZ…] -d SEC [-amp A] [-am HZ] [-mic]`: play a generated WAV of the summed
+// partials, with 20 ms fades, optionally holding the mic, then exit. With -am (the soak's music, 05 §18.5 case 23)
+// it loops a seamless WAV of one slow-AM period (loopToneWAV) for -d seconds instead.
 func (v *fixtureVerb) tone(args []string) int {
 	fs := flag.NewFlagSet("tone", flag.ContinueOnError)
 	role := fs.String("role", "", "the fixture's role (harness-internal)")
 	freqs := fs.String("f", "440", "frequency list (Hz), comma-separated")
 	dur := fs.Float64("d", 10, "duration (s)")
 	amp := fs.Float64("amp", 0.125, "amplitude of each partial (0..1); default −18 dBFS")
+	am := fs.Float64("am", 0, "loop the tone with this slow amplitude modulation (Hz); 0 = a plain tone")
 	mic := fs.Bool("mic", false, "also hold the default microphone open")
 	if err := fs.Parse(args); err != nil {
 		return exitSetup
 	}
 	hello(*role)
 	if *mic {
-		closeMic, err := v.openMic()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mic:", err)
+		closeMic, ok := v.holdMic(*role)
+		if !ok {
 			return exitFail
 		}
 		defer closeMic()
 	}
-	if err := startTone(*role, splitFloatsCSV(*freqs), *amp, *dur); err != nil {
+	var err error
+	if *am > 0 {
+		err = startLoopTone(*role, splitFloatsCSV(*freqs), *amp, *am)
+	} else {
+		err = startTone(*role, splitFloatsCSV(*freqs), *amp, *dur)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return exitFail
 	}
 	time.Sleep(time.Duration((*dur + 0.2) * float64(time.Second)))
 	stopSound()
 	return exitAllPass
+}
+
+// startLoopTone logs the first-render time and starts the soak's looped music (05 §18.5 case 23).
+func startLoopTone(role string, freqs []float64, amp, am float64) error {
+	wav, err := loopToneWAV(freqs, amp, am)
+	if err != nil {
+		return err
+	}
+	emit(fixtureLine{Role: role, FirstRenderNS: qpcNS()})
+	return playLoopWAV(wav)
 }
 
 // idle is `fixture idle -role R -d SEC [-mic]`: run silent (a voice app waiting), optionally holding the mic.
@@ -122,9 +154,8 @@ func (v *fixtureVerb) idle(args []string) int {
 	}
 	hello(*role)
 	if *mic {
-		closeMic, err := v.openMic()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mic:", err)
+		closeMic, ok := v.holdMic(*role)
+		if !ok {
 			return exitFail
 		}
 		defer closeMic()
@@ -157,9 +188,8 @@ func (v *fixtureVerb) spawn(args []string) int {
 		return exitSetup
 	}
 	if *mic {
-		closeMic, err := v.openMic()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mic:", err)
+		closeMic, ok := v.holdMic(*role)
+		if !ok {
 			return exitFail
 		}
 		defer closeMic()
@@ -190,9 +220,14 @@ func (v *fixtureVerb) spawn(args []string) int {
 }
 
 // reusePID is `fixture reuse-pid -target PID -parent PID [-max N]` (case 27 only, 05 §18.3): create suspended copies
-// of itself under -parent (CREATE_SUSPENDED with PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, through os/exec's
-// SysProcAttr) and terminate each whose PID isn't -target, up to -max attempts. A match is left suspended (alive)
-// until the harness kills it. It prints {"matched": true|false, "attempts": n} (and "pid" on a match).
+// of itself under -parent and terminate each whose PID isn't -target, up to -max attempts. A match is left
+// suspended (alive) until the harness kills it. It prints {"matched": true|false, "attempts": n} (and "pid" on a
+// match).
+//
+// The copies come from suspendedSpawner, a direct CreateProcessW with CREATE_SUSPENDED and
+// PROC_THREAD_ATTRIBUTE_PARENT_PROCESS that inherits no handle, so the parent needs only PROCESS_CREATE_PROCESS, as
+// 05 §18.3 says (os/exec would also duplicate the standard handles into the parent, which needs PROCESS_DUP_HANDLE,
+// and opens three NUL handles per attempt).
 func (v *fixtureVerb) reusePID(args []string) int {
 	fs := flag.NewFlagSet("reuse-pid", flag.ContinueOnError)
 	target := fs.Int("target", 0, "the PID to recreate")
@@ -202,14 +237,11 @@ func (v *fixtureVerb) reusePID(args []string) int {
 		return exitSetup
 	}
 	matched := false
-	if *target <= 0 || *parent <= 0 {
+	if *target <= 0 || *target > math.MaxUint32 || *parent <= 0 || *parent > math.MaxUint32 {
 		emit(fixtureLine{Matched: &matched, Error: "target and parent are required"})
 		return exitSetup
 	}
-	// PROCESS_CREATE_PROCESS for the parent attribute; os/exec also duplicates the copy's standard handles into
-	// the parent, which needs PROCESS_DUP_HANDLE (the game is our own fixture, same user).
-	ph, err := windows.OpenProcess(windows.PROCESS_CREATE_PROCESS|windows.PROCESS_DUP_HANDLE, false,
-		uint32(*parent)) //nolint:gosec // G115: a PID fits in uint32
+	ph, err := windows.OpenProcess(windows.PROCESS_CREATE_PROCESS, false, uint32(*parent))
 	if err != nil {
 		emit(fixtureLine{Matched: &matched, Error: "open the parent: " + err.Error()})
 		return exitFail
@@ -220,28 +252,79 @@ func (v *fixtureVerb) reusePID(args []string) int {
 		emit(fixtureLine{Matched: &matched, Error: err.Error()})
 		return exitFail
 	}
+	spawner, err := newSuspendedSpawner(ph, self, []string{"fixture", verbIdle, "-d", "1"})
+	if err != nil {
+		emit(fixtureLine{Matched: &matched, Error: err.Error()})
+		return exitFail
+	}
+	defer spawner.close()
 	for n := 1; n <= *maxN; n++ {
-		cmd := exec.CommandContext(context.Background(), self, "fixture", "idle", "-d", "1") //nolint:gosec // G204: a copy of this binary
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			CreationFlags: windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW,
-			ParentProcess: syscall.Handle(ph),
-		}
-		if err := cmd.Start(); err != nil {
+		pi, err := spawner.create()
+		if err != nil {
 			emit(fixtureLine{Matched: &matched, Attempts: n, Error: "create: " + err.Error()})
 			return exitFail
 		}
-		if cmd.Process.Pid == *target {
+		if pi.ProcessId == uint32(*target) {
 			matched = true
-			emit(fixtureLine{Matched: &matched, Attempts: n, PID: uint32(*target)}) //nolint:gosec // G115: a PID
-			_ = cmd.Process.Release()                                               // leave it suspended and alive
+			emit(fixtureLine{Matched: &matched, Attempts: n, PID: pi.ProcessId})
+			_ = windows.CloseHandle(pi.Thread) // leave it suspended and alive: the harness kills it with the case
+			_ = windows.CloseHandle(pi.Process)
 			return exitAllPass
 		}
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_, _ = windows.WaitForSingleObject(pi.Process, 2000) // its PID is free once it is gone and unreferenced
+		_ = windows.CloseHandle(pi.Thread)
+		_ = windows.CloseHandle(pi.Process)
 	}
 	emit(fixtureLine{Matched: &matched, Attempts: *maxN})
 	return exitAllPass
 }
+
+// suspendedSpawner creates suspended copies of a program as children of another process (case 27's PID-reuse loop):
+// CreateProcessW with CREATE_SUSPENDED and EXTENDED_STARTUPINFO_PRESENT, an attribute list holding only
+// PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, and no inherited handle.
+type suspendedSpawner struct {
+	parent  windows.Handle // kept alive for the attribute list, which points at it
+	attrs   *windows.ProcThreadAttributeListContainer
+	exe     *uint16
+	cmdline string
+}
+
+// newSuspendedSpawner prepares the attribute list for parent (opened with PROCESS_CREATE_PROCESS) and exe's command
+// line.
+func newSuspendedSpawner(parent windows.Handle, exe string, args []string) (*suspendedSpawner, error) {
+	s := &suspendedSpawner{parent: parent, cmdline: windows.ComposeCommandLine(append([]string{exe}, args...))}
+	var err error
+	if s.exe, err = windows.UTF16PtrFromString(exe); err != nil {
+		return nil, err
+	}
+	if s.attrs, err = windows.NewProcThreadAttributeList(1); err != nil {
+		return nil, fmt.Errorf("attribute list: %w", err)
+	}
+	if err := s.attrs.Update(windows.PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, unsafe.Pointer(&s.parent),
+		unsafe.Sizeof(s.parent)); err != nil {
+		s.attrs.Delete()
+		return nil, fmt.Errorf("parent attribute: %w", err)
+	}
+	return s, nil
+}
+
+// create starts one suspended copy. The caller closes both handles of the result.
+func (s *suspendedSpawner) create() (windows.ProcessInformation, error) {
+	var pi windows.ProcessInformation
+	cmd, err := windows.UTF16FromString(s.cmdline) // CreateProcessW may write into the command line
+	if err != nil {
+		return pi, err
+	}
+	si := windows.StartupInfoEx{ProcThreadAttributeList: s.attrs.List()}
+	si.Cb = uint32(unsafe.Sizeof(si))
+	err = windows.CreateProcess(s.exe, &cmd[0], nil, nil, false,
+		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW|windows.EXTENDED_STARTUPINFO_PRESENT, nil, nil,
+		&si.StartupInfo, &pi)
+	return pi, err
+}
+
+func (s *suspendedSpawner) close() { s.attrs.Delete() }
 
 // bursts is `fixture bursts -dll PATH -n N`: load the DLL and render N 2 kHz bursts, printing the predicted onsets.
 func (v *fixtureVerb) bursts(args []string) int {
@@ -273,9 +356,11 @@ func (v *fixtureVerb) bursts(args []string) int {
 	return exitAllPass
 }
 
-// endpointTone is `fixture endpoint-tone -dll PATH -endpoint ID -f HZ -d SEC`: render a tone on a chosen endpoint.
+// endpointTone is `fixture endpoint-tone -role R -dll PATH -endpoint ID -f HZ -d SEC` (case 22): render a tone on a
+// chosen endpoint with im_test_render_tone, logging firstRenderNs right before.
 func (v *fixtureVerb) endpointTone(args []string) int {
 	fs := flag.NewFlagSet("endpoint-tone", flag.ContinueOnError)
+	role := fs.String("role", "", "the fixture's role (harness-internal)")
 	dll := fs.String("dll", "", "the folder of isshoni-media.dll")
 	endpoint := fs.String("endpoint", "", "the IMMDevice id")
 	freq := fs.Float64("f", 683, "frequency (Hz)")
@@ -283,6 +368,7 @@ func (v *fixtureVerb) endpointTone(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return exitSetup
 	}
+	hello(*role)
 	eng, err := native.Open(native.Options{Dir: *dll, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "endpoint-tone: open:", err)
@@ -294,6 +380,7 @@ func (v *fixtureVerb) endpointTone(args []string) int {
 		fmt.Fprintln(os.Stderr, "endpoint-tone: hooks:", err)
 		return exitFail
 	}
+	emit(fixtureLine{Role: *role, FirstRenderNS: qpcNS()})
 	if err := hooks.RenderTone(*endpoint, float32(*freq), 0.125, secs(*dur)); err != nil {
 		fmt.Fprintln(os.Stderr, "endpoint-tone: render:", err)
 		return exitFail

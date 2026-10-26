@@ -91,8 +91,8 @@ jobs:
       - name: Install rpm (release:snapshot's asset check lists the rpm packages with it)
         run: |
           if ! command -v rpm > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends rpm
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends rpm
           fi
 
       - name: Build the releases 0.0.1-ci.1 and 0.0.1-ci.2
@@ -198,9 +198,9 @@ jobs:
             exit 1
             ;;
           esac
-          sudo apt-get update -qq
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
           # shellcheck disable=SC2086 # one or two package names
-          sudo apt-get install -y -qq --no-install-recommends $qemu qemu-utils cloud-image-utils
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends $qemu qemu-utils cloud-image-utils
           "qemu-system-$(uname -m)" --version | sed -n 1p
 
       - name: Download the ${{ matrix.distro }} cloud image
@@ -474,8 +474,8 @@ jobs:
       - name: Install rpm (release:assets lists the rpm packages and their dependencies with it)
         run: |
           if ! command -v rpm > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends rpm
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends rpm
           fi
           rpm --version
 

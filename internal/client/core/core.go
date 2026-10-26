@@ -164,7 +164,7 @@ type Client struct {
 	authErr    *StopError         // the first terminal Auth error of a dial
 	dialCancel context.CancelFunc // ends the Dial in progress
 	forced     *protocol.Secret   // the forced refresh's token, for the next hello only
-	watchStats bool
+	watch      statsWatch         // stats.watch (stats.go)
 	// Signaling as the connection actor has seen it (recovery.go): readySeq counts its readies, sigReady says
 	// whether it is ready now, connID is the last ready's connection id and downAt when it last left ready.
 	// readyCh is closed and replaced at every change of them.

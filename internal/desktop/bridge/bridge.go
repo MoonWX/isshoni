@@ -17,10 +17,11 @@
 //     token of Auth.AccessToken, for the active server's own origin only (03 §5.8).
 //
 // Methods whose slices haven't landed return not_implemented (README §4 "Interfaces first"): Auth's server changes
-// and Unlink (WA71), Share's controller calls (WA58), Settings' writes and hotkeys and Updates (WA84). Audio works
-// once main hands it 05's service (WA77); until then it is not_implemented too.
+// and Unlink (WA71), Settings' writes and hotkeys and Updates (WA84). Audio works once main hands it 05's service
+// (WA77); until then it is not_implemented too. Share calls the app's share controller (internal/desktop/share).
 //
-// Events (Go → SPA, 03 §6.3) go out through Deps.Emit with the "isshoni:" prefix (events.go).
+// Events (Go → SPA, 03 §6.3) go out through Deps.Emit with the "isshoni:" prefix (events.go): 05's audio events and
+// the share controller's share.state, share.stats and share.notice.
 package bridge
 
 import (
@@ -35,6 +36,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/audio"
 	"github.com/MoonWX/isshoni/internal/desktop/servers"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
+	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/protocol"
 )
@@ -65,6 +67,13 @@ type Core interface {
 	OwnConnections(ids []string) error
 	Probe(ctx context.Context) (media.Probe, error)
 }
+
+// shareSource has the share controller (03 §10.1): *app.App's Shares.
+type shareSource interface {
+	Shares() app.ShareController
+}
+
+var _ shareSource = (*app.App)(nil)
 
 var _ Core = (*app.App)(nil)
 
@@ -153,9 +162,12 @@ type Deps struct {
 	ProbeApp deviceauth.AppInfo
 	// AllowInsecureLoopback is true in dev and e2e builds (http:// loopback servers, 03 §8.1).
 	AllowInsecureLoopback bool
-	Audio                 AudioPolicy    // 05's service; nil until README WA77 wires it
-	Settings              SettingsSource // settings.json
-	Shell                 WindowShell    // Window.SetFullscreen
+	Audio                 AudioPolicy // 05's service; nil until README WA77 wires it
+	// Shares is the share controller; nil means App's own (*app.App's Shares). Without one, Share's controller
+	// calls answer not_implemented.
+	Shares   app.ShareController
+	Settings SettingsSource // settings.json
+	Shell    WindowShell    // Window.SetFullscreen
 	// PolicyOff reports 06's update policy (update.PolicyDisabled) for SettingsView.updates.policyOff; nil: false.
 	PolicyOff func() bool
 	// Emit sends an event to the page (03 §6.3): the shell's Emit. nil drops events.
@@ -185,6 +197,13 @@ func New(d Deps) (*Services, error) {
 	case d.Servers == nil:
 		return nil, errors.New("bridge: Deps.Servers is required")
 	}
+	shares := d.Shares
+	if src, ok := d.App.(shareSource); ok && shares == nil {
+		shares = src.Shares()
+	}
+	if shares == nil {
+		shares = noShares{}
+	}
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
@@ -203,7 +222,7 @@ func New(d Deps) (*Services, error) {
 	s := &Services{
 		App:      &App{core: d.App, log: log},
 		Auth:     &Auth{core: d.App, servers: d.Servers, probe: probe, log: log},
-		Share:    &Share{core: d.App, log: log},
+		Share:    &Share{core: d.App, ctl: shares, log: log},
 		Audio:    &Audio{core: d.App, policy: d.Audio, log: log},
 		Settings: &Settings{store: d.Settings, policyOff: d.PolicyOff, log: log},
 		Window:   &Window{shell: d.Shell},
@@ -214,6 +233,7 @@ func New(d Deps) (*Services, error) {
 			emit(EventPrefix+ev.Name, ev.Payload)
 		}))
 	}
+	s.closers = append(s.closers, s.Share.ctl.Subscribe(func(ev share.Event) { s.Share.forward(ev, emit) }))
 	return s, nil
 }
 

@@ -28,6 +28,7 @@ const (
 	sndAsync     = 0x0001
 	sndNoDefault = 0x0002
 	sndMemory    = 0x0004
+	sndLoop      = 0x0008
 )
 
 // soundMu guards soundBuf: PlaySoundW(SND_MEMORY|SND_ASYNC) reads the WAV while it plays, so the buffer must stay
@@ -44,6 +45,22 @@ func playTone(freqs []float64, amp, seconds float64) error {
 	soundMu.Lock()
 	defer soundMu.Unlock()
 	r, _, err := procPlaySound.Call(uintptr(unsafe.Pointer(&wav[0])), 0, sndMemory|sndAsync|sndNoDefault)
+	if r == 0 {
+		return fmt.Errorf("PlaySound: %w", err)
+	}
+	soundBuf = wav
+	return nil
+}
+
+// playLoopWAV plays an in-memory WAV over and over (SND_LOOP, asynchronously) until stopSound: the soak's music
+// (loopToneWAV), 30 minutes from a 10 s loop.
+func playLoopWAV(wav []byte) error {
+	if len(wav) == 0 {
+		return fmt.Errorf("PlaySound: an empty WAV")
+	}
+	soundMu.Lock()
+	defer soundMu.Unlock()
+	r, _, err := procPlaySound.Call(uintptr(unsafe.Pointer(&wav[0])), 0, sndMemory|sndAsync|sndNoDefault|sndLoop)
 	if r == 0 {
 		return fmt.Errorf("PlaySound: %w", err)
 	}

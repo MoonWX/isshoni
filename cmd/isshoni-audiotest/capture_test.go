@@ -64,7 +64,7 @@ func TestCaptureMapsSessionsByPID(t *testing.T) {
 		},
 	}
 	pids := map[uint32]string{101: "audiohelper", 201: "isshoniTab", 202: "otherTab"}
-	c.sample(r, []string{"exclusion-unavailable"}, nil, pids)
+	c.sample(r, fhState{banners: []string{"exclusion-unavailable"}}, nil, pids)
 
 	if got := len(c.roles); got != 3 {
 		t.Fatalf("%d roles sampled, want 3 (the real Edge and TeamSpeak are no fixture's)", got)
@@ -98,9 +98,9 @@ func TestCaptureEventsOnceAndFresh(t *testing.T) {
 	ev1 := media.AudioEvent{TNanos: engineAt(0.2), Code: "session_created", App: "exe:game.exe"}
 	ev2 := media.AudioEvent{TNanos: engineAt(3.01), Code: "session_created", App: "discord"}
 	ev3 := media.AudioEvent{TNanos: engineAt(3.02), Code: "fastpath_exit"}
-	c.sample(media.AudioReport{Events: []media.AudioEvent{stale, ev1}}, nil, nil, nil)
-	c.sample(media.AudioReport{Events: []media.AudioEvent{stale, ev1, ev2}}, nil, nil, nil)
-	c.sample(media.AudioReport{Events: []media.AudioEvent{stale, ev1, ev2, ev3}}, nil, nil, nil)
+	c.sample(media.AudioReport{Events: []media.AudioEvent{stale, ev1}}, fhState{}, nil, nil)
+	c.sample(media.AudioReport{Events: []media.AudioEvent{stale, ev1, ev2}}, fhState{}, nil, nil)
+	c.sample(media.AudioReport{Events: []media.AudioEvent{stale, ev1, ev2, ev3}}, fhState{}, nil, nil)
 	if len(c.events) != 3 {
 		t.Fatalf("%d events, want 3 (each once, the stale one dropped): %+v", len(c.events), c.events)
 	}
@@ -125,12 +125,12 @@ func TestCaptureForeign(t *testing.T) {
 		{AppID: "exe:quiet.exe", PeakDB: -65},
 	}}
 	pids := map[uint32]string{1: "game"}
-	c.sample(r, nil, levels, pids)
+	c.sample(r, fhState{}, levels, pids)
 	if len(c.foreign) != 0 {
 		t.Fatalf("foreign %+v, want none", c.foreign)
 	}
 	levels.Apps = append(levels.Apps, media.AudioLevel{AppID: "exe:spotify.exe", PeakDB: -30})
-	c.sample(r, nil, levels, pids)
+	c.sample(r, fhState{}, levels, pids)
 	if len(c.foreign) != 1 || c.foreign[0].app != otherRedacted {
 		t.Fatalf("foreign %+v, want one redacted entry", c.foreign)
 	}
@@ -185,7 +185,7 @@ func TestCaptureFinishControls(t *testing.T) {
 	c.sample(media.AudioReport{QPCNanos: engineAt(2), Sessions: []media.AudioSession{
 		{PID: 1, AppID: "exe:game.exe", Flow: "render", State: "active", Verdict: "heard"},
 		{PID: 2, AppID: "discord", Flow: "render", State: "inactive", Verdict: "kept_out"},
-	}}, nil, nil, map[uint32]string{1: "game", 2: "voice"})
+	}}, fhState{}, nil, map[uint32]string{1: "game", 2: "voice"})
 	rec := c.finish(cs, captureEnd{
 		dur: 8, plan: planSpans(cs, 8), reparented: true,
 		firstRender: map[string]int64{"game": engineAt(-0.95)},

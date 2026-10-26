@@ -23,8 +23,11 @@
 //   - hints.go: the server's quality hints (the codec switch, layer pausing, caps) and the rate controller's Ticks,
 //     presets (Share.SetPreset, and one set from another connection), pause (Share.SetPaused, and one set from
 //     another connection), and what a republish owes them;
-//   - relay.go, stats.go: the relay and stats, which a later slice of docs/m2/README.md fills in (README WA55);
-//     bearer auth's integration tests come with WA73.
+//   - stats.go: the engine's Stats poll into the snapshot, the stats reports to the server every 10 s, and the
+//     server's view of the share (WatchServerStats, stats.watch);
+//   - relay.go: the same-user relay, of which the core consumes playback.state only (EventPlaybackState).
+//
+// Bearer auth's integration tests come with README WA73.
 //
 // The core never stores a token: 02's manager owns the credential. Nothing it logs holds a token, an SDP, an ICE
 // candidate, a window title, a source or app name, or a relay payload (§11.12). It has no Wails dependency (D18) and

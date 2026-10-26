@@ -76,6 +76,55 @@ func TestKeyedLimiterEviction(t *testing.T) {
 	}
 }
 
+// refund gives one token back after a refill, never more than the burst, and creates no entry for a key it does
+// not hold (M2 02 §6.3 item 4).
+func TestKeyedLimiterRefund(t *testing.T) {
+	l := newKeyedLimiter(perMinute(20), 10) // one token per 3 s
+	key := netip.MustParsePrefix("198.51.100.7/32")
+	for i := range 20 {
+		if ok, _ := l.allow(key, t0); !ok {
+			t.Fatalf("take %d refused", i+1)
+		}
+	}
+	if ok, _ := l.allow(key, t0); ok {
+		t.Fatal("the 21st take passed an empty bucket")
+	}
+	// A refund is one token: one more take passes, the next does not.
+	l.refund(key, t0)
+	if ok, _ := l.allow(key, t0); !ok {
+		t.Fatal("a take after a refund refused")
+	}
+	if ok, wait := l.allow(key, t0); ok || wait != 3*time.Second {
+		t.Fatalf("the take after that: ok %v, wait %v; want refused, 3s", ok, wait)
+	}
+	// The refill counts before the refund: 1.5 s of refill plus one token is more than one take, less than two.
+	l.refund(key, t0.Add(1500*time.Millisecond))
+	if ok, _ := l.allow(key, t0.Add(1500*time.Millisecond)); !ok {
+		t.Fatal("a take after refill and refund refused")
+	}
+	if ok, wait := l.allow(key, t0.Add(1500*time.Millisecond)); ok || wait != 1500*time.Millisecond {
+		t.Fatalf("the second take: ok %v, wait %v; want refused, 1.5s", ok, wait)
+	}
+	// Refunds never fill a bucket beyond its burst.
+	for range 50 {
+		l.refund(key, t0.Add(time.Hour))
+	}
+	for i := range 20 {
+		if ok, _ := l.allow(key, t0.Add(time.Hour)); !ok {
+			t.Fatalf("take %d of a full bucket refused", i+1)
+		}
+	}
+	if ok, _ := l.allow(key, t0.Add(time.Hour)); ok {
+		t.Fatal("50 refunds filled the bucket beyond its burst of 20")
+	}
+	// A key without an entry has a full bucket already: nothing to give back, and no entry is made.
+	other := netip.MustParsePrefix("198.51.100.8/32")
+	l.refund(other, t0)
+	if n := l.size(); n != 1 {
+		t.Errorf("%d keys after a refund to an unknown key, want 1", n)
+	}
+}
+
 func TestConnLimitsFlood(t *testing.T) {
 	l := newConnLimits(DefaultConfig().Limits, t0)
 	now := t0

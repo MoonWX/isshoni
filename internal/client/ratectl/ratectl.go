@@ -30,11 +30,15 @@ const (
 	// DefaultStartBps is where the full layer starts when Config.StartBps is 0, for every preset in M2.
 	DefaultStartBps = 4_000_000
 
-	// RampFactor is the ramp's growth per step in percent of the ramp (×1.15): 4 → 8 Mbit/s in 5 steps, 10 s. A
+	// RampFactor is the ramp's growth per step in percent of the ramp (×1.15): 4 → 8 Mbit/s in 5 steps, 14 s. A
 	// step rounds up, so every step is at least MinChange and passes the live guard.
 	RampFactor = 115
-	// RampEvery is the time between two ramp steps.
-	RampEvery = 2 * time.Second
+	// RampEvery is the time between two ramp steps. README WA54 tuned it from 01 §9.6's 2 s: it must be longer than
+	// the server takes to answer a step that overfills the uplink's queue. Its delay rule backs off on the second or
+	// third of its once-a-second ticks after the step (01 §10.1), up to 3 s later. With 2 s the next step often came
+	// before that hint, and the backoff then waited out the live guard (MinInterval) from that step. itest D19's queue
+	// grew to 0.94 s of its 1 s buffer and drained only 10 s after the crossing, against D19's 6 s.
+	RampEvery = 3 * time.Second
 	// RampDelay is the time from Live to the ramp's first step.
 	RampDelay = 2 * time.Second
 	// OneStepDelay is when the full layer of an encoder without live bitrate ramps, in its one step, after Live.

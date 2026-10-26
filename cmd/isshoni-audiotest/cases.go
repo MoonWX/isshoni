@@ -1,25 +1,47 @@
 package main
 
 // This file is the audiotest case table (docs/m2/05-windows-audio.md §18.5): the OS-neutral checks and the Windows
-// fixture setup of every case WA62a owns (1–8, 10, 11, 15–21 and 24–27). The mic cases 9 and 12–14, the
-// multi-endpoint case 22 and the soak case 23 are added by WA62b. M3 and M4 add their own fixtures later.
+// fixture setup of every case, 1–27. WA62a wrote the cases that need no microphone (1–8, 10, 11, 15–21 and 24–27);
+// WA62b added the mic cases 9 and 12–14, the multi-endpoint case 22 and the soak case 23 (`run -long` only). M3 and
+// M4 add their own fixtures later.
 //
 // A case is pure data: its checks drive the portable verdict (verdict.go) on a recording, and its fixture plan
 // drives the Windows driver (driver_windows.go, through fixtureplan.go). The frequencies are 05 §18.3's (all
-// −18 dBFS, ≥ 90 Hz apart).
+// −18 dBFS, ≥ 90 Hz apart), except isshoni's own tone (freqSelf).
 
 // The fixture frequencies (05 §18.3).
+//
+// freqSelf is not 05 §18.3's 907 Hz: a −18 dBFS 1000 Hz tone with the mixer's 5 ms onset or fade reads up to about
+// −44 dBFS at 907 Hz in a 50 ms window, over the absent limit of −50 dBFS (WA62a's measurement; 05 §18.6's "at most
+// about −64 dBFS" does not hold). The integrator decided for group 6 to move isshoni's tone at least 200 Hz from the
+// engine's 1000 Hz test tone and from every other fixture tone. 1250 Hz, the suggested value, lies 70 Hz from case
+// 27's 1320 Hz chime partial, so the tone is 1700 Hz: 300 Hz from the bursts' 2000 Hz, 380 Hz from 1320 Hz, and
+// clear of the second harmonics of 683 and 1000 Hz, the tones it shares cases 4, 10 and 26 with. TestSelfToneSpacing
+// pins the rule, and TestFadedToneNeverTripsSelf the analyzer's expectation.
 const (
 	freqGame       = 1000 // the game friends should hear
-	freqLateGame   = 683  // game2, and the late child of case 25
+	freqLateGame   = 683  // game2, the late child of case 25, and case 22's tone on the second endpoint
 	freqVoice      = 440  // the voice app, and the browser voice tab
 	freqVoice2     = 571  // the second voice app
-	freqBrowserTab = 797  // the browser's "other tab"
-	freqSelf       = 907  // isshoni's own playback (and the late isshoni child of case 26)
+	freqBrowserTab = 797  // the browser's "other tab" (and the harness's own tone in case 10)
+	freqSelf       = 1700 // isshoni's own playback (and the late isshoni child of case 26); see above
 	freqChimeLow   = 880  // case 27's sound-check chime partials (§11.3)
 	freqChimeHigh  = 1320
 	freqBursts     = 2000 // case 20's bursts (im_test_render_bursts)
 )
+
+// selfSpacingHz is the least distance between isshoni's own tone and any other fixture tone (the group 6 decision).
+const selfSpacingHz = 200
+
+// soakAMHz is the slow amplitude modulation of the soak's music-like fixture (05 §18.5 case 23): one period per
+// 10 s loop of its WAV, whose integer-cycle carriers make the loop seamless.
+const soakAMHz = 0.1
+
+// soakSec is the soak case's recording length (05 §18.5: 30 min).
+const soakSec = 1800.0
+
+// The soak's budgets (05 §18.5 case 23): the counters that must stay zero, and the resampler's ppm ceiling.
+const soakMaxResamplePpm = 1000
 
 // requirement is how a case contributes to the gate exit code (05 §18.5, §18.10).
 type requirement int
@@ -27,9 +49,9 @@ type requirement int
 const (
 	reqYes       requirement = iota // required
 	reqFastPath                     // required only when the gate ships audio.fastPath on (cases 4, 5, 26)
-	reqMic                          // required, but SKIPs without a microphone (WA62b)
-	reqInfo                         // informational: never changes the exit code
-	reqTierMinor                    // a minor-release tier case (soak, WA62b)
+	reqMic                          // required, but SKIPs without a microphone with desktop-app access (9, 12–14)
+	reqInfo                         // informational: never changes the exit code (22, 27)
+	reqTierMinor                    // a minor-release tier case (23, the soak): never changes the exit code
 )
 
 // The check expectations (05 §18.6).
@@ -55,7 +77,15 @@ const (
 // rows are isshoni's.
 const selfRole = "self"
 
-// eventTSet names the recorder's SetExclusions stamp as a window bound or a measurement event (case 15's T_set).
+// The FriendsHear prompt kinds a case checks (05 §14.6; internal/desktop/audio's PromptMic and PromptBrowserMic,
+// pinned equal by TestPromptKindsMatchTheService).
+const (
+	promptMic        = "mic"
+	promptBrowserMic = "browser-mic"
+)
+
+// eventTSet names the recorder's SetExclusions stamp as a window bound or a measurement event (cases 13 and 15's
+// T_set: the first stamp after the case's Decide or SetAppDecision).
 const eventTSet = "T_set"
 
 // sessionPrefix marks a bound or measurement event as a role's session_created engine event (cases 8, 25).
@@ -94,16 +124,36 @@ type checkSpec struct {
 }
 
 // rowCheck is an app-row or session expectation for a fixture role (05 §18.5: "Discord row kept_out/builtin", "the
-// child's session note = covered"): every report sample at or after from (zero = 1.5 s) in which the role's session
-// is active must show it. verdict, reason and detail are the app row's (looked up by the session's app id); note is
-// the session's. An empty field asserts nothing.
+// child's session note = covered", "warning shared_app_uses_mic"): every report sample at or after from (zero =
+// 1.5 s) in which the role's session is active must show it. verdict, reason, detail, warning and browser are the
+// app row's (looked up by the session's app id); note is the render session's. A role whose only session is a
+// microphone session (Steam in case 9) is checked through that session's app row. An empty field asserts nothing.
 type rowCheck struct {
 	role    string
 	verdict string
 	reason  string
 	detail  string
+	warning string // one of the row's warnings (05 §12.1's apps[].warnings)
+	browser bool   // the row is a browser's
 	note    string
 	from    bound
+}
+
+// promptCheck is a "the mic prompt existed" expectation (05 §18.5 cases 12 and 13): some report sample in
+// [from, to] (zero values: [1.5 s, end]) shows a pending FriendsHear prompt of kind for the role's app.
+type promptCheck struct {
+	role string
+	kind string // audio.PromptMic | audio.PromptBrowserMic
+	from bound
+	to   bound
+}
+
+// decideCall is a mid-run Service.Decide a case makes (05 §18.5 case 13): at t seconds the harness answers the
+// pending prompt of role's app with decision; the recorder's next SetExclusions stamp is the case's T_set.
+type decideCall struct {
+	at       float64
+	role     string
+	decision string // "keep-out" | "include"
 }
 
 // measureSpec is one event-relative value a case records and asserts (05 §17, §18.6, §18.7).
@@ -124,6 +174,7 @@ type fixtureStep struct {
 	verb          string    // verbTone | verbIdle | verbSpawn
 	freqs         []float64 // the tone (a spawn's -tone)
 	amp           float64   // 0 = the default −18 dBFS
+	am            float64   // > 0: a tone looped with this slow amplitude modulation (Hz), the soak's music
 	at            float64   // start time relative to the recording start; ≤ 0 = with its parent (top level: at the settle)
 	dur           float64   // how long it plays or lives (s); 0 = until the case ends
 	mic           bool
@@ -149,9 +200,10 @@ type caseSpec struct {
 	desc string
 	req  requirement
 
-	checks    []checkSpec
-	rowChecks []rowCheck
-	measures  []measureSpec
+	checks       []checkSpec
+	rowChecks    []rowCheck
+	promptChecks []promptCheck
+	measures     []measureSpec
 
 	// engineThroughout, if set, must be the report's engine in every sample inside [expectFrom, end]
 	// ("include-set", "exclude-self", "endpoint"); "" = any. 05 §18.6 limits the expectations to the window: right
@@ -162,8 +214,11 @@ type caseSpec struct {
 	bannerThroughout string
 	// expectFrom is where the engine and banner expectations start (zero = 1.5 s, the default check window).
 	expectFrom bound
-	// counterZero are report counters that must stay 0 (case 5's fastpathLateCuts).
+	// counterZero are report counters that must stay 0 (case 5's fastpathLateCuts; the soak's underruns, trims and
+	// mixerResyncs).
 	counterZero []string
+	// counterMax are report counters with a ceiling (the soak's maxResamplePpm ≤ 1000).
+	counterMax map[string]int
 
 	// clickFrom, clickTo bound the click window; the zero value is the default [1.5 s, end]. noClick disables the
 	// click check (05 §18.5: "unless marked").
@@ -184,13 +239,43 @@ type caseSpec struct {
 	// selfTone, if set, is a frequency the harness plays itself through PlaySoundW for the whole case, from the
 	// settle on (cases 4 and 10): isshoni's own playback, role selfRole.
 	selfTone float64
+	// sharedRole, if set, is the fixture whose pid the case passes to Service.OnShareStarted as the shared app
+	// (case 14), instead of 0 (a monitor).
+	sharedRole string
+	// decide, if set, is a Service.Decide the case makes mid-run (case 13).
+	decide *decideCall
 
 	// special, if set, routes the case to the driver's own handler instead of the tone verdict: "timestamps"
-	// (case 20), "opus" (case 21), "pid-reuse" (case 27).
+	// (case 20), "opus" (case 21), "multi-endpoint" (case 22), "soak" (case 23), "pid-reuse" (case 27).
 	special string
+	// long marks a case that runs only with `run -long` (the soak, 05 §18.2).
+	long bool
+	// minEndpoints is how many active render endpoints the case needs; with fewer it SKIPs (case 22: 2).
+	minEndpoints int
 
 	// fixtures is the Windows fixture plan (fixtureplan.go, driver_windows.go).
 	fixtures []fixtureStep
+	// driverRoles are the roles of fixtures the driver starts itself, outside the plan (case 20's bursts, case 22's
+	// endpoint tone), so checks may name them.
+	driverRoles []string
+}
+
+// needsMic reports whether cs needs a microphone with desktop-app access (05 §18.4): a mic case, or a case with a
+// fixture that holds the mic (the soak's idle voice app). Without one the case SKIPs.
+func (cs caseSpec) needsMic() bool {
+	if cs.req == reqMic {
+		return true
+	}
+	var walk func(s *fixtureStep) bool
+	walk = func(s *fixtureStep) bool {
+		return s.mic || (s.child != nil && walk(s.child))
+	}
+	for i := range cs.fixtures {
+		if walk(&cs.fixtures[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // viewerCall is a Service.SetViewerBrowser call a case makes (05 §5.9; cases 11, 24).
@@ -230,10 +315,13 @@ const (
 	exeBrowser   = `Browser\browser.exe`
 	exeSelfWV    = `SelfWebView\msedgewebview2.exe`
 	exeBursts    = `Bursts\bursts.exe`
+	exeSteam     = `Steam\steam.exe`
+	exeSteamGame = `Steam\steamapps\common\TestGame\game.exe`
+	exeChrome    = `Google\Chrome\Application\chrome.exe`
+	exeKook      = `KOOK\kook.exe`
 )
 
-// cases returns the case table of the cases WA62a owns, in case-number order (05 §18.5). WA62b appends 9, 12–14, 22
-// and 23.
+// cases returns the case table, in case-number order (05 §18.5).
 func cases() []caseSpec {
 	return []caseSpec{
 		{
@@ -303,7 +391,7 @@ func cases() []caseSpec {
 			counterZero: []string{"fastpathLateCuts"},
 			fixtures: []fixtureStep{
 				explorerTone("game", exeGame, freqGame),
-				explorerTone("game2", exeGame2, freqLateGame), // "as 4 without 907"
+				explorerTone("game2", exeGame2, freqLateGame), // "as 4 without" isshoni's own tone
 				{role: "voice", exe: exeDiscord, verb: verbTone, freqs: []float64{freqVoice}, at: 3,
 					underExplorer: true},
 			},
@@ -358,6 +446,23 @@ func cases() []caseSpec {
 			},
 		},
 		{
+			num: 9, name: "steam-game", req: reqMic,
+			desc: "a game under Steam's folder is heard while Steam, holding the mic, is kept out (the launcher stop)",
+			checks: []checkSpec{
+				present(freqGame, "game"),
+			},
+			// Steam has only a microphone session: its row is read through that session's app id.
+			rowChecks: []rowCheck{
+				{role: "steam", verdict: controlKeptOut, reason: "mic"},
+				{role: "game", verdict: controlHeard},
+			},
+			fixtures: []fixtureStep{
+				// `Steam\steam.exe` (`spawn -mic`) → `steamapps\common\TestGame\game.exe` playing 1000 (05 §18.5).
+				{role: "steam", exe: exeSteam, verb: verbSpawn, mic: true, underExplorer: true,
+					child: &fixtureStep{role: "game", exe: exeSteamGame, verb: verbTone, freqs: []float64{freqGame}}},
+			},
+		},
+		{
 			num: 10, name: "isshoni-self", req: reqYes, selfTone: freqBrowserTab,
 			desc: "isshoni's own playback and its WebView2 child are never captured",
 			checks: []checkSpec{
@@ -372,7 +477,7 @@ func cases() []caseSpec {
 			},
 			fixtures: []fixtureStep{
 				explorerTone("game", exeGame, freqGame),
-				// The self WebView is the harness's own child (not reparented), with a child that plays 907.
+				// The self WebView is the harness's own child (not reparented), with a child that plays isshoni's tone.
 				{role: "selfWebviewParent", exe: exeSelfWV, verb: verbSpawn,
 					child: &fixtureStep{role: "selfWebview", exe: exeSelfWV, verb: verbTone,
 						freqs: []float64{freqSelf}}},
@@ -380,6 +485,61 @@ func cases() []caseSpec {
 		},
 		viewerCase(11, "viewer-browser", "a browser that plays the user's isshoni viewer is kept out whole, reason viewer",
 			nil),
+		{
+			num: 12, name: "browser-mic", req: reqMic,
+			desc: "a browser whose tab holds the mic is kept out whole (reason mic) and asked about (browser-mic)",
+			checks: []checkSpec{
+				present(freqGame, "game"),
+				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "discordWeb",
+					ctl: controlKeptOut, reason: "mic"},
+				{freq: freqBrowserTab, from: at(1.5), to: end(), expect: expectAbsent, role: "otherTab",
+					ctl: controlKeptOut, reason: "mic"},
+			},
+			rowChecks:    []rowCheck{{role: "discordWeb", verdict: controlKeptOut, reason: "mic", browser: true}},
+			promptChecks: []promptCheck{{role: "discordWeb", kind: promptBrowserMic}},
+			fixtures: []fixtureStep{
+				explorerTone("game", exeGame, freqGame),
+				// chrome.exe (spawn) → chrome.exe (`spawn -tone 440 -mic`, Discord Web) → chrome.exe playing 797.
+				{role: "chrome", exe: exeChrome, verb: verbSpawn, underExplorer: true,
+					child: &fixtureStep{role: "discordWeb", exe: exeChrome, verb: verbSpawn,
+						freqs: []float64{freqVoice}, mic: true,
+						child: &fixtureStep{role: "otherTab", exe: exeChrome, verb: verbTone,
+							freqs: []float64{freqBrowserTab}}}},
+			},
+		},
+		{
+			num: 13, name: "mic-user", req: reqMic,
+			desc: "an unknown app that holds the mic is kept out and asked about; answering include fades it in",
+			checks: []checkSpec{
+				present(freqGame, "game"),
+				{freq: freqVoice, from: at(1.5), to: at(5.0), expect: expectAbsent, role: "kook",
+					ctl: controlKeptOut, reason: "mic"},
+				{freq: freqVoice, from: at(5.6), to: end(), expect: expectPresent, role: "kook",
+					ctl: controlNotKeptOut},
+			},
+			measures: []measureSpec{
+				{key: measureOnset, freq: freqVoice, event: afterTSet(0), budget: budgetOnsetMs},
+			},
+			promptChecks: []promptCheck{{role: "kook", kind: promptMic, to: at(5.0)}},
+			decide:       &decideCall{at: 5, role: "kook", decision: "include"},
+			fixtures: []fixtureStep{
+				explorerTone("game", exeGame, freqGame),
+				{role: "kook", exe: exeKook, verb: verbTone, freqs: []float64{freqVoice}, mic: true,
+					underExplorer: true},
+			},
+		},
+		{
+			num: 14, name: "shared-app-mic", req: reqMic, sharedRole: "game",
+			desc: "the shared app is heard although it holds the mic, with the shared_app_uses_mic warning",
+			checks: []checkSpec{
+				present(freqGame, "game"),
+			},
+			rowChecks: []rowCheck{{role: "game", verdict: controlHeard, warning: "shared_app_uses_mic"}},
+			fixtures: []fixtureStep{
+				{role: "game", exe: exeGame, verb: verbTone, freqs: []float64{freqGame}, mic: true,
+					underExplorer: true},
+			},
+		},
 		{
 			num: 15, name: "runtime-rule", req: reqYes,
 			desc: "adding a keep-out rule mid-share fades the app out within 100 ms, with no click",
@@ -457,7 +617,8 @@ func cases() []caseSpec {
 		},
 		{
 			num: 20, name: "timestamps", req: reqYes, special: "timestamps", noClick: true,
-			desc: "PCM-tap onset times match im_test_render_bursts' predicted device-position times",
+			desc:        "PCM-tap onset times match im_test_render_bursts' predicted device-position times",
+			driverRoles: []string{"bursts"},
 		},
 		{
 			num: 21, name: "opus", req: reqYes, special: "opus", noClick: true,
@@ -468,6 +629,39 @@ func cases() []caseSpec {
 			fixtures: []fixtureStep{
 				explorerTone("game", exeGame, freqGame),
 				explorerTone("discord", exeDiscord, freqVoice),
+			},
+		},
+		{
+			num: 22, name: "multi-endpoint", req: reqInfo, special: "multi-endpoint", noClick: true, minEndpoints: 2,
+			desc: "whether a tone on a second render endpoint is captured (INFO; SKIP with one endpoint)",
+			checks: []checkSpec{
+				present(freqGame, "game"),
+				{freq: freqLateGame, from: at(1.5), to: end(), expect: expectInfo, role: "game2", ctl: controlNone},
+			},
+			fixtures: []fixtureStep{
+				explorerTone("game", exeGame, freqGame), // on the default endpoint
+			},
+			// game2 is `fixture endpoint-tone` on another active render endpoint, started by the driver (it needs
+			// the endpoint's id and the DLL's folder).
+			driverRoles: []string{"game2"},
+		},
+		{
+			num: 23, name: "soak", req: reqTierMinor, special: "soak", long: true,
+			desc: "30 min of a music-like tone with an idle voice app holding the mic: no underruns, trims, " +
+				"resyncs or clicks",
+			checks: []checkSpec{
+				present(freqGame, "music"), present(freqLateGame, "music"),
+				// 05 §18.5: "440 never present"; checked with the absent rule, which is stricter.
+				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, ctl: controlNone},
+			},
+			counterZero: []string{"underruns", "trims", "mixerResyncs"},
+			counterMax:  map[string]int{"maxResamplePpm": soakMaxResamplePpm},
+			fixtures: []fixtureStep{
+				// The music: 1000 + 683 Hz with a slow AM, a seamless 10 s loop.
+				{role: "music", exe: exeGame, verb: verbTone, freqs: []float64{freqGame, freqLateGame}, am: soakAMHz,
+					underExplorer: true},
+				// Discord idle with the mic: it forces the include set and holds a capture session all along.
+				{role: "discord", exe: exeDiscord, verb: verbIdle, mic: true, underExplorer: true},
 			},
 		},
 		viewerCase(24, "viewer-browser-included",

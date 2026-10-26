@@ -489,9 +489,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run-test-go == 'true'
     runs-on: ubuntu-24.04
-    # With -race and coverage the main module takes 8–10 minutes on the runner and tools/ about 8 more (mostly
-    # g2g's decode and render tests), so 20 minutes no longer covered both.
-    timeout-minutes: 30
+    # With -race and coverage the main module took 8–10 minutes on the runner before M2's group 6 added about 5
+    # minutes of itest cases (internal/server/itest alone is about 12 minutes under -race), and tools/ about 8 more
+    # (mostly g2g's decode and render tests).
+    timeout-minutes: 45
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1015,8 +1016,8 @@ jobs:
 
       - name: Install busybox (test:sh runs the install.sh unit tests under it)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends busybox
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends busybox
 
       - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
         run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
@@ -1248,8 +1249,8 @@ jobs:
       - name: Install rpm (release:assets lists the rpm packages and their dependencies with it)
         run: |
           if ! command -v rpm > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends rpm
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends rpm
           fi
           rpm --version
 
@@ -1314,8 +1315,8 @@ jobs:
       - name: Install rpm (release:snapshot's asset check lists the rpm packages with it)
         run: |
           if ! command -v rpm > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends rpm
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends rpm
           fi
 
       - name: Build the releases 0.0.1-ci.1 and 0.0.1-ci.2
@@ -1675,8 +1676,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! command -v clang-format-18 > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends clang-format-18
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends clang-format-18
           fi
           task lint:native CLANG_FORMAT=clang-format-18
 

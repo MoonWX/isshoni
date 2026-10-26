@@ -1,6 +1,6 @@
 // "Test my connection" in the room: the connection test's panel is a chunk of its own, and the dialog is offered
 // when the server may be out of reach. A chunk that can't be loaded must not take the page down.
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useEffect } from 'react';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
@@ -101,7 +101,10 @@ describe('ConnTestDialog', () => {
       }
       const { setOpen } = renderDialog(() => Promise.resolve(CountedPanel));
       expect(await screen.findByText('the connection test')).toBeInTheDocument();
-      expect([mounts, unmounts]).toEqual([1, 0]);
+      // The text is there at the commit, the effect that counts the mount a moment later (a passive effect).
+      await waitFor(() => {
+        expect([mounts, unmounts]).toEqual([1, 0]);
+      });
 
       setOpen(false);
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();

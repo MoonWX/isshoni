@@ -22,8 +22,9 @@ import (
 // that connection's user: any connection of the user in the room may update or stop it.
 //
 // M2 adds the pause bit (M2 01 §10.3, feature share.pause): share.update{paused} sets or clears it, the MediaPeer
-// stops asking the sharer for keyframes meanwhile, and room.state shows the share as paused while it would be live.
-// Stalled wins over paused, a starting share shows paused once it goes live, and no timeout applies to paused.
+// stops asking the sharer for keyframes meanwhile, and room.state shows the share as paused while it is live or
+// starting. Stalled wins over paused, and no timeout applies to paused: a paused sharer sends no frame, so a share
+// paused while starting can't go live, and its start timeout is suspended until the resume, which starts a fresh one.
 //
 // Share records live in their room, under the room's lock. Everything that calls a MediaPeer for a share runs on the
 // actor of the share's publishing connection, which is the only goroutine that may call that peer: a request from
@@ -44,7 +45,8 @@ func newShareID() string {
 type share struct {
 	info protocol.ShareInfo
 	// paused is the share's pause bit (M2 01 §10.3): set and cleared by share.update{paused} from a connection of the
-	// user with the feature share.pause. It is kept through every lifecycle change and has no timeout of its own.
+	// user with the feature share.pause. It is kept through every lifecycle change and has no timeout of its own;
+	// while it is set, a starting share has no start timeout either (setPausedLocked).
 	paused bool
 	// ref is share.start's idempotency key on the publishing connection, and params the ShareParams of the latest
 	// share.start or share.update: a share.start with the same ref gets them again (01 §8.7).
@@ -59,8 +61,10 @@ type share struct {
 	// announced: the share went live once, and room.event share.started went out (once per share, 01 §8.6).
 	announced bool
 	// deadline is when the share ends with media_timeout: StartedAt + ShareStartTimeout while starting, the moment
-	// it stalled + StalledTimeout while stalled, zero while live (01 §4.4). The publishing connection's actor keeps
-	// its share timer at the earliest deadline of its shares (armShareTimer).
+	// it stalled + StalledTimeout while stalled, zero while live (01 §4.4). A starting share's pause bit suspends its
+	// start timeout (zero while the bit is set), and its resume restarts it: the resume + ShareStartTimeout
+	// (M2 01 §10.3). The publishing connection's actor keeps its share timer at the earliest deadline of its shares
+	// (armShareTimer).
 	deadline time.Time
 }
 
@@ -84,10 +88,10 @@ func (s *share) applyMedia(ev ShareMediaEvent) bool {
 }
 
 // status is the share's status as room.state shows it (M2 01 §10.3): stalled while the pub PC is down (stalled
-// wins), else paused while the pause bit is set and the share is live, else starting or live as in M1. A share paused
-// while starting stays starting, under its start timeout, and shows paused once it goes live.
+// wins), else paused while the pause bit is set and the share is live or starting, else starting or live as in M1.
+// A share paused while starting shows paused at once: it sends no frame until its resume, so it can't go live before.
 func (s *share) status() protocol.ShareStatus {
-	if s.paused && s.info.Status == protocol.ShareStatusLive {
+	if s.paused && (s.info.Status == protocol.ShareStatusLive || s.info.Status == protocol.ShareStatusStarting) {
 		return protocol.ShareStatusPaused
 	}
 	return s.info.Status
@@ -101,11 +105,20 @@ func (r *room) setStatusLocked(s *share, st protocol.ShareStatus) {
 	r.h.metrics.shareStatus(from, s.status())
 }
 
-// setPausedLocked sets or clears the share's pause bit (M2 01 §10.3) and reports whether the status that room.state
-// shows changed: it doesn't for a share that is starting or stalled.
-func (r *room) setPausedLocked(s *share, paused bool) bool {
+// setPausedLocked sets or clears the share's pause bit at now (M2 01 §10.3) and reports whether the status that
+// room.state shows changed: it doesn't for a stalled share, whose status wins. A starting share's start timeout is
+// suspended while the bit is set, since a paused sharer sends no frame and the share can't go live; clearing the bit
+// gives it a fresh ShareStartTimeout from now. The caller re-arms the publishing connection's share timer
+// (armShareTimer). A live or stalled share keeps its deadline: none while live, the stalled timeout while stalled.
+func (r *room) setPausedLocked(s *share, paused bool, now time.Time) bool {
 	from := s.status()
 	s.paused = paused
+	if s.info.Status == protocol.ShareStatusStarting {
+		s.deadline = time.Time{}
+		if !paused {
+			s.deadline = now.Add(r.h.cfg.ShareStartTimeout)
+		}
+	}
 	to := s.status()
 	r.h.metrics.shareStatus(from, to)
 	return from != to
@@ -232,8 +245,9 @@ func (c *conn) rejectMedia(env protocol.Envelope, call string, err error) {
 // the publishing role). A ref that a share of this connection already has returns that share's ShareParams again,
 // so a reply lost in a reconnect can be retried. Otherwise the limits are checked (share_limit), the MediaPeer
 // creates the share and returns how to encode it, and the share joins the room in starting: room.state shows it, and
-// it ends with media_timeout unless its first keyframe arrives within ShareStartTimeout. The ok goes out before any
-// room.state with the new share (01 §7): the snapshot reaches this connection through its inbox.
+// it ends with media_timeout unless its first keyframe arrives within ShareStartTimeout (a pause suspends that
+// timeout, setPausedLocked). The ok goes out before any room.state with the new share (01 §7): the snapshot reaches
+// this connection through its inbox.
 func (c *conn) onShareStart(env protocol.Envelope) {
 	v, ok := decode[protocol.ShareStart](c, env)
 	if !ok || !c.requireRoom(env) {
@@ -437,9 +451,10 @@ func (c *conn) updateShareAt(owner *conn, r *room, seq uint64, env protocol.Enve
 
 // updateShare applies share.update v to a share that this connection publishes in room r: the MediaPeer returns the
 // new ShareParams (and pauses or resumes the share's media, M2 01 §10.3), then the label, the preset and the pause bit
-// change in room.state. A pause or resume shows only in room.state, never as a room.event, and only once the share is
-// live: the bit of a starting share is kept until its first keyframe. It runs on the connection's actor, with r its
-// room; v.Paused has passed onShareUpdate's feature check.
+// change in room.state. A pause or resume shows only in room.state, never as a room.event, for a live or a starting
+// share (a stalled one shows stalled). Pausing a starting share suspends its start timeout and resuming it starts a
+// fresh one (setPausedLocked), so the share timer is re-armed. It runs on the connection's actor, with r its room;
+// v.Paused has passed onShareUpdate's feature check.
 func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 	r.mu.Lock()
 	s := r.shares[v.ShareID]
@@ -453,6 +468,7 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 		return shareUpdated{err: err}
 	}
 	params.ShareID = v.ShareID
+	now := time.Now()
 	var o outbox
 	paused := false // the update set or cleared the pause bit
 	r.mu.Lock()
@@ -468,7 +484,7 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 		}
 		if v.Paused != nil && s.paused != *v.Paused {
 			paused = true
-			changed = r.setPausedLocked(s, *v.Paused) || changed
+			changed = r.setPausedLocked(s, *v.Paused, now) || changed
 		}
 		s.params = params
 		if changed {
@@ -478,6 +494,7 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 	r.mu.Unlock()
 	o.send()
 	if paused {
+		c.armShareTimer() // a starting share's start timeout was suspended or restarted
 		msg := "share resumed"
 		if *v.Paused {
 			msg = "share paused"
@@ -595,8 +612,9 @@ func (c *conn) armShareTimer() {
 }
 
 // shareTimeouts ends the connection's shares whose deadline has passed with media_timeout (01 §4.4): no first
-// keyframe within ShareStartTimeout of share.start, or stalled for StalledTimeout. The timers run on while the
-// connection is detached: a share's media does not depend on the WebSocket.
+// keyframe within ShareStartTimeout of share.start (or of the resume of a share paused while starting, M2 01 §10.3),
+// or stalled for StalledTimeout. The timers run on while the connection is detached: a share's media does not depend
+// on the WebSocket.
 func (c *conn) shareTimeouts() {
 	if c.room == nil {
 		return
@@ -614,13 +632,14 @@ func (c *conn) shareTimeouts() {
 //     share) and, unless the share replaces another one, Web Push is told (once per share). A stalled share is live
 //     again, without an event;
 //   - stalled: the publisher's pub PC is not connected. A live share is stalled, and ends with media_timeout unless
-//     it is live again within StalledTimeout. A starting share stays starting: its start timeout covers it;
+//     it is live again within StalledTimeout. A starting share stays starting: its start timeout covers it, unless
+//     its pause bit has suspended that timeout;
 //   - changed: the layers, the codec or the audio changed;
 //   - gone (reserved, 01 §15.2): the share's tracks are gone for good; it ends with stopped.
 //
 // Each event also carries what the SFU receives now, which room.state shows once the share has been live. Events
 // about a share that has ended, or that another connection publishes, are dropped. These are the share's lifecycle;
-// a share whose pause bit is set shows paused wherever it would show live (share.status, M2 01 §10.3).
+// a share whose pause bit is set shows paused wherever it would show live or starting (share.status, M2 01 §10.3).
 func (c *conn) onShareMedia(id string, ev ShareMediaEvent) {
 	r := c.room
 	now := time.Now()

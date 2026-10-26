@@ -19,6 +19,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/MoonWX/isshoni/internal/client/core"
+	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/fake"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
@@ -63,6 +64,15 @@ type timedStatus struct {
 // bearer auth as WA73's acceptance asks.
 func (w *world) recoveringDesktop(m *member, engine fake.EngineConfig, settings *webrtc.SettingEngine) *recoveryApp {
 	w.t.Helper()
+	return w.recoveringDesktopOn(m, engine, settings, nil)
+}
+
+// recoveringDesktopOn is recoveringDesktop with wrap between the core and its fake engine: the core runs on
+// wrap(engine), while the app's picks, the test's controls (Session) and the close go to the fake itself. A nil wrap
+// gives the core the fake.
+func (w *world) recoveringDesktopOn(m *member, engine fake.EngineConfig, settings *webrtc.SettingEngine,
+	wrap func(*fake.Engine) media.Engine) *recoveryApp {
+	w.t.Helper()
 	t := w.t
 	site, err := url.Parse(w.srv.URL)
 	if err != nil {
@@ -81,6 +91,10 @@ func (w *world) recoveringDesktop(m *member, engine fake.EngineConfig, settings 
 	}
 	logs := &lockedBuffer{}
 	eng := fake.NewEngine(engine)
+	var coreEngine media.Engine = eng
+	if wrap != nil {
+		coreEngine = wrap(eng)
+	}
 	a := &recoveryApp{sock: &sockets{}}
 	tr, ok := a.sock.transport(t, w.srv.Client.Transport).(*http.Transport)
 	if !ok {
@@ -97,7 +111,7 @@ func (w *world) recoveringDesktop(m *member, engine fake.EngineConfig, settings 
 	c, err := core.New(core.Options{
 		ServerURL:  w.srv.URL,
 		Header:     http.Header{"Cookie": {strings.Join(cookies, "; ")}},
-		Engine:     eng,
+		Engine:     coreEngine,
 		Settings:   settings,
 		HTTPClient: &http.Client{Transport: tr},
 		Logger:     slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),

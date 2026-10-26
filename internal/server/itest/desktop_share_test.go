@@ -10,6 +10,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/MoonWX/isshoni/internal/client/core"
+	"github.com/MoonWX/isshoni/internal/client/publish"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/fake"
 	"github.com/MoonWX/isshoni/internal/protocol"
@@ -123,14 +124,35 @@ func TestDesktopShareAndWatch(t *testing.T) {
 	}) {
 		t.Errorf("EventShare snapshots %+v, want one of the live share", evs)
 	}
-	// The live counters fire no EventShare (§11.10): a second of media, and nothing else changes.
+	// The live counters fire no EventShare (§11.10): a second of media, and nothing else changes but the full layer's
+	// ramp (§9.3: a target step every 3 s for about 14 s after live), whose TargetBps is not a counter.
 	time.Sleep(500 * time.Millisecond) // the coalescing of the last watcher change
 	quiet := len(app.shareEvents())
 	time.Sleep(time.Second)
-	if evs := app.shareEvents(); len(evs) != quiet {
-		t.Errorf("EventShare fired %d times in a second of media alone: %+v", len(evs)-quiet, evs[quiet:])
+	if evs := app.shareEvents(); len(evs) > quiet {
+		for i := max(quiet, 1); i < len(evs); i++ {
+			if !sameButTargets(evs[i-1], evs[i]) {
+				t.Errorf("EventShare fired in a second of media alone for more than a target step: %+v after %+v",
+					evs[i], evs[i-1])
+			}
+		}
 	}
 	bob.check()
+}
+
+// sameButTargets reports whether two snapshots differ in nothing but their layers' targets and live counters.
+func sameButTargets(a, b core.ShareSnapshot) bool {
+	strip := func(s core.ShareSnapshot) string {
+		s.AudioSentBps, s.Server = 0, nil
+		s.Layers = slices.Clone(s.Layers)
+		for i := range s.Layers {
+			l := &s.Layers[i]
+			l.TargetBps, l.SentBps, l.FPS, l.FPSIn = 0, 0, 0, 0
+			l.CaptureToSend, l.EngineLatency = publish.LatencyStats{}, publish.LatencyStats{}
+		}
+		return fmt.Sprintf("%+v", s)
+	}
+	return strip(a) == strip(b)
 }
 
 // layerOf returns a snapshot's layer rid (a zero one when it has none).

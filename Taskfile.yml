@@ -257,7 +257,8 @@ tasks:
       - cmd: "echo 'test:go: note: the main module has no Go packages yet'"
         silent: true
         if: '{{if .GO_PKGS}}false{{else}}true{{end}}'
-      - cmd: go test -race -count=1 -timeout 15m {{.CLI_ARGS}} ./...
+      # 25m per test binary: internal/server/itest, with M2's desktop cases, takes about 12 minutes under -race.
+      - cmd: go test -race -count=1 -timeout 25m {{.CLI_ARGS}} ./...
         if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
       - go -C tools test -race -count=1 -timeout 15m ./...
 

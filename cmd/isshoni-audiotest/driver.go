@@ -37,8 +37,15 @@ type driver interface {
 	apps(w io.Writer) error
 	// runCase runs one tone case and returns its recording for the portable verdict (05 §18.5).
 	runCase(cs caseSpec, cfg gateConfig) (recording, error)
-	// runSpecial runs a case the driver scores itself (timestamps, opus, pid-reuse) and returns its report.
+	// runSpecial runs a case the driver scores itself (timestamps, opus, multi-endpoint, soak, pid-reuse) and returns
+	// its report, scored by the portable functions of special.go and soak.go.
 	runSpecial(cs caseSpec, cfg gateConfig) (caseReport, error)
+	// record records the PCM tap for ro.dur seconds with the built-in rules plus ro.exclude, handing every chunk and a
+	// status every second to sink (05 §18.2's `record`).
+	record(ro recordOptions, sink recordSink) error
+	// redaction is what the driver collected for the report's redaction so far (05 §18.7): its work folders, its
+	// own folder, and the app and exe names the engine's reports showed.
+	redaction() redactInfo
 	// close stops the engine.
 	close() error
 }
@@ -83,8 +90,8 @@ func (r *recorder) lastStamp() (int64, bool) {
 	return r.stamps[len(r.stamps)-1], true
 }
 
-// stampAt is the engine clock of the i-th SetExclusions call (0-based), and whether there was one. Case 15 reads
-// stampCount right before its SetAppDecision and takes the next stamp as T_set (05 §18.5).
+// stampAt is the engine clock of the i-th SetExclusions call (0-based), and whether there was one. Cases 13 and 15
+// read stampCount right before their Decide or SetAppDecision and take the next stamp as T_set (05 §18.5).
 func (r *recorder) stampAt(i int) (int64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

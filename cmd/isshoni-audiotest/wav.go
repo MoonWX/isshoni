@@ -9,9 +9,10 @@ import (
 )
 
 // This file is the portable WAV helpers of the audiotest (docs/m2/05-windows-audio.md §18.3), ported from spike S1
-// (spikes/s1-win-audio/wav.go). toneWAV generates the fixtures' tones in memory for PlaySoundW; writeWAV saves the
-// captured tap when -keep-wav is given; readWAV reads a WAV back (tests, and WA62b's record/merge). None of it needs
-// the engine, so it builds and is tested on every OS.
+// (spikes/s1-win-audio/wav.go). toneWAV generates the fixtures' tones in memory for PlaySoundW, and loopToneWAV the
+// soak's seamless music loop; writeWAV saves the captured tap when -keep-wav is given; wavStream writes `record`'s
+// file chunk by chunk; readWAV reads a WAV back (tests). None of it needs the engine, so it builds and is tested on
+// every OS.
 
 // toneWAV builds an in-memory 16-bit stereo 48 kHz WAV: the sum of sines at freqs, each at amplitude amp, over
 // seconds, with 20 ms linear fades at both ends so starting and stopping never clicks (S1's generator, 05 §18.3).
@@ -42,6 +43,41 @@ func toneWAV(freqs []float64, amp, seconds float64) []byte {
 	return data
 }
 
+// loopToneWAV builds the soak's music-like loop (05 §18.5 case 23): one period of a slow amplitude modulation at am
+// Hz (1/am seconds) of the sum of sines at freqs, each at amp × (0.75 + 0.25·sin(2π·am·t)), 16-bit stereo 48 kHz,
+// with no fades. Every partial must complete a whole number of cycles in the period, so PlaySoundW's SND_LOOP
+// repeats it without a seam (no click, no level dip); otherwise it is an error.
+func loopToneWAV(freqs []float64, amp, am float64) ([]byte, error) {
+	if am <= 0 || am > 10 {
+		return nil, fmt.Errorf("am %g Hz: want (0, 10]", am)
+	}
+	period := 1 / am
+	n := int(math.Round(period * sampleRate))
+	if math.Abs(float64(n)-period*sampleRate) > 1e-6 {
+		return nil, fmt.Errorf("am %g Hz: the period is not a whole number of samples", am)
+	}
+	for _, f := range freqs {
+		if c := f * period; math.Abs(c-math.Round(c)) > 1e-9 {
+			return nil, fmt.Errorf("%g Hz makes %g cycles in the %g s loop: want a whole number", f, c, period)
+		}
+	}
+	data := make([]byte, 44+n*4)
+	writeWAVHeader(data, n)
+	le := binary.LittleEndian
+	for i := range n {
+		t := float64(i) / sampleRate
+		g := 0.75 + 0.25*math.Sin(2*math.Pi*am*t)
+		var sum float64
+		for _, f := range freqs {
+			sum += math.Sin(2 * math.Pi * f * t)
+		}
+		v := int16(math.Round(clamp1(amp*g*sum) * 32767))
+		le.PutUint16(data[44+i*4:], uint16(v)) //nolint:gosec // G115: a sample's two's-complement bits
+		le.PutUint16(data[46+i*4:], uint16(v)) //nolint:gosec // G115: the right channel is the same
+	}
+	return data, nil
+}
+
 // clamp1 clamps a sample to [−1, 1] (a sum of partials can exceed it; WAV stores a bounded integer).
 func clamp1(v float64) float64 { return math.Max(-1, math.Min(1, v)) }
 
@@ -63,9 +99,8 @@ func writeWAVHeader(b []byte, n int) {
 	le.PutUint32(b[40:], uint32(n*blockAlign)) //nolint:gosec // G115: a WAV chunk size
 }
 
-// writeWAV saves interleaved stereo float32 samples as a 48 kHz IEEE-float WAV (-keep-wav; S1's writer).
-func writeWAV(path string, interleaved []float32) error {
-	dataLen := len(interleaved) * 4
+// floatWAVHeader is the 44-byte header of a 48 kHz stereo IEEE-float WAV whose data chunk holds dataLen bytes.
+func floatWAVHeader(dataLen int) []byte {
 	hdr := make([]byte, 44)
 	le := binary.LittleEndian
 	copy(hdr[0:], "RIFF")
@@ -80,6 +115,59 @@ func writeWAV(path string, interleaved []float32) error {
 	le.PutUint16(hdr[34:], 32)
 	copy(hdr[36:], "data")
 	le.PutUint32(hdr[40:], uint32(dataLen)) //nolint:gosec // G115: a WAV chunk size
+	return hdr
+}
+
+// wavStream writes a 48 kHz stereo IEEE-float WAV chunk by chunk (`record`'s file, 05 §18.2), so a long recording
+// never sits in memory; close patches the header's sizes.
+type wavStream struct {
+	f      *os.File
+	frames int
+	buf    []byte
+}
+
+// newWAVStream creates path (0600) with a header for an empty data chunk.
+func newWAVStream(path string) (*wavStream, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Write(floatWAVHeader(0)); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &wavStream{f: f}, nil
+}
+
+// write appends one stereo chunk (the shorter channel's length).
+func (w *wavStream) write(left, right []float64) error {
+	n := min(len(left), len(right))
+	w.buf = w.buf[:0]
+	for i := range n {
+		w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(float32(left[i])))
+		w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(float32(right[i])))
+	}
+	if _, err := w.f.Write(w.buf); err != nil {
+		return err
+	}
+	w.frames += n
+	return nil
+}
+
+// close writes the final sizes into the header and closes the file.
+func (w *wavStream) close() error {
+	_, err := w.f.WriteAt(floatWAVHeader(w.frames*8), 0)
+	if cerr := w.f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// writeWAV saves interleaved stereo float32 samples as a 48 kHz IEEE-float WAV (-keep-wav; S1's writer).
+func writeWAV(path string, interleaved []float32) error {
+	dataLen := len(interleaved) * 4
+	hdr := floatWAVHeader(dataLen)
+	le := binary.LittleEndian
 	body := make([]byte, dataLen)
 	for i, v := range interleaved {
 		le.PutUint32(body[i*4:], math.Float32bits(v))
