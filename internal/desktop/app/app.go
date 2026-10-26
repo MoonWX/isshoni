@@ -183,20 +183,17 @@ func (a *App) Run(ctx context.Context) error {
 // Log files are what users attach to public issues (03 §17), and a part is an interface whose errors the app can't
 // vouch for: one may wrap a server's answer, a request's headers, a path with the user's name or the engine's detail
 // (05 §16 keeps that out of 05's own lines). So the attribute names the error's kind, never its text: a media error's
-// op, code and reason (never its detail), a context error's text, and "error" for anything else, as 05's errAttr
-// does.
+// Redacted form (op, code and reason, never its detail), a context error's text, and "error" for anything else, as
+// 05's errAttr does.
+//
+// TODO(WA58): the session part's terminal error is 01's *core.StopError, whose Error() is only its reason and the
+// server's code ("core: stopped: unlinked (session_revoked)"): log that text instead of "error" once the app imports
+// core.
 func errAttr(err error) slog.Attr {
 	var me *media.Error
 	switch {
 	case errors.As(err, &me):
-		s := string(me.Code)
-		if me.Op != "" {
-			s = me.Op + ": " + s
-		}
-		if me.Reason != "" {
-			s += " (" + me.Reason + ")"
-		}
-		return slog.String("err", s)
+		return slog.String("err", me.Redacted())
 	case errors.Is(err, context.Canceled):
 		return slog.String("err", context.Canceled.Error())
 	case errors.Is(err, context.DeadlineExceeded):

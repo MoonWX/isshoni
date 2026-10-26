@@ -22,20 +22,14 @@ var (
 )
 
 // errAttr is the log attribute of err, without anything that could name an app, a path or a pid: for a media error
-// its code, op and reason (never its detail), for a context error its text, and "error" for anything else (a
-// settings store's or an exec error can carry a path with the user's name, 05 §16).
+// its Redacted form (code, op and reason, never its detail), for a context error its text, and "error" for anything
+// else (a settings store's or an exec error can carry a path with the user's name, 05 §16). 03's app logs its parts'
+// errors the same way.
 func errAttr(err error) slog.Attr {
 	var me *media.Error
 	switch {
 	case errors.As(err, &me):
-		s := string(me.Code)
-		if me.Op != "" {
-			s = me.Op + ": " + s
-		}
-		if me.Reason != "" {
-			s += " (" + me.Reason + ")"
-		}
-		return slog.String("err", s)
+		return slog.String("err", me.Redacted())
 	case errors.Is(err, context.Canceled):
 		return slog.String("err", context.Canceled.Error())
 	case errors.Is(err, context.DeadlineExceeded):

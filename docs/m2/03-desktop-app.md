@@ -1912,8 +1912,9 @@ temporary profile therefore needs only `%LOCALAPPDATA%` (and a test credential p
   Credentials are never touched by a settings problem (as 02 §11.6 does for `servers.json`).
 - **Size**: no JSON object anywhere in the file has more than 1024 keys (four times the largest one, 05's `appRules`
   with at most 256; `serverPrefs` has at most 20). A file with a larger object counts as one that doesn't parse;
-  `Update` and `SetAudioSection` refuse a value with one (`FieldError`), and a write that would make one fails, so the
-  app never writes a file it would set aside.
+  `Update` and `SetAudioSection` refuse a value with one (`FieldError`). A write keeps every key the app knows and as
+  many unknown keys as fit, the first ones in key order (one WARN with the count when some don't), so the app never
+  writes a file it would set aside, and a file it read never makes its writes fail.
 - **Migrations** are forward-only, one function per schema step, run at load; a file with a newer `schema` than the app
   knows is read best-effort and not migrated.
 - `SettingsView` (to the SPA) is everything above except `audio` (05's own view through `Audio.*`), plus
