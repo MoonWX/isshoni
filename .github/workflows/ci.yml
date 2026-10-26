@@ -856,8 +856,9 @@ jobs:
     needs: [changes, build]
     if: needs.changes.outputs.run-e2e == 'true'
     runs-on: ubuntu-24.04
-    # The suite takes about 7 minutes; the runners' apt mirror has taken up to 18 minutes for the step below.
-    timeout-minutes: 30
+    # The suite takes about 8 minutes; the runners' apt mirror has taken up to 25 minutes for the step below, slow
+    # rather than stalled (its 30 s timeouts don't fire).
+    timeout-minutes: 45
     env:
       # Absolute: npm runs the e2e script from web/ (06 §7.2).
       ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni
