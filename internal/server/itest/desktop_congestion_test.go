@@ -73,15 +73,15 @@ const (
 	maxFinalLossPct = 2.0
 	// recoverWithin: once the limit lifts, the full layer is back at its ceiling, the upload hint off and the estimate
 	// gone within this (D9). After a backoff the estimate is held for 10 s, then grows by 15.1 % a step, and the full
-	// layer follows each step with one of its ramp's, RampEvery apart (a hint every 3–4 s). The way back takes longest
-	// after a backoff right at the lift (the estimate's probes can hit the policer about every 20–25 s): the hold, some
-	// 9 steps from about 2.2 Mbit/s and the upload hint's UploadOff. A second backoff on the next tick that lowers the
-	// estimate by less than a hint's 15 % restarts the hold without one, and the first growth step after it is no hint
-	// either: about 4 s more. The bound was 60 s; README WF5 made it 75 s, because RampEvery must stay 3 s for D19
-	// (01 §9.6 has 2 s; README WA54), which costs D9 about 10 s: with the loss row of then the way back took up to 57 s
-	// at 3 s and 45 s at 2 s. WF5 also counted the loss row's loss once, so a backoff keeps 80 % of what arrived (about
-	// 2.2 Mbit/s here, not about 1.4) and the way back has 3–4 steps fewer: 39–49.5 s in nine runs under -race on the
-	// Mac.
+	// layer follows each step with one of its ramp's, RampEvery apart (a step every 3–3.5 s). The way back takes
+	// longest after a backoff right at the lift (the estimate's probes reach the policer about every 20–25 s): the
+	// hold, some 12–14 ramp steps from about 1.4–1.9 Mbit/s, and the upload hint's UploadOff after the last of them.
+	// Each time the policer loses, the estimate backs off to 80 % of what arrived in the last second (about 2.2 Mbit/s)
+	// and, in every run here, 2–3 s later once more, as the policer still lost some of the lower rate: to about
+	// 1.7 Mbit/s, which restarts the hold. The bound was 60 s; README WF5 made it 75 s, because RampEvery must stay 3 s
+	// for D19 (01 §9.6 has 2 s; README WA54), which costs D9 about 10 s: with WA54's loss row the way back took up to
+	// 57 s at 3 s and 45 s at 2 s. With WF5's (the loss counted once, on the last second's arrivals) it took 29–54 s in
+	// five runs under -race on the Mac.
 	recoverWithin = 75 * time.Second
 	// ceilingF is the Auto preset's full layer (M1 02 §8.6), where the ramp ends.
 	ceilingF = 8_000_000

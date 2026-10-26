@@ -31,9 +31,10 @@ func joinAs(t *testing.T, s *SFU, user UserID, conn ConnID, role Role, client Cl
 	return c, sig
 }
 
-// layerStat is one video layer's uplink stats with what the native estimator reads.
+// layerStat is one video layer's uplink stats with what the native estimator reads, at a steady rate: what arrived in
+// the last second is the 2 s average.
 func layerStat(rid string, bps int, loss float64, delay time.Duration) LayerUplinkStats {
-	return LayerUplinkStats{RID: rid, Bitrate: bps, RawLossPct: loss, QueueDelay: delay}
+	return LayerUplinkStats{RID: rid, Bitrate: bps, RawLossPct: loss, QueueDelay: delay, arrived: bps}
 }
 
 // nativeRig is a native policy on a fake clock that a test ticks a second at a time, each tick a new generation of
@@ -206,10 +207,12 @@ func TestNativeUplinkRows(t *testing.T) {
 		r.want(est, cong, f(est, 1, unknown))
 		r.want(est, cong, f(est, 0, unknown))
 		growAt(unknown)
-		// A rate below 85 % of the estimate says nothing about more.
+		// A rate below 75 % of the estimate says nothing about more (README WF5; §10.1 had 85 %), and 75 % is enough.
 		r.want(est, cong, f(est, 0, unknown))
-		r.want(est, cong, f(est*84/100, 0, unknown))
-		growAt(unknown)
+		r.want(est, cong, f(est*74/100, 0, unknown))
+		threeQuarters := int(math.Ceil(0.75 * float64(est)))
+		est = grow()
+		r.want(est, cong, f(threeQuarters, 0, unknown))
 		// Up to the preset's ceilings × 1.1 (8.3 Mbit/s × 1.1), where the estimate is cleared.
 		ceiling := nativeCeilingSlack * float64(fullMaxBitrate+previewMaxBitrate)
 		for est > 0 {
@@ -286,15 +289,16 @@ func TestNativeUplinkRows(t *testing.T) {
 	})
 }
 
-// TestNativeUplinkLossOnce pins the loss row's value (README WF5): max(nativeMinCap, 0.8 × rate), whatever the loss.
-// The rate is what arrived, since a Layer's Bitrate counts only the packets it received, so the lost ones are out of
-// it already. 01 §10.1's row as first written, 0.8 × rate × (1 − loss/100), counted the loss a second time.
+// TestNativeUplinkLossOnce pins the loss row's value (README WF5): max(nativeMinCap, 0.8 × arrived), whatever the
+// loss, with arrived what arrived of the active layers in the ticker's last second. The lost packets are out of it
+// already, so 01 §10.1's row as first written, 0.8 × rate × (1 − loss/100), counted the loss a second time; and the
+// 2 s average (Bitrate) still carries what the sharer sent before the loss began.
 func TestNativeUplinkLossOnce(t *testing.T) {
 	s, _ := newTicklessSFU(t)
 	const unknown = time.Duration(-1)
 
 	// The policy: 5 Mbit/s that arrived backs off to 4 Mbit/s at any loss that backs off (counted twice: 3.2 Mbit/s
-	// at 20 %, 500 kbit/s at 90 %), and the rate of two layers is the sum of both, at their weighted loss.
+	// at 20 %, 500 kbit/s at 90 %), and what arrived of two layers is the sum of both, at their weighted loss.
 	for _, loss := range []float64{3, 10, 20, 50, 90} {
 		r := newNativeRig(t, s, ShareID(fmt.Sprintf("s_once_%g", loss)))
 		r.tick(layerStat("f", 5_000_000, loss, unknown)) // 3 %: the first tick of its streak
@@ -303,9 +307,16 @@ func TestNativeUplinkLossOnce(t *testing.T) {
 	r := newNativeRig(t, s, "s_once_two")
 	two := []LayerUplinkStats{layerStat("f", 4_000_000, 50, unknown), layerStat("q", 300_000, 0, unknown)}
 	r.want(3_440_000, HintReasonCongestion, two...) // 46.5 % of 4.3 Mbit/s; counted twice: 1.84 Mbit/s
+	// The last second's: 3 Mbit/s that arrived in it, while the 2 s average is still 5 Mbit/s, is 2.4 Mbit/s.
+	r = newNativeRig(t, s, "s_once_last")
+	last := layerStat("f", 5_000_000, 20, unknown)
+	last.arrived = 3_000_000
+	r.want(2_400_000, HintReasonCongestion, last)
 
-	// The Layer: of a second of 400 packets of 1000 bytes (3.2 Mbit/s sent), every fourth is lost. Its Bitrate is the
-	// 2.4 Mbit/s that arrived, its raw loss 25 %, and the sharer is told 0.8 × 2.4 Mbit/s, not that × 0.75.
+	// The Layer: a second of 400 packets of 1000 bytes (3.2 Mbit/s) all arrive, then of the next second's 400 every
+	// fourth is lost. Its Bitrate's 2 s average is then about 2.89 Mbit/s, what arrived in the last second 2.4 Mbit/s,
+	// its raw loss 12.5 % over the two seconds, and the sharer is told 0.8 × 2.4 Mbit/s: not that × 0.875 (the loss
+	// counted again), nor 0.8 × the average (2.31 Mbit/s).
 	s, _ = newTicklessSFU(t)
 	ctx := testCtx(t)
 	pub, pubSig := joinAs(t, s, "alice", "c-pub", RolePublisher, ClientDesktop)
@@ -315,24 +326,40 @@ func TestNativeUplinkLossOnce(t *testing.T) {
 	payload := make([]byte, 1000)
 	payload[0] = 0x41 // a non-IDR slice
 	l.tick(t0)        // the baseline
-	for i := range 400 {
-		if i%4 == 1 {
-			continue // lost; the last packet arrives, so the second's sequence space is all 400
+	// second sends the packets of second n (from 0), skipping those lost, and has the Conn look as the ticker does.
+	second := func(n int, lost func(i int) bool) LayerUplinkStats {
+		t.Helper()
+		for i := range 400 {
+			if lost(i) {
+				continue
+			}
+			k := 400*n + i
+			l.handleRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: uint16(100 + k), Timestamp: 3000 * uint32(k/10),
+				PayloadType: 96}, Payload: payload}, ProfileHigh, at(float64(k)*2.5))
 		}
-		l.handleRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: uint16(100 + i), Timestamp: 3000 * uint32(i/10),
-			PayloadType: 96}, Payload: payload}, ProfileHigh, at(float64(i)*2.5))
+		l.tick(t0 + int64(n+1)*int64(time.Second))
+		s.uplinkGen.Add(1) // the ticker's next second
+		if err := pub.CheckUplink(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return sh.uplinkStats(ClientDesktop).Layers[0]
 	}
-	l.tick(t0 + int64(time.Second))
-	st := sh.uplinkStats(ClientDesktop).Layers[0]
-	if st.Bitrate != 2_400_000 || st.RawLossPct != 25 {
-		t.Fatalf("the layer's stats = %+v, want 2.4 Mbit/s that arrived and 25 %% raw loss", st)
+	if st := second(0, func(int) bool { return false }); st.Bitrate != 3_200_000 || st.arrived != 3_200_000 ||
+		st.RawLossPct != 0 {
+		t.Fatalf("the layer's stats after a second without loss = %+v, want 3.2 Mbit/s and no loss", st)
 	}
-	s.uplinkGen.Add(1) // the ticker's next second
-	if err := pub.CheckUplink(ctx); err != nil {
-		t.Fatal(err)
+	if got := pubSig.hints(); len(got) != 0 {
+		t.Fatalf("hints after a second without loss = %+v, want none", got)
+	}
+	// Lost: every fourth; the last packet arrives, so the second's sequence space is all 400.
+	st := second(1, func(i int) bool { return i%4 == 1 })
+	wantAvg := int(math.Round(3_200_000 - (1-math.Exp(-float64(time.Second)/float64(rateWindow)))*800_000))
+	if st.Bitrate != wantAvg || st.arrived != 2_400_000 || st.RawLossPct != 12.5 {
+		t.Fatalf("the layer's stats = %+v, want a 2 s average of %d bit/s, 2.4 Mbit/s that arrived in the last "+
+			"second and 12.5 %% raw loss", st, wantAvg)
 	}
 	if got := pubSig.hints(); len(got) != 1 || got[0].Reason != HintReasonCongestion || got[0].MaxBitrate != 1_920_000 {
-		t.Fatalf("hints = %+v, want one congestion hint of 1.92 Mbit/s (0.8 × what arrived)", got)
+		t.Fatalf("hints = %+v, want one congestion hint of 1.92 Mbit/s (0.8 × what arrived in the last second)", got)
 	}
 }
 
@@ -869,6 +896,7 @@ func TestNativeUplinkLooksBetweenTicks(t *testing.T) {
 			second := func() {
 				t.Helper()
 				l.stats.bitrate.Store(4_000_000)
+				l.stats.arrived.Store(4_000_000)
 				l.stats.rawLossPct.Store(math.Float64bits(tc.loss))
 				l.stats.queueDelay.Store(int64(tc.delay))
 				s.uplinkGen.Add(1)

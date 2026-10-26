@@ -131,6 +131,7 @@ type layerStats struct {
 
 	// Rates, written by the ticker.
 	bitrate atomic.Int64  // bit/s of payload, 2 s moving average
+	arrived atomic.Int64  // bit/s of payload over the last tick's second alone: what arrived in it (M2 01 §10.1)
 	pps     atomic.Uint64 // packets per second, 2 s moving average (math.Float64bits)
 	fps     atomic.Uint64 // frames per second, 2 s moving average (math.Float64bits)
 	lossPct atomic.Uint64 // loss over the last two seconds, in percent (math.Float64bits)
@@ -432,10 +433,10 @@ func (l *Layer) info(now int64) LayerInfo {
 }
 
 // tick turns the Layer's counters into its rates and sizes its packet cache; the SFU's ticker calls it once a second
-// (02 §9.1). Bitrate, packet rate and frame rate are 2 s moving averages. Loss is what the last two seconds of the
-// sequence space are missing: a gap that a late or retransmitted packet fills within that time is no loss. Raw loss
-// is what the same two seconds were missing before any repair, and a video layer's queueing delay comes from its
-// delayTrend (M2 01 §10.1).
+// (02 §9.1). Bitrate, packet rate and frame rate are 2 s moving averages; the bitrate of the last second alone is
+// kept too, for the native uplink estimator's loss row. Loss is what the last two seconds of the sequence space are
+// missing: a gap that a late or retransmitted packet fills within that time is no loss. Raw loss is what the same two
+// seconds were missing before any repair, and a video layer's queueing delay comes from its delayTrend (M2 01 §10.1).
 func (l *Layer) tick(now int64) {
 	st := &l.stats
 	if l.kind == webrtc.RTPCodecTypeVideo {
@@ -462,7 +463,9 @@ func (l *Layer) tick(now int64) {
 	}
 	average := func(old, sample float64) float64 { return old + weight*(sample-old) }
 
-	st.bitrate.Store(int64(math.Round(average(float64(st.bitrate.Load()), per(cur.bytes-prev.bytes)*8))))
+	arrived := per(cur.bytes-prev.bytes) * 8
+	st.arrived.Store(int64(math.Round(arrived)))
+	st.bitrate.Store(int64(math.Round(average(float64(st.bitrate.Load()), arrived))))
 	pps := average(math.Float64frombits(st.pps.Load()), per(cur.packets-prev.packets))
 	st.pps.Store(math.Float64bits(pps))
 	st.fps.Store(math.Float64bits(average(math.Float64frombits(st.fps.Load()), per(cur.frames-prev.frames))))
