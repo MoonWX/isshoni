@@ -12,9 +12,10 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/signal/signaltest"
 )
 
-// share.pause (M2 01 §10.3, slice WA27): share.update{paused} from a connection with the feature sets the share's
-// pause bit, which room.state shows as the status paused while the share would be live; stalled wins; a starting
-// share shows paused once it goes live; any connection of the user may pause; without the feature paused is ignored.
+// share.pause (M2 01 §10.3, slices WA27 and WF3): share.update{paused} from a connection with the feature sets the
+// share's pause bit, which room.state shows as the status paused while the share is live or starting; stalled wins;
+// a starting share's start timeout is suspended while it is paused, and its resume starts a fresh one; any connection
+// of the user may pause; without the feature paused is ignored.
 
 const pausedStatus = protocol.ShareStatusPaused
 
@@ -188,8 +189,10 @@ func TestSharePause(t *testing.T) {
 	})
 }
 
-// Pausing a starting share stores the bit: the share stays starting, and shows paused once it would be live. The
-// first keyframe still announces it. The start timeout still applies while it is starting.
+// Pausing a starting share (WF3): room.state shows it paused at once, to everyone and with no room.event, and a
+// resume shows it starting again; the gauge follows. A first keyframe while the bit is set (one in flight at the
+// pause) still announces it, with its layers, and it stays paused until the resume brings it live. What the pause
+// does to the start timeout is TestSharePauseStartTimeout's.
 func TestSharePauseStarting(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -208,14 +211,22 @@ func TestSharePauseStarting(t *testing.T) {
 		if u := lastUpdate(t, peer); u.Paused == nil || !*u.Paused {
 			t.Errorf("UpdateShare got %+v, want paused true", u)
 		}
-		if st := statusAfter(t, cb, id); st != "" {
-			t.Errorf("room.state with %s after pausing a starting share, want none: it stays starting", st)
+		for _, c := range []*signaltest.Client{ca, cb} {
+			if st := statusAfter(t, c, id); st != pausedStatus {
+				t.Errorf("status %q after pausing a starting share, want paused", st)
+			}
 		}
-		if got := e.shareCounts(); got != [4]float64{1, 0, 0, 0} {
-			t.Errorf("isshoni_shares %v, want only starting", got)
+		if got := e.shareCounts(); got != [4]float64{0, 0, 0, 1} {
+			t.Errorf("isshoni_shares %v, want only paused", got)
+		}
+		if snap := e.hub.Snapshot(); snap.Rooms[0].Shares[0].Info.Status != pausedStatus {
+			t.Errorf("snapshot status %s, want paused", snap.Rooms[0].Shares[0].Info.Status)
+		}
+		if e.logs.count("level=INFO", "msg=\"share paused\"", "share_id="+id) != 1 {
+			t.Errorf("no share paused line:\n%s", e.logs)
 		}
 
-		// The first keyframe: paused, not live, and share.started goes out as for any share.
+		// The first keyframe: still paused, now with its layers, and share.started goes out as for any share.
 		peer.Sink().ShareMedia(id, liveEvent())
 		settle()
 		evs, st := drain(t, cb)
@@ -232,18 +243,258 @@ func TestSharePauseStarting(t *testing.T) {
 		if st := statusAfter(t, cb, id); st != protocol.ShareStatusLive {
 			t.Errorf("status %q after the resume, want live", st)
 		}
+		quiet(t, ca)
 
-		// A share paused while starting that never goes live still ends at its start timeout.
+		// A share paused while starting and resumed before its first keyframe: paused, then starting again.
 		id2 := startShare(t, ca, screen("r2")).ShareID
-		setPaused(t, ca, id2, true)
 		quiet(t, ca, cb)
-		time.Sleep(signal.DefaultConfig().ShareStartTimeout)
-		settle()
-		evs, st = drain(t, cb)
-		if len(stopped(evs)) != 1 || evs[0].ShareID != id2 || evs[0].Reason != protocol.EndReasonMediaTimeout ||
-			shareIn(st, id2) != nil {
-			t.Errorf("events %+v, state %+v; want %s ended with media_timeout", evs, st, id2)
+		setPaused(t, ca, id2, true)
+		if st := statusAfter(t, cb, id2); st != pausedStatus {
+			t.Errorf("status %q after pausing the second share, want paused", st)
 		}
+		if got := e.shareCounts(); got != [4]float64{0, 1, 0, 1} {
+			t.Errorf("isshoni_shares %v, want one live and one paused", got)
+		}
+		setPaused(t, ca, id2, false)
+		if st := statusAfter(t, cb, id2); st != protocol.ShareStatusStarting {
+			t.Errorf("status %q after resuming the second share, want starting", st)
+		}
+		if got := e.shareCounts(); got != [4]float64{1, 1, 0, 0} {
+			t.Errorf("isshoni_shares %v, want one starting and one live", got)
+		}
+		goLive(e, wa.ConnectionID, id2)
+		settle()
+		if evs, st := drain(t, cb); len(evs) != 1 || evs[0].Kind != protocol.RoomEventKindShareStarted ||
+			evs[0].ShareID != id2 || mustShare(t, st, id2).Status != protocol.ShareStatusLive {
+			t.Errorf("events %+v, state %+v; want %s announced and live", evs, st, id2)
+		}
+	})
+}
+
+// A share paused while starting has no start timeout (WF3): a paused sharer sends no frame, so it can't go live
+// before its resume. It stays past ShareStartTimeout for as long as it is paused, whatever media facts come that are
+// not a first keyframe; the resume starts a fresh ShareStartTimeout, which ends it with media_timeout when no first
+// keyframe comes in time, and a first keyframe after the resume brings it live. A pause and a resume from another
+// connection of the user move the timer of the publishing one. A resume of a share that isn't paused, and a pause
+// that is dropped for want of the feature, leave the start timeout as it was.
+func TestSharePauseStartTimeout(t *testing.T) {
+	startTimeout := signal.DefaultConfig().ShareStartTimeout
+
+	// expectTimeout checks the share.stopped{media_timeout} of share id at `at` on each client, with the state
+	// without it.
+	expectTimeout := func(t *testing.T, id string, at time.Time, cs ...*signaltest.Client) {
+		t.Helper()
+		for _, c := range cs {
+			evs, st := drain(t, c)
+			if len(evs) != 1 || evs[0].Kind != protocol.RoomEventKindShareStopped || evs[0].ShareID != id ||
+				evs[0].Reason != protocol.EndReasonMediaTimeout || !evs[0].At.Equal(at) || shareIn(st, id) != nil {
+				t.Errorf("events %+v, state %+v; want %s ended with media_timeout at %v", evs, st, id, at)
+			}
+		}
+	}
+	// expectEndShare checks that the peer's last MediaPeer call ended share id with media_timeout, and that it was
+	// the only EndShare.
+	expectEndShare := func(t *testing.T, p *signaltest.Peer, id string) {
+		t.Helper()
+		calls := p.MediaCalls()
+		ends := p.CallsTo("EndShare")
+		if last := calls[len(calls)-1]; len(ends) != 1 || last.Method != "EndShare" || last.Args[0] != id ||
+			last.Args[1] != protocol.EndReasonMediaTimeout {
+			t.Errorf("MediaPeer calls %+v, want EndShare(%s, media_timeout) last and once", calls, id)
+		}
+	}
+
+	t.Run("media_timeout after the resume", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t)
+			defer e.close()
+			cookieA, _ := e.user(false)
+			cookieB, _ := e.user(false)
+			ca, wa := e.pauseConn(cookieA)
+			cb, _ := e.connect(cookieB, signaltest.DefaultHello())
+			join(t, ca, "lounge")
+			join(t, cb, "lounge")
+			quiet(t, ca, cb)
+			peer := e.media.Peer(wa.ConnectionID)
+
+			id := startShare(t, ca, screen("r1")).ShareID
+			time.Sleep(10 * time.Second)
+			setPaused(t, ca, id, true)
+			// Not connected, layers changed: neither is a first keyframe, and neither restarts the start timeout.
+			peer.Sink().ShareMedia(id, signal.ShareMediaEvent{Kind: signal.ShareMediaStalled,
+				Layers: []protocol.VideoLayer{low}, Codec: protocol.CodecH264ConstrainedBaseline})
+			peer.Sink().ShareMedia(id, signal.ShareMediaEvent{Kind: signal.ShareMediaChanged,
+				Layers: []protocol.VideoLayer{high}, Codec: protocol.CodecH264High})
+
+			// Well past the 30 s of share.start, and past 30 s of the pause: the share is still there, paused.
+			time.Sleep(2 * time.Minute)
+			synctest.Wait()
+			evs, st := drain(t, cb)
+			if len(evs) != 0 {
+				t.Errorf("events %+v while paused, want none", evs)
+			}
+			if s := mustShare(t, st, id); s.Status != pausedStatus || len(s.Layers) != 0 || s.Codec != "" {
+				t.Errorf("share %+v while paused, want it paused as it was declared", s)
+			}
+			if ends := peer.CallsTo("EndShare"); len(ends) != 0 {
+				t.Errorf("EndShare calls %+v while paused, want none", ends)
+			}
+			if got := e.shareCounts(); got != [4]float64{0, 0, 0, 1} {
+				t.Errorf("isshoni_shares %v while paused, want only paused", got)
+			}
+
+			// The resume: starting again, with a fresh start timeout from the resume.
+			quiet(t, ca)
+			resumedAt := time.Now()
+			setPaused(t, ca, id, false)
+			time.Sleep(startTimeout - time.Millisecond)
+			synctest.Wait()
+			evs, st = drain(t, cb)
+			if len(evs) != 0 || mustShare(t, st, id).Status != protocol.ShareStatusStarting {
+				t.Fatalf("1 ms before the fresh timeout: events %+v, state %+v; want the share starting", evs, st)
+			}
+			if got := e.shareCounts(); got != [4]float64{1, 0, 0, 0} {
+				t.Errorf("isshoni_shares %v after the resume, want only starting", got)
+			}
+			time.Sleep(time.Millisecond)
+			synctest.Wait()
+			expectTimeout(t, id, resumedAt.Add(startTimeout), ca, cb)
+			expectEndShare(t, peer, id)
+			if e.logs.count("level=INFO", "share ended", "share_id="+id, "reason=media_timeout") != 1 {
+				t.Errorf("no share ended line:\n%s", e.logs)
+			}
+			if got := e.shareCounts(); got != [4]float64{} {
+				t.Errorf("isshoni_shares %v after the timeout, want none", got)
+			}
+		})
+	})
+
+	t.Run("live after the resume", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t)
+			defer e.close()
+			cookieA, a := e.user(false)
+			cookieB, _ := e.user(false)
+			ca, wa := e.pauseConn(cookieA)
+			cb, _ := e.connect(cookieB, signaltest.DefaultHello())
+			join(t, ca, "lounge")
+			join(t, cb, "lounge")
+			id := startShare(t, ca, screen("r1")).ShareID
+			setPaused(t, ca, id, true)
+			quiet(t, ca, cb)
+			peer := e.media.Peer(wa.ConnectionID)
+
+			time.Sleep(time.Minute)
+			setPaused(t, ca, id, false)
+			// The first keyframe 1 ms before the fresh timeout: live, announced, and it stays.
+			time.Sleep(startTimeout - time.Millisecond)
+			goLive(e, wa.ConnectionID, id)
+			time.Sleep(5 * time.Minute)
+			synctest.Wait()
+			evs, st := drain(t, cb)
+			if len(evs) != 1 || evs[0].Kind != protocol.RoomEventKindShareStarted || evs[0].UserID != a.UserID ||
+				evs[0].ShareID != id {
+				t.Errorf("events %+v, want share.started only", evs)
+			}
+			if s := mustShare(t, st, id); s.Status != protocol.ShareStatusLive ||
+				!slices.Equal(s.Layers, []protocol.VideoLayer{high, low}) {
+				t.Errorf("share %+v, want it live with both layers", s)
+			}
+			if ends := peer.CallsTo("EndShare"); len(ends) != 0 {
+				t.Errorf("EndShare calls %+v, want none", ends)
+			}
+			if got := e.shareCounts(); got != [4]float64{0, 1, 0, 0} {
+				t.Errorf("isshoni_shares %v, want only live", got)
+			}
+		})
+	})
+
+	t.Run("from another connection", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t)
+			defer e.close()
+			cookieA, a := e.user(false)
+			cookieB, _ := e.user(false)
+			a1, w1 := e.pauseConn(cookieA)
+			a2, w2 := e.pauseConn(e.session(a, "sessionA2"))
+			cb, _ := e.connect(cookieB, signaltest.DefaultHello())
+			for _, c := range []*signaltest.Client{a1, a2, cb} {
+				join(t, c, "lounge")
+			}
+			id := startShare(t, a1, screen("r1")).ShareID
+			quiet(t, a1, a2, cb)
+			peer1, peer2 := e.media.Peer(w1.ConnectionID), e.media.Peer(w2.ConnectionID)
+
+			setPaused(t, a2, id, true)
+			time.Sleep(2 * time.Minute)
+			synctest.Wait()
+			evs, st := drain(t, cb)
+			if len(evs) != 0 || mustShare(t, st, id).Status != pausedStatus {
+				t.Errorf("events %+v, state %+v after two minutes paused from the other connection; want the share "+
+					"paused", evs, st)
+			}
+			quiet(t, a1, a2)
+
+			resumedAt := time.Now()
+			setPaused(t, a2, id, false)
+			time.Sleep(startTimeout - time.Millisecond)
+			synctest.Wait()
+			if evs, st := drain(t, cb); len(evs) != 0 || mustShare(t, st, id).Status != protocol.ShareStatusStarting {
+				t.Fatalf("1 ms before the fresh timeout: events %+v, state %+v; want the share starting", evs, st)
+			}
+			time.Sleep(time.Millisecond)
+			synctest.Wait()
+			expectTimeout(t, id, resumedAt.Add(startTimeout), a1, cb)
+			expectEndShare(t, peer1, id)
+			if calls := peer2.MediaCalls(); len(calls) != 0 {
+				t.Errorf("MediaPeer calls at the other connection %+v, want none", calls)
+			}
+		})
+	})
+
+	t.Run("the start timeout as it was", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t)
+			defer e.close()
+			cookieA, _ := e.user(false)
+			cookieP, _ := e.user(false)
+			cookieB, _ := e.user(false)
+			ca, wa := e.pauseConn(cookieA)
+			plain, wp := e.connect(cookieP, signaltest.DefaultHello()) // no share.pause
+			cb, _ := e.connect(cookieB, signaltest.DefaultHello())
+			for _, c := range []*signaltest.Client{ca, plain, cb} {
+				join(t, c, "lounge")
+			}
+			quiet(t, ca, plain, cb)
+
+			t0 := time.Now()
+			id1 := startShare(t, ca, screen("r1")).ShareID
+			id2 := startShare(t, plain, screen("r2")).ShareID
+			time.Sleep(20 * time.Second)
+			setPaused(t, ca, id1, false)   // not paused: nothing to resume
+			setPaused(t, plain, id2, true) // dropped: the publisher lacks the feature
+			time.Sleep(startTimeout - 20*time.Second - time.Millisecond)
+			synctest.Wait()
+			evs, st := drain(t, cb)
+			if len(evs) != 0 || mustShare(t, st, id1).Status != protocol.ShareStatusStarting ||
+				mustShare(t, st, id2).Status != protocol.ShareStatusStarting {
+				t.Fatalf("1 ms before the timeout: events %+v, state %+v; want both shares starting", evs, st)
+			}
+			quiet(t, ca, plain)
+			time.Sleep(time.Millisecond)
+			synctest.Wait()
+			evs, st = drain(t, cb)
+			if len(stopped(evs)) != 2 || len(evs) != 2 || st == nil || len(st.Shares) != 0 {
+				t.Fatalf("events %+v, state %+v at the timeout; want both shares ended", evs, st)
+			}
+			for _, ev := range evs {
+				if ev.Reason != protocol.EndReasonMediaTimeout || !ev.At.Equal(t0.Add(startTimeout)) {
+					t.Errorf("event %+v, want media_timeout at share.start + %v", ev, startTimeout)
+				}
+			}
+			expectEndShare(t, e.media.Peer(wa.ConnectionID), id1)
+			expectEndShare(t, e.media.Peer(wp.ConnectionID), id2)
+		})
 	})
 }
 
