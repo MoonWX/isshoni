@@ -303,11 +303,12 @@ func TestDesktopReinitCongestion(t *testing.T) {
 			}
 		}
 	}
-	// End to end: the full layer's changes before the limit and after the lift are watched by bob, and carol watches
-	// every change of the preview.
-	if seen["f"] < 2 {
-		t.Errorf("the viewers got the new encoder's keyframe at %d of the full layer's %d changes, want 2 at least",
-			seen["f"], len(changes["f"]))
+	// End to end: every watched change was checked above; at least one of the full layer's must have been watched and
+	// seen (the ramp step to the ceiling, before the limit). Which later ones bob watches depends on the SFU moving
+	// him to q under the policer, and a run can have as few as two changes of f.
+	if seen["f"] < 1 {
+		t.Errorf("the viewers got the new encoder's keyframe at none of the full layer's %d changes, want 1 at least",
+			len(changes["f"]))
 	}
 	if len(changes["q"]) > 0 && seen["q"]+missed["q"] == 0 {
 		t.Errorf("the viewers watched none of the preview's %d changes, want carol to watch them", len(changes["q"]))
