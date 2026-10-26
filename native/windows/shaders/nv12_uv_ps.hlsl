@@ -6,11 +6,12 @@
 
 float2 main(float4 pos : SV_Position) : SV_Target {
   float2 p = float2(2.0 * pos.x - 0.5, 2.0 * pos.y);
-  if (!InsideDest(p)) {
-    return float2(128.0, 128.0) / 255.0;
+  float2 cbcr = float2(128.0, 128.0) / 255.0; // one return, as Fetch has (fxc /WX, X4000)
+  if (InsideDest(p)) {
+    float3 rgb = Fetch(p);
+    float y = dot(rgb, kLuma);
+    float2 c = float2((rgb.b - y) / 1.8556, (rgb.r - y) / 1.5748); // / 2(1 - Kb), / 2(1 - Kr)
+    cbcr = (128.0 + 224.0 * c) / 255.0;
   }
-  float3 rgb = Fetch(p);
-  float y = dot(rgb, kLuma);
-  float2 c = float2((rgb.b - y) / 1.8556, (rgb.r - y) / 1.5748); // / 2(1 - Kb), / 2(1 - Kr)
-  return (128.0 + 224.0 * c) / 255.0;
+  return cbcr;
 }

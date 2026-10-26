@@ -46,11 +46,15 @@ float3 Tap(float2 st) {
 }
 
 // The R'G'B' at an output position p (luma pixels) inside the destination rectangle.
+// One return: fxc /WX reads an early return inside the branch as a possibly uninitialized result (X4000).
 float3 Fetch(float2 p) {
   float2 st = ToRegion((p - g_dest.xy) / g_dest.zw) * g_src_scale;
+  float3 c;
   if (g_box != 0u) {
     float2 h = 0.5 * g_texel;
-    return 0.25 * (Tap(st - h) + Tap(st + float2(h.x, -h.y)) + Tap(st + float2(-h.x, h.y)) + Tap(st + h));
+    c = 0.25 * (Tap(st - h) + Tap(st + float2(h.x, -h.y)) + Tap(st + float2(-h.x, h.y)) + Tap(st + h));
+  } else {
+    c = Tap(st);
   }
-  return Tap(st);
+  return c;
 }

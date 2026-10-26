@@ -3,8 +3,9 @@
 #include "convert.hlsli"
 
 float main(float4 pos : SV_Position) : SV_Target {
-  if (!InsideDest(pos.xy)) {
-    return 16.0 / 255.0;
+  float y = 16.0 / 255.0; // one return, as Fetch has (fxc /WX, X4000)
+  if (InsideDest(pos.xy)) {
+    y = (16.0 + 219.0 * dot(Fetch(pos.xy), kLuma)) / 255.0;
   }
-  return (16.0 + 219.0 * dot(Fetch(pos.xy), kLuma)) / 255.0;
+  return y;
 }

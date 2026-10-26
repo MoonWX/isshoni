@@ -22,9 +22,10 @@ void SteadyTickClock::WaitUntil(int64_t deadline_ns, const std::atomic<bool> &st
 }
 
 void SteadyTickClock::Interrupt() noexcept {
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-  }
+  // Taking the mutex and releasing it before the notify orders the wake after a waiter's check (no bare block:
+  // clang-format 17 and 18 lay one out differently).
+  std::unique_lock<std::mutex> lock(mu_);
+  lock.unlock();
   cv_.notify_all();
 }
 
