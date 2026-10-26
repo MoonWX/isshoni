@@ -973,6 +973,21 @@ jobs:
       - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
         run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
 
+      # lint:ps and test:ps (M2 06 §10.1, §16) run PSScriptAnalyzer and Pester under the image's
+      # pwsh. Both fetch their module at deploy/windows/tools.json's version from the PowerShell
+      # Gallery into .deps/psmodules/ and check its SHA-256 (Taskfile.yml); the cache saves the
+      # download.
+      - name: Cache the PowerShell modules (Pester, PSScriptAnalyzer)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps/psmodules
+          key: psmodules-${{ runner.os }}-${{ hashFiles('deploy/windows/tools.json') }}
+
+      - name: task lint:ps test:ps
+        run: |
+          pwsh --version
+          task lint:ps test:ps
+
   acme:
     # The ACME tests of docs/m1/04-server-platform.md §17: the TLS manager, and `isshoni serve`
     # in auto mode, against Pebble with pebble-challtestsrv as its DNS. Pebble issues for a
