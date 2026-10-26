@@ -54,7 +54,7 @@ the Discord Web separate-window launcher (Later).
 | PID reuse | Hold a `SYNCHRONIZE` handle on every include target while its stream lives (snapshot checks when the handle can't be opened, §5.7); creation-time checks on parent links; a lineage cache for orphans; loose (PID-only) ancestry for the safety invariant, reported as its own reason `pid_reuse` | A held handle makes reuse of that PID impossible; the loose check covers whatever Windows itself uses for "tree" until the INFO case `pid-reuse-tree` measures it |
 | Mic users | Kept out by default, sticky for the life of the app's root process, one-tap prompt remembered per app (by exe name) | Push-to-talk apps toggle their capture stream; a 10 s timeout (S1) would let incoming voices leak between presses |
 | Mixer clock | 10 ms ticks on QPC, 48 kHz stereo float; per-stream PI-controlled adaptive resampling (speexdsp); silence is corrected by dropping or padding zeros | S1 limitation: QPC vs device clock drift caused rare trims; at 100 ppm that is a dip every ~6 minutes |
-| Click safety | S1's fades as built (preroll 40 ms, 10 ms fades, 64-frame tail ramp) plus the onset fade (5 ms ramp after ≥ 50 ms of digital silence; a new channel counts as silent, as in S1's code) | S1 runs 1–2: the only artifact was the stream-attach click; the onset fade is the diagnosed fix |
+| Click safety | S1's fades (preroll 40 ms, 10 ms fades) with a shaped 64-frame backstop tail instead of S1's linear ramp (§9.4, WA36), plus the onset fade (5 ms ramp after ≥ 50 ms of digital silence, on the stream's input before the resampler, §9.5; a new channel counts as silent, as in S1's code) | S1 runs 1–2: the only artifact was the stream-attach click; the onset fade is the diagnosed fix |
 | Opus (04's stage, 05's requirements) | 48 kHz stereo, 20 ms frames, `OPUS_APPLICATION_AUDIO`, signal music, constrained VBR, complexity 10, bitrate from `ShareParams.AudioBitrate` (128 k, Movie 256 k), in-band FEC off, DTX off (§10.1) | FEC only works in SILK/hybrid, which these bitrates never use (plan); continuous frames keep jitter buffers and A/V sync steady |
 | Timestamps | The mixer hands 04's stage chunks stamped on an exact 10 ms grid in the QPC domain: `tick_k − L`, `L` = the fixed estimate of the delay from the audio engine's mix (the loopback QPC position) to the mixer's pop, so a chunk is stamped with the time Windows mixed it, without the sharer's output-device latency (§10.3); `L0` = 50 ms until a silence re-anchor measures it; 04's stage subtracts the encoder lookahead, so packets sit on an exact 20 ms grid | Video stamps DWM's composition time (WGC `SystemRelativeTime`, DD `LastPresentTime`), not the display's; friends never go through the sharer's speakers. Go derives RTP timestamps from capture times (M1 publisher); any jitter would break the 960-sample RTP step |
 | Startup probe | A 200 ms, −60 dBFS, 997 Hz tone in a private session, captured by an INCLUDE stream on isshoni itself. Failure → endpoint loopback + banner | Plan. Process loopback is digital and pre-volume (S1: muted 19% volume still gave −12 dB), so a nearly inaudible tone suffices |
@@ -229,10 +229,12 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
 ### 4.3 Semantics
 
 - **Threads.** Every function may be called from any thread, concurrently. All COM work happens on DLL-owned MTA
-  threads (§7, §8). An ABI call that needs COM (`im_list_audio_apps` one-shot snapshot) posts a request to the watcher
-  thread and waits at most **3 s**, then returns `IM_ERR_TIMEOUT` (−15). `im_audio_sound_check` is exempt from the 3 s
-  limit: it waits `timeout_ms + 500` (§11.3). The DLL never calls `CoInitializeEx` on a caller thread (Go threads
-  arrive through `SyscallN` in any COM state, 04 §12.4).
+  threads (§7, §8). An ABI call that needs COM (`im_list_audio_apps`' one-shot snapshot, `im_audio_watch`,
+  `im_audio_unwatch`) posts a request to the watcher thread and waits at most **3 s**, then returns `IM_ERR_TIMEOUT`
+  (−15); `im_audio_watch` returns once the watcher has published its first report. `im_set_exclusions` doesn't wait:
+  it returns once the rules are copied, and the watcher applies them on its thread within 50 ms (WA35).
+  `im_audio_sound_check` is exempt from the 3 s limit: it waits `timeout_ms + 500` (§11.3). The DLL never calls
+  `CoInitializeEx` on a caller thread (Go threads arrive through `SyscallN` in any COM state, 04 §12.4).
 - **Memory.** The DLL copies `im_exclusions`, its rule array and every string during the call (04 §5.1); the caller's
   memory may be freed when the call returns. JSON exports follow 04's snprintf rule: they return the full length `n`,
   and when `n ≥ cap` the caller retries once with `n + 1` bytes (Go: 01 §7.3's buffer helper, starting at 64 KiB). The
@@ -246,11 +248,16 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
   `api/` layer runs these checks before it forwards (`validate.cpp`, README WA11), so a refused rule set never reaches
   `AudioEngine`. Unknown `flags` bits are ignored. An unknown mode → `IM_ERR_INVALID_ARG`.
 - **Implicit rules.** The DLL always adds `IM_RULE_INSTANCE(GetCurrentProcessId())` with source `IM_RULE_SRC_SELF` and
-  app id `isshoni`, whatever Go passes.
+  app id `isshoni`, whatever Go passes. The watcher starts with that rule alone, so a one-shot report taken before the
+  first `im_set_exclusions` or `im_audio_watch` already shows isshoni's own sessions as kept out (`isshoni`).
 - **Before start.** `im_set_exclusions` without a watcher or share stores the rules for the next `im_audio_watch` or
-  `im_start` (unless that start passes its own `exclusions`) and returns `IM_OK`.
+  `im_start` (unless that start passes its own `exclusions`) and returns `IM_OK`. The stored set belongs to one
+  `im_init`: `im_shutdown` clears it.
 - **State.** Neither watching nor live: `im_audio_levels_get` → `IM_ERR_BAD_STATE`. No running audio session:
-  `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE`.
+  `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE` (until WA45 adds capture no audio session can run,
+  so they always answer it). A watcher thread that failed to start in `im_init` leaves the audio calls answering as
+  after `IM_INIT_NO_AUDIO`. Until WA53 builds the sound check, `im_audio_sound_check` answers
+  `IM_ERR_NOT_IMPLEMENTED` (`IM_ERR_BAD_STATE` after `IM_INIT_NO_AUDIO`).
 - **Silence flags.** The mix bus is silent while any of three flags is set: **paused** (04's `im_set_paused`, which
   reaches `Mixer::SetPaused`, §10.5), **muted** (`im_audio_set_muted`: the mute 01's core sets with the pause, 01 D14),
   or **mode off** (`im_audio_set_mode(IM_AUDIO_MODE_OFF)`: the per-share "Share sound" switch). Each flag is set and
@@ -263,14 +270,19 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
   exactly two cases:
   - a second concurrent session with `mode ≠ IM_AUDIO_MODE_OFF` → `IM_ERR_LIMIT` (04 §6.4: one session with audio per
     process; a programming error, the v1 UI runs one share);
-  - after `im_init` with `IM_INIT_NO_AUDIO`, `mode ≠ IM_AUDIO_MODE_OFF` → `IM_ERR_BAD_STATE`.
+  - after `im_init` with `IM_INIT_NO_AUDIO`, `mode = IM_AUDIO_MODE_EXCLUDE_APPS` → `IM_ERR_BAD_STATE` (README §3 item
+    35). `IM_AUDIO_MODE_TEST_TONE` (100) still starts and plays: the tone is 04's own source and touches no audio API
+    (04 §10.3), so video-only tools and CI runners without audio keep their A/V checks. Until the session makes this
+    check (README WA52's row), such an `im_start` answers `IM_OK` and runs the share without audio packets (audio
+    state off); `audio_bridge_test` pins only what both readings share: neither `SetRules` nor `NewMixer` is called.
 
   Device loss, audio-service restarts, a missing render endpoint and stream failures are handled inside (§7.5, §8.5)
   and appear in the report (`state`, `events`); an audio-only config on a machine without a render endpoint starts in
   state `no-device` and feeds silence. The plan's `AUDIO_DEVICE_CHANGED` is the report event `default_device_changed`
   / `device_removed`, not a return code (04 has no audio events, §10.5).
 - **`IM_INIT_NO_AUDIO`.** The DLL touches no audio API: `audio_flags = 0`; `im_audio_watch`, `im_list_audio_apps`,
-  `im_audio_levels_get` and `im_audio_sound_check` return `IM_ERR_BAD_STATE`; `im_start` with audio as above.
+  `im_audio_levels_get` and `im_audio_sound_check` return `IM_ERR_BAD_STATE`; `im_start` with `EXCLUDE_APPS` as
+  above, while the test tone works.
 
 ## 5. Exclusion policy
 
@@ -484,7 +496,9 @@ mechanism (the relay messages are 01's, the SPA side is 03's, §22):
    (01's `user.connections`) counts as `playing: false` for its connID (03 makes that call).
 3. If `os == "windows"` and the family is `chrome`, `edge` or `firefox`, the service adds `IM_RULE_APP_EXCLUDE`
    (source VIEWER, app id `exe:<name>`) for every exe of that family (§5.4) whose session is active in the latest
-   report; if none is active yet, it re-checks each report for 30 s. `safari`, `other` and unknown values add nothing
+   report; if none is active yet, it re-checks each report for 30 s, a window that also restarts when the watcher
+   starts (reports exist only from then on), and within it more active exes of the family are added after the first
+   match (WA37). `safari`, `other` and unknown values add nothing
    and show the banner `viewer-unknown-browser` (§14.7) while that connID plays. A family stays kept out while **any**
    connID of that family reports playing; `playing: false` for one connID clears only that connID.
 4. The rules last until no connID of that family plays, the share ends, or the user picks "Include" on that row. A tab
@@ -558,8 +572,9 @@ leaks, and a failed probe switches to `endpoint`.
    snapshot. Leaving it out would make the next reconcile open it again and leave a reconcile in the preroll window
    unable to drop it (step 5).
 5. **Commit check** (on the watcher thread, right before a newly activated stream joins the mixer): take a fresh
-   snapshot and repeat step 2 for that target. The stream joins the mixer in `Preroll` (§9.2), so nothing it captured
-   is mixed for the next 40 ms; any reconcile in that window that finds the target unsafe drops it without output.
+   snapshot and repeat step 2 for that target. The stream joins the mixer in `Preroll` (§9.2), and the mixer drops its
+   ring's backlog when it takes the channel, so the 40 ms preroll counts from the join and nothing it captured is mixed
+   for the next 40 ms; any reconcile in that window that finds the target unsafe drops it without output.
 6. **Running targets** are re-checked on every reconcile. A target that became unsafe (a kept-out process appeared in
    its tree), whose app became kept out, or whose process exited, fades out over the next 10 ms of its buffer (§9.4).
    A session that merely vanished while its process lives keeps its stream for 3 polls (3 s), as in S1
@@ -590,13 +605,14 @@ leaks, and a failed probe switches to `endpoint`.
   the fast path runs, a session event skips the 20 ms debounce of §7.3: the watcher refreshes only the new session's
   process and its ancestors and classifies it at once (≤ 5 ms), because the cut below must land inside the 40 ms
   preroll:
-  - Let C be the QPC time of the event that revealed it (the `OnSessionCreated` callback, the capture-session event,
-    or the poll). The EXCLUDE stream's ring stores QPC positions per packet (§8.3), so audio captured after `C − 20 ms`
-    is still unmixed when detection took less than 20 ms of the 40 ms preroll. The ring is cut at `C − 20 ms` with a 5 ms
-    fade ending at the cut, and the stream closes. An app can't play before its session exists, so the voice app's
-    first sample is never mixed, **provided** the `OnSessionCreated` callback reaches the watcher at most 20 ms after
-    the app's first rendered sample. That notification lag is not documented; case 5 measures it from the fixture's
-    own logged first-render time and fails above 20 ms (§18.5, §18.6).
+  - Let C be the QPC time of the event that revealed it (the `OnSessionCreated` callback, the capture-session event, or
+    the poll). The EXCLUDE stream's ring stores QPC positions per packet (§8.3), so audio captured after `C − 20 ms` is
+    still unmixed when detection took less than 20 ms of the 40 ms preroll. The ring is cut at `C − 20 ms` with a 5 ms
+    fade ending at the cut (a shorter linear fade over the frames that remain when the cut point is less than 5 ms
+    ahead, rather than a jump to a partial gain), and the stream closes. An app can't play before its session exists, so
+    the voice app's first sample is never mixed, **provided** the `OnSessionCreated` callback reaches the watcher at
+    most 20 ms after the app's first rendered sample. That notification lag is not documented; case 5 measures it from
+    the fixture's own logged first-render time and fails above 20 ms (§18.5, §18.6).
   - **Late isshoni descendants.** A process started under isshoni after the EXCLUDE stream was activated (a WebView2
     audio utility, a sound-check helper) must stay inside that stream's excluded tree. Case 26
     (`fast-path-late-child`) checks it; if it leaks, the fast path also exits (the same cut) on any new isshoni
@@ -666,7 +682,14 @@ calls, no locks held across calls, no waiting), as Windows requires of `IMMNotif
   `NtQueryInformationProcess(ProcessCommandLineInformation = 60)` and parse `--user-data-dir=` (quoted or not),
   normalized as §5.3's path rule says. Failures leave the field empty: an unknown folder is an app boundary; an unknown creation time accepts the
   parent link (fail toward more matches).
-- Refresh cost ≤ 3 ms for 300 processes (details cached per process key).
+- Refresh cost ≤ 3 ms for 300 processes (details cached per process key). As built (WA35) the detail cache is keyed
+  by pid and refreshed when the parent pid or exe changes, exactly as above, so a pid that the same exe under the same
+  parent reuses within one poll keeps the old creation time; catching that would cost an `OpenProcess` per process
+  per second. `FileDescription` (§5.1) is read for the processes with a session, the shared window's process and the
+  processes an exe rule without a name matches, with their parent chains. `NtQueryInformationProcess` and
+  `RtlGetVersion` (ntdll) and the version-info functions (version.dll) are resolved at run time with
+  `LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_SYSTEM32)` and `GetProcAddress`, like `ActivateAudioInterfaceAsync` (§8.1),
+  so `deploy/windows/dll-imports.txt` gains no entry for them.
 
 ### 7.5 Device changes and the audio service
 
@@ -754,7 +777,7 @@ calls, no locks held across calls, no waiting), as Windows requires of `IMMNotif
 
 | State | Enter | Leave |
 |---|---|---|
-| `Preroll` | stream joined, or after an underrun/trim | ≥ **40 ms** buffered → `Running`, gain ramps 0 → 1 over the first chunk (10 ms) |
+| `Preroll` | stream joined (its ring's backlog is dropped at the join, §6.2 step 5), or after an underrun/trim | ≥ **40 ms** buffered → `Running`, gain ramps 0 → 1 over the first chunk (10 ms); over 20 ms only when this entry takes over from another engine (§9.4), so a re-entry after an underrun or trim always fades in over 10 ms |
 | `Running` | from `Preroll` | buffered < **20 ms** → fade out over this chunk, back to `Preroll` (`underruns`); buffered > **100 ms** → fade out, trim to 40 ms, `Preroll` (`trims`); removal or failure → `Fading` |
 | `Fading` | removal, failure, unsafe target | gain reached 0 (10 ms) → removed; the watcher frees it outside the mixer |
 
@@ -762,29 +785,59 @@ With adaptive resampling, underruns and trims are emergency paths; the target is
 
 ### 9.3 Adaptive resampling
 
-- Every stream has a PI controller on its buffer fill. Fill is sampled at each tick and smoothed with a 1 s EWMA;
-  every 100 ms the error `e = fill − 40 ms` updates the ratio:
-  `ppm = clamp(Kp·e + Ki·∫e dt, −1000, +1000)` with Kp = 50 ppm/ms, Ki = 1 ppm/(ms·s), the integral clamped to
-  ±400 ms·s, and a slew limit of 20 ppm per update. These are starting values; slice A4 tunes them in simulation
-  against the acceptance numbers of §17.
+As built in WA36 (`native/common/audiomix`, `controller.h`, `mix_engine.h`):
+
+- **What is controlled: the head age, not the tick-sampled fill.** Every stream has a PI controller on its head age
+  `d = tick time − the QPC time of the ring's head frame`, the same `d` that §10.3 measures for timestamps: the fill
+  plus the age of the newest captured frame. Sampled at the tick, the fill itself jumps by a whole capture packet
+  (10 ms) whenever a packet's arrival crosses the tick, and with drift that crossing point moves slowly, so the sampled
+  fill carries a 10 ms sawtooth whose period runs from seconds to minutes (20 s at 500 ppm), which a loop with a 20 s
+  time constant follows: `mix_drift_test`'s `SampledFillControlMissesTheRatioBound` measures a ratio standard deviation
+  of 117–122 ppm that way, against 8–11 ppm on the head age, which doesn't depend on when packets arrive.
+- **The loop.** `d` is smoothed with a 1 s EWMA; every 100 ms the error `e = d̄ − target` updates the ratio:
+  `ppm = clamp(Kp·e + Ki·∫e dt, −992, +992)` with **Kp = 100 ppm/ms, Ki = 2.5 ppm/(ms·s)**, the integral clamped to
+  ±400 ms·s, and a slew limit of 20 ppm per update. A4 tuned these in its drift simulation against §17 (the starting
+  values Kp = 50 and Ki = 1 settled slowly, and with the integral worth only 400 ppm they left a 2 ms error at
+  500 ppm, the +500 ppm fill peaking at 54.7 ms against the 55 ms bound). The head age moves by 0.001 ms/s per ppm of
+  mismatch, so these values make a critically damped loop with a 20 s time constant, and `Ki × 400 ms·s` = 1000 ppm
+  lets the integral alone hold any drift of the range, with no steady-state error.
+- **The target** is set every tick to `max(L, F)`, kept within 40..90 ms. `L` is the mixer's stamping delay (§10.3):
+  holding `d` at `L` stamps every chunk with the time its audio was mixed. `F` is the stream's **fill floor**,
+  `40 ms + the ring's arrival lag + half its packet length`, both averaged over about 10 s of packets (the arrival lag
+  is how long after its last frame was mixed a packet reached the capture thread, each packet's lag clamped to
+  0..50 ms; `CaptureRing::Write` takes the packet's arrival time): the newest frame's age averages the packets' lag
+  plus half a packet, so at `d = F` the fill averages 40 ms. With 10 ms packets that reach the capture thread within
+  5 ms of their mix, `F ≤ L0 = 50 ms` (§10.3's typical `d`: 40 ms of fill and one packet), so `d = L`: exact stamps
+  and a fill of 40 ms or a little more. Packets that come later (a capture offset S1 never measured on hardware) or
+  longer packets would leave less fill at `L`, down to underruns; `d` then sits at `F`, the fill still averages
+  40 ms, and the stamps carry the error `|L_true − L|` that §10.3 accepts for `L0` (a re-anchor can't raise `L`). So
+  the 40 ms target is held **on average over the packet phase**, not as the tick-sampled value. `mix_drift_test` also
+  runs ±500 ppm with packets 15 and 25 ms late and with 20 ms packets against §17.
 - **Active streams** run through a speexdsp resampler, created on the watcher thread before the channel joins the
-  mixer with `speex_resampler_init_frac(2, 1 000 001, 1 000 000, 48000, 48000, 5, &err)` (quality 5). Starting from a
+  mixer with `speex_resampler_init_frac(2, 62 501, 62 500, 48000, 48000, 5, &err)` (quality 5). Starting from a
   non-unity ratio makes speexdsp pick its interpolated filter and allocate that table (1 288 entries at quality 5:
   base length 80 × oversample 16 + 8) up front; `speex_resampler_init(…, 48000, 48000, …)` would reduce to 1:1, pick
-  the 80-entry direct table, and `speex_realloc` the interpolated one on the mixer thread at the first non-zero ppm.
-  The ratio is updated with `speex_resampler_set_rate_frac(st, 1 000 000 + ppm, 1 000 000, 48000, 48000)` (integer
-  ppm; the ratio is input per output, so a too-full buffer drains), and **ppm is never 0**: the controller's output is
-  clamped to |ppm| ≥ 1 (0 becomes +1, or −1 when the previous value was negative). At ppm = 0 the ratio reduces to
-  1:1 again, which flips speexdsp back to the direct table (a recompute on the mixer thread) and truncates
-  `samp_frac_num`, a sub-sample phase jump; with drift near zero ppm would cross 0 often. The filter length stays 80
-  for every |ppm| ≤ 1000, so with these two rules updates allocate nothing on the mixer thread. The mixer asks it for
-  exactly 480 output frames per tick.
-- **Silent streams** (the last 100 ms digital silence) skip the resampler and correct the fill directly by dropping or
-  padding zeros, up to 48 frames per tick: zeros are zeros, so this is exact and free. Most inactive-session streams
-  live here. When a stream leaves this bypass, the mixer calls `speex_resampler_reset_mem(st)` before feeding it, so
-  the filter history from before the silence never comes out at the onset (reset_mem only zeroes memory; it doesn't
-  allocate).
-- The endpoint stream uses the same controller.
+  the 80-entry direct table, and `speex_realloc` the interpolated one on the mixer thread at the first non-unity
+  ratio.
+- **The ratio's denominator is 62 500, not 10⁶.** speexdsp 1.2.1 (the vcpkg port) rescales the filter phase in
+  `speex_resampler_set_rate_frac` with a 32-bit `phase × new_den / old_den`, which returns `RESAMPLER_ERR_OVERFLOW`
+  for almost any phase at a 10⁶ denominator and leaves the state half updated (a probe crashed on the next chunk;
+  `mix_resampler_test` asserts the overflow). 62 500² < 2³², so the ratio is
+  `speex_resampler_set_rate_frac(st, 62 500 + k, 62 500, 48000, 48000)` with an integer step `k`: one step is exactly
+  16 ppm, every ppm is a multiple of 16, and `|k| ≤ 62` (±992 ppm). The ratio is input per output, so a too-full
+  buffer drains. **The step is never 0**: the controller's output is clamped to `|k| ≥ 1`, i.e. `|ppm| ≥ 16` (0
+  becomes +1, or −1 when the previous value was negative). At `k = 0` the ratio reduces to 1:1 again, which flips
+  speexdsp back to the direct table (a recompute on the mixer thread) and truncates `samp_frac_num`, a sub-sample
+  phase jump; with drift near zero the command would cross 0 often. The filter length stays 80 for every
+  `|ppm| ≤ 992`, so with these rules ratio changes allocate nothing on the mixer thread (`mix_alloc_test` counts it).
+  The mixer asks it for exactly 480 output frames per tick.
+- **Silent streams** (the last 100 ms digital silence) skip the resampler and correct the head age directly by
+  dropping or padding zeros, up to 48 frames per tick: zeros are zeros, so this is exact and free. The controller's
+  average follows every tick meanwhile, but it makes no update. Most inactive-session streams live here. When a
+  stream leaves this bypass, the mixer calls `speex_resampler_reset_mem(st)` before feeding it, so the filter history
+  from before the silence never comes out at the onset (reset_mem only zeroes memory; it doesn't allocate).
+- The endpoint stream uses the same controller. A stream that re-enters `Running` restarts its average from its
+  current head age and keeps its integral and last ratio (the device's drift estimate).
 - The 40 ms fill target is part of the audio's age at capture (01 §12.1). It may drop to 20–25 ms only if 01's
   sound-on g2g gate (01 §12.2, the `gate` run) misses, and only with A4's drift simulation (§17) still passing at the
   lower target (01 §12.1 lever 2); the change is then recorded here.
@@ -793,17 +846,35 @@ With adaptive resampling, underruns and trims are emergency paths; the target is
 
 - Every start and stop is a 10 ms linear gain ramp over audio that is still buffered (packets arrive in whole 10 ms
   blocks, so waiting for an empty ring would leave nothing to fade).
-- A chunk that ends early while gain > 0 gets a 64-frame tail ramp from its last value to zero (backstop).
+- A chunk that ends early while gain > 0 gets a 64-frame **shaped** tail (backstop; WA36's `TailFrame`): it carries
+  on the last slope `s` from the last value `v` and decays, frame `t` (1..64) being
+  `(v + (s + w·v)·t)·e^(−w·t)·(1 − t/64)` with `w = 0.1`, a critically damped return that the linear window ends at
+  exactly zero, and it runs on into the next chunk when this one ends first. S1's linear 64-frame ramp from mid-wave
+  bends the waveform at once: on a −6 dBFS 1 kHz tone it clicks by S1's own detector at some phases, which
+  conflicts with "no click on any fade path" (§17); the shaped tail stays below the detector's threshold at every
+  phase (`mix_engine_test`).
 - Removal of a newly kept-out app takes effect from the next tick on its buffered audio: friends stop hearing it within
   ≈ 60 ms of the rule change (plus network).
-- Crossfades between engines (§6.5) are 20 ms equal-gain.
+- Crossfades between engines (§6.5) are 20 ms equal-gain. Each engine's streams form one group (the include set, the
+  fast path's EXCLUDE stream, the endpoint stream), so every switch of §6.5 crossfades, `exclude-self → endpoint`
+  included. A stream opened for a switch is marked as crossfading; when the first such stream of a group starts
+  running, every audible stream of the other groups fades out over the same 20 ms in which it fades in, and those not
+  audible yet leave at once. That takeover happens **once per group**: from then on every stream of the group that
+  was in the mixer at that tick counts as taken over, so its re-entry after an underrun or a trim fades in over 10 ms
+  and leaves the other groups alone (otherwise a re-entering endpoint stream would drop the include streams of a
+  switch back that are still prerolling). A stream reopened inside the running engine (a device change, §7.5) is not
+  marked and fades in on its own.
 
 ### 9.5 Onset fade (the S1 click fix)
 
 When a stream's input turns non-silent after at least **50 ms** of digital silence (|x| < 1e-6 on both channels), its
 next **5 ms** (240 frames) are ramped in linearly. Windows drops the first milliseconds of an app that starts playing
 right after a loopback attaches, so the app's own fade-in never arrives and the waveform starts mid-cycle (S1 run 2,
-diagnosed from the WAV). Applied after resampling, before the channel gain.
+diagnosed from the WAV). Applied to the stream's **input, before the resampler** (WA36), and before the channel gain.
+After the resampler it would come too late: speexdsp's 80-tap filter turns a waveform that starts mid-cycle into a
+band-limited step that rings for about 40 frames on either side, so a ramp that starts at the first ringing sample has
+barely risen when the step arrives, and S1's detector flagged that click. The onset state advances by the input frames
+the resampler consumed.
 
 The silence counter of a **new channel**, and of a channel re-entering `Running` from `Preroll`, starts **saturated**
 (≥ 50 ms, as S1's `size_t silent_frames = kOnsetSilenceFrames;`), so its first non-silent sample always ramps. S1's
@@ -812,7 +883,7 @@ counter starting at 0 would meet the 50 ms rule and still click.
 
 ### 9.6 Mix bus
 
-- Sum of channels × gain × onset ramp.
+- Sum of the channels' resampled chunks × their gain (the onset ramp is already in each stream's input, §9.5).
 - Soft clip above −1 dBFS: for |x| > t (t = 0.891), `y = sign(x)·(t + (1 − t)·tanh((|x| − t)/(1 − t)))`; continuous
   slope at t. Replaces S1's hard clamp.
 - **Silence flags** (§4.3): `paused` (`Mixer::SetPaused`, from 04's `im_set_paused`), `muted` (`im_audio_set_muted`,
@@ -880,20 +951,29 @@ carries.
   `chunk time = tick − L`, move stamps *earlier* than the mix, about 2 × the latency too early: the wrong sign.)
 - **Delay estimate L.** For every running channel the mixer measures `d = tick_time − qpc(ring head)` at each pop
   (§8.3), i.e. how long ago the audio engine mixed the audio it mixes now, and keeps a 1 s EWMA of it per channel. The
-  measured value of the mix is `L_meas` = the median over running channels of those EWMAs. A typical `d` is the ring's
-  40 ms preroll fill plus one 10 ms capture packet, so ≈ 50 ms.
+  measured value of the mix is `L_meas` = the median over running channels of the head age each settles at: its EWMA,
+  or its fill floor `F` (§9.3) when that is higher, since its controller never holds `d` below `F` and an `L` below it
+  would only make that stream's stamps late. A typical `d` is the ring's 40 ms preroll fill plus one 10 ms capture
+  packet, so ≈ 50 ms. Each channel's controller holds its `d` at `max(L, F)` (§9.3), so whenever the packets reach the
+  capture thread within about 5 ms of their mix, `d = L` and a chunk's time is exactly when its first frame was mixed,
+  also after a re-anchor changed `L`.
 - **Start value.** Chunks are stamped from the very first chunk with the fixed **`L0 = 50 ms`**. When the first chunk
   is due no channel has prerolled yet (the mixer starts inside `im_start`, §10.5), so there is nothing to measure.
   L is never taken from the running EWMA directly (that would break the exact 10 ms spacing) and never jumps at a
   fixed time (that would step the grid during sound, the common case being a game already playing at share start).
-  A measured value replaces L only through the silence re-anchor below. If sound plays throughout a share, L0 stays,
-  and the stamp error is `|L_true − L0|`, about 10 ms or less.
+  A measured value replaces L only through the silence re-anchor below. If sound plays throughout a share, L0 stays;
+  since every controller holds its stream's `d` at `L0`, or at its fill floor `F` when that is higher (§9.3), the
+  stamps stay exact except for a stream held at its floor, whose audio is stamped `F − L0` late, about 10 ms or less.
 - **Re-anchor during silence.** While the mix has been digital silence since the last anchor, a newly running stream
   may re-measure L (its `L_meas` after its preroll); if the new value L' differs from L by more than 5 ms, the grid
   restarts (`OnGap`, §10.4). Nobody hears a jump in silence. A new grid's first chunk time is
   `max(tick − L', previous chunk time + 10 ms)`, so its first packet time is at least
   `max(tick − L' − lookahead, previous packet time + 20 ms)`. If the clamp binds, L moves only part of the way (to
   `tick − chunk time`) and is re-measured at the next silence. Chunk and packet times never decrease (01 §5.3).
+  "Digital silence since the last anchor" includes the chunk being made (WA36): a stream that is already playing when
+  it starts running (a game playing at share start) never moves the grid (L0 stays, no `OnGap`), and every jump lands
+  in silence. Because a new grid can't start before the previous chunk + 10 ms, a re-anchor between two consecutive
+  ticks can only lower L (a later L' leaves the grid where it is).
   L is always ≥ 0 (`d` is positive by causality; a negative measurement, from a bad timestamp, is clamped to 0), so
   04's start-at-`epoch_ns` drop rule (04 §10.3) holds for any L.
 - **Chunk time** (what 05 passes to `OnChunk`) = `tick_k − L`, on the exact 10 ms grid. **Packet time** = the chunk
@@ -973,6 +1053,16 @@ class Mixer {
   touches the other two.
 - **No events.** There is no event sink and there are no audio events or audio error codes (04 §10.1, §10.2): the
   report's `seq`, `state` and `events[]` and the levels' `report_seq` carry everything, and Go polls them (§14.4).
+- **Who calls it.** 04's session (`src/session/session_object.cpp`, WA23) creates the session's `Mixer` through
+  `NewMixer`, starts, pauses and stops it and reads `State` (04 §10.2); `audio_bridge/` only says which `AudioEngine`
+  that is (`audio_bridge::Engine()`, with a test override). `Mixer` must cope with being destroyed without `Stop` after
+  a failed `Start` (the session then runs without it).
+- **The mixer core's sink.** `im_audiomix`'s `MixEngine` (WA36) feeds `im::audiomix::ChunkSink`, which has exactly
+  `PcmSink`'s two methods and rules: `native/common/CMakeLists.txt` links `im_audiomix` with `im_common` and
+  `im_speexdsp` only, so it can't include 04's `pcm_sink.h`. WA45's `Mixer` hands the session's `PcmSink` over through
+  a two-line adapter that forwards both calls; it also supplies the Windows `TickClock` (the high-resolution waitable
+  timer of §9.1 on the QPC) and MMCSS through `MixerOptions::thread_hook`, and maps `im_audiomix`'s counters and
+  events into the report (§12.1).
 
 ## 11. Probe, fallback and sound check
 
@@ -991,6 +1081,12 @@ sound, and caches them until the next device event.
 Neither loopback bit means backend `none`: no active render endpoint, or the audio service is unavailable. Endpoint
 counts are in the report's `device` (§12.1); the OS build is `im_caps.os_build`. The product floor is build 19045
 (04 `IM_OS_SUPPORTED`), so there is no pre-1803 path and no timer capability bit.
+
+As built (WA35): the flags are computed on the watcher thread, the first time and after every device change, and
+cached otherwise; a watcher that doesn't answer within 3 s gives 0. `IM_AUDIO_SESSION_EVENTS` needs at least one
+active render endpoint, and without one the loopback bits are not probed at all (backend `none`). The
+process-loopback activation waits up to 1 s per attempt, with two attempts: typically it completes in milliseconds,
+but the worst case exceeds the 50 ms first-call target above.
 
 ### 11.2 Startup probe (each audio start)
 
@@ -1107,10 +1203,22 @@ banner `viewer-muted` explains it.
 | `events[].code` | `session_created`, `session_expired`, `stream_opened`, `stream_running`, `stream_removed`, `stream_failed`, `activation_failed`, `fastpath_enter`, `fastpath_exit`, `fastpath_late_cut`, `default_device_changed`, `device_added`, `device_removed`, `no_device`, `audiosrv_restart`, `probe_ok`, `probe_failed`, `mixer_resync`, `underrun`, `trim`, `silent_reopen`, `rules_changed`, `muted`, `unmuted`, `mode_changed`, `reanchor` |
 
 `counters` are the mixer's; packets dropped after the mixer are 04's (`im_get_stats` `audio.drops`). Caps: `apps` ≤ 128
-rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes. Rows: apps with a session,
+rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary), and the first 128
+top-level `warnings`, so the report stays within §17's 256 KiB (WA36's writer caps `warnings`; WA35's interim writer
+doesn't, see "The writer" below). Rows: apps with a session,
 plus running processes matched by a built-in rule (so "Discord · kept out" shows while Discord is silent), plus the
 shared app. `seq` increases whenever anything except levels, counters, `qpcNs` and `events` changes. Unknown fields are
 ignored by Go (additive changes only).
+
+**The one-shot snapshot** (state `stopped`, the watcher not watching) is planned on the watcher thread with the
+remembered mic roots and lineage (§5.6, §5.7) and kept for 1 s, so the snprintf retry with a larger buffer gets the
+same document; applying rules, a watch or an unwatch drops it. Until WA45 adds capture, every report is the
+watcher's prediction: mode `exclude-apps`, engine `none`, `live` false, `probe.result` `pending` with an active render
+endpoint and `skipped` without, `probe.format` `""`, every `sessions[].stream` `none` with format `""`.
+
+**The writer.** Two C++ writers produce this JSON byte for byte against the same goldens after group 4: WA35's
+`native/windows/src/audio/report.cpp` (the watcher landed first) and WA36's `im_audiomix` writer (05 A4). WA45 keeps
+one of them with its golden test and removes the other (README §3 item 36).
 
 ### 12.2 Levels
 
@@ -1267,7 +1375,8 @@ it (the mapping itself is `internal/media/native/audio.go`'s, WA35, since `inter
 the fake makes the same errors itself. **Rule checks before a call**: the binding refuses, as `CodeInvalid` with a
 `Detail` naming the rule's index (never its strings), a value, app id or name holding a NUL byte (a C string would
 silently carry a shorter value, and §4.3 gives the DLL no way to see it) and a value of 520 bytes or more
-(`IM_MAX_RULE_VALUE` counts the NUL); everything else of §4.3's rule checks is the DLL's `IM_ERR_INVALID_ARG`.
+(`IM_MAX_RULE_VALUE` counts the NUL), and more than `IM_MAX_RULES` rules (WA35); everything else of §4.3's rule
+checks is the DLL's `IM_ERR_INVALID_ARG`.
 **Mode validation** happens in Go, without a call, in the binding's single mode mapping (`audio.go`, §13.2):
 - `AudioConfig.Mode` (at `im_start`): `""` and `AudioExcludeApps` → `IM_AUDIO_MODE_EXCLUDE_APPS`, `AudioTestTone` →
   `IM_AUDIO_MODE_TEST_TONE` (100); `AudioOff`, `AudioEverything` (reserved; rejected in M2, README §3 item 15) and
@@ -1289,11 +1398,14 @@ two sides can't drift.
 
 ### 13.2 The Windows binding (`internal/media/native/audio.go`)
 
-- **`audio.go`** (no build tag, 01 §7.7; README WA10 declared it with not-implemented stubs, WA35 fills them):
+- **`audio.go`** (no build tag, 01 §7.7; README WA10 declared it with not-implemented stubs, WA35 filled them):
   `buildExclusions` (the struct, the rule array and a NUL-terminated byte slice per string, pinned for the call with
-  04 §12.4's `addrOf`/`runtime.Pinner`: the DLL copies everything, §4.3); the status → error table of §13.1; the
-  single mode mapping of §13.1 (used by 04's `media.Config` → `imStartConfig` conversion for `AudioConfig.Mode` and by
-  `SetAudioMode`); level decoding; report decoding through `media.ParseAudioReport`. The methods of
+  04 §12.4's `addrOf`/`runtime.Pinner`: the DLL copies everything, §4.3); the status → error table of §13.1 (the
+  audio JSON exports go through `bridge.go`'s snprintf helper, `callJSONWith`, which takes this table as its status
+  mapper); the single mode mapping of §13.1 (`buildAudioConfig`, used by 04's `media.Config` → `imStartConfig`
+  conversion for `AudioConfig.Mode` and by `SetAudioMode`); level decoding; report decoding through
+  `media.ParseAudioReport`. `AudioApps` (WA10's declaration) returns `AudioReport().Apps`, with Op
+  `list_audio_apps` in its errors. The methods of
   `media.AudioController` are implemented here, on the engine type `native.Open` returns (01 §7.1, 04 §12.2), calling
   procs through the `caller` interface, so all of this is tested on the Mac and CI ubuntu with 01 §7.7's `caller`
   fake. The C-layout mirrors `imRule`, `imExclusions`, `imAudioLevel` and `imAudioLevels` are in 04's `abi.go`, beside
@@ -1311,14 +1423,13 @@ two sides can't drift.
 - **Bitrate**: 01's `Session.SetBitrate(media.LayerAudio, bps)` maps to `im_set_audio_bitrate(s, bps)`.
 - **Packets**: Opus packets become `media.Packet{Kind: KindAudio, Layer: "", CaptureNS, Data, Reinit}` (04 §12.3);
   `IM_PACKET_PCM` packets become `media.Packet{Kind: KindPCM, CaptureNS, Data}` (01 §5.1), returned by
-  `Session.Next` like every other packet (README §3 item 32: WA35 replaces the interim `PCMTap()` channel and
-  `PCMChunk` type WA23 left in `bridge.go` and `types.go`). Only a config with `TapPCM` produces them, and the core
-  never sets it, so the pump and the publisher never see PCM.
-- **Start-time mapping**: WA35 folds WA23's `startAudioConfig` and `startExclusions` (`bridge.go`) into this file's
-  single mode mapping and `buildExclusions`, so `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode` share one
-  mapping. The folded `buildExclusions` applies §13.1's rule checks on every path (`Start`, `WatchAudio`,
-  `SetExclusions`): a NUL in a value, app id or name, or a value of 520 bytes or more, is `CodeInvalid` with the rule's
-  index in `Detail`. Until WA35, `bridge.go`'s `startExclusions` refuses only a NUL, without the index.
+  `Session.Next` like every other packet (README §3 item 32; there is no `PCMTap()` channel and no `PCMChunk` type).
+  Only a config with `TapPCM` produces them, and the core never sets it, so the pump and the publisher never see PCM.
+- **Start-time mapping**: `bridge.go`'s start conversion calls this file's `buildAudioConfig`, so `Start`,
+  `WatchAudio`, `SetExclusions` and `SetAudioMode` share one mode mapping and one `buildExclusions`, which applies
+  §13.1's rule checks on every path (`Start`, `WatchAudio`, `SetExclusions`): more than `IM_MAX_RULES` rules is
+  `CodeInvalid`, and so is a NUL in a value, app id or name or a value of 520 bytes or more, with the rule's index in
+  `Detail`.
 - **`AudioTestHooks`** (in `audio.go`, so it compiles everywhere; it answers only the engine `native.Open` returned,
   which exists only on Windows; `cmd/isshoni-audiotest/driver_windows.go` is its one user):
 
@@ -1418,6 +1529,12 @@ ubuntu against the fake engine.
 There is no persisted sound mode: the built-in list can't be turned off (plan), and the per-share **Share sound**
 switch (03, `SetShareSound`) is the only "off". Unknown keys are ignored and written back unchanged.
 
+As built (WA37), `Settings` has its own `UnmarshalJSON`/`MarshalJSON`: an absent key, `null` or a value of the wrong
+type gets its default (so `{}` and `null` are `DefaultSettings()`), `appRules` keeps its order (oldest decision first:
+the order the 256-entry limit drops by), and unknown keys are written back after the four known ones. The service
+normalizes what it reads: it drops `appRules` entries whose id is invalid or locked (built-in voice apps, `isshoni`)
+or whose decision is not `keep-out` or `include`, drops unknown tip codes, and keeps the newest 256 decisions.
+
 ### 14.2 API
 
 ```go
@@ -1431,6 +1548,8 @@ type SelfInfo struct {
 	Exe            string // the binary started with --sound-check-helper (03: os.Executable()); "" = no helper
 }
 
+// SettingsStore: AudioSettings returns what json.Unmarshal of the "audio" section gives, and DefaultSettings() or the
+// zero Settings when there is none (New reads both as the defaults, so a privacy default never flips).
 type SettingsStore interface {
 	AudioSettings() Settings
 	SaveAudioSettings(Settings) error
@@ -1441,7 +1560,15 @@ type Settings struct {
 	AppRules        map[string]Decision `json:"appRules"`
 	FastPath        bool                `json:"fastPath"`
 	DismissedTips   []string            `json:"dismissedTips"`
+	// unexported: appRules' order and the unknown keys (§14.1); Settings has its own UnmarshalJSON and MarshalJSON
 }
+
+func DefaultSettings() Settings // §14.1's defaults: mic users kept out, no decisions, fast path on, no tip dismissed
+
+// SoundCheckHelperFlag is the argument that starts the binary as the sound-check helper (§11.3): 03's main dispatches
+// it to RunSoundCheckHelper before anything else.
+const SoundCheckHelperFlag = "--sound-check-helper"
+func RunSoundCheckHelper() int
 
 // AppRule is one remembered decision (Settings → Audio in 03).
 type AppRule struct {
@@ -1459,6 +1586,7 @@ func (s *Service) FriendsHear() FriendsHear
 func (s *Service) AppRules() []AppRule // from appRules, sorted by name
 func (s *Service) Watch(on bool) error  // the share sheet is open
 func (s *Service) WatchLevels(on bool)  // a level meter is on screen; reference-counted
+func (s *Service) SetVisible(visible bool) // 03 §4.4: the window's visibility; recorded only, no engine call
 func (s *Service) Decide(promptID string, d Decision) error // "keep-out" | "include" only
 func (s *Service) DismissPrompt(promptID string) error      // keeps the app out for this run; saves nothing
 func (s *Service) SetAppDecision(appID string, d Decision) error
@@ -1488,8 +1616,13 @@ var (
 	ErrInvalidAppID    = errors.New("audio: invalid app id")   // SetAppDecision: not "exe:<lower-case exe name>"
 	ErrInvalidDecision = errors.New("audio: invalid decision") // Decide, SetAppDecision
 	ErrUnknownTip      = errors.New("audio: unknown tip")      // DismissTip
+	ErrClosed          = errors.New("audio: service closed")   // Watch(true), SoundCheck, SetShareSound after Close
 )
 ```
+
+The package also exports the string constants of the JSON it emits (WA37): the event names (`EventReport` …
+`EventAlert`), the modes, controls, warnings, prompt kinds, banner codes and levels, and `TipDucking`;
+`FriendsHear.voiceApps` rows are of type `VoiceAppInfo`.
 
 - **`AudioConfig()`** returns `{Mode: media.AudioExcludeApps, Exclusions: the current rules including SharedPID}`
   and first flushes the 50 ms debounce of §14.3 (a pending rebuild calls `SetExclusions` at once), so the DLL and the
@@ -1502,9 +1635,13 @@ var (
   its `shared_app_uses_mic` / `shared_app_kept_out` warnings.
 - **Order around a share** (03's share controller): `OnShareStarted(uint32(req.Source.PID), req.Audio)` right before
   `core.StartShare`; `OnShareStopped()` when `Share.Done()` closes, whoever ended the share (the user, source gone,
-  the server, unlinked). `OnShareStarted` sets `SharedPID`, `soundOn = withAudio` and `paused = false`, and starts the
-  watcher if the sheet hasn't. `OnShareStopped` drops the viewer rules (§5.9), sets `SharedPID` to 0 and stops the
-  watcher unless `Watch(true)` holds it; per-run viewer overrides stay until isshoni quits.
+  the server, unlinked; also when `StartShare` fails). `OnShareStarted` sets `SharedPID`, `soundOn = withAudio` and
+  `paused = false`, keeps out again the browsers of the viewer tabs that still play, and starts the watcher if the
+  sheet hasn't. From then until `OnShareStopped` the share is live: polling and rule changes go on even if
+  `WatchAudio` failed (the DLL replaces a running share's rules, §4.3). `OnShareStopped` drops the viewer rules
+  (§5.9), sets `SharedPID` to 0 and stops the watcher unless `Watch(true)` holds it; per-run viewer overrides stay
+  until isshoni quits, and so does the table of tabs that play (`SetViewerBrowser`): a tab reports only when its
+  playback starts or stops (03 §12.2), so the next share must keep out a browser whose tab still plays (WA37).
 - **`SetPaused(paused)`** is idempotent and makes no engine call. 03's share controller calls it on every pause and
   resume, including screen lock and unlock and a pause from another device that 01's snapshot reports. The engine side
   of pause is not the Service's: 01's core pauses the Session (04's `im_set_paused`, which fades audio through
@@ -1514,9 +1651,11 @@ var (
 - **`SetShareSound(on)`** is the per-share **Share sound** switch. During a live share with audio it calls
   `SetAudioMode(AudioOff)` for off and `SetAudioMode(AudioExcludeApps)` for on (§6.5). Pause and sound are separate
   engine flags (§4.3), so friends hear silence while `paused || !soundOn`, and a resume keeps a switched-off share
-  silent. During a share started without audio there is no track to turn on: it only records the value, makes no
-  engine call, and `FriendsHear.mode` stays `off` (03 disables the checkbox for such a share). Outside a share it does
-  nothing and returns nil.
+  silent. When the share's audio session isn't running yet (`ErrAudioNotRunning`), the switch is recorded and
+  applied with the first live report. During a share started without audio there is no track to turn on: it only
+  records the value, makes no engine call, and `FriendsHear.mode` stays `off` (03 disables the checkbox for such a
+  share). Outside a share it does nothing and returns nil. `FriendsHear.mode` and the `sound-off` cause `off` come
+  from the service's own Share sound state (`withAudio && soundOn`), not from the report's `mode`.
 - **`WatchLevels(on)`** adds or removes one watcher of the meters (never below 0); §14.4 sets the polling rate from the
   count.
 - **`SoundCheck`** (§11.3): with `SelfInfo.Exe` it starts `<Exe> --sound-check-helper` (`exec.CommandContext`; on
@@ -1538,7 +1677,11 @@ var (
 ### 14.3 Rules builder
 
 Every call that changes inputs rebuilds `media.Exclusions` and calls `SetExclusions` (debounced 50 ms; `AudioConfig()`
-flushes the debounce):
+flushes the debounce). As built (WA37): the send goes 50 ms after the first unapplied change and takes every later
+change with it (the debounce is not restarted by each change); `SetExclusions` is called only while the watcher runs
+or a share is live, and otherwise the rules go with the next `WatchAudio`, `AudioConfig()` or `im_start`. The rules
+always use Windows exe names (the fake scripts a Windows PC on the Mac and Linux too), and all three self rules carry
+app id and name `isshoni`:
 1. Self: `RuleInstance(PID)`, `RuleAppExclude("isshoni.exe", SourceSelf, "isshoni", "isshoni")`,
    `RuleWebViewDataDir(dir)` with the host's folder (the DLL also matches folders below it, which covers WebView2's
    `\EBWebView`, §5.3).
@@ -1551,6 +1694,8 @@ flushes the debounce):
    browser included after a mic prompt is still kept out while it plays an isshoni viewer. **"Include" on a row whose
    reason is `viewer`** (`SetAppDecision(id, "include")`) sets that override for the exe: it suppresses only these
    row-4 rules until isshoni quits and doesn't write `appRules`, so mic keep-out (row 6) still applies to that browser.
+   Whether an "Include" is on a viewer row is decided from the service's own rules (a viewer rule names the exe and
+   no saved keep-out exists), not from the report row, which may be a poll old.
 6. Flags from settings; `SharedPID` from `SetSharedPID` and `OnShareStarted`.
 
 `Watch(true)` calls `WatchAudio` with the current rules; `Watch(false)` calls `UnwatchAudio` unless a share is live.
@@ -1667,18 +1812,24 @@ Example (Discord in a call, KOOK just opened the mic, sharing a game window):
   errors as §14.2 lists.
 - An app with decision `include` that uses the mic is heard and carries warning `included-uses-mic`.
 - With `keepOutMicUsers` off: no prompts; mic users are heard with `included-uses-mic`.
+- The service works out `included-uses-mic` itself for a heard mic user that is included or heard because
+  `keepOutMicUsers` is off: the DLL's planner sets the report's `included_uses_mic` only when a row-5 allow rule
+  matched (WA37). It also makes no mic prompt for a browser exe that has a viewer rule (pending or applied), so a
+  prompt doesn't flash and use up that browser's once-per-run prompt.
+- `FriendsHear.prompts` lists at most 3 and `alert.questions` counts the listed ones; further pending prompts are kept
+  and move up as earlier ones are answered.
 - While the window is hidden, 03 shows the prompt as a toast with the `desktop.native.toast.*` texts (§14.8).
 
 ### 14.7 Banner and tip rules
 
 | Code | Shown when | Level |
 |---|---|---|
-| `exclusion-unavailable` | probe `failed`, or `unsupported` with `osBuild >= 19041` | error |
+| `exclusion-unavailable` | probe `failed`, or `unsupported` with `osBuild >= 19041`; defensively also engine `endpoint` with no probe banner (the endpoint engine hears voice apps; §15's Win10 build-gate row) | error |
 | `windows-too-old` | probe `unsupported` with `osBuild < 19041` (defensive: below 19045 the app doesn't share, 04 `IM_OS_SUPPORTED`) | error |
 | `no-output-device` | state `no-device` | warning |
 | `reconnecting-sound` | `rebuilding` true | info |
 | `sound-off` | during a live share: `!soundOn` (the report's mode `off`) → `params.cause = "off"`; else paused (`SetPaused` or the report's `paused`) or the report's `muted` → `params.cause = "paused"` | info |
-| `capture-trouble` | a heard, playing app is `capture_failed`; `params.app` = its name | warning |
+| `capture-trouble` | a heard, playing app is `capture_failed`; `params.app` = its name (one banner, naming the first such app in sort order) | warning |
 | `viewer-muted` | engine `endpoint` while live (03 mutes the in-app viewer) | info |
 | `viewer-unknown-browser` | a viewer tab on Windows that plays reported family `safari`, `other` or an unknown value | warning |
 | tip `ducking` | the ducking preference is not 3 ("Do nothing") or absent, a mic user or voice app runs, and the tip isn't dismissed | — |
@@ -1784,7 +1935,7 @@ outside the window during a live share: tray warning state, pill text and one to
 | Timestamps | mix-time error ≤ 15 ms median, ≤ 5 ms p5–p95 spread (case 20); real-share A/V offset \|median\| ≤ 20 ms (`enginetest avsync`, §19.3); chunk spacing exactly 10 ms, packet spacing exactly 20 ms within a grid, from the first chunk (L0, §10.3); a new grid starts ≥ 10 ms (chunks) / ≥ 20 ms (packets) after the previous time, so times never decrease (§10.3) |
 | `im_audio_levels_get` | < 50 µs, lock-free |
 | `im_set_exclusions` | applied ≤ 50 ms |
-| COM-waiting calls | `im_list_audio_apps` one-shot ≤ 3 s, then `IM_ERR_TIMEOUT`; `im_audio_sound_check` ≤ `timeout_ms + 500` |
+| COM-waiting calls | `im_list_audio_apps` one-shot, `im_audio_watch` and `im_audio_unwatch` ≤ 3 s, then `IM_ERR_TIMEOUT`; `im_audio_sound_check` ≤ `timeout_ms + 500` |
 
 ## 18. The audiotest harness (the M2 exit gate)
 
@@ -2126,9 +2277,12 @@ Native tests use GoogleTest through 04's vcpkg `tests` feature and run with `tas
   `Preroll` → `Running` re-entry); a stream leaving the silent bypass gets `speex_resampler_reset_mem` (a stream fed
   a tone, then 200 ms of zeros, then the tone again shows no pre-silence samples at the onset); soft clip continuity;
   crossfade; PI controller in simulation (drift −500…+500 ppm, 10 ms bursts with ±3 ms jitter, 2 simulated hours:
-  fill 40 ± 15 ms after 60 s, zero underruns/trims, ratio std dev ≤ 30 ppm); the controller never emits ppm = 0 (a
-  drift of exactly 0 ppm for 10 simulated minutes: every update has |ppm| ≥ 1), and a ppm sweep through −1/+1 around
-  zero produces no click; **no allocation on the mixer thread after `Mixer::Start`** (Linux `host-debug`: a
+  fill 40 ± 15 ms after 60 s, zero underruns/trims, ratio std dev ≤ 30 ppm; the 2-hour runs are
+  `mix_drift_long_test`, a ctest entry of its own, beside `mix_drift_test`'s 20-minute runs, which add packets 15 and
+  25 ms late and 20 ms packets, §9.3; under a sanitizer the speexdsp runs last 20 s and skip only the ratio's spread);
+  the controller never emits ppm = 0 (a drift of exactly 0 ppm for 10 simulated minutes: every update has an
+  absolute ppm of 16 or more, one step of §9.3's 62 500 denominator), and a sweep through −1/+1 step around zero
+  produces no click; **no allocation on the mixer thread after `Mixer::Start`** (Linux `host-debug`: a
   `malloc`/`realloc`/`free` interposer counts calls from the mixer thread through 10 simulated minutes with ppm
   changes, onsets and bypass exits; must be 0; other hosts skip it with a log line); silence drop/pad; chunk
   timestamps exactly on the 10 ms grid; **sound from t = 0** (a channel playing before the first chunk): chunk
@@ -2384,7 +2538,7 @@ Each slice is independently testable. "Mac" means `task test` on the developer's
 | A1 | `audiorules` | Go data of §5.4 + tests | lower case, unique, families complete; `go test` green | Mac, CI | — | 0.5 |
 | A2 | Go audio types and fake | `internal/media/audio.go` (§13.1), goldens, `fake/audio_ctl.go` (`EngineConfig.AudioScenario`, the scenarios of §13.3, the call-log fields) | goldens parse; fake scenarios scripted under synctest; the fake's `AudioController` works before `Start`; `GOOS=windows/darwin/linux` and the gomobile package builds pass | Mac, CI | 01's C01 (media package) | 1.5 |
 | A3 | `audiopolicy` core | portable C++20 of §5–6 as CMake target `im_audiopolicy` in `native/common/audiopolicy/` (added by 04's `native/common/CMakeLists.txt`): snapshot, rules, classifier, lineage, mic state, planner, invariants, the WebView2 path rule | ≈ 60 GoogleTest table cases and the 10 000-seed property test pass under `task native:test` in `host-debug` and `host-tsan` (macOS clang, ubuntu-24.04) and `win-x64-ci` (windows-2025, MSVC) | Mac, CI | 04's E1 | 3 |
-| A4 | `audiomix` core | target `im_audiomix` in `native/common/audiomix/`: rings with QPC side ring, PI resampler (speexdsp from `native/vcpkg.json`, `init_frac` creation, \|ppm\| ≥ 1, `reset_mem` on leaving the bypass), silence drop/pad, channel states, fades, onset fade (saturated counter for new channels), soft clip, levels, silence flags, chunk timestamps (mix time, L0 = 50 ms, re-anchor only in silence) and the `OnGap` rules (§10.3, §10.4); report writer producing the goldens | §19.1 `audiomix` and report-writer tests pass, including the 30 ms-silence onset, ppm never 0, no mixer-thread allocation (Linux `host-debug`) and sound from t = 0; the drift simulation meets §17 | Mac, CI | A2 (goldens), 04's E1 | 3 |
+| A4 | `audiomix` core | target `im_audiomix` in `native/common/audiomix/`: rings with QPC side ring, PI resampler (speexdsp from `native/vcpkg.json`, `init_frac` creation, the 62 500 denominator, \|ppm\| ≥ 16, `reset_mem` on leaving the bypass), silence drop/pad, channel states, fades, onset fade (saturated counter for new channels), soft clip, levels, silence flags, chunk timestamps (mix time, L0 = 50 ms, re-anchor only in silence) and the `OnGap` rules (§10.3, §10.4); report writer producing the goldens | §19.1 `audiomix` and report-writer tests pass, including the 30 ms-silence onset, ppm never 0, no mixer-thread allocation (Linux `host-debug`) and sound from t = 0; the drift simulation meets §17 | Mac, CI | A2 (goldens), 04's E1 | 3 |
 | A5 | Windows watcher (no capture) | process table, endpoints, session notifications, meters, mic detection, device notifications, `AudioEngine::Init/Shutdown/Watch/Unwatch/SetRules/ListAppsJson/LevelsGet/ProbeFlags`, `im_caps.audio_flags`; Go `internal/media/native` (`audio.go`; an `audio_windows.go` only if WA35 needs Windows-only helpers, §13.2) | caller-fake tests on the Mac and CI ubuntu; hosted CI windows: process-table tests, 100 start/stop cycles without leaks, `no-device` state, `IM_INIT_NO_AUDIO` returns. PC (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR): `isshoni-audiotest apps` lists playing apps with correct verdicts for Discord, a browser and a Steam game | Mac, CI, PC | A3, 04's E2 (DLL skeleton and loader) | 2.5 |
 | A6 | Windows capture and mixer | activators, held handles (and the no-handle path, §5.7), commit check, loopback streams, capture thread, include set (`pid_reuse` verdicts, `covered` notes), fast path with retroactive cut, endpoint engine, probe, mode/mute/pause flags, sound check, health checks, `Mixer` of §10.5 calling 04's `PcmSink` (packets reach `im_next_packet` through 04's bridge), test exports (`im_test_render_bursts` predicting from `IAudioClock`, §13.2), `AudioTestHooks` | hosted CI builds and `selfcheck` passes. PC: cases 1–4, 10, 15, 19–21 pass (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR), and 04's E13 acceptance: `enginetest capture -audio mix` gives a playable `audio.ogg` | CI windows, PC | A0, A4, A5, 04's E13 | 4 |
 | A7 | Audiotest harness | §18 complete: analyzer (S1's as base, plus the 50 ms short-window rule and measured cut/onset of §18.6), runner, the `SetExclusions` recorder, fixtures (`firstRenderNs`, `reuse-pid`), all cases (24–27 included), gate configuration, report, redaction, summary, `record`, `merge`, README with the "unverified" column for R7 | Mac: analyzer and verdict tests, including the 20 ms burst that must FAIL absent and the faded 1000 Hz tone that must not trip 907 Hz. PC: all required cases run; any failure is a real engine bug, fixed in A6's code by a `WF` fix slice that lists `native/windows/src/audio/`, never in a harness PR (README §3 item 13; a case 25 or 26 failure switches on its fallback, §6.2, §6.4) | Mac, CI, PC | A6 (runs), A2, A8 (the harness drives the service) | 3 |

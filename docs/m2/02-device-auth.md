@@ -91,7 +91,8 @@ internal/server/auth/
   deviceflow.go                           StartDeviceFlow, LookupUserCode, DecideUserCode, the device_code grant
   devicepassword.go                       PasswordDeviceLogin (§14)
   refresh.go                              the refresh_token grant: rotation, reuse detection, grace
-  bearer.go                               AuthenticateBearerToken, the bearer cache, Touch for devices
+  bearer.go                               AuthenticateBearerToken, the bearer cache, TouchPrincipal's device case
+                                          (session.go: TouchPrincipal, and Touch with M1's signature)
   devicename.go                           NormalizeDeviceName
   limiter.go                              + device-code-ip, device-code-ip48 (IPKey48), device-token-ip, device-lookup
 internal/server/httpapi/
@@ -473,7 +474,10 @@ unique.
   ClientKind: device.ClientKind}`. `DeviceName` (new in M2) is set only for a bearer principal, from the device row.
 - **Bearer cache**: token hash → (device, user, token expiry), TTL `min(30 s, token expiry − now)`. Every path that
   deletes a device or changes a user (03 §7.4's invalidation list) also forgets that device's or user's entries,
-  synchronously, before `ConnCloser` runs.
+  synchronously, before `ConnCloser` runs. As built (WA39): every successful refresh also forgets the device, because
+  `TrimAccessTokens` and the grace paths' `DeleteAccessTokensIssuedBy` may delete access tokens the cache still holds,
+  and those must be refused at once; and the cache refuses a token whose `expires_at` it knows has passed without
+  reading the database ("expiry checks without a DB read").
 - **Use**: `last_seen_at` and `last_ip` of the device are written at most once per 5 min per device (an in-memory
   timestamp, best effort, like sessions, 03 §7.4). `MaybeRotate` does nothing for a bearer principal (as built).
 - A bearer request **ignores cookies completely**: the `Cookie` header is not read, and the cross-origin half of 03
@@ -488,9 +492,10 @@ unique.
 ```
 
 `exchangeId` is optional (16 random bytes the client draws per logical refresh and reuses for that refresh's retries,
-memory only); `appVersion` is optional and, when valid (§5.2's rule), updates the device row, so the Devices page shows
-what runs now. A malformed `exchangeId` is 422 `validation_failed {exchangeId: invalid}`; a malformed refresh token is
-400 `invalid_grant`.
+memory only); `appVersion` is optional and updates the device row, so the Devices page shows what runs now. A
+malformed `exchangeId`, or a non-empty `appVersion` that breaks §5.2's rule, is 422 `validation_failed
+{exchangeId|appVersion: invalid}` (as §7.1's #45 error list says, rather than silently ignored); a malformed refresh
+token is 400 `invalid_grant`. The 422 checks come first, then the refresh token's shape (WA39).
 
 The new pair is generated before the `Write` (no `crypto/rand` inside it). Then, in one `Write`, with `P` the presented
 token, `T` its `spent_at`, `C` the token its `replaced_by` names and `X` the HMAC of the request's `exchangeId`:
@@ -504,8 +509,8 @@ without `exchangeId` never takes the retry row.
 |---|---|---|
 | `P` unknown or expired | — | 400 `invalid_grant` |
 | `P` unspent | `SpendRefreshToken(P, new refresh, X)`; insert the new access and refresh tokens with `issued_by = P`; `TrimAccessTokens(device, 5)`; `TouchDevice(ip, appVersion)` | 200 pair |
-| `P` spent, `C` is P's own child, and `X` equals `P.exchange_hash` | the client's retry of the same refresh (**grace**): `DeleteAccessTokensIssuedBy(P)` (C's access token); `SupersedeRefreshToken(C, new refresh)` (C stays as a spent row until its own expiry, `exchange_hash` NULL); insert a new pair with `issued_by = P`; `SetReplacedBy(P, new refresh)` | 200 pair |
-| `P` spent, `C` is P's own child, `now − T ≤ 120 s`, and `C.created_at = T` (no grace re-issue yet) | the answer was lost and the client restarted (**grace**): same as the row above; the new pair's `created_at` is `now ≠ T`, so a second replay falls through | 200 pair |
+| `P` spent, `C` is P's own child, and `X` equals `P.exchange_hash` | the client's retry of the same refresh (**grace**): `DeleteAccessTokensIssuedBy(P)` (C's access token); `SupersedeRefreshToken(C, new refresh)` (C stays as a spent row until its own expiry, `exchange_hash` NULL); insert a new pair with `issued_by = P`; `SetReplacedBy(P, new refresh)`; `TrimAccessTokens(device, 5)` (§6.7: at every insert); `TouchDevice(ip, appVersion)` | 200 pair |
+| `P` spent, `C` is P's own child, `now − T ≤ 120 s`, and `C.created_at = T` (no grace re-issue yet) | the answer was lost and the client restarted (**grace**): same as the row above; the new pair's `created_at` is `now ≠ T` (the store keeps milliseconds, so a re-issue that falls in the spend's own millisecond stores `T + 1 ms`), so a second replay falls through | 200 pair |
 | any other spent `P` (its child was used, the window passed, a second replay, another `exchangeId` after the window, or `P` is a child that a grace path superseded) | **reuse**: `DeleteDevice` (cascades every token and the device's push subscriptions); audit `device.refresh_reused` | 400 `invalid_grant` with `params {reason: "reused"}` |
 
 - **Why a grace path keeps C**: the client that takes a grace path never received C (its answer was lost), so it
@@ -518,7 +523,11 @@ without `exchangeId` never takes the retry row.
   chain left with the other holder.
 - After a committed reuse: the bearer cache forgets the device, `ConnCloser.CloseConnections({UserID, DeviceID},
   ReasonDeviceRevoked)` (01 sends `session_revoked`, 4401), the admin alert `refresh_token_reused` (03 §7.11; actor
-  `system`, target the username), and `{UserID}: devices`.
+  `system`, target the username), and `{UserID}: devices`. auth sends no notifications, so `DeviceToken` returns an
+  exported **`*auth.RefreshReusedError{UserID, DeviceID}`** for a reuse, which unwraps to the client's answer
+  (`*api.Error` `invalid_grant {reason: reused}`): httpapi's #45 handler finds it with `errors.As`, notifies
+  `{UserID}: devices`, then writes the error as for any service error. Neither ID reaches the client (WA39-R3; WA47
+  builds the handler and its §7.1 test checks the notification).
 - A user who is not `active` has no devices (03 §7.7 deletes them on disable and reset), so the table needs no status
   row; the code checks it anyway and answers `invalid_grant`.
 - Why the exchange id: the client retries one refresh with the same `exchangeId` for as long as it runs (§11.4), so a
@@ -539,23 +548,25 @@ without `exchangeId` never takes the retry row.
    every call, so nothing else holds the site's copy; `config` keeps importing no protocol package. As built, an
    allowed origin is accepted only for a socket without a valid cookie, which then authenticates with `hello.auth`; a
    valid cookie from such an origin gets 403. The Go connection sends no `Origin` and takes the non-browser path.
-2. **The bearer adapter** (`internal/server/wire.go`): `AuthenticateBearer(ctx, token)` calls
-   `auth.AuthenticateBearerToken(ctx, token.Reveal())`; `*api.Error` `invalid_token` or `unauthenticated` →
-   `signal.ErrInvalid` (the hub answers `unauthenticated`, 4401); other errors pass through (the hub answers
-   `internal`). The `Identity` is `{UserID, Name: Username, Admin: Role == admin, DeviceID, DeviceName}`
-   (`identityOf` copies the principal's `DeviceName`). `Admin` is set for a bearer identity exactly as for a cookie
-   one (presence's admin flag and the admin-only `invalidate` topics, as built); only the REST admin routes refuse a
-   bearer (§6.4).
+2. **The bearer adapter** (`internal/server/wire.go`, WA56's change): `AuthenticateBearer(ctx, token)` calls
+   `auth.AuthenticateBearerToken(ctx, token.Reveal())` (until WA56, `wire.go`'s adapter answers every bearer
+   `signal.ErrInvalid`, as M1 built it); `*api.Error` `invalid_token` or `unauthenticated` → `signal.ErrInvalid` (the
+   hub answers `unauthenticated`, 4401); other errors pass through (the hub answers `internal`). The `Identity` is
+   `{UserID, Name: Username, Admin: Role == admin, DeviceID, DeviceName}` (`identityOf` copies the principal's
+   `DeviceName`). `Admin` is set for a bearer identity exactly as for a cookie one (presence's admin flag and the
+   admin-only `invalidate` topics, as built); only the REST admin routes refuse a bearer (§6.4).
    - **`signal.Identity.DeviceName string`** (new in M2, bearer identities only; "" for cookie sessions): the device's
      current name, which the hub puts into 01-client-core's `OwnConnection.DeviceName` (its §10.4). `LogValue` stays
      as built (user id and admin flag only), so the name is never logged.
-3. **Revalidation**: `Revalidate` for an identity with a `DeviceID` already builds a bearer principal (as built);
-   M2's `auth.Touch` checks that the device exists and its user is `active` (cache or one read), records the use
-   (§6.1), and returns the principal with the device row's current `DeviceName` (§6.8: `Touch` now returns
-   `(Principal, error)`). `Revalidate` copies it into the identity; a `DeviceName` that changed is applied like a
-   changed `Name` (M1 01 §3.2), so a rename through `PATCH /me/devices/{id}` reaches open connections within the
-   5-min revalidation. The access token's expiry doesn't matter after `hello` (01 §3.2): a connection lives until its
-   device is revoked.
+3. **Revalidation**: `Revalidate` for an identity with a `DeviceID` already builds a bearer principal (as built); M2's
+   **`auth.TouchPrincipal`** checks that the device exists, is the principal's user's and that user is `active` (cache
+   or one read), records the use (§6.1), and returns the principal as the rows have it now: the device row's current
+   `DeviceName` and the user's current name and role (§6.8). `Touch` keeps M1's signature (`error` only) and calls
+   `TouchPrincipal` (WA39-R2): `wire.go`'s `sessionService` interface calls `Touch`, and only WA56 and WA66 may change
+   `wire.go`, so **WA56** switches `sessionService` and `Revalidate` to `TouchPrincipal`. `Revalidate` copies the
+   principal into the identity; a `DeviceName` that changed is applied like a changed `Name` (M1 01 §3.2), so a rename
+   through `PATCH /me/devices/{id}` reaches open connections within the 5-min revalidation. The access token's expiry
+   doesn't matter after `hello` (01 §3.2): a connection lives until its device is revoked.
 4. **Pre-auth refund**: a socket without a cookie takes a token of the hub's per-IP pre-auth bucket at the upgrade
    (20 per IP key per minute, 01 §3.1 step 4). M2 gives it back when its `hello` authenticates with a bearer
    (`keyedLimiter.refund`, beside the existing `h.authenticated(s)`), so the bucket counts only sockets that never
@@ -645,9 +656,10 @@ credentials, an `Admin` route only the cookie):
 | 12 | `POST /me/password` | `UserSession` | Account changes happen in the browser, never in the app (decision 10) |
 | 13 | `POST /me/delete` | `UserSession` | Same |
 | 14 | `GET /me/sessions` | `User` | For a bearer no entry is `current`, and M1's "own session must be live" check is skipped |
+| 15 | `DELETE /me/sessions/{id}` | `User` (as built, unchanged) | A bearer may revoke any of its user's web sessions (`RevokeSession` accepts it; WA39) |
 | 16 | `POST /me/sessions/revoke-others` | `UserSession` | "Other than this browser" has no meaning for a device |
 | 17 | `GET /me/devices` | `User` | The caller's device is `current: true`; M1's "own session must exist" check becomes "own device must exist" for a bearer |
-| 18 | `DELETE /me/devices/{id}` | `User` | A bearer may remove its own device: that is signing out (`device.revoked {via: "app"}`) |
+| 18 | `DELETE /me/devices/{id}` | `User` | A bearer may remove its own device: that is signing out (`device.revoked {via: "app"}`); another device of its user is removed as on the Devices page (`{via: "devices_page"}`, which M1's cookie path now writes too, instead of `{}`) |
 | 21–23 | `GET /invites`, `POST /invites`, `DELETE /invites/{id}` | `User` (as built; the handler checks admin, `membersCanInvite` or the creator) | The desktop invite dialog uses them (03-desktop-app); an admin's bearer may create and revoke invites, which is what any member with `membersCanInvite` can do |
 | 24, 28 | `POST /push/subscriptions`, `POST /push/test` | `UserSession` | A subscription belongs to a web session (03 §12.4.6); native push is *later* |
 | 29–43, and M1 04's `GET\|POST /admin/doctor`, `GET /admin/bandwidth` | every `/api/v1/admin/*` route (#43 is M1 04's dashboard) | `Admin`, cookie only | Decision 10; the paragraph under the access table |
@@ -728,8 +740,14 @@ func (s *Service) StartDeviceFlow(ctx context.Context, in api.DeviceCodeRequest,
 func (s *Service) LookupUserCode(ctx context.Context, p Principal, userCode string, m ReqMeta) (api.DeviceLookup, error)
 // DecideUserCode (CHANGED: takes the request, for deviceName).
 func (s *Service) DecideUserCode(ctx context.Context, p Principal, in api.DeviceDecideRequest, m ReqMeta) error
-// DeviceToken serves both grants (§5.4, §6.2).
+// DeviceToken serves both grants (§5.4, §6.2). A reused refresh token returns *RefreshReusedError{UserID, DeviceID},
+// which unwraps to *api.Error invalid_grant {reason: reused}: the caller notifies {UserID}: devices when errors.As
+// finds it, then writes the error as usual; neither ID reaches the client.
 func (s *Service) DeviceToken(ctx context.Context, in api.DeviceTokenRequest, m ReqMeta) (api.DeviceTokenResponse, error)
+type RefreshReusedError struct {
+	UserID   store.UserID
+	DeviceID store.DeviceID
+}
 // PasswordDeviceLogin is POST /device/password (§14): login's order and buckets, then the device_code grant's
 // success Write with linked_via = 'password'. Errors as Login's, plus 422 for the device fields.
 func (s *Service) PasswordDeviceLogin(ctx context.Context, in api.DevicePasswordRequest, m ReqMeta) (api.DeviceTokenResponse, error)
@@ -749,10 +767,20 @@ func (s *Service) RevokeOwnDevice(ctx context.Context, p Principal, m ReqMeta) e
 
 // ---- changed for bearer principals ----
 // Authenticate: an Authorization header → the bearer path (§6.1), the cookie is not read; else the cookie (M1).
-// Touch (CHANGED: returns the principal): func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr)
-// (Principal, error). A session principal comes back unchanged; a bearer principal checks its device row and user
-// (§6.3) and comes back with the row's current DeviceName. wire.go's toucher interface and Revalidate follow.
-// RevokeDevice: allowed for a bearer; its own ID is the app's sign-out.
+// TouchPrincipal (NEW, WA39; 03 §7.13 sketched it as a changed Touch): the hub's Revalidate, returning the principal.
+func (s *Service) TouchPrincipal(ctx context.Context, p Principal, ip netip.Addr) (Principal, error)
+// A session principal comes back unchanged; a bearer principal checks its device row and user (§6.3) and comes back
+// as the rows have it now (the device's current DeviceName, the user's current name and role). Only
+// *api.Error{unauthenticated} means the credential is gone; the use is recorded best effort, never returned.
+// Touch keeps M1's signature, func (s *Service) Touch(ctx, p, ip) error, and calls TouchPrincipal: wire.go's
+// sessionService interface calls it, and WA56 switches that interface and Revalidate to TouchPrincipal (copying
+// DeviceName). A bearer whose device or user went away between the request chain and a method's Write gets
+// unauthenticated from that method (loadCaller), as from Touch, not invalid_token.
+// RevokeDevice: allowed for a bearer; its own ID is the app's sign-out ({via: "app"}), another device of its user
+// is removed as on the Devices page ({via: "devices_page"}, also the cookie path's detail now).
+// RevokeSession: allowed for a bearer (DELETE /me/sessions/{id} stays a User route, §6.4 #15).
+// Logout: refuses a bearer principal with 403 forbidden {credential: "session"}: POST /auth/logout is a Public route
+// that reads the cookie, and the app signs out with RevokeOwnDevice.
 // LogoutEverywhere: allowed for a bearer; deletes every session and device, its own included.
 // ChangePassword, DeleteSelf, RevokeOtherSessions keep refusing a bearer (the routes are UserSession, §6.4).
 // The admin methods (03 §7.11, M1 04's ops routes) are reached only by cookie principals: their routes are Admin,
@@ -761,12 +789,12 @@ func (s *Service) RevokeOwnDevice(ctx context.Context, p Principal, m ReqMeta) e
 func NormalizeDeviceName(in string) (string, error) // §5.6; field codes as errors
 ```
 
-**As built after WA30** (interfaces first): the device flow and the password link are real; `AuthenticateBearerToken`,
-`RenameDevice`, `RevokeOwnDevice`, the `refresh_token` grant of `DeviceToken`, the bearer cases of `Touch`,
-`RevokeDevice` and `LogoutEverywhere`, and `Principal.DeviceName` are declared and return not-implemented errors (or
-an empty value) until WA39. `Touch` keeps M1's signature (`error` only) until WA39 and the wiring slice change it
-together, because `wire.go` (WA56's and WA66's) calls it. auth sends no notifications: httpapi sends `{UserID}:
-devices` after the call (§5.4, WA47).
+**As built after WA39**: the whole API above is real; no not-implemented stub is left. `Touch` keeps M1's signature
+and `TouchPrincipal` is the principal-returning Touch (WA39-R2; WA39 is the last slice that changes
+`internal/server/auth`, and WA56 switches `wire.go`'s `sessionService`, `Revalidate` and the bearer adapter, §6.3).
+auth sends no notifications: httpapi sends `{UserID}: devices` after the call (§5.4, WA47), after a reuse through
+`RefreshReusedError` (§6.2). `device.refresh_reused` is written with a system actor that carries the presenter's IP
+(§8's IP column), although `store.Actor`'s comment says system actors have no IP.
 
 `ReasonDeviceRevoked` (as built) is used for every device row of §6.5; `AdminAlert` kind `refresh_token_reused`
 (03 §7.11) is raised after a committed reuse. New limiter rates in `limiter.go`:
@@ -1010,7 +1038,9 @@ Golden JSON for each type goes in `internal/protocol/api/testdata/`; `task gen` 
 `TestAuditActionsInSource` and `TestAuditCoverage` (03 §10, README S70) gain these rows: every action above is produced
 by a real request (or the janitor) and found in `GET /api/v1/admin/audit` with its kinds and IP. `device.expired`'s
 row came with the store (group 2's integration fix, since the store names the action from WA19 on): a "later" row
-targeting `device`, with no actors listed, until WA47's `TestAuditCoverage` produces it.
+targeting `device`, with no actors listed, until WA47's `TestAuditCoverage` produces it. Group 4's integration added
+`device.renamed` (`inAuth`) and marked `device.refresh_reused` `sec` and `inAuth` (36 actions): auth writes both
+(WA39), and they stay "later" rows until WA47's `TestAuditCoverage` produces them.
 
 **Admin alert**: `refresh_token_reused` (03 §7.11), after the commit, to every admin with `adminAlerts` on.
 
@@ -2118,12 +2148,12 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
 - **`version.Parse(s) (SemVer, error)`, `version.Compare(a, b string) (int, error)`, `version.Below(v, floor string) (below, ok bool)`**,
   `SemVer.Compare` and `version.ErrNotSemVer` in `internal/version` (§13.2): available to 06-windows-release's "no
   downgrades" check and 01-client-core.
-- **Server Go**: `auth.(*Service)` methods of §6.8 (with `PasswordDeviceLogin` and `Touch` returning the principal);
-  `auth.Principal.DeviceName` and `signal.Identity.DeviceName` (bearer only, never logged; copied by `wire.go`'s
-  `AuthenticateBearer` and `Revalidate`; 01-client-core's `OwnConnection.DeviceName` reads it);
-  `httpapi.UserSession`, `httpapi.UserDevice`, and `httpapi.Admin` refusing every bearer (403 `forbidden
-  {credential: session}`; 04's admin routes inherit it); `httpapi.Deps.DesktopOrigins []string`; `site.ExtraOrigins =
-  protocol.DesktopOrigins()` in `wire.go`, feeding `signal.Config.AllowedOrigins` (as built) and
+- **Server Go**: `auth.(*Service)` methods of §6.8 (with `PasswordDeviceLogin`, and `TouchPrincipal` returning the
+  principal while `Touch` keeps M1's signature); `auth.Principal.DeviceName` and `signal.Identity.DeviceName` (bearer
+  only, never logged; copied by `wire.go`'s `AuthenticateBearer` and `Revalidate`; 01-client-core's
+  `OwnConnection.DeviceName` reads it); `httpapi.UserSession`, `httpapi.UserDevice`, and `httpapi.Admin` refusing every
+  bearer (403 `forbidden {credential: session}`; 04's admin routes inherit it); `httpapi.Deps.DesktopOrigins []string`;
+  `site.ExtraOrigins = protocol.DesktopOrigins()` in `wire.go`, feeding `signal.Config.AllowedOrigins` (as built) and
   `httpapi.Deps.DesktopOrigins`; the store methods of §4.2; migration `0002_device_flow.sql`; `PruneStats.Devices`.
 - **Client Go** (for 01-client-core and 03-desktop-app):
   - `deviceauth.Manager.AccessToken(ctx context.Context, forceRefresh bool) (protocol.Secret, error)`: the
@@ -2254,9 +2284,9 @@ DA1 and can run beside them; DA13 waits for 03-desktop-app's and 06-windows-rele
 | DA1 | **Shared names**: `api` device DTOs (with `DevicePasswordRequest`) with redaction and golden JSON, `NormalizeUserCode`/`FormatUserCode`, `DeviceInfo.Current`; `protocol.DesktopAssetOriginWindows` and `protocol.DesktopOrigins`; `internal/version/semver.go` exported and the hub switched to it (its `semver.go` removed); `task gen` | `internal/protocol/api`, `internal/protocol`, `internal/version`, `internal/server/signal` (semver only), `web/src/protocol/*.gen.ts` | §16.1 rows for `api`, `protocol`, `version`; the hub's tests unchanged and green; tygo drift check green | — | Mac, CI ubuntu | 1 |
 | DA2 | **Store**: migration 0002, every §4.2 method, the devices prune rule, `PruneStats.Devices` | `internal/server/store` | §16.1 store row; the migration test from a schema-1 file with rows; 03 §15's schema tests green | DA1 | Mac, CI ubuntu | 1.5 |
 | DA3 | **Device flow in auth**: `StartDeviceFlow`, `LookupUserCode`, `DecideUserCode`, the `device_code` grant of `DeviceToken`, `PasswordDeviceLogin` (§14, sharing the grant's success `Write`), `NormalizeDeviceName`, the four buckets (`device-code-ip48` with `IPKey48` included), the 5,000 pending-code cap, the device cap, audit rows `device.approved/denied/linked` (both `via`), `auth.throttled` scopes | `internal/server/auth` | §16.1 device-flow row, password-link cases included (fake clock, counting hasher/store fakes) | DA2 | Mac, CI ubuntu | 2.5 |
-| DA4 | **Tokens in auth**: `AuthenticateBearerToken` and `Authenticate`'s bearer path with the cache, `Principal.DeviceName`, the `refresh_token` grant (rotation, reuse, grace with the superseded child kept as a spent row), `Touch` for devices (returning the principal), `RenameDevice`, `RevokeOwnDevice`, bearer cases of `RevokeDevice`/`LogoutEverywhere`, `device.expired` in the janitor log, the `refresh_token_reused` alert | `internal/server/auth` | §16.1 tokens row; the M1 revocation matrix tests still green with device rows present | DA3 | Mac, CI ubuntu | 2 |
+| DA4 | **Tokens in auth**: `AuthenticateBearerToken` and `Authenticate`'s bearer path with the cache, `Principal.DeviceName`, the `refresh_token` grant (rotation, reuse, grace with the superseded child kept as a spent row), `TouchPrincipal` for devices (`Touch` keeps M1's signature, §6.8), `RefreshReusedError`, `RenameDevice`, `RevokeOwnDevice`, bearer cases of `RevokeDevice`/`LogoutEverywhere`, `device.expired` in the janitor log, the `refresh_token_reused` alert | `internal/server/auth` | §16.1 tokens row; the M1 revocation matrix tests still green with device rows present | DA3 | Mac, CI ubuntu | 2 |
 | DA5 | **REST**: `device.go` routes (#44–#49, #52; #48 `/device/password` included), `Access` `UserSession`/`UserDevice`, `Admin` refusing a bearer, the credential step, the CORS step, `Deps.DesktopOrigins`, the §6.4 access changes, `/me` and `/me/devices` for bearers, `PATCH /me/devices/{id}`, `/info` `deviceFlow`, notify topics, audit coverage | `internal/server/httpapi` | §16.1 httpapi row (endpoint table, credential and CORS matrices, audit coverage) | DA4 | Mac, CI ubuntu | 2 |
-| DA6 | **Hub and wiring**: the pre-auth refund; `signal.Identity.DeviceName`; `wire.go`: `site.ExtraOrigins = protocol.DesktopOrigins()` after `config.NewSite` (the hub's `AllowedOrigins` line stays as built) and `httpapi.Deps.DesktopOrigins = s.site.ExtraOrigins`, `AuthenticateBearer` → `AuthenticateBearerToken`, `identityOf` and `Revalidate` copying `DeviceName` (a change applied like a changed `Name`); `itest/device_helpers_test.go` with `linkDevice`; `itest/device_test.go` cases 1–3 and 5 with `linkDevice` and raw HTTP in place of the manager (the manager comes in DA11), and cases 9–12 (raw HTTP only) | `internal/server/signal`, `internal/server` (wire.go), `internal/server/itest` | §16.1 signal row; §16.2 cases 1–3, 5 through `linkDevice`, and 9–12; `goleak` clean | DA5 | Mac, CI ubuntu | 1 |
+| DA6 | **Hub and wiring**: the pre-auth refund; `signal.Identity.DeviceName`; `wire.go`: `site.ExtraOrigins = protocol.DesktopOrigins()` after `config.NewSite` (the hub's `AllowedOrigins` line stays as built) and `httpapi.Deps.DesktopOrigins = s.site.ExtraOrigins`, `AuthenticateBearer` → `AuthenticateBearerToken`, `identityOf` and `Revalidate` copying `DeviceName` (a change applied like a changed `Name`), with `wire.go`'s `sessionService` interface and `Revalidate` switched from `Touch` to `auth.TouchPrincipal` (WA39 kept `Touch`'s M1 signature, §6.3 item 3, §6.8); `itest/device_helpers_test.go` with `linkDevice`; `itest/device_test.go` cases 1–3 and 5 with `linkDevice` and raw HTTP in place of the manager (the manager comes in DA11), and cases 9–12 (raw HTTP only) | `internal/server/signal`, `internal/server` (wire.go), `internal/server/itest` | §16.1 signal row; §16.2 cases 1–3, 5 through `linkDevice`, and 9–12; `goleak` clean | DA5 | Mac, CI ubuntu | 1 |
 | DA7 | **Web**: `web/src/link/`, the router line, DevicesPage app rows, `lib/appLink.ts`, i18n (`lazy/link.en.json`, two `errors.*` keys), Vitest, `web/e2e/link.spec.ts`, `a11y.spec` states | `web/src/link`, `web/src/app/router.tsx` (one line), `web/src/account`, `web/src/lib/appLink.ts`, `web/src/i18n`, `web/e2e` | §16.3; `task lint typecheck test e2e` green; initial JS stays under 05's 200 KB budget (the page is lazy) | DA6 | Mac, CI ubuntu | 2 |
 | DA8 | **Client compat and deep links**: `internal/client/compat` (with the undecided `FromError` case), `internal/client/deeplink` with `links.json` and the fuzz target | `internal/client/compat`, `internal/client/deeplink` | §16.1 compat and deeplink rows; 06's `lint-go` (`GOOS=windows`) green | DA1 | Mac, CI ubuntu | 1 |
 | DA9 | **Credential store**: interface, memory, file (non-Windows), Windows Credential Manager | `internal/client/credstore` | §16.1 credstore row on ubuntu and on 06's `windows-go` job | — | Mac, CI ubuntu, CI windows (06 windows-go) | 1.5 |
