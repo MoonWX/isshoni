@@ -1,12 +1,15 @@
 // session_fake_test (docs/m2/04-windows-engine.md §18.2, README WA23): the session core through the C ABI with the
 // test hooks (IM_TEST_HOOKS builds: win-x64-ci, win-x64-asan): test:pattern (and the fake picker's picks), IM_ENC_FAKE
 // and the test tone; no GPU and no audio device (the engine runs with IM_INIT_NO_AUDIO, which the tone doesn't need).
+// IM_ENC_FAKE takes no pixels, so these sessions run no GPU path (README WF2: frame times only, no WARP device) and
+// the timing bounds below hold on a runner without a GPU; session_gpu_test runs the session's GPU path.
 //
 // It asserts: each layer's first packet is KEYFRAME|REINIT within 500 ms after im_start returns, also on a static
 // pattern and with no captured frame at all; IM_ENC_FAKE's output (real SPS/PPS for the profile and size, CB byte e0,
 // AU sizes, the Marker's CaptureNS = capture_ts_ns − epoch_ns); every capture_ts_ns ≥ epoch_ns; f ≈ 60 fps, q 15 fps; a
 // keyframe within one interval, also on a static screen; two AUs of a layer at least one 90 kHz tick apart (a static
-// IDR followed by a late frame); im_set_layer_active; pause (only REFRESH and IDR packets, audio keeps 50 packets/s);
+// IDR followed by a late frame); im_set_layer_active; pause (only REFRESH and IDR packets, audio keeps 50 packets/s,
+// fpsIn keeps counting the captured frames);
 // im_set_profile; im_set_content_hint coalesced with an im_update_layer; an injected encode error (the same encoder
 // re-opened, or ENCODER_CHANGED before the next candidate's first REINIT|KEYFRAME); an injected device removal
 // (ENDED{IM_ERR_ENCODER_LOST} device_removed within 1 s, then a new session on a new device); exhausted candidates; a
@@ -23,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -36,6 +40,7 @@
 #include "im/h264/nal.h"
 #include "im/h264/sps.h"
 #include "isshoni_media.h"
+#include "session/session.h"
 #include "session/sources.h"
 #include "testhooks/fake_encoder.h"
 #include "testhooks/testhooks.h"
@@ -55,6 +60,19 @@ std::string LastError() {
 }
 
 bool StartsWith(const std::string &s, const std::string &prefix) { return s.rfind(prefix, 0) == 0; }
+
+// im_get_stats' document ("" when it fails).
+std::string StatsOf(im_session s) {
+  std::vector<char> buf(16384);
+  const int32_t n = im_get_stats(s, buf.data(), static_cast<int32_t>(buf.size()));
+  return n > 0 ? std::string(buf.data(), static_cast<std::size_t>(std::min<int32_t>(n, 16383))) : std::string();
+}
+
+// The number right after the first occurrence of key in doc (-1 when there is none).
+double NumberAfter(const std::string &doc, const std::string &key) {
+  const std::size_t at = doc.find(key);
+  return at == std::string::npos ? -1.0 : std::strtod(doc.c_str() + at + key.size(), nullptr);
+}
 
 // One packet, copied out of the engine's memory (valid until the next call).
 struct Pkt {
@@ -272,6 +290,7 @@ TEST_F(Session, FirstPacketOfEachLayerIsAReinitKeyframeWithin500ms) {
   EXPECT_EQ(info.layers[1].width, 640u);
   EXPECT_EQ(info.layers[1].height, 360u);
   EXPECT_EQ(info.layers[1].fps, 15u);
+  EXPECT_FALSE(im::session::GpuPathOf(s)) << "IM_ENC_FAKE sessions run no GPU path: they stay off WARP";
   ExpectFirstKeyframes(s, started_, epoch_, 2, "moving pattern");
   EXPECT_EQ(im_stop(s), IM_OK);
 }
@@ -563,6 +582,11 @@ TEST_F(Session, PauseSendsOnlyRefreshesAndIdrsWhileAudioFlows) {
   ASSERT_EQ(im_request_keyframe(s, 0), IM_OK);
   uint32_t audio = 0, new_frames = 0, idrs = 0, refreshes = 0;
   const std::vector<Pkt> pkts = Pull(s, milliseconds(2000));
+  // fpsIn counts captured frames (§5.6) and capture runs on while paused (§8.5): the 60 Hz pattern over the last 2 s,
+  // all of them paused, although the video thread takes none of them.
+  const std::string stats = StatsOf(s);
+  EXPECT_NE(stats.find("\"paused\":true"), std::string::npos) << stats;
+  EXPECT_GT(NumberAfter(stats, "\"fpsIn\":"), 40.0) << stats;
   int64_t first_audio = 0, last_audio = 0;
   for (const Pkt &p : pkts) {
     if (p.kind == IM_PACKET_AUDIO) {

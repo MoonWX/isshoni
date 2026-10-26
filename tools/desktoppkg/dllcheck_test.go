@@ -433,6 +433,40 @@ func TestFFmpegDLLChecks(t *testing.T) {
 	}
 }
 
+// TestLoadConfigNote: without -load-config the load-config line is a note saying why it isn't checked (WA11's
+// dll_search_test verdict was "not honored": no check, 06 §5.1), never a problem; with -load-config the note shows the
+// value only.
+func TestLoadConfigNote(t *testing.T) {
+	rules := repoRules(t)
+	good := goodDLL(rules)
+	const want = "load config: DependentLoadFlags 0x0000 (not checked: the delay-load helper doesn't honor " +
+		"/DEPENDENTLOADFLAG, so the engine's delay-load hook is the guard, 04 §13.1)"
+	r := checkEngineDLL(good.build(), rules, goodExpect)
+	if len(r.problems) != 0 || !slices.Contains(r.notes, want) {
+		t.Errorf("problems %q, notes %q; want the note %q", r.problems, r.notes, want)
+	}
+	for _, n := range r.notes {
+		if strings.Contains(n, "WA11") || strings.Contains(n, "verdict decides") {
+			t.Errorf("a note still names WA11's verdict as pending: %q", n)
+		}
+	}
+	// A DLL linked with the flag anyway: still only printed.
+	flagged := good
+	flagged.loadConfig = true
+	flagged.dependFlags = 0x800
+	printed := func(n string) bool {
+		return strings.HasPrefix(n, "load config: DependentLoadFlags 0x0800 (not checked: ")
+	}
+	r = checkEngineDLL(flagged.build(), rules, goodExpect)
+	if len(r.problems) != 0 || !slices.ContainsFunc(r.notes, printed) {
+		t.Errorf("flagged: problems %q, notes %q", r.problems, r.notes)
+	}
+	r = checkEngineDLL(flagged.build(), rules, dllExpect{version: goodExpect.version, winver: goodWinver, loadConfig: true})
+	if len(r.problems) != 0 || !slices.Contains(r.notes, "load config: DependentLoadFlags 0x0800") {
+		t.Errorf("-load-config: problems %q, notes %q", r.problems, r.notes)
+	}
+}
+
 // TestDLLCheckCommand runs the command on fixture files: exit 0 with a summary, 1 with every problem, 2 on usage.
 func TestDLLCheckCommand(t *testing.T) {
 	root := repoRoot(t)
@@ -453,7 +487,8 @@ func TestDLLCheckCommand(t *testing.T) {
 
 	code, stdout, stderr := runCmd(t, "-root", root, "dll-check", "-dll", good, "-version", "0.0.0-ci.7", "-winver", "0.0.0.7")
 	if code != 0 || !strings.Contains(stdout, "isshoni-media.dll passed") || !strings.Contains(stdout, "exports: 39") ||
-		!strings.Contains(stdout, "static imports: KERNEL32.dll, ole32.dll") {
+		!strings.Contains(stdout, "static imports: KERNEL32.dll, ole32.dll") ||
+		!strings.Contains(stdout, "dll-check: load config: DependentLoadFlags 0x0000 (not checked: the delay-load helper") {
 		t.Errorf("good: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 
