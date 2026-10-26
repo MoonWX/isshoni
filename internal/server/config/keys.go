@@ -103,13 +103,14 @@ func (k Key) clone() Key {
 
 // ReservedEnvNames are the ISSHONI_* names that are not config keys and that the server ignores without a warning:
 // install.sh's, the release tooling's and the dev tasks' variables, plus ISSHONI_CONFIG (read as the config path).
-// The list matches 06's; a new non-key ISSHONI_* name must be added to both (04 §4.2). The env-only switches
-// ISSHONI_IN_CONTAINER and ISSHONI_ALLOW_EPHEMERAL_DATA are read by the server and are not warned about either.
+// The list matches 06's, with M2 06 §7.3's names after M1's; a new non-key ISSHONI_* name must be added to both
+// (04 §4.2). The env-only switches ISSHONI_IN_CONTAINER and ISSHONI_ALLOW_EPHEMERAL_DATA are read by the server and
+// are not warned about either.
 func ReservedEnvNames() []string { return slices.Clone(reservedEnv) }
 
 var reservedEnv = []string{
 	EnvConfig,
-	"ISSHONI_VERSION", // install.sh's target version and the Vite build version
+	"ISSHONI_VERSION", // install.sh's (and install-desktop.ps1's) target version and the Vite build version
 	"ISSHONI_YES",
 	"ISSHONI_NO_FIREWALL",
 	"ISSHONI_DOWNLOAD_BASE",
@@ -119,6 +120,20 @@ var reservedEnv = []string{
 	"ISSHONI_BIN",
 	"ISSHONI_DEV_SERVER",
 	"ISSHONI_LOADTEST_PASSWORD", // 02's isshoni-loadtest admin password
+	// M2 06 §7.3 (ISSHONI_VERSION and ISSHONI_DOWNLOAD_BASE are above): install-desktop.ps1's switches,
+	"ISSHONI_NO_UPDATE_CHECKS",
+	"ISSHONI_NO_LAUNCH",
+	"ISSHONI_ALLOW_DOWNGRADE",
+	// the updater's test builds (M2 06 §8.11),
+	"ISSHONI_UPDATE_TEST_BASE",
+	"ISSHONI_UPDATE_TEST_SIGNERS",
+	// the engine DLL of the Go tests (M2 04 §12.1) and the compat job (M2 06 §10.3),
+	"ISSHONI_TEST_ENGINE_DLL",
+	"ISSHONI_COMPAT_SERVER_URL",
+	"ISSHONI_COMPAT_ADMIN_FILE",
+	// and the release notes (M2 06 §11.7).
+	"ISSHONI_DESKTOP_MIN_VERSION",
+	"ISSHONI_FFMPEG_VERSION",
 }
 
 // envOnly are the env-only switches of §4.3: read directly, never warned about.

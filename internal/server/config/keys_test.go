@@ -261,7 +261,32 @@ func TestReservedNames(t *testing.T) {
 		"ISSHONI_INSTALL_SOURCED", "ISSHONI_INSTALLER_VERSION", "ISSHONI_SNAPSHOT_VERSION", "ISSHONI_BIN",
 		"ISSHONI_DEV_SERVER", "ISSHONI_LOADTEST_PASSWORD",
 	}
+	want = append(want, desktopEnvNames[2:]...) // M2 06 §7.3 after M1's; its first two names are M1's already
 	if got := ReservedEnvNames(); !slices.Equal(got, want) {
 		t.Errorf("ReservedEnvNames = %v, want 04 §4.2's list %v", got, want)
+	}
+}
+
+// desktopEnvNames is M2 06 §7.3's list, in its order.
+var desktopEnvNames = []string{
+	"ISSHONI_VERSION", "ISSHONI_DOWNLOAD_BASE",
+	"ISSHONI_NO_UPDATE_CHECKS", "ISSHONI_NO_LAUNCH", "ISSHONI_ALLOW_DOWNGRADE",
+	"ISSHONI_UPDATE_TEST_BASE", "ISSHONI_UPDATE_TEST_SIGNERS",
+	"ISSHONI_TEST_ENGINE_DLL", "ISSHONI_COMPAT_SERVER_URL", "ISSHONI_COMPAT_ADMIN_FILE",
+	"ISSHONI_DESKTOP_MIN_VERSION", "ISSHONI_FFMPEG_VERSION",
+}
+
+// The server never warns about M2 06 §7.3's names (README WA66): a desktop or release task that sets them in the
+// shell the server runs in leaves the server's log alone.
+func TestDesktopEnvNamesNotWarned(t *testing.T) {
+	env := make([]string, 0, len(desktopEnvNames))
+	for _, n := range desktopEnvNames {
+		if !slices.Contains(ReservedEnvNames(), n) {
+			t.Errorf("%s is not a reserved name", n)
+		}
+		env = append(env, n+"=1")
+	}
+	if ws := mustLoad(t, "", env).Warnings(); len(ws) != 0 {
+		t.Errorf("warnings:%s\nwant none", problemList(ws))
 	}
 }
