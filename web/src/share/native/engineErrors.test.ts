@@ -2,9 +2,10 @@
 import { describe, expect, it } from 'vitest';
 
 import { i18n } from '../../i18n';
+import { SHARE_HOLD_ENDED } from '../../platform/desktop/DesktopShare';
 import { BridgeError } from '../../platform/desktop/errors';
 import { ProtocolError } from '../../protocol/errors';
-import { isPickAgain, shareErrorText, shareErrorView } from './engineErrors';
+import { isPickAgain, shareErrorText, shareErrorView, shareFailureText } from './engineErrors';
 
 const t = i18n.t.bind(i18n);
 const engine = (code: string, reason?: string) =>
@@ -87,12 +88,35 @@ describe('shareErrorView: the code rows', () => {
     expect(shareErrorView(new BridgeError('publisher_offline'))).toMatchObject({ seeWhy: true });
   });
 
+  it('a live share whose server was out of reach for 30 s isn’t the probe’s "check the address"', () => {
+    const ended = new BridgeError('server_unreachable', SHARE_HOLD_ENDED);
+    expect(shareErrorView(ended)).toEqual({ key: 'desktop.share.errors.serverUnreachable', action: 'share-again' });
+    expect(shareErrorText(ended, t)).toBe(
+      "Your share stopped: isshoni couldn't reach the server for 30 seconds. Check your connection and share again.",
+    );
+    expect(shareErrorText(new BridgeError('server_unreachable'), t)).toBe(t('desktop.errors.server_unreachable'));
+  });
+
   it('the controller’s codes and the wire codes C2 passes on have their texts', () => {
     expect(shareErrorText(new BridgeError('already_sharing'), t)).toBe(
       "You're already sharing. Stop that share first.",
     );
     expect(shareErrorText(new BridgeError('room_full'), t)).toBe(t('errors.room_full'));
     expect(shareErrorText(new BridgeError('no_such_code'), t)).toBe(t('desktop.errors.internal'));
+  });
+
+  it('shareFailureText: a pick-again failure that stays on screen says what happened', () => {
+    expect(shareFailureText(new BridgeError('pick_expired', { reason: 'pick_expired' }), t)).toBe(
+      'That pick timed out. Pick what to share again.',
+    );
+    expect(shareFailureText(engine('source_gone', 'pick_expired'), t)).toBe(
+      'That pick timed out. Pick what to share again.',
+    );
+    expect(shareFailureText(engine('invalid', 'self_window'), t)).toBe('Pick something other than isshoni.');
+    expect(shareFailureText(engine('cancelled'), t)).toBe('');
+    expect(shareFailureText(new BridgeError('already_sharing'), t)).toBe(
+      shareErrorText(new BridgeError('already_sharing'), t),
+    );
   });
 
   it('anything but a bridge error is M1’s', () => {

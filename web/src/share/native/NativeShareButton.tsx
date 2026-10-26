@@ -7,7 +7,8 @@
 // Failures (engineErrors.ts, §10.5): a pick Go no longer holds (pick_expired from Share.Start) opens the picker again
 // without a word; a pick of an isshoni window (self_window) opens it again with "Pick something other than isshoni"
 // above the sheet; every other failed pick is said in the sheet, with its action; a failed start is the share panel's
-// to show (a toast when no panel is mounted). A pick is opened again by itself once per Share click.
+// to show (a toast when no panel is mounted). A pick is opened again by itself once per Share click; a second
+// pick_expired in the same click is a failed start like the others ("That pick timed out…" with [Pick again]).
 //
 // As M1's button: it links the share state to the app's uiStore when it mounts (shareUi.ts), and gives the focus back
 // when what its sheet started ended without a share.
@@ -23,7 +24,7 @@ import type { ShareElsewhere } from '../ShareSheet';
 import { shareStore, type ShareFlowOutcome, type ShareStore, type StartShare } from '../shareStore';
 import { linkShareUi } from '../shareUi';
 import { DndTip } from './DndTip';
-import { isPickAgain, shareErrorText, shareErrorView } from './engineErrors';
+import { isPickAgain, shareErrorText, shareErrorView, shareFailureText } from './engineErrors';
 import { FirstShareSheet } from './FirstShareSheet';
 import { NativeShareSheet } from './NativeShareSheet';
 
@@ -122,7 +123,7 @@ export function NativeShareButton({
         if (now === 'failed') {
           // The start failed: the share panel shows it, or a toast without one.
           setSheetOpen(false);
-          if (panels === 0) ui.getState().toast({ kind: 'error', message: shareErrorText(err, t) });
+          if (panels === 0) ui.getState().toast({ kind: 'error', message: shareFailureText(err, t) });
           return;
         }
         // The pick failed: said in the sheet, with what to do.

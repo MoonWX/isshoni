@@ -13,3 +13,6 @@ export const NativeSharePanel = lazy(() => load().then((m) => ({ default: m.Nati
 
 /** Where Share would be on a PC that can't share (Share.Capabilities' reason). */
 export const NativeShareUnavailable = lazy(() => load().then((m) => ({ default: m.NativeShareUnavailable })));
+
+/** The header's Share on a PC that can't share: disabled, with the reason as its description and tooltip. */
+export const NativeShareDisabled = lazy(() => load().then((m) => ({ default: m.NativeShareDisabled })));

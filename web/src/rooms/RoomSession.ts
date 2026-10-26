@@ -8,9 +8,10 @@
 // seams below (SessionMedia, ShareRecovery, onRoomEvent), so rooms/ builds without them.
 //
 // The desktop app (M2, docs/m2/03 §9, §10.2): its share is native, published by the app's own connection (C2), so it
-// can outlive this page; the runtime hands such a share to adoptShare() once the room's snapshot lists it. A native
-// share's end is C2's to report: when this page's connection sees it end, the session only tells the share
-// (serverEnded refreshes its view), and the share's own `ended` detaches it.
+// can outlive this page; the runtime sends the UI to that share's room (followShareRoom) and hands the share to
+// adoptShare() once the room's snapshot lists it. A native share's end is C2's to report: when this page's connection
+// sees it end, the session only tells the share (serverEnded refreshes its view), and the share's own `ended` detaches
+// it.
 import { createEmitter } from '../lib/emitter';
 import { errorMessage } from '../lib/errorText';
 import { LocalError } from '../lib/errors';
@@ -474,6 +475,21 @@ export class RoomSession {
     if (this.#desired === null) return false;
     this.#log.info('adopting the share the app publishes');
     this.#attachShare(share);
+    return true;
+  }
+
+  /**
+   * The platform publishes a share this page didn't start in roomId, which isn't the desired room (docs/m2/03 §9: the
+   * desktop's native share after a reload, which C2 kept publishing): a share follows the page's room, so its room
+   * becomes the desired one. The UI is sent there as for the server's redirects (roomStore.redirect, code 'share'),
+   * and the route's join follows. Ignored (false) while the session has a share or one is starting, outside a room,
+   * and for the desired room itself.
+   */
+  followShareRoom(roomId: string): boolean {
+    if (this.#disposed || this.#share !== null || this.#startingShare) return false;
+    if (this.#desired === null || this.#desired === roomId) return false;
+    this.#log.info('the app shares in another room: the page goes there');
+    this.#stores.room.setState({ redirect: { roomId, code: 'share' } });
     return true;
   }
 

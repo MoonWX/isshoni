@@ -7,7 +7,8 @@
 // - the desktop's own tile is local: subscribed with the low layer and no audio, shown as "Preview: what friends
 //   see", never heard;
 // - the tray says "Live, 1 watching" once the harness has the tray (README WA68; a null tray view is noted);
-// - the harness's debug-level log names no window title and no share label (03 §17);
+// - the harness's debug-level log names no window title, no share label, no exe and none of the `normal` audio
+//   scenario's apps (03 §17, §22.4);
 // - the panel's Stop ends the share for the friend; a second share needs no first-share sheet (tips.firstShareShown).
 //
 // Pause, the late joiner, the hotkeys and the audio alert case come with README WA80.
@@ -23,6 +24,8 @@ const LIVE_TIMEOUT_MS = 30_000;
 const MEDIA_TIMEOUT_MS = 20_000;
 /** The fake engine's picker names its window this way (internal/media/fake): the label that stays on this PC. */
 const FAKE_LABEL = 'Fake window';
+/** The display names of the apps in 05's `normal` fake audio scenario (internal/media/fake/audio_ctl.go). */
+const NORMAL_SCENARIO_APPS = ['Spotify', 'Discord', 'Steam', 'Google Chrome'];
 
 test.describe.configure({ timeout: 150_000 });
 
@@ -162,8 +165,10 @@ test('a fake pick goes live through the first-share sheet; a browser watches; th
   await panel.getByRole('button', { name: 'Stop sharing' }).click();
   await expect(panel).toBeHidden({ timeout: MEDIA_TIMEOUT_MS });
 
-  // 03 §17: the harness's log, at debug level, names neither the window nor the share's label.
+  // 03 §17, §22.4: the harness's log, at debug level, names neither the window nor the share's label, no exe and
+  // no app of the audio scenario the share ran on.
   const log = await fsp.readFile(desktop.logPath, 'utf8');
   expect(log).not.toContain(FAKE_LABEL);
   expect(log).not.toMatch(/\.exe\b/i);
+  for (const name of NORMAL_SCENARIO_APPS) expect(log, name).not.toContain(name);
 });

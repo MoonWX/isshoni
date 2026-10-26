@@ -1,12 +1,14 @@
 // The native share panel (docs/m2/03 §10.3, §22.3 "Native panel"): the bar for each state of the share's view, the
 // minimized line, the unreachable bar's Test connection URL, the Details disclosure (Ctrl+Shift+D, watchServerStats
 // on open and off on close, no names), "Switched to <encoder>" for 5 s, Share sound only for a share started with
-// sound, no "No sound captured" line, and a failed share with what to do.
+// sound, no "No sound captured" line, and a failed share with what to do (also a pick that timed out, and a new
+// pick from the panel that fails before any share).
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ShareView } from '../../platform/desktop/bridge';
+import { BridgeError } from '../../platform/desktop/errors';
 import { shareView } from '../../platform/desktop/testing/shareView';
 import { createTestServices, renderRoute } from '../../test/render';
 import type { ShareWatcher } from '../watchers';
@@ -26,7 +28,14 @@ afterEach(() => {
 async function renderPanel(
   current: ShareView | null = shareView(),
   opts: { watchers?: ShareWatcher[]; withStart?: boolean; adopted?: boolean } = {},
-): Promise<NativeSetup & { onStop: ReturnType<typeof vi.fn>; rerender: () => void }> {
+): Promise<
+  NativeSetup & {
+    onStop: ReturnType<typeof vi.fn>;
+    onStart: ReturnType<typeof vi.fn>;
+    rerender: () => void;
+    toasts: () => string[];
+  }
+> {
   const setup = await nativeSetup({ current });
   const onStop = vi.fn();
   const services = createTestServices({ platform: setup.platform });
@@ -47,7 +56,13 @@ async function renderPanel(
       { path: '/desktop/settings', element: <h1>Settings</h1> },
     ],
   });
-  return { ...setup, onStop, rerender: () => void router.navigate('/') };
+  return {
+    ...setup,
+    onStop,
+    onStart,
+    rerender: () => void router.navigate('/'),
+    toasts: () => services.ui.getState().toasts.map((t) => t.message),
+  };
 }
 
 const region = () => screen.getByRole('region', { name: 'Your share' });
@@ -222,6 +237,56 @@ describe('a failed share (docs/m2/03 §10.5)', () => {
     expect(await within(region()).findByRole('alert')).toHaveTextContent('The window you shared was closed.');
     await userEvent.click(within(region()).getByRole('button', { name: 'Dismiss' }));
     expect(screen.queryByRole('region')).not.toBeInTheDocument();
+  });
+
+  it('the server was out of reach for 30 s: "Your share stopped…", and Share again', async () => {
+    const r = await renderPanel(shareView(), { withStart: true });
+    act(() => {
+      r.fake.emit('share.state', shareView({ state: 'ended', endReason: 'server-unreachable' }));
+    });
+    expect(await within(region()).findByRole('alert')).toHaveTextContent(
+      "Your share stopped: isshoni couldn't reach the server for 30 seconds. Check your connection and share again.",
+    );
+    await userEvent.click(within(region()).getByRole('button', { name: 'Share again' }));
+    await waitFor(() => {
+      expect(r.fake.callsOf('share.pick')).toHaveLength(1);
+    });
+  });
+
+  it('a pick that timed out (pick_expired again): it says so, and Pick again starts a new pick', async () => {
+    const r = await renderPanel(null, { withStart: true });
+    act(() => {
+      r.store.setState({ phase: 'failed', error: new BridgeError('pick_expired', { reason: 'pick_expired' }) });
+    });
+    expect(await within(region()).findByRole('alert')).toHaveTextContent(
+      'That pick timed out. Pick what to share again.',
+    );
+    await userEvent.click(within(region()).getByRole('button', { name: 'Pick again' }));
+    await waitFor(() => {
+      expect(r.onStart).toHaveBeenCalledTimes(1);
+    });
+    expect(r.fake.callsOf('share.pick')).toHaveLength(1);
+  });
+
+  it('Share again whose pick fails before any share: a toast says why, as the panel goes', async () => {
+    const r = await renderPanel(shareView(), { withStart: true });
+    r.fake.answers['share.pick'] = () => Promise.reject(new BridgeError('engine.invalid', { reason: 'self_window' }));
+    act(() => {
+      r.fake.emit(
+        'share.state',
+        shareView({
+          state: 'failed',
+          endReason: 'error',
+          error: { code: 'engine.encoder_lost', params: { reason: 'device_removed' } },
+        }),
+      );
+    });
+    await userEvent.click(await within(region()).findByRole('button', { name: 'Share again' }));
+    await waitFor(() => {
+      expect(r.toasts()).toEqual(['Pick something other than isshoni.']);
+    });
+    expect(screen.queryByRole('region')).not.toBeInTheDocument();
+    expect(r.onStart).not.toHaveBeenCalled();
   });
 
   it('a share that ended normally leaves no panel', async () => {

@@ -98,10 +98,17 @@ export function viewError(view: Pick<ShareView, 'state' | 'error'> | null): Brid
 }
 
 /**
+ * The params that mark a server_unreachable error as the end of a live share whose 30 s hold ran out (01's core), not
+ * a server that never answered: the panel says "Your share stopped…" for it (share/native/engineErrors.ts).
+ */
+export const SHARE_HOLD_ENDED = Object.freeze({ ended: 'server-unreachable' });
+
+/**
  * What the share panel says about an end that wasn't the user's (docs/m2/03 §10.1, §10.5), as the store's error: a
- * failed share's error; "The window you shared was closed" (source-gone); "can't reach the server" when 01's 30 s
- * hold ran out (server-unreachable). null for the others: the user's own stops, a stop from another device (the
- * store's notice), the server's end, unlinked (the relink page follows) and the system's (Go's toast says why).
+ * failed share's error; "The window you shared was closed" (source-gone); "Your share stopped: isshoni couldn't reach
+ * the server for 30 seconds" when 01's 30 s hold ran out (server-unreachable, server_unreachable with
+ * SHARE_HOLD_ENDED). null for the others: the user's own stops, a stop from another device (the store's notice), the
+ * server's end, unlinked (the relink page follows) and the system's (Go's toast says why).
  */
 export function endError(view: Pick<ShareView, 'state' | 'error' | 'endReason'> | null): BridgeError | null {
   const failed = viewError(view);
@@ -110,7 +117,7 @@ export function endError(view: Pick<ShareView, 'state' | 'error' | 'endReason'> 
     case 'source-gone':
       return new BridgeError('engine.source_gone');
     case 'server-unreachable':
-      return new BridgeError('server_unreachable');
+      return new BridgeError('server_unreachable', SHARE_HOLD_ENDED);
     default:
       return null;
   }
@@ -181,6 +188,11 @@ export class DesktopShare implements ActiveShare, ShareRecovery {
   /** The share's id on the server; '' until C2's share.start was answered. It changes with `replaces`. */
   get shareId(): string {
     return this.#view.shareId;
+  }
+
+  /** The room C2 publishes the share in (docs/m2/03 §9: the page's room follows it after a reload). */
+  get roomId(): string {
+    return this.#view.roomId;
   }
 
   get state(): LocalShareState {

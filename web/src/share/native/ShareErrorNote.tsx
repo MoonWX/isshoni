@@ -1,6 +1,8 @@
 // A native share's failure as the sheets and the panel say it (docs/m2/03 §10.5, engineErrors.ts): the text, with
 // role="alert", and the one thing to do about it. Links go to the system browser (platform.openExternal): the project
-// site's troubleshooting sections, and the server's Download page.
+// site's troubleshooting sections, and the server's Download page. A pick_expired reaches it only when the picker
+// wasn't reopened (the Share button reopens it once per click, without a word), so it says "That pick timed out…"
+// (shareFailureText); with onShareAgain, a pick-again failure (pick_expired, self_window) offers [Pick again].
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
@@ -8,14 +10,17 @@ import { useNavigate } from 'react-router';
 import { useApp } from '../../app/context';
 import { DOCS_URL } from '../../conntest/links';
 import { Button } from '../../ui/Button';
-import { shareErrorText, shareErrorView } from './engineErrors';
+import { shareErrorView, shareFailureText } from './engineErrors';
 import styles from './native.module.css';
 
 export interface ShareErrorNoteProps {
   error: unknown;
   /** [Try again] (permission_denied): the picker opens again. Not offered without it. */
   onRetry?: (() => void) | undefined;
-  /** [Share again] (device_removed): a new pick. Not offered without it. */
+  /**
+   * [Share again] (device_removed, a share the server lost for 30 s) and [Pick again] (pick_expired, self_window): a
+   * new pick. Not offered without it.
+   */
   onShareAgain?: (() => void) | undefined;
   /** Extra buttons after the error's own (the panel's Dismiss). */
   children?: ReactNode;
@@ -26,7 +31,7 @@ export function ShareErrorNote({ error, onRetry, onShareAgain, children }: Share
   const { platform } = useApp();
   const navigate = useNavigate();
   const view = shareErrorView(error);
-  const text = shareErrorText(error, t);
+  const text = shareFailureText(error, t);
   const bridge = platform.desktop?.bridge;
   const origin = platform.serverOrigin;
 
@@ -73,6 +78,15 @@ export function ShareErrorNote({ error, onRetry, onShareAgain, children }: Share
             }}
           >
             {t('desktop.share.errors.download')}
+          </Button>,
+        );
+      }
+      break;
+    case 'pick-again':
+      if (onShareAgain) {
+        actions.push(
+          <Button key="pick" size="sm" onClick={onShareAgain}>
+            {t('desktop.share.errors.pickAgain')}
           </Button>,
         );
       }

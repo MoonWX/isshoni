@@ -190,6 +190,19 @@ describe('failures (docs/m2/03 §10.5)', () => {
     expect(r.store.getState().phase).toBe('starting');
   });
 
+  it('pick_expired twice in one Share click: the second is said ("That pick timed out…"), not reopened', async () => {
+    const r = await renderNative({
+      onStart: () => Promise.reject(new BridgeError('pick_expired', { reason: 'pick_expired' })),
+    });
+    await openSheetAndShare();
+    await waitFor(() => {
+      expect(r.toasts()).toEqual(['That pick timed out. Pick what to share again.']);
+    });
+    expect(r.onStart).toHaveBeenCalledTimes(2);
+    expect(r.fake.callsOf('share.pick')).toHaveLength(2);
+    expect(r.store.getState().phase).toBe('failed');
+  });
+
   it('permission_denied: the sheet says it, with Windows settings and Try again', async () => {
     const r = await renderNative();
     r.fake.answers['share.pick'] = vi

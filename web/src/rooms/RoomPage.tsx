@@ -26,8 +26,9 @@
 // connection test and is dropped from the URL (docs/m2/03 §7.6: the desktop app's "Test connection" opens the room
 // with it in the browser).
 //
-// Share is offered by capabilities().canShare (docs/m2/03 §7.6, useShareAvailability), read asynchronously. In the
-// desktop app (platform.sharing.mode 'native', docs/m2/03 §10) the Share button and the panel are share/native/'s
+// Share is offered by capabilities().canShare (docs/m2/03 §7.6, useShareAvailability), read asynchronously; a desktop
+// that can't share shows it disabled, described by the engine's reason (§10.5). In the desktop app
+// (platform.sharing.mode 'native', docs/m2/03 §10) the Share button and the panel are share/native/'s
 // (rooms/lazyNative.ts); the app's own share, which its C2 publishes, counts as this page's for "already sharing
 // from another tab or device" (platform.sharing.localConnectionIds()), and that sheet's Stop it asks C2 to stop the
 // other share (platform.sharing.stopOther), since this page's connection is a viewer.
@@ -57,7 +58,7 @@ import { ConnectionBanner } from './ConnectionBanner';
 import { ConnTestDialog } from './ConnTestDialog';
 import { useLocalShare, useRoom, useRoomSession, useShareAvailability } from './hooks';
 import { RoomStage, ShareButton, SharePanel, TapToStartPill } from './lazyMedia';
-import { NativeShareButton, NativeSharePanel } from './lazyNative';
+import { NativeShareButton, NativeShareDisabled, NativeSharePanel } from './lazyNative';
 import { PeoplePanel } from './PeoplePanel';
 import { RoomHeader } from './RoomHeader';
 import styles from './RoomPage.module.css';
@@ -184,9 +185,10 @@ export function RoomPage() {
         <Suspense fallback={null}>
           <TapToStartPill viewer={viewer} />
         </Suspense>
-        {platform.sharing !== null && !failed && availability?.canShare !== false && (
-          // The same button until the chunk is there and the platform said it can share, so the header doesn't
-          // move. No button for a room that refused the user: there is nothing to share into.
+        {platform.sharing !== null && !failed && (availability?.canShare !== false || native) && (
+          // The same button until the chunk is there and the platform said whether it can share, so the header
+          // doesn't move. No button for a room that refused the user: there is nothing to share into. A desktop
+          // that can't share keeps it disabled, with the reason (docs/m2/03 §10.5).
           <Suspense
             fallback={
               <Button variant="primary" icon={<MonitorUp />} disabled>
@@ -198,6 +200,8 @@ export function RoomPage() {
               <Button variant="primary" icon={<MonitorUp />} disabled>
                 {t('room.share.start')}
               </Button>
+            ) : !availability.canShare ? (
+              <NativeShareDisabled reason={availability.reason} label={t('room.share.start')} />
             ) : native ? (
               <NativeShareButton onStart={startShare} elsewhere={shareElsewhere} label={t('room.share.start')} />
             ) : (

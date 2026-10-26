@@ -10,16 +10,23 @@
 // Wiring, in the room page (rooms/RoomPage.tsx, rooms/RoomStage.tsx):
 //   <NativeShareButton onStart={startShare} elsewhere={elsewhere} />      // instead of M1's ShareButton
 //   <NativeSharePanel share={share} onStop={stopShare} watchers={watchers} />   // instead of M1's SharePanel
-//   <NativeShareUnavailable reason={caps.reason} />                       // canShare false
+//   <NativeShareUnavailable reason={caps.reason} />                       // canShare false: the empty state's note
+//   <NativeShareDisabled reason={caps.reason} label="Share" />            // canShare false: the header's Share
 import '../../i18n/lazy/desktop';
 
 export {
   isPickAgain,
   shareErrorText,
   shareErrorView,
+  shareFailureText,
   type ShareErrorAction,
   type ShareErrorView,
 } from './engineErrors';
 export { NativeShareButton, type NativeShareButtonProps } from './NativeShareButton';
 export { NativeSharePanel, type NativeSharePanelProps } from './NativeSharePanel';
-export { NativeShareUnavailable, type NativeShareUnavailableProps } from './NativeShareUnavailable';
+export {
+  NativeShareDisabled,
+  NativeShareUnavailable,
+  type NativeShareDisabledProps,
+  type NativeShareUnavailableProps,
+} from './NativeShareUnavailable';

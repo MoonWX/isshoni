@@ -240,6 +240,11 @@ export type ShareHint = { kind: 'upload-limited'; approxHeight: number } | { kin
 export interface ActiveShare {
   /** Changes on re-publish (`replaces`, 01 §10.6); watch 'state'. */
   readonly shareId: string;
+  /**
+   * M2, native: the room the share publishes in (the desktop's ShareView.roomId), which the room runtime makes the
+   * page's room after a reload (docs/m2/03 §9). Absent for a share this page publishes itself.
+   */
+  readonly roomId?: string;
   readonly kind: ShareKind;
   readonly preview: MediaStream | null;
   readonly state: LocalShareState;
@@ -268,6 +273,16 @@ export interface SharingProvider {
   start(src: PickedSource, opts: { preset: Preset; withAudio: boolean }, ctx: ShareContext): Promise<ActiveShare>;
   /** M2, native: the share the app publishes now (e.g. after the page reloaded), or null. */
   current?(): ActiveShare | null;
+  /**
+   * M2, native: resolves once current() and localConnectionIds() say what the app knows (the desktop: its provider's
+   * chunk has loaded and Go answered the first Share.Current()). The room runtime checks the share then (docs/m2/03 §9).
+   */
+  ready?(): Promise<void>;
+  /**
+   * M2, native: calls fn whenever current() or localConnectionIds() may answer differently (a share starts or ends,
+   * the app's publisher connection changes). Returns the function that removes fn.
+   */
+  onChange?(fn: () => void): () => void;
   /** M2: connections whose shares are this page's local shares beyond the page's own (desktop: C2). */
   localConnectionIds?(): string[];
   /** M2, native: share.stop for another connection's share of this user (the desktop SPA's role is viewer). */

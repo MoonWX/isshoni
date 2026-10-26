@@ -10,6 +10,8 @@
 //   SetAudioEnabled → 05's SetShareSound), who watches (M1, names from room.state) and the Details disclosure, also
 //   toggled with Ctrl+Shift+D while the window has focus (ShareDetails.tsx);
 // - a failed share: its text and action (engineErrors.ts), e.g. [Share again] after the graphics driver restarted.
+//   [Share again] and [Pick again] start a new pick here; the page's native Share button shows its sheets, and a pick
+//   that fails (self_window, permission_denied, …) before any share is said as a toast, since the panel goes with it.
 //
 // M1's "No sound captured" line doesn't apply to native shares (05's silent-stream check does). Later slices add:
 // What friends hear, the banners and the mic prompt card (README WA77), and Pause with the hotkeys' tooltips (WA80).
@@ -30,6 +32,7 @@ import { presetText } from '../presetText';
 import { shareStore, type ShareStore, type StartShare } from '../shareStore';
 import { linkShareUi } from '../shareUi';
 import type { ShareWatcher } from '../watchers';
+import { shareFailureText } from './engineErrors';
 import styles from './native.module.css';
 import { ShareDetails } from './ShareDetails';
 import { ShareErrorNote } from './ShareErrorNote';
@@ -129,7 +132,16 @@ export function NativeSharePanel({
       ? (): void => {
           store.getState().dismiss();
           const picking = sharing.pick({ preset, withAudio: true });
-          void store.getState().pick(picking, { preset, start: onStart });
+          void store
+            .getState()
+            .pick(picking, { preset, start: onStart })
+            .then((outcome) => {
+              // A failed start stays in this panel (phase failed). A failed pick left the flow idle, so the panel is
+              // gone: say it as a toast.
+              if (outcome.step !== 'failed' || store.getState().phase === 'failed') return;
+              const message = shareFailureText(outcome.error, t);
+              if (message !== '') ui.getState().toast({ kind: 'error', message });
+            });
         }
       : undefined;
 

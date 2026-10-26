@@ -156,6 +156,8 @@
         "troubleshooting": "How to fix this",
         "download": "Open download page",
         "shareAgain": "Share again",
+        "pickAgain": "Pick again",
+        "serverUnreachable": "Your share stopped: isshoni couldn't reach the server for 30 seconds. Check your connection and share again.",
         "sharingSettings": "Settings → Sharing",
         "logs": "Open logs folder"
       },

@@ -5,6 +5,8 @@
 //   reason or code                              text                                  what is offered
 //   pick_expired (start; the controller's own)  none                                  the OS picker reopens
 //   self_window (pick)                          "Pick something other than isshoni"   the OS picker reopens
+//     (once per Share click; when it isn't reopened, shareFailureText says "That pick timed out…" for pick_expired,
+//     and the note offers [Pick again])
 //   driver_too_old                              update the graphics driver            /troubleshooting#desktop-gpu-driver
 //   no_media_foundation                         the Media Feature Pack                #desktop-media-feature-pack
 //   blocked_by_policy                           Smart App Control or a policy         #desktop-smart-app-control
@@ -18,6 +20,8 @@
 //   engine.internal, engine.invalid, .busy      something went wrong in the engine    Open logs folder
 //   engine.cancelled                            never shown (Share.Pick() answers null)
 //   publisher_offline                           can't reach the server                "See why" (#desktop-linking)
+//   server_unreachable ending a live share      "Your share stopped: … 30 seconds"    Share again
+//     (01's 30 s hold ran out: DesktopShare's endError, SHARE_HOLD_ENDED)
 //   any other bridge code                       desktop.errors.<code>
 //   a wire code from C2 (room_full, …)          M1's errors.<code>
 //
@@ -26,11 +30,15 @@ import type { TFunction } from 'i18next';
 
 import { i18n } from '../../i18n';
 import { errorMessage } from '../../lib/errorText';
+import { SHARE_HOLD_ENDED } from '../../platform/desktop/DesktopShare';
 import { BridgeError } from '../../platform/desktop/errors';
 
 /** What the UI offers next to the text. */
 export type ShareErrorAction =
-  /** Opens the OS picker again (pick_expired, self_window); for pick_expired without a word. */
+  /**
+   * Opens the OS picker again (pick_expired, self_window); for pick_expired without a word. Where it isn't reopened
+   * by itself, the note offers [Pick again].
+   */
   | 'pick-again'
   /** App.OpenOSSettings('graphics-capture') and [Try again] (permission_denied). */
   | 'capture-settings'
@@ -38,7 +46,7 @@ export type ShareErrorAction =
   | 'troubleshooting'
   /** The server's Download page (a damaged install). */
   | 'download'
-  /** [Share again]: a new pick (device_removed). */
+  /** [Share again]: a new pick (device_removed, a share whose server was out of reach for 30 s). */
   | 'share-again'
   /** Settings → Sharing (/desktop/settings#sharing). */
   | 'sharing-settings'
@@ -136,6 +144,9 @@ export function shareErrorView(err: unknown): ShareErrorView | null {
   if (err.code === 'pick_expired') return { key: null, action: 'pick-again' };
   if (media !== null) return byReason(reason) ?? byMediaCode(media);
   if (err.code === 'publisher_offline') return { key: 'desktop.errors.publisher_offline', action: null, seeWhy: true };
+  if (err.code === 'server_unreachable' && err.params['ended'] === SHARE_HOLD_ENDED.ended) {
+    return { key: 'desktop.share.errors.serverUnreachable', action: 'share-again' };
+  }
   const key = `desktop.errors.${err.code}`;
   if (has(key)) return { key, action: null };
   // A wire code C2 passed through (room_full, share_limit, …): M1's text.
@@ -155,4 +166,15 @@ export function shareErrorText(err: unknown, t: TFunction = i18n.t): string {
   const view = shareErrorView(err);
   if (view === null) return errorMessage(err, t);
   return view.key === null ? '' : t(view.key);
+}
+
+/**
+ * The text of a failure that stays on screen (the panel, a toast) instead of reopening the picker: shareErrorText,
+ * and for a pick Go no longer holds, which says nothing while the picker reopens, "That pick timed out. Pick what to
+ * share again." ('' only for cancelled).
+ */
+export function shareFailureText(err: unknown, t: TFunction = i18n.t): string {
+  const text = shareErrorText(err, t);
+  if (text !== '' || shareErrorView(err)?.action !== 'pick-again') return text;
+  return t('desktop.errors.pick_expired');
 }

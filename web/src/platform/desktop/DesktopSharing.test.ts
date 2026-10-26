@@ -1,15 +1,17 @@
 // DesktopSharing and DesktopShare (docs/m2/03 §10.2, §22.3) with a fake NativeBridge: the PickedSource of a native
 // pick, Share.Start's arguments, the state mapping from share.state (ShareView), the shareId change on `replaces`,
 // the recovery methods as no-ops, stopOther(roomId, shareId), localConnectionIds, the hint from ShareView.hint (no
-// HintDetector), the end reasons, the page's share store, and the order of events and answers.
+// HintDetector), the end reasons, the page's share store, the order of events and answers, and the change signal
+// (onChange) the room runtime and the viewer follow.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createShareStore, type ShareStore } from '../../share/shareStore';
 import type { ActiveShare, ShareContext, ShareHint, SignalClientLike } from '../types';
 import type { Picked, ShareView } from './bridge';
-import { DesktopShare, isDesktopShare, localEndOf, localStateOf } from './DesktopShare';
+import { DesktopShare, isDesktopShare, localEndOf, localStateOf, SHARE_HOLD_ENDED } from './DesktopShare';
 import { DesktopSharing } from './DesktopSharing';
 import { BridgeError } from './errors';
+import { lazySharing } from './lazySharing';
 import { createFakeBridge, type FakeBridge } from './testing/fakeBridge';
 import { shareView, startingView } from './testing/shareView';
 
@@ -355,6 +357,77 @@ describe('DesktopSharing: localConnectionIds (docs/m2/03 §10.4)', () => {
   });
 });
 
+describe('DesktopSharing: onChange (docs/m2/03 §9, §10.4)', () => {
+  it('fires when a share is made or ends and when C2’s id changes, not for a view of the same share', async () => {
+    const fake = createFakeBridge({ active: 'https://watch.example.com' });
+    let answerInfo: (v: { publisherConnectionId: string }) => void = () => undefined;
+    fake.answers['share.current'] = null;
+    fake.answers['app.info'] = () =>
+      new Promise((resolve) => {
+        answerInfo = resolve;
+      });
+    const sharing = new DesktopSharing(fake.bridge, { store: null });
+    const seen: [string | null, string[]][] = [];
+    const off = sharing.onChange(() => {
+      seen.push([sharing.current()?.shareId ?? null, sharing.localConnectionIds()]);
+    });
+    await sharing.ready();
+    expect(seen).toEqual([]);
+    // App.Info answers after the first pull: C2 becomes known.
+    answerInfo({ publisherConnectionId: 'c_pub' });
+    await flush();
+    expect(seen).toEqual([[null, ['c_pub']]]);
+    fake.emit('share.state', shareView({ shareId: 's_a', connectionId: 'c_pub' }));
+    fake.emit('share.state', shareView({ shareId: 's_a', connectionId: 'c_pub', watching: 4 }));
+    fake.emit('share.state', shareView({ shareId: 's_a', connectionId: 'c_new' }));
+    fake.emit('share.state', shareView({ state: 'ended', shareId: 's_a', connectionId: 'c_new', endReason: 'user' }));
+    expect(seen).toEqual([
+      [null, ['c_pub']],
+      ['s_a', ['c_pub']],
+      ['s_a', ['c_new']],
+      [null, ['c_new']],
+    ]);
+    off();
+    fake.emit('share.state', shareView({ shareId: 's_b', connectionId: 'c_new' }));
+    expect(seen).toHaveLength(4);
+  });
+
+  it('a share that outlived the page is a change once the first pull brings it', async () => {
+    const fake = createFakeBridge({ active: 'https://watch.example.com' });
+    fake.answers['share.current'] = shareView({ connectionId: 'c_pub' });
+    fake.answers['app.info'] = { publisherConnectionId: '' };
+    const sharing = new DesktopSharing(fake.bridge, { store: null });
+    const changes = vi.fn();
+    sharing.onChange(changes);
+    expect(sharing.current()).toBeNull();
+    await sharing.ready();
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(sharing.current()?.state).toBe('live');
+    expect(sharing.localConnectionIds()).toEqual(['c_pub']);
+  });
+
+  it('through lazySharing (the entry chunk’s provider): ready() and the listeners added before the load', async () => {
+    const fake = createFakeBridge({ active: 'https://watch.example.com' });
+    fake.answers['share.current'] = shareView({ connectionId: 'c_pub' });
+    fake.answers['app.info'] = { publisherConnectionId: 'c_pub' };
+    const report = vi.fn();
+    const sharing = lazySharing(fake.bridge, report);
+    const changes = vi.fn();
+    const off = sharing.onChange?.(changes);
+    expect(sharing.current?.()).toBeNull();
+    expect(sharing.localConnectionIds?.()).toEqual([]);
+    await sharing.ready?.();
+    expect(changes).toHaveBeenCalled();
+    expect(sharing.current?.()?.state).toBe('live');
+    expect(sharing.localConnectionIds?.()).toEqual(['c_pub']);
+    off?.();
+    const seen = changes.mock.calls.length;
+    fake.emit('share.state', shareView({ state: 'ended', endReason: 'user' }));
+    expect(changes).toHaveBeenCalledTimes(seen);
+    expect(report).not.toHaveBeenCalled();
+  });
+});
+
 describe('DesktopSharing and the page’s share store (05 §13.1)', () => {
   it('a share that outlived the page is followed: live, the sound, the hint, the end', async () => {
     const { sharing, fake, store } = await setup({ current: shareView({ preset: 'movie', audioOn: false }) });
@@ -402,7 +475,11 @@ describe('DesktopSharing and the page’s share store (05 §13.1)', () => {
     store.getState().dismiss();
     fake.emit('share.state', shareView());
     fake.emit('share.state', shareView({ state: 'ended', endReason: 'server-unreachable' }));
-    expect(store.getState()).toMatchObject({ phase: 'failed', error: { code: 'server_unreachable' } });
+    // Not the server probe's "can't reach this server": a share whose 30 s hold ran out (share/native's text).
+    expect(store.getState()).toMatchObject({
+      phase: 'failed',
+      error: { code: 'server_unreachable', params: SHARE_HOLD_ENDED },
+    });
     store.getState().dismiss();
     for (const endReason of ['server', 'unlinked', 'system', 'hotkey'] as const) {
       fake.emit('share.state', shareView());

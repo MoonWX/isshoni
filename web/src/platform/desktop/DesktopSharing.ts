@@ -10,6 +10,10 @@
 //   runtime adopts it into the room session (RoomSession.adoptShare). null until the first view arrived.
 // - localConnectionIds(): C2's connection id (App.Info().publisherConnectionId, and each view's connectionId), so the
 //   room page counts the app's own share as local (the viewer, findShareElsewhere).
+// - ready() and onChange(fn): when current() and localConnectionIds() are settled, and whenever they may answer
+//   differently (a share is made or ends, C2's connection id changes). Both can change after the room's snapshot
+//   arrived (this chunk and Go's first answers come later), so the room runtime and the viewer check again then
+//   instead of waiting for a room.state that a quiet room may never send.
 // - stopOther(roomId, shareId) → Share.StopOther: C2 sends share.stop for another connection's share of this user,
 //   which this page's own connection may not (its role is viewer, 01 §6.3).
 //
@@ -59,6 +63,8 @@ export class DesktopSharing implements SharingProvider {
   #events = 0;
   /** Final views so far: Share.Start's answer makes no share when its share ended since the call. */
   #finals = 0;
+  /** onChange's listeners. */
+  readonly #listeners = new Set<() => void>();
 
   constructor(bridge: NativeBridge, opts: DesktopSharingOptions = {}) {
     this.#bridge = bridge;
@@ -76,17 +82,27 @@ export class DesktopSharing implements SharingProvider {
     bridge.app
       .info()
       .then((info) => {
-        if (info.publisherConnectionId !== '' && this.#publisherId === '')
-          this.#publisherId = info.publisherConnectionId;
+        if (this.#publisherId === '') this.#setPublisher(info.publisherConnectionId);
       })
       .catch((err: unknown) => {
         this.#log.warn('App.Info failed', { error: err });
       });
   }
 
-  /** Resolves once the first pull of Share.Current() was answered (tests, and whoever needs current() settled). */
+  /** Resolves once the first pull of Share.Current() was answered (the room runtime, tests). */
   ready(): Promise<void> {
     return this.#ready;
+  }
+
+  /**
+   * Calls fn whenever current() or localConnectionIds() may answer differently: a share is made or ends, C2's
+   * connection id changes. Returns the function that removes fn.
+   */
+  onChange(fn: () => void): () => void {
+    this.#listeners.add(fn);
+    return () => {
+      this.#listeners.delete(fn);
+    };
   }
 
   /**
@@ -135,7 +151,7 @@ export class DesktopSharing implements SharingProvider {
       preset: opts.preset,
       withAudio: opts.withAudio,
     });
-    if (view.connectionId !== '') this.#publisherId = view.connectionId;
+    this.#setPublisher(view.connectionId);
     // The answer, unless events have told more meanwhile: the share may be live already, or over.
     if (this.#share === null && this.#finals === finals) this.#apply(view, true);
     const share = this.#share;
@@ -160,6 +176,24 @@ export class DesktopSharing implements SharingProvider {
   /** Share.StopOther: C2 sends share.stop for another connection's share of this user. */
   stopOther(roomId: string, shareId: string): Promise<void> {
     return this.#bridge.share.stopOther(roomId, shareId);
+  }
+
+  /** C2's connection id is id (unless it is ''); a new one is a change. */
+  #setPublisher(id: string): void {
+    if (id === '' || id === this.#publisherId) return;
+    this.#publisherId = id;
+    this.#changed();
+  }
+
+  /** Tells onChange's listeners; one that throws is logged and the others still run. */
+  #changed(): void {
+    for (const fn of [...this.#listeners]) {
+      try {
+        fn();
+      } catch (err) {
+        this.#log.warn('a share change listener failed', { error: err });
+      }
+    }
   }
 
   /** Pulls Share.Current() and applies it unless an event came first. */
@@ -187,6 +221,7 @@ export class DesktopSharing implements SharingProvider {
       if (share !== null) {
         this.#share = null;
         share.end(view);
+        this.#changed();
       }
       return;
     }
@@ -200,13 +235,16 @@ export class DesktopSharing implements SharingProvider {
       // Go says there is no share now: this one is over, without a final view.
       this.#share = null;
       share.end(null);
+      this.#changed();
       return;
     }
-    if (view.connectionId !== '') this.#publisherId = view.connectionId;
     if (share !== null) {
       share.update(view);
+      this.#setPublisher(view.connectionId);
       return;
     }
+    // The id first, without telling: the new share's change below says both.
+    if (view.connectionId !== '') this.#publisherId = view.connectionId;
     this.#share = new DesktopShare({
       bridge: this.#bridge,
       view,
@@ -216,5 +254,6 @@ export class DesktopSharing implements SharingProvider {
       },
       log: this.#log,
     });
+    this.#changed();
   }
 }

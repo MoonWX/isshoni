@@ -1,7 +1,10 @@
 // desktop-reload.spec (M2 03 §22.4 A, §9, README WA65): the desktop page reloads while the app shares (a reload, or a
 // webview that restarts): C2 keeps publishing, so the share goes on for its viewers without a gap, and the page that
-// comes back adopts it (platform.sharing.current() → RoomSession.adoptShare): the panel is back and live, the own
-// tile is local at the low layer again, and its Stop ends the share.
+// comes back adopts it (platform.sharing.current() → RoomSession.adoptShare): the panel is back and live (and passes
+// axe in both colour schemes, 03 §22.4), the own tile is local at the low layer again, and its Stop ends the share.
+import AxeBuilder from '@axe-core/playwright';
+import type { Page } from '@playwright/test';
+
 import { expect, test } from './fixtures.ts';
 import { videoOf, waitForRoom, waitForState, waitForStats } from './stats.ts';
 
@@ -10,6 +13,24 @@ const MEDIA_TIMEOUT_MS = 20_000;
 const FAKE_LABEL = 'Fake window';
 
 test.describe.configure({ timeout: 120_000 });
+
+/** The axe check of 05 §19.3 (WCAG 2.0 A and AA, 2.1 AA), in both colour schemes, on what `include` holds. */
+async function expectAccessible(page: Page, what: string, include: string): Promise<void> {
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+    await page.waitForTimeout(200);
+    const { violations, passes } = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
+      .include(include)
+      .analyze();
+    expect(passes.length, `axe checked ${what} (${colorScheme})`).toBeGreaterThan(0);
+    const serious = violations
+      .filter((v) => v.impact === 'serious' || v.impact === 'critical')
+      .map((v) => `${v.id}: ${v.help} (${v.nodes.map((n) => n.target.join(' ')).join(', ')})`);
+    expect(serious, `axe on ${what} (${colorScheme})`).toEqual([]);
+  }
+  await page.emulateMedia({ colorScheme: null, reducedMotion: null });
+}
 
 test('a reload while sharing: the share goes on for viewers, and the page adopts it', async ({
   startDesktop,
@@ -56,6 +77,7 @@ test('a reload while sharing: the share goes on for viewers, and the page adopts
   // The page adopts it: the panel is back and live, and the Share button waits for this share to end.
   await expect(panel.getByText(`You're live · ${FAKE_LABEL}`)).toBeVisible({ timeout: LIVE_TIMEOUT_MS });
   await expect(page.getByRole('banner').getByRole('button', { name: 'Share', exact: true })).toBeDisabled();
+  await expectAccessible(page, 'the adopted share panel', 'section[aria-label="Your share"]');
   const own = await waitForState(
     page,
     (s) => s.viewer.shares.find((sh) => sh.id === share.id && sh.local && sh.subscription?.video === 'low'),

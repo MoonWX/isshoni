@@ -242,6 +242,11 @@
   color: var(--color-text-muted);
 }
 
+/* The header's disabled Share on a PC that can't share: the wrapper carries the tooltip. */
+.disabledShare {
+  display: inline-flex;
+}
+
 /* ---- Details ---- */
 
 .details {

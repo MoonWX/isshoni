@@ -98,14 +98,21 @@ describe('RoomPage in the desktop app (docs/m2/03 §10.2)', () => {
     expect(screen.getByRole('button', { name: 'Share your screen' })).toBeEnabled();
   });
 
-  it('a PC that can’t share gets no Share button, and the empty state says why (capabilities().canShare)', async () => {
+  it('a PC that can’t share: Share is disabled with why, and the empty state says it (capabilities().canShare)', async () => {
+    const why = "Sharing isn't available on this PC. Sharing needs Windows 10 22H2 or later.";
     await setupDesktop({ canShare: false, reason: 'unsupported_os' });
     await open();
     await advance();
-    expect(screen.queryByRole('button', { name: /^Share/ })).not.toBeInTheDocument();
-    expect(
-      screen.getByText("Sharing isn't available on this PC. Sharing needs Windows 10 22H2 or later."),
-    ).toBeInTheDocument();
+    // The empty state: the note instead of [Share your screen].
+    expect(screen.queryByRole('button', { name: 'Share your screen' })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('main')).getByText(why)).toBeInTheDocument();
+    // The header's Share is disabled, described by the same reason (docs/m2/03 §10.5), also in a room with shares.
+    sendState({ participants: [alex], shares: [shareInfo('s_bea', 'u_bea', 'c_bea')] });
+    await advance();
+    const share = within(screen.getByRole('banner')).getByRole('button', { name: 'Share' });
+    expect(share).toBeDisabled();
+    expect(share).toHaveAccessibleDescription(why);
+    expect(share.closest('[title]')).toHaveAttribute('title', why);
   });
 
   it('the app’s own share is the page’s; a share from another device is stopped through C2', async () => {

@@ -1,19 +1,44 @@
 // The desktop app's native share in the room runtime (docs/m2/03 §9, §10.2, §10.4; README WA65): the share that C2
-// publishes outlives the page, so the runtime adopts it once a room.state lists it (RoomSession.adoptShare), the
-// session then shows and stops it like one the page started, its end is C2's to report (serverEnded only refreshes),
-// and the viewer counts C2's shares as the page's own (platform.sharing.localConnectionIds()).
+// publishes outlives the page, so its room becomes the page's room (RoomSession.followShareRoom) and the runtime
+// adopts it once a room.state lists it (RoomSession.adoptShare), also when the provider learns of it after the
+// snapshot (ready, onChange); the session then shows and stops it like one the page started, its end is C2's to
+// report (serverEnded only refreshes), and the viewer counts C2's shares as the page's own
+// (platform.sharing.localConnectionIds()).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ActiveShare, PickedSource, SharingProvider } from '../platform/types';
 import type { RoomEvent } from '../protocol/types.gen';
 import { createHarness, FakeShare, shareInfo, tick, type Harness } from './testing/harness';
 
-/** A native SharingProvider whose current share and local connections the test sets. */
+/** A native SharingProvider whose current share, local connections and readiness the test sets. */
 class NativeSharing implements SharingProvider {
   readonly mode = 'native' as const;
   share: ActiveShare | null = null;
   ids: string[] = ['c_publisher'];
   readonly stopped: [string, string][] = [];
+  readonly #listeners = new Set<() => void>();
+  #ready: () => void = () => undefined;
+  readonly #readyPromise = new Promise<void>((resolve) => {
+    this.#ready = resolve;
+  });
+
+  /** The provider has said what it publishes (DesktopSharing's first Share.Current() answer). */
+  becomeReady(): void {
+    this.#ready();
+  }
+  /** current() or localConnectionIds() answer differently now. */
+  changed(): void {
+    for (const fn of [...this.#listeners]) fn();
+  }
+  ready(): Promise<void> {
+    return this.#readyPromise;
+  }
+  onChange(fn: () => void): () => void {
+    this.#listeners.add(fn);
+    return () => {
+      this.#listeners.delete(fn);
+    };
+  }
 
   pick(): Promise<PickedSource | null> {
     return Promise.resolve(null);
@@ -60,6 +85,11 @@ async function inRoom(roomId = 'lounge'): Promise<void> {
 }
 
 const nativeInfo = (id = 's_native') => shareInfo(id, ownUser, 'c_publisher');
+
+/** The app's share as DesktopShare names it: with the room C2 publishes it in. */
+const shareIn = (roomId: string, id = 's_native') => Object.assign(new FakeShare(id), { roomId });
+
+const room = () => h.runtime.stores.room.getState();
 
 describe('the runtime adopts the app’s share (docs/m2/03 §9)', () => {
   it('once a room.state of the session’s room lists the share platform.sharing.current() names', async () => {
@@ -121,6 +151,107 @@ describe('the runtime adopts the app’s share (docs/m2/03 §9)', () => {
     h.hub.sendState('lounge', { shares: [nativeInfo()] });
     await session().leave();
     expect(share.calls).toEqual(['stop']);
+  });
+});
+
+describe('the share’s room is the page’s room (docs/m2/03 §9)', () => {
+  it('a reload that lands in another room: the page is sent to the share’s room, which adopts it', async () => {
+    const share = shareIn('games');
+    native.share = share;
+    await inRoom('lounge'); // the route's room
+    await tick();
+    expect(room().redirect).toEqual({ roomId: 'games', code: 'share' });
+    expect(session().share).toBeNull();
+    // The room page follows the redirect (useRoomSession): it clears it, and the new route joins.
+    room().clearRedirect();
+    const joined = session().join('games');
+    await tick();
+    await joined;
+    h.hub.sendState('games', { shares: [nativeInfo()] });
+    expect(session().share).toBe(share);
+    expect(room().redirect).toBeNull();
+  });
+
+  it('once per share: going elsewhere before it was adopted isn’t sent back', async () => {
+    native.share = shareIn('games');
+    await inRoom('lounge');
+    await tick();
+    expect(room().redirect).toMatchObject({ roomId: 'games' });
+    room().clearRedirect();
+    void session().join('games');
+    await tick();
+    void session().join('lounge');
+    await tick();
+    expect(room().redirect).toBeNull();
+  });
+
+  it('checked when the provider is ready: the route’s room is another, so the page goes to the share’s', async () => {
+    await inRoom('lounge');
+    native.share = shareIn('games');
+    await tick();
+    expect(room().redirect).toBeNull();
+    native.becomeReady();
+    await tick();
+    expect(room().redirect).toEqual({ roomId: 'games', code: 'share' });
+  });
+
+  it('never for a share in the page’s room, nor for one the page held: a confirmed switch stops it', async () => {
+    // A share whose end comes later, as C2's final view does after Share.Stop.
+    class StoppingShare extends FakeShare {
+      readonly roomId = 'lounge';
+      override stop(): Promise<void> {
+        this.calls.push('stop');
+        return Promise.resolve();
+      }
+    }
+    const own = new StoppingShare('s_native');
+    native.share = own;
+    await inRoom('lounge');
+    native.becomeReady();
+    await tick();
+    expect(room().redirect).toBeNull();
+    h.hub.sendState('lounge', { shares: [nativeInfo()] });
+    expect(session().share).toBe(own);
+    expect(session().followShareRoom('games')).toBe(false);
+    // "Stop sharing and switch?" yes: the session stops it and joins; Go still reports it until its end arrives.
+    const joined = session().join('games');
+    await tick();
+    await joined;
+    expect(own.calls).toEqual(['stop']);
+    expect(native.current()).toBe(own);
+    native.changed();
+    await tick();
+    expect(room().redirect).toBeNull();
+    expect(room().roomId).toBe('games');
+  });
+});
+
+describe('a share the provider learns of after the snapshot (docs/m2/03 §9, §10.4)', () => {
+  it('is adopted and marked local without a new room.state', async () => {
+    native.ids = [];
+    await inRoom();
+    h.hub.sendState('lounge', { shares: [nativeInfo()] });
+    expect(session().share).toBeNull();
+    expect(h.runtime.viewer.store.getState().shares[0]).toMatchObject({ local: false });
+    const share = shareIn('lounge');
+    native.share = share;
+    native.ids = ['c_publisher'];
+    const snapshot = room().state;
+    native.changed();
+    expect(session().share).toBe(share);
+    await tick();
+    expect(h.runtime.viewer.store.getState().shares[0]).toMatchObject({ local: true, localPreview: false });
+    expect(room().state).toBe(snapshot);
+  });
+
+  it('C2’s id alone, known late, marks its share local', async () => {
+    native.ids = [];
+    await inRoom();
+    h.hub.sendState('lounge', { shares: [nativeInfo()] });
+    expect(h.runtime.viewer.store.getState().shares[0]).toMatchObject({ local: false });
+    native.ids = ['c_publisher'];
+    native.changed();
+    expect(h.runtime.viewer.store.getState().shares[0]).toMatchObject({ local: true });
   });
 });
 
