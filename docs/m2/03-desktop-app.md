@@ -106,7 +106,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
 | W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and `window.open(…)` leave the page on the asset origin | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, `Shell.Reload()` |
-| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Local\io.isshoni.desktop.v1` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>` in `winos` (distinct from the running mutex of §13.4) |
+| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Local\io.isshoni.desktop.v1` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>` in `winos` (distinct from the running mutex of §13.4). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
 | W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test | Window option to hide on close, plus our own quit path from the tray |
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
 | W9 | WebView2 settings: DevTools off in production builds, default context menu off, zoom control off, browser accelerator keys off, general autofill and password save off, status bar off, swipe navigation off, external drop off | CDP e2e per setting where observable; else manual | The SPA-level mitigations of §5.4 |
@@ -191,7 +191,8 @@ raises the log level for one run. `main` handles its modes in the order of §13.
   tray.
 - Hiding (close while live, close with "keep in tray") keeps the page running: WebView2 reports
   `document.visibilityState = 'hidden'`, and the M1 viewer turns video subscriptions off after 10 s while the
-  audible share keeps playing (05 §12.4). The window's visibility also goes to 05 (`audio.Service.SetVisible`).
+  audible share keeps playing (M1 05 §12.4's layer policy). The window's visibility also goes to 05
+  (`audio.Service.SetVisible`, 05 §14.2), which only records it: 05 gives it no effect on the policy in M2.
 
 ### 4.5 Repository layout and import rules
 
@@ -234,7 +235,7 @@ internal/desktop/
 ├─ servers/     `Normalize` (address field rules and the invite/setup hint) and `Probe` over 02's client (§8.1)
 ├─ session/     C2: 01's core for the active linked server, and `core.Auth` over 02's Manager (§9)
 ├─ share/       share controller: picks, state machine, pause, tips, the 01/05 calls (§10.1)
-├─ settings/    settings.json: schema, load, atomic save, migration; implements 05's audio.SettingsStore (§14)
+├─ settings/    settings.json: schema, load, atomic save, migration; 05's audio.SettingsStore (NewAudioStore, §14)
 ├─ i18n/        Go lookups in the SPA's catalog (§18.1)
 ├─ applog/      slog to rotating files, redaction, crash output (§17)
 ├─ tray/        pure tray view model (§11.1)
@@ -420,13 +421,13 @@ font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-s
   permissions (`WebviewWindowOptions.Permissions`). Without any policy the pinned Wails grants every permission without a
   prompt (`SetGlobalPermission(Allow)`); the kinds left out keep the webview's own prompt, and the page's
   `Permissions-Policy` (§5.3) turns camera, microphone and geolocation off too.
-- **WebView2 runtime**: Evergreen, minimum 120.0 (`webview2Min`, which must equal the installer's `WEBVIEW2_MIN`,
-  06 §6.5). The version EdgeUpdate records is compared part by part as numbers; empty, unparsable and `0.0.0.0` (what
-  an uninstall leaves) count as none. When it is missing or older, a native message box says "isshoni needs the
-  Microsoft Edge WebView2 Runtime" with Microsoft's WebView2 download page and the project site's
-  `/troubleshooting#desktop-webview2` (English until WA41's `desktop.native.*` key; neither link is clickable in a
-  message box, Ctrl+C copies its text), and the app exits 1: the pinned Wails would only log it and show a blank
-  window. The installer installs it when missing (06).
+- **WebView2 runtime**: Evergreen, minimum 120.0 (`webview2Min`, which must equal the installer's `WEBVIEW2_MIN`, 06
+  §6.5). The version EdgeUpdate records is compared part by part as numbers; empty, unparsable and `0.0.0.0` (what an
+  uninstall leaves) count as none. When it is missing or older, a native message box says "isshoni needs the Microsoft
+  Edge WebView2 Runtime" with Microsoft's WebView2 download page and the project site's
+  `/troubleshooting#desktop-webview2` (the text is `desktop.native.webview2.missing` from the app's catalog, WA41;
+  neither link is clickable in a message box, Ctrl+C copies its text), and the app exits 1: the pinned Wails would only
+  log it and show a blank window. The installer installs it when missing (06).
 - **Windows N editions** have no H.264 decoder without the Media Feature Pack: `detectCaps()` then reports no H.264
   decode, and the M1 codec banner (05 §10.6) shows; the troubleshooting page names the Media Feature Pack (06).
 
@@ -540,12 +541,12 @@ The server's own CSP (04 §9.6) does not apply to the desktop webview, whose pag
 package app // internal/desktop/app
 
 type Deps struct {
-	Settings *settings.Store     // settings.json; also 05's audio.SettingsStore (§14.2)
+	Settings *settings.Store     // settings.json; 05's audio.SettingsStore through settings.NewAudioStore (§14.2)
 	Servers  *deviceauth.Servers // 02: servers.json, one Manager per server, the credential store
-	Session  *session.Session    // C2: 01's core for the active linked server (§9)
+	Session  Session             // C2: 01's core for the active linked server (§9); *session.Session (WA58)
 	Engine   media.Engine        // native.Open on Windows; fake.NewEngine in dev and e2e builds (§4.5)
-	Audio    *audio.Service      // 05 (internal/desktop/audio)
-	Updater  *update.Updater     // 06 (internal/update); built in the first instance only (§13.4)
+	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio; wired by WA77)
+	Updater  Updater             // 06's *update.Updater, built in the first instance only (§13.4; wired by WA84)
 	Shell    Shell               // cmd/isshoni-desktop over Wails; e2ehost: a recording fake
 	OS       OSHooks             // winos on Windows; stubs elsewhere
 	I18n     *i18n.Catalog
@@ -613,6 +614,17 @@ Wiring in `main.go` (first instance, §13.4 step 7):
 
 The consumer interfaces for the sibling docs are in §24 with the exact shapes this doc assumes; each sibling's names
 win and the adapter in `internal/desktop/*` maps them.
+
+As built (WA41, interfaces first): `Deps.Session`, `Audio` and `Updater` are small interfaces that `app` declares
+(`Session` with `Run`; `AudioService` and `Updater` with `Run` and `Close`), because WA41 merged before the concrete
+types; `*audio.Service` and `*update.Updater` fit them, and `settings.AudioStore[audio.Settings]` fits
+`audio.SettingsStore` (compile-time checks in `internal/desktop/app/deps_test.go`). 05's `audio.SettingsStore` is a
+generic adapter, `settings.NewAudioStore[T](store, defaults)`, not methods on `*settings.Store`, so `settings` doesn't
+import `internal/desktop/audio`: with `T = audio.Settings` its methods are exactly the interface's, the section's
+unknown keys are kept, and the defaults apply under the saved values (§14.2). `app` also declares the methods WA48's
+`App` service calls (`Info`, `OpenExternal` with `ValidExternalURL`, `OpenOSSettings`, `Heartbeat`, `Live`, `Log`,
+`OwnConnections`; `OpenLogsFolder` and `OpenNotices` return `ErrNotImplemented` until their slices); `Shell` has no
+`SetTray` until WA68's tray package.
 
 ### 6.2 Bound services (`internal/desktop/bridge`)
 
@@ -701,7 +713,7 @@ a pull method; the SPA subscribes first and then pulls, so it misses nothing.
 | `audio.prompt` | 05's `Prompt {id, appId, name, kind: 'mic' \| 'browser-mic', since}` | a new prompt | part of `FriendsHear.prompts` |
 | `audio.alert` | 05's `Banner` (an error-level banner: `exclusion-unavailable`, `windows-too-old`) | once per code per share during a live share (05 §14.4); Go also shows the §15 toast | part of `FriendsHear.banners` |
 | `auth.state` | `AuthState` (02 §11.7; its `origin` names the server) | every change of the active server's state; the SPA ignores one whose `origin` isn't its `serverOrigin` (§5.8) | `Auth.State()` |
-| `deeplink.open` | `PendingLink`: `{roomId}` for the active server (`""` = the SPA's own last room), or `{add: {origin, host, hostUnicode, roomId}}` for an unknown server (`host`/`hostUnicode` from `deeplink.Link`) | a deep link, `--server` or `PendingServer` (§13.2) | `App.PendingLink()` |
+| `deeplink.open` | `PendingLink`, exactly one shape: `{roomId}` for the active server (`""` = the SPA's own last room); `{add: {origin, host, hostUnicode, roomId}}` for an unknown server (`host`/`hostUnicode` from `deeplink.Link`); `{switch: {origin, host, hostUnicode, roomId}, live: {roomId}}` for a known server while a share is live (§13.2's question); `{error: "too_many_servers"}` for a 21st server (WA41) | a deep link, `--server` or `PendingServer` (§13.2) | `App.PendingLink()` |
 | `window.state` | `{visible, focused, fullscreen}` | changes | — |
 | `settings.changed` | `SettingsView` | after any change, from any source | `Settings.Get()` |
 | `update.state` | `UpdateStatus` | changes | `Updates.Status()` |
@@ -864,14 +876,22 @@ chunks.
 Boot (05 §4) in the desktop:
 - Step 0 (fragment stash): unchanged and harmless (desktop routes have no fragment tokens).
 - Step 1 (secure context): **only for `BrowserPlatform`**. The desktop's pages come from its own asset handler.
-- Step 4: when `platform.desktop.server` is null, boot skips `/info` and renders the router at `/desktop/setup`.
-  Otherwise `GET /api/v1/info` through `apiFetch` (a Public route: when the active server isn't linked, `apiFetch`
-  sends it without `Authorization`, §7.3); the Offline screen gains "Switch server" (to `/desktop/settings#servers`)
-  in the desktop.
+- Step 4: when `platform.desktop.server` is null, boot skips `/info` and renders the router at `/desktop/setup`, or
+  at the desktop page the app opened (`/desktop/setup`, `/desktop/relink`, `/desktop/settings`, e.g. Settings).
+  The app's own pages (`isDesktopPage`) skip `/info` **with a server too** (WA42): they talk to the bridge only, so an
+  `isshoni://` link for a new server opens the add step (`/desktop/setup?add=…`) while the active server is down, and
+  Settings opens directly. Every other path asks for `GET /api/v1/info` through `apiFetch` (a Public route: when the
+  active server isn't linked, `apiFetch` sends it without `Authorization`, §7.3); the Offline screen gains "Switch
+  server" (it opens the router at `/desktop/settings#servers` without `/info`) in the desktop. When Go refuses the
+  token because the active server is incompatible (`Auth.AccessToken` rejects with `incompatible_server`, which
+  `api()` wraps in a `NetworkError`), `loadInfo` answers `incompatible` at once, without retries, and the router
+  starts at `/desktop/setup`, whose link step shows the version texts with Try again (§8.2, §16.3); `['me']` then
+  resolves to null, so `RequireAuth` follows the `AuthState` instead of showing Offline.
 - Step 6: the service worker is already registered only when `platform.pwa` is set (`app/boot.tsx`); the desktop's is
   `null`.
-- `createConnection` passes `buildVersion: ''` for the desktop, which turns `staleBuild` off (`isStaleBuild` needs a
-  non-empty build version): the desktop SPA is the app's own build and a reload can't change it (§16.3).
+- `createConnection` (`web/src/rooms/connection.ts`, where the `SignalClient` is built) passes `buildVersion: ''` for
+  the desktop, even when `opts.buildVersion` is given, which turns `staleBuild` off (`isStaleBuild` needs a non-empty
+  build version): the desktop SPA is the app's own build and a reload can't change it (§16.3).
 
 ### 7.3 `DesktopPlatform` behavior
 
@@ -916,7 +936,10 @@ browsers are unchanged.
 In the desktop, the room runtime hands every C1 stop to `platform.desktop.signalStopped(info.error)` (WA42 wires it in
 `web/src/rooms/`) and acts on the `SignalStopAction` it returns: a stop with `session_revoked` or `account_disabled`,
 or a second `unauthenticated` right after the forced refresh, calls `Auth.SessionEnded(serverOrigin, code)` and
-`redial`s once if the result's `status` is `linked`, else `relink` (the relink page follows `auth.state`, §8.3). A
+`redial`s once if the result's `status` is `linked`, else `relink` (the relink page follows `auth.state`, §8.3). The
+one redial comes back only once a connection has stayed ready for `BackoffResetMs` (10 s), as the `SignalClient`'s
+forced refresh does (WA42): a server that welcomes the PC and revokes the session at once, while Go's refresh keeps
+succeeding, gets M1's reaction on the second stop instead of a loop. A
 hello refused with `client_outdated` or `protocol_unsupported` calls `Auth.HelloRefused(serverOrigin, error)` and
 shows 02 §13.3's screen from the returned state (`version`, §16.3). A `not_found` from either (the server isn't active
 any more) stops C1 and waits for the reload (`wait`).
@@ -966,8 +989,7 @@ export type PromptAnswer = 'keep-out' | 'include';        // decide; dismissing 
 
 - **`WailsBridge`** (M2): the generated bindings plus `@wailsio/runtime`'s `Events.On`; errors parsed per §6.4. Until
   WA48 generates the bindings, `wails/WailsBridge.ts` is a stub that throws `BridgeError` `not_implemented`, so the
-  dynamic import has a target; every bridge call of a real Wails build rejects with `not_implemented` meanwhile, and
-  the Mac dev app's boot shows the Offline screen instead of NotFound until WA42 and WA48 land.
+  dynamic import has a target; every bridge call of a real Wails build rejects with `not_implemented` meanwhile.
 - **`HttpBridge`** (M2, e2e only in practice), served by `internal/desktop/e2ehost` (§22.4) on the asset origin and
   selected only by `bridge.js`'s `transport`, which only `e2ehost` sets to `"http"`. The wire: a call is `POST
   /__bridge/call` with `Content-Type: application/json` and `{"service", "method", "args"}`, where `service` and
@@ -994,18 +1016,30 @@ New routes in `app/router.tsx` (the page-folder contract of 05 §5; folder `desk
 | `/desktop/relink` | `RelinkPage` | desktop only | the active server signed this PC out (§8.3) |
 | `/desktop/settings` | `SettingsPage` | desktop only | §14.4; anchors `#servers`, `#sharing`, `#audio`, `#app`, `#updates`, `#about` |
 
-- `RequireDesktop` (a layout route in `app/guards.tsx`): NotFound in the browser.
+- `RequireDesktop` (a layout route in `app/guards.tsx`): NotFound in the browser. In the desktop `/desktop` and
+  `/desktop/` show NotFound too (an index route under it), not an empty layout.
+- Two route tables (WA42): `createAppRoutes(sources, target)` and `preloadRoute(path, sources, target)` take a
+  `RouteTarget` (`'browser'` by default; `routeTargetOf(platform)`), and the desktop's table leaves every page behind
+  `RequireBrowser` unloaded, not only `/link`. The stub pages render M1's `PageUnavailable` ("Not in this build yet")
+  until WA71 and WA82 fill them, and the `version` action reuses M1's `VersionMismatch` screen (no reload marker,
+  never `stillStale`) until WA82 adds the desktop actions.
 - `RequireBrowser`: wraps `/login`, `/invite`, `/signup`, `/pending`, `/reset`, `/setup`, `/admin/*`, `/account`,
   `/account/notifications`, `/account/devices`, `/download` and `/link` (02 §10.1: approval needs a cookie session; a
   bearer gets 403 on `/device/lookup`). In the desktop it calls `openExternal(serverOrigin + path + search)` once (for
   `/link` that keeps `?code=`) and renders "Opened in your browser" with a Back button; in the browser it renders its
   child. (D7.)
-- `RequireAuth` in the desktop, when `['me']` is `null`, decides by `AuthState`: `unlinked` with a notice →
-  `/desktop/relink`; `unlinked` without one → `/desktop/setup` (the link step for the active server); `linked` or
-  `offline` (a 401 that a refresh cures) → refetch `['me']` after the next `auth.state`. Never `/login`.
+- `RequireAuth` in the desktop, when `['me']` is `null`, decides by `AuthState`: `unlinked` with a notice of a
+  refused refresh (`signed_out`, `refresh_reused`, `account_disabled`; 02 §11.3–§11.4, §8.3) → `/desktop/relink`;
+  `unlinked` with a link-step outcome (`denied`, `code_expired`, `save_failed`, which the wizard shows) or without a
+  notice, `linking` and `incompatible` (the link step shows it with Try again, §22.3) → `/desktop/setup` (the link
+  step for the active server); `linked` or `offline` (a 401 that a refresh cures) → refetch `['me']` after the next
+  `auth.state`. Never `/login`. With no server it goes to `/desktop/setup` without asking for `['me']` (`apiFetch`
+  would throw with no `serverOrigin`).
 - The account menu in the desktop: "Settings" (`/desktop/settings`), "Switch server" (when more than one), "Account ↗"
-  and, for admins, "Admin ↗" (both open the browser), and "Sign out of <server>" (§8.3). "Invite friends" stays
-  (its dialog is a REST call).
+  and, for admins, "Admin ↗" (both open the browser), and "Sign out of <server>" (§8.3) through `Auth.Unlink()`,
+  never `POST /auth/logout` (02 §11.8). "Invite friends" stays (its dialog is a REST call). Not built yet: the menu is
+  `web/src/rooms/AccountMenu.tsx`, which WA42's paths didn't include and no slice row lists; until a slice takes it
+  (README WA71's row), the desktop still shows M1's menu with its Sign out and Notifications.
 - `/about` works in both.
 
 ### 7.6 What the browser keeps unchanged
@@ -1022,7 +1056,13 @@ The browser runs the same code; it sees only these M2 changes, each of which is 
 
 The rule from 05 §8 stays: nothing outside `platform/` reads cookies or `location.origin`, builds `/api` URLs or
 constructs `RTCPeerConnection`. UI decides whether to offer Share from `capabilities().canShare`, never from `role`
-(the desktop is `role: 'viewer'` and can share); DK4 audits the M1 code for `role` checks.
+(the desktop is `role: 'viewer'` and can share); DK4 audits the M1 code for `role` checks. WA42's audit found no
+reader of `platform.role` but the hello in `rooms/connection.ts`, and three Share gates that read
+`platform.sharing !== null` instead of `capabilities().canShare`: `rooms/RoomPage.tsx` (the header's Share button
+and the `SharePanel`) and `rooms/RoomStage.tsx` (`EmptyRoom`). In the browser the two agree; in the desktop they
+differ once WA65 plugs in `DesktopSharing`, whose engine can report `canShare` false (`unsupported_os`,
+`no_encoder`), so WA65 switches them to `capabilities().canShare`, read asynchronously as `viewer/useControls.ts`
+does (README WA65's row).
 
 ---
 
@@ -1757,8 +1797,16 @@ Links are handled at most once per second; extra ones within that second are dro
 
 ### 13.3 Single instance
 
-- One instance per Windows user session: Wails' single-instance option with unique id `io.isshoni.desktop` (W6; the
-  fallback is the mutex and pipe named in §3.2).
+- One instance per Windows user session, through W6's fallback in `winos` (WA41; §3.2 says why Wails' own option
+  can't be used at beta.34): the first instance holds the mutex `Local\io.isshoni.desktop.v1` and serves the pipe
+  `\\.\pipe\io.isshoni.desktop.v1.<user SID>`, whose DACL admits only the current user and no remote client. It
+  creates the next pipe instance before it closes the one it served, so the name is never free while it serves, and
+  serving starts at §13.4 step 3, right after the mutex is taken; the first pipe instance is retried for up to 5 s.
+  Command lines that arrive before `Boot` has run wait in a queue (at most 8), so a second click during a cold
+  WebView2 start isn't lost after the 2 s forward bound; the queue stops at Wails' shutdown, and the mutex and pipe
+  are released right after Wails' `Run` returns (a forward into a dead window would otherwise block the exit). A
+  second launch connects at identification level only (the server can't impersonate it) and forwards nothing to a
+  server that runs as another account. The macOS dev build has no single instance.
 - A second launch forwards `os.Args[1:]` unchanged to the first and exits 0 within 2 s; before forwarding it calls
   `AllowSetForegroundWindow(ASFW_ANY)`, so the first instance may come to the front (Windows' focus rules otherwise
   only flash its taskbar button). The first instance runs `HandleArgs` with them and applies the same `--open-url`
@@ -1773,13 +1821,15 @@ Links are handled at most once per second; extra ones within that second are dro
 `main.go` handles a start in this order (06 §2.4 owns the contract's other side):
 
 **First action, before step 0 and in every mode** (04 §13.3 layer 2): `windows.SetDefaultDllDirectories(
-LOAD_LIBRARY_SEARCH_SYSTEM32)` and `windows.SetDllDirectory("")` (`SetDllDirectoryW`), so no later bare-name load,
-by Go, Wails, WebView2's loader or a system DLL, searches the current directory or `PATH`. If the slice that owns this
-step finds that a Wails or WebView2 bare-name load needs the app folder, the flags are
-`LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`, which still exclude the current directory and
-`PATH`; the choice is recorded in that slice's PR. A failure is logged at WARN once logging exists and the start goes
-on (both calls exist on every supported build). A `chdir` to the exe's folder is then optional. §22.2's marker test
-checks it on windows-2025.
+LOAD_LIBRARY_SEARCH_SYSTEM32)` and `windows.SetDllDirectory("")` (`SetDllDirectoryW`), so no later bare-name load, by
+Go, Wails, WebView2's loader or a system DLL, searches the current directory or `PATH`. If the slice that owns this step
+finds that a Wails or WebView2 bare-name load needs the app folder, the flags are `LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+LOAD_LIBRARY_SEARCH_SYSTEM32`, which still exclude the current directory and `PATH`; the choice is recorded in that
+slice's PR. **WA41's choice: `LOAD_LIBRARY_SEARCH_SYSTEM32` only**, without `APPLICATION_DIR`: the pinned Wails loads
+WebView2 through its own Go loader by full path, and `isshoni-media.dll` is loaded by full path (04 §13.3). It is not
+yet confirmed on the owner's PC; a bare-name load that fails there moves the flags to the pair above. A failure is
+logged at WARN once logging exists and the start goes on (both calls exist on every supported build). A `chdir` to the
+exe's folder is then optional. §22.2's marker test checks it on windows-2025.
 
 0. **`--sound-check-helper`**: when `os.Args[1] == "--sound-check-helper"`, `os.Exit(audio.RunSoundCheckHelper())`
    (05 §11.3) before any other step but the first action: no single instance, no Wails, no WebView2 check, no
@@ -1787,7 +1837,8 @@ checks it on windows-2025.
 1. **One-shot modes** (skipped entirely when `--open-url` is present, §13.1): each runs first, opens no window, skips
    single instance and does not create the mutex:
    - `--version`: prints exactly one JSON line `{"version","commit","date","protocol":{"min","max"},"engineAbi"}`
-     (`internal/version`, `protocol.MinVersion`/`Version`, `media.ABIVersion`: the ABI major, 1, as 06 §2.4) to stdout
+     (`internal/version`, `protocol.MinVersion`/`Version`, `media.ABIVersion`: the ABI major, 1, as 06 §2.4, not the
+     DLL's packed `im_version`, 65536 = major << 16 | minor) to stdout
      and exits 0. A GUI-subsystem process writes to its inherited stdout handle; when it has none, it calls
      `AttachConsole(ATTACH_PARENT_PROCESS)` first.
    - `--self-check=<path>`: loads `isshoni-media.dll` and FFmpeg from the exe's folder (`native.Open`), reads
@@ -1808,6 +1859,10 @@ checks it on windows-2025.
    - `-Embedding` (COM activation of a toast button while no instance runs, §15): registers the Wails notification
      activator and takes the activation. Every action carries a nonce of a run that is gone (§15), so all are dropped,
      except `open`, which continues as a normal start (steps 2–7); otherwise it exits 0 within 5 s.
+   - As built after WA41: `--version` is real; `-Embedding` exits 0 (every action dropped) until WA68 adds `open`;
+     `--self-check`, `--forget-credentials` and `--purge-data` (WA59), `--update-now` (WA84) and
+     `--sound-check-helper` as step 0 (WA77) log an error and exit 2 with no window, single instance or mutex until
+     their slices. The "closed unexpectedly" crash notice (§17) is only logged until its UI comes.
 2. **Shell relaunch** (Windows, D16): skipped with `--relaunched` and when `Local\io.isshoni.desktop.running`
    already exists (this start will only forward). Look up the parent with a Toolhelp snapshot
    (`CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, own entry's `th32ParentProcessID`); a parent that is gone, or was
@@ -1898,18 +1953,26 @@ temporary profile therefore needs only `%LOCALAPPDATA%` (and a test credential p
 
 - The server list, the active server, users and devices are 02's `servers.json`; settings.json keeps only per-server
   preferences under `serverPrefs`, keyed by origin. An entry whose origin is not in `servers.json` is dropped at load.
-- `audio` is 05's section (05 §14.1). `settings.Store` implements `audio.SettingsStore`: `AudioSettings()` unmarshals
-  the opaque section into 05's `audio.Settings` (05 owns defaults and validation), and `SaveAudioSettings` marshals it
-  back through the debounced atomic write below.
+- `audio` is 05's section (05 §14.1). `settings.NewAudioStore[audio.Settings](store, audio.DefaultSettings)`
+  implements `audio.SettingsStore` (a generic adapter, so `settings` doesn't import `internal/desktop/audio`, §6.1):
+  `AudioSettings()` unmarshals the opaque section into 05's `audio.Settings` with 05's defaults under the saved values
+  (05 owns defaults and validation), and `SaveAudioSettings` marshals it back, keeping the section's unknown keys,
+  through the debounced atomic write below.
 - `updates.check`: when settings.json is missing or has no `updates.check`, the load reads the installer's
   `HKCU\Software\isshoni\UpdateChecks` DWORD once (0 → `false`, anything else → `true`; absent → `true`) and saves
   the result. It is never read again.
 - No token, password, window title or share label is ever written here.
 - **Writes**: debounced 500 ms, then `settings.json.tmp` written and fsynced, the old file copied to
   `settings.json.bak`, and the temp file renamed over (Go's `os.Rename`, `MoveFileEx` with `REPLACE_EXISTING`).
-- **Reads**: unknown fields are kept and written back (a newer app's settings survive a downgrade); a file that doesn't
-  parse is renamed `settings.json.bad-<UTC timestamp>` and `settings.json.bak` is tried; if both fail, defaults.
-  Credentials are never touched by a settings problem (as 02 §11.6 does for `servers.json`).
+- **Reads**: unknown fields are kept and written back (a newer app's settings survive a downgrade), also inside the
+  entries of `serverPrefs` and `pill.positions`, which are merged rather than replaced; a file that doesn't parse is
+  renamed `settings.json.bad-<UTC timestamp>` and `settings.json.bak` is tried; if both fail, defaults. A file that
+  can't be read for another reason than not existing (a sharing violation, an ACL problem) is neither set aside nor
+  overwritten at start and doesn't trigger the `UpdateChecks` read: `settings.json.bak` or the defaults stay in memory
+  until a change is saved (WA41). Credentials are never touched by a settings problem (as 02 §11.6 does for
+  `servers.json`).
+- **Updates** check only the values they change: a loaded value this build can't parse (a hotkey of a newer build, a
+  hand edit) is kept and reported (`invalid`) and never blocks saving another field (WA41).
 - **Migrations** are forward-only, one function per schema step, run at load; a file with a newer `schema` than the app
   knows is read best-effort and not migrated.
 - `SettingsView` (to the SPA) is everything above except `audio` (05's own view through `Audio.*`), plus
@@ -2056,8 +2119,9 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   `protocol.Secret`: otherwise `Auth.LinkWithPassword`'s password and `Auth.AccessToken`'s token would reach the log
   at `log.level: debug`.
 - **SPA log**: `lib/log.ts` (05) forwards `warn` and `error` to `App.Log` in the desktop (≤ 10 per second; above that
-  one "N messages dropped" line per minute), with `component: spa`. The SPA's desktop code never passes an app name,
-  app id, window title or share label to `log` (the same rule as above).
+  one "N messages dropped" line per minute), with `component: spa` as the record's one component key and the page's
+  attributes in an `attrs` group, so none can duplicate the record's own keys (WA41). The SPA's desktop code never
+  passes an app name, app id, window title or share label to `log` (the same rule as above).
 - **Crashes**: at start the app calls `debug.SetCrashOutput` on `logs\crash-<UTC timestamp>.txt` (Go panics and fatal
   runtime errors land there). The next start that finds a crash file newer than the last clean exit shows once:
   "isshoni closed unexpectedly last time. [Open logs folder]". A native crash in the DLL ends the process without a Go
@@ -2086,8 +2150,12 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   outside-the-window keys `desktop.native.audio.voiceAppsHeard`, `desktop.native.audio.questionsWaiting_one`/`_other`
   and `desktop.native.toast.voiceAppsHeard`; the SPA adds `desktop.share.first.hotkeys` and the DND tip's priority
   line.
-- `check:i18n` gains `desktop.native` in `READ_WHOLE` (Go uses it), and a Go test (`i18n_test.go`) scans
-  `internal/desktop` for `T("desktop.native.…")` literals and fails when one is missing from the file.
+- `check:i18n` gains `desktop.native` in `READ_WHOLE` (Go uses it; group 4's integration added it to
+  `web/scripts/check-i18n.mjs`), and a Go test (`i18n_test.go`) scans `internal/desktop` for `T("desktop.native.…")`
+  literals and fails when one is missing from the file.
+- The texts of `RequireBrowser`'s "Opened in your browser" screen and the Offline screen's "Switch server" are in the
+  entry chunk, where the lazy `desktop` namespace isn't loaded, so they are four `common.*` keys in `en.json`
+  (`back`, `openedInBrowser.title`, `openedInBrowser.body`, `screens.offline.switchServer`; WA42).
 - Error codes of §6.4 map to `desktop.errors.<code>` (the wire codes they pass through keep M1's `errors.<code>`).
   The codes are constants of a small stdlib-only package, `internal/desktop/bridge/codes`, which `tygo.yaml` exports
   to `web/src/platform/desktop/codes.gen.ts`; `check:i18n`'s error-code rule reads that file like `types.gen.ts`, so a
@@ -2405,7 +2473,7 @@ shows the encoder and the full layer's bitrate, and its windows stay out of the 
 | Shell relaunch under `explorer.exe` (§13.4 step 2) | §13.4 | 05 (§6.2's include rules assume it) |
 | AppUserModelID, Wails `Options.Name` and single-instance id `io.isshoni.desktop`; exe name `isshoni.exe`; Run value name `isshoni` | §4.2, §13.3, §14.1, §15 | 06 (shortcut, uninstall), 05 (own tree by PID, plus the exe name `isshoni.exe` and the WebView2 user data folder; changing either needs 05's rule change) |
 | Data locations (§14.1): settings, `servers.json` folder, WebView2 profile, logs, the Pending values, the notification registry keys and temp icon written at runtime | §14.1 | 06 (uninstall and purge: what to keep or remove), 02 (credential naming is 02's) |
-| `settings.json` `audio` section through `settings.Store` as `audio.SettingsStore`; `audio.SelfInfo{PID, WebViewDataDir, Exe}`; window visibility to `SetVisible` | §6.1, §14.2 | 05 |
+| `settings.json` `audio` section through `settings.NewAudioStore` as `audio.SettingsStore`; `audio.SelfInfo{PID, WebViewDataDir, Exe}`; window visibility to `SetVisible` | §6.1, §14.2 | 05 |
 | The endpoint viewer mute (`viewerStore.audioMutedForShare`) | §12.1 | 05 (`viewer-muted` banner) |
 | `Engine.Pick(ctx, media.PickRequest{OwnerWindow: <main HWND>})`; `ErrCancelled` → null; the app applies `WDA_EXCLUDEFROMCAPTURE` to its own windows (04 doesn't) | §10.1, §11.5 | 04, 01 |
 | `ShareView` fields used by the shell: `border` (from `Source.OSBorder`, then `ShareSnapshot.NoOSIndicator`), `label` (the controller's, from `Source.Name`; `ShareRequest.Label` always `""`), `kind`, `watching` (`len(Watchers)`) | §6.3, §10.1 | 01 and 04 add `NoOSIndicator` and `OSBorder` |

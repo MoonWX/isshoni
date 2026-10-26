@@ -1584,6 +1584,10 @@ StartShare ─► joining ─► starting ──first room.state with status liv
                 └──────────┴──────────────────────────────────────────────┴──┴─────────► ended(reason)
 ```
 
+`reconnecting` covers the 30 s hold (signaling down, §11.7), a pub PC that is recovering (an ICE restart or a
+rebuild, §11.6) and a republished share that isn't live yet, which is 03 §10.1's "C2 down or pub PC recovering";
+during a hold signaling takes precedence, so the state shows `reconnecting`, not `unreachable` (WA38).
+
 Start, in order (the whole start is bounded by 30 s, the server's start timeout, 01 §4.4). `StartShare` returns
 after step 3 (§11.2): with `ErrNotReady` at once when the connection isn't online, with the error of a failed step,
 or with the share.
@@ -1666,16 +1670,20 @@ pub column of 01 §10.4:
 | Condition | Driver |
 |---|---|
 | First offer, or a new share on the PC | `Offer` with `tracks`, `gen` 1 (or current), `neg + 1`; one outstanding offer, changes folded into one follow-up (01 §9 rule 3) |
-| ICE `disconnected` for 3 s | `signal.Probe()` at once; then `OfferICERestart` (same `gen`, `neg + 1`) |
-| ICE restart not `connected` within 15 s, PC `failed` or closed under it, or `pc.restart{pub, rebuild}` | rebuild: close the Publisher, new Publisher, `gen + 1`, same share id; the pump re-attaches (keyframes) |
-| `sdp_invalid` or `bad_request` in scope `pc` naming the outstanding offer | one rebuild; a second within 60 s ends the share (`error`, `sdp_invalid`) (01 §9 rule 8) |
+| ICE `disconnected` | `signal.Probe()` as soon as ICE first goes `disconnected` (while signaling is ready); still `disconnected` 3 s later: `OfferICERestart` (same `gen`, `neg + 1`) |
+| ICE restart, rebuilt PC or republished PC not `connected` within 15 s, PC `failed` or closed under it, or `pc.restart{pub, rebuild}` | rebuild: close the Publisher, new Publisher, `gen + 1`, same share id; the pump re-attaches (keyframes) |
+| `sdp_invalid` or `bad_request` in scope `pc` naming the outstanding offer, or an answer the Publisher can't apply | one rebuild; a second within 60 s ends the share (`error`, `sdp_invalid`) (01 §9 rule 8) |
 | `stale_negotiation` | ignored |
 | `rate_limited` in scope `pc` | the offer goes out again after `retryAfterMs` (1 s when absent) |
 | 5 rebuilds without reaching `connected` | snapshot state `unreachable` (03: "Can't reach the server's media port" with the connection test); rebuilds go on every 30 s |
 | Signaling not ready | state changes are recorded; acting waits for `ready` |
 
-Limits: at most one ICE restart per 5 s and one rebuild per 10 s (01 §10.4). Remote candidates: the server sends all
-of its own in the answer (01 §9 rule 5); local ones are trickled with `pc.ice` (at most 64 kept while not ready).
+Limits: at most one ICE restart per 5 s and one rebuild per 10 s (01 §10.4). A rebuild that the spacing holds back
+(one that `pc.restart` asked for included) is owed and runs once the spacing allows; it is never dropped. Remote
+candidates: the server sends all of its own in the answer (01 §9 rule 5). **Local candidates are not trickled** (WA38):
+`publish.Publisher.Offer` waits for gathering, so every local candidate is in the offer and the core sends no
+`pc.ice`, which costs little while gathering finds host candidates only (the server sends no ICE servers). Trickle, if
+a later milestone wants it, needs an `Offer` variant in `internal/client/publish`.
 
 `DefaultSettings`: network types `udp4`, `udp6`, `tcp4`, `tcp6` (ICE-TCP active candidates reach the server's TCP 443
 and 7882 passive ones, M1 02 §7.4; M1's `TestICETCPVia443` proves it for Go clients); `SetICEMulticastDNSMode(disabled)`;
@@ -1689,17 +1697,31 @@ so 3 s without inbound traffic is a real outage); `LoggerFactory = logx.NewPionL
   flowing (a WebSocket drop is not a media drop, 01 §4.2). On `ready` within 30 s the timer stops; after 30 s the
   share ends with `server-unreachable` ("Sharing stopped: the server was unreachable", as the web's 60 s, 01 §10.6).
 - **Resumed `welcome`** (01 §10.5): re-send a pending pub offer (same `neg`), ICE-restart a pub PC that isn't
-  `connected`, retry requests that failed with `connection_lost` (`share.start` with the same `ref`, `share.stop`),
-  then reconcile with the first `room.state`: a local share missing on the server is republished (below); a server
-  share with this `connectionId` that the core doesn't have is stopped with `share.stop`.
+  `connected`, retry requests that failed with `connection_lost` (`share.start` with the same `ref`, `share.stop`;
+  `StartShare` also retries a `room.join` cut short, and on a new connection a start begins again from `room.join`
+  with a new `ref`), then reconcile with the first `room.state`: a local share missing on the server is republished
+  (below); a server share with this `connectionId` that the core doesn't have is stopped with `share.stop`. As built
+  (WA38):
+  - A `room.state` that arrives while signaling is down is kept and reconciled after the resumed `welcome` (the signal
+    client's States and Events channels give no order between them).
+  - A resumed `welcome` whose `roomId` is absent or names another room than the share's (the connection was taken out
+    of the room while away: kicked, room closed) publishes the share again at once, from `room.join` (M1 01 §10.5),
+    without touching the old pub PC.
+  - A resumed `welcome` with no active share while the connection is still in a room (the share ended offline): the
+    core sends `share.stop` for its shares in that `room.state`, then `room.leave` (D12).
+  - A share republished **on the connection it was on** (the server lost the share, the connection resumed) gets its
+    new Publisher at the next `gen` with `neg` 1, as a rebuild does: the server keeps a connection's pub `gen` (M1 01
+    §9 rule 2 resets it only after `welcome{resumed: false}`), so a `gen`-1 offer there would be stale. Only a new
+    connection starts again at `gen` 1.
+  - A republish whose `room.join` or `share.start` is refused tries `rate_limited` again after `retryAfterMs` (1 s
+    when absent) and a retryable `internal` once (M1 01 §12.1); other codes end the share.
+  - A republish replaces the share's `ShareParams` (id, codec, encodings) but doesn't yet feed them to ratectl or the
+    engine, nor re-send `paused`: preset and pause reconciling after a republish are WA46's (README WA46's row).
 - **Not resumed** (server restart, grace over, or the new connection after a forced token refresh): drop the pub PC
   without a message, `gen` back to 1; `room.join{the share's room}`; `share.start{replaces: oldShareId, ref: new}`; a
   new Publisher at `gen` 1; the engine session continues and the pump asks for keyframes. The share keeps its local
   identity; its `ID` changes and the app gets a snapshot (viewers move focus by `replaces`, 01 §10.6). The
-  connection's id changes too (`Status.ConnectionID`, `EventStatus`). Until WA38 builds this, WA29's core ends the
-  active share on a welcome that isn't resumed (`EndInfo{server, Server: disconnected}`), and a `pc`-scope error
-  about the outstanding offer other than `stale_negotiation` and `rate_limited` ends it with `error` and that code
-  instead of §11.6's rebuild.
+  connection's id changes too (`Status.ConnectionID`, `EventStatus`).
 - **Reconcile with `room.state`** (D13), for the share's own `ShareInfo` in every snapshot:
   - `preset` differs from the applied one (changed from a web tab): `share.update{shareId, preset}` (idempotent) →
     the reply's `ShareParams` go to `ratectl.Params` and `Session.Reconfigure` (preset tuning, frame rate; Text runs
@@ -2109,13 +2131,25 @@ The component the client core owns, capture → last packet sent, is measured on
    (Synthetic, 1080p60 at 8 Mbit/s, the default 4 s GOP) → core → in-process server → `sfutest.Viewer`. For each `f`
    frame, `latency = arrival of its last packet − (Origin + Marker.CaptureNS)`. Asserts p95 < 60 ms and max < 200 ms
    over 20 s (loopback; under `-race` except on windows). This catches a pump, pacer or SFU change that holds frames
-   back.
+   back. As built (WA43): every frame of the window must arrive whole (a dropped frame can't improve the numbers),
+   and the test skips under `-short`, like `TestTenByTen`. It runs today in `test:go` on ubuntu (under `-race`) and in
+   the Mac's `task test`; the `windows-go` and `desktop-macos` jobs don't test `internal/server/itest` (06 §10.1), so
+   the macOS and Windows runs named above wait for a job that does. `test:go` lists packages without `-v`, which
+   prints nothing for a passing package: the p50/p95/max values show with
+   `go test -race -run '^TestDesktopLatency$' -v ./internal/server/itest/`. The 8 Mbit/s load: until WA46's ramp
+   lands, the core runs at `ratectl.Initial`'s first targets (4 Mbit/s on `f`), so the test watches the core's `f`
+   target for 8 s (`RampDelay + 2·RampEvery + 2 s`) and, when it never moved, sets 8 Mbit/s on the fake session itself
+   through the control the ramp uses (logged `ramped false`); the pacer then still paces for the first targets, which
+   makes the bounds harder to meet, not easier. Once the ramp lands that fallback never runs and can go (WA46).
 2. **Viewer path** (`web/e2e/latency.spec.ts`, Playwright on Chrome, the e2e job): `isshoni-loadtest -scenario smoke
    -decodable -publishers 1 -subscribers 0` publishes (as `decodable.spec` does, `LOADTEST_BIN`); the Chrome viewer
    records `requestVideoFrameCallback` metadata for 20 s. When `captureTime` is present (Chrome estimates it from our
    SRs; sender and viewer share the machine's clock), asserts median `expectedDisplayTime − captureTime` < 150 ms and
    p95 < 250 ms; otherwise asserts median `expectedDisplayTime − receiveTime` < 100 ms and annotates the test that the
-   capture leg was not measured. This catches timestamp or SR mistakes that make Chrome's jitter buffer grow.
+   capture leg was not measured. This catches timestamp or SR mistakes that make Chrome's jitter buffer grow. As
+   built (WA43): the loadtest also gets `-duration 45s` (smoke's default 30 s would leave the 20 s recording only
+   what remains after the stage and decoder start), and the capture leg's median must be above 0, so a sender report
+   that puts `captureTime` in the future can't pass the bounds trivially.
 
 ## 13. Limits and timeouts
 
