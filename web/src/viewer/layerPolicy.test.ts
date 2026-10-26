@@ -72,4 +72,24 @@ describe('desiredSubscriptions', () => {
     // Absent means not visible: an unmounted tile.
     expect(wants({ visible: {} })).toEqual(['s_a high/on', 's_b off/off', 's_c off/off']);
   });
+
+  it('rule 7 (M2): a local share without a preview of the page gets the low layer at most and never audio', () => {
+    // docs/m2/03 §10.4: the desktop app's own share. After the remote shares, in its order.
+    const local = (over: Partial<LayerInputs>) =>
+      wants({ remoteShares: ['s_a'], localShares: ['s_own'], ...over }).filter((w) => w.startsWith('s_own'));
+    expect(local({ visible: { s_a: true, s_own: true } })).toEqual(['s_own low/off']);
+    expect(local({ visible: { s_a: true, s_own: false } })).toEqual(['s_own off/off']);
+    // Picked onto the stage, in PiP, or "audible": still the preview layer, still silent.
+    expect(local({ focused: 's_own', visible: { s_own: true } })).toEqual(['s_own low/off']);
+    expect(local({ pip: 's_own' })).toEqual(['s_own low/off']);
+    expect(local({ audible: 's_own', visible: { s_own: true } })).toEqual(['s_own low/off']);
+    // The page's other rules apply: a page hidden for 10 s, fullscreen on another share.
+    expect(local({ pageHiddenForMs: PAGE_HIDDEN_OFF_MS, visible: { s_own: true } })).toEqual(['s_own off/off']);
+    expect(local({ fullscreen: true, visible: { s_own: true } })).toEqual(['s_own off/off']);
+    expect(desiredSubscriptions(inputs({ localShares: ['s_own'], visible: { s_own: true } })).at(-1)).toEqual({
+      shareId: 's_own',
+      video: 'low',
+      audio: 'off',
+    });
+  });
 });

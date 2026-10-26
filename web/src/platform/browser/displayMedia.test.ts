@@ -152,7 +152,7 @@ describe('createBrowserSharing', () => {
       expect(load).toHaveBeenCalledTimes(2);
       expect(publisher.start).not.toHaveBeenCalled();
       // The source is the caller's to release, as on every rejection of start().
-      expect(src.preview.getTracks().every((t) => t.readyState === 'live')).toBe(true);
+      expect(src.preview?.getTracks().every((t) => t.readyState === 'live')).toBe(true);
       expect(logLines().filter((l) => l.component === 'capture' && l.level === 'warn')).toHaveLength(1);
 
       // The chunk arrives the next time.

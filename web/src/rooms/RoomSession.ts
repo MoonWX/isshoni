@@ -6,6 +6,11 @@
 //
 // It never imports React (05 §3 "Layering rule") and never imports viewer/ or share/: those reach it through the
 // seams below (SessionMedia, ShareRecovery, onRoomEvent), so rooms/ builds without them.
+//
+// The desktop app (M2, docs/m2/03 §9, §10.2): its share is native, published by the app's own connection (C2), so it
+// can outlive this page; the runtime hands such a share to adoptShare() once the room's snapshot lists it. A native
+// share's end is C2's to report: when this page's connection sees it end, the session only tells the share
+// (serverEnded refreshes its view), and the share's own `ended` detaches it.
 import { createEmitter } from '../lib/emitter';
 import { errorMessage } from '../lib/errorText';
 import { LocalError } from '../lib/errors';
@@ -457,6 +462,21 @@ export class RoomSession {
     }
   }
 
+  /**
+   * Takes a share that this page didn't start as the session's local share (docs/m2/03 §9): the desktop app's native
+   * share, which C2 keeps publishing while this page reloads (or its webview restarts). The room runtime calls it once
+   * a room.state of the session's room lists the share platform.sharing.current() names. It sets `share` and wires
+   * the share's events exactly as startShare does. Ignored (false) while the session has a share or one is starting,
+   * outside a room, and for a share that has ended.
+   */
+  adoptShare(share: ActiveShare): boolean {
+    if (this.#disposed || this.#share !== null || this.#startingShare || share.state === 'ended') return false;
+    if (this.#desired === null) return false;
+    this.#log.info('adopting the share the app publishes');
+    this.#attachShare(share);
+    return true;
+  }
+
   /** Stops the local share (the Stop button): ActiveShare.stop() sends share.stop and cleans up the pub PC. */
   async stopShare(): Promise<void> {
     const share = this.#share;
@@ -824,11 +844,25 @@ export class RoomSession {
 
   #serverEnded(share: SessionShare, reason: EndReason | undefined): void {
     this.#log.info('the server ended the local share', { reason: reason ?? 'room.state' });
+    if (this.#platform.sharing?.mode === 'native') {
+      // The desktop's native share: C2, not this page's connection, reports the authoritative end (docs/m2/03
+      // §10.2). The share only refreshes its view, and its own `ended` detaches it. Seen again from the next snapshot
+      // that lists it, so this isn't asked at every snapshot meanwhile.
+      this.#shareSeenId = null;
+      this.#tellServerEnded(share, reason);
+      return;
+    }
     this.#detachShare();
     if (typeof share.serverEnded !== 'function') {
       void this.#stop(share);
       return;
     }
+    this.#tellServerEnded(share, reason);
+  }
+
+  /** ShareRecovery.serverEnded; a failure is only logged. */
+  #tellServerEnded(share: SessionShare, reason: EndReason | undefined): void {
+    if (typeof share.serverEnded !== 'function') return;
     try {
       const done = share.serverEnded(reason);
       if (done instanceof Promise) {

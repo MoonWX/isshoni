@@ -39,6 +39,8 @@ export function sharerName(t: TFunction, share: ViewerShare): string {
 
 /** What is shared, in a word: the label the sharer typed, else the kind. */
 export function shareWhat(t: TFunction, share: ViewerShare): string {
+  // The desktop app's own share shows the layer its friends' tiles get (docs/m2/03 §10.4).
+  if (share.local && !share.localPreview) return t('viewer.tile.lowPreview');
   const label = share.info.label?.trim();
   return label !== undefined && label !== '' ? label : kindLabel(t, share.info.kind);
 }
@@ -96,7 +98,8 @@ export interface ShareView {
  *   last frame stays under "Waiting for video…";
  * - the `bandwidth` or `unavailable` reason: a badge; a reason this build doesn't know: a badge without a specific
  *   reason (01 §8.13).
- * A share this page publishes shows its preview; only `stalled` applies to it.
+ * A share this page publishes shows its preview; only `stalled` applies to it. A local share of another local
+ * connection (the desktop app's own share, docs/m2/03 §10.4) shows its subscribed layer, with every state above.
  */
 export function shareView(
   share: ViewerShare,
@@ -105,7 +108,7 @@ export function shareView(
   frozen = false,
 ): ShareView {
   const stalled = share.info.status === ShareStatusStalled;
-  if (share.local) return { overlay: stalled ? 'stalled' : null, badge: null };
+  if (share.localPreview) return { overlay: stalled ? 'stalled' : null, badge: null };
   const reason: string | undefined = status?.reason;
   if (reason === StatusReasonCodec) return { overlay: 'codec', badge: null };
   let badge: ShareBadge | null = null;

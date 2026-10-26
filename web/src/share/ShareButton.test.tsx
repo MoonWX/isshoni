@@ -205,8 +205,8 @@ describe('ShareButton: a whole screen with system audio (05 §13.3)', () => {
       expect(onStart).toHaveBeenCalledExactlyOnceWith(src, { preset: 'auto', withAudio: false });
     });
     expect(audio?.readyState).toBe('ended');
-    expect(src.preview.getAudioTracks()).toEqual([]);
-    expect(src.preview.getVideoTracks()[0]?.readyState).toBe('live');
+    expect(src.preview?.getAudioTracks()).toEqual([]);
+    expect(src.preview?.getVideoTracks()[0]?.readyState).toBe('live');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(store.getState()).toMatchObject({ phase: 'starting', withAudio: false });
     expect(toasts()).toEqual([]);
@@ -220,7 +220,7 @@ describe('ShareButton: a whole screen with system audio (05 §13.3)', () => {
     await waitFor(() => {
       expect(onStart).toHaveBeenCalledExactlyOnceWith(src, { preset: 'auto', withAudio: true });
     });
-    expect(src.preview.getAudioTracks()[0]?.readyState).toBe('live');
+    expect(src.preview?.getAudioTracks()[0]?.readyState).toBe('live');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
@@ -453,7 +453,7 @@ describe('ShareButton: the button that was used goes away mid-flow', () => {
     await waitFor(() => {
       expect(onStart).toHaveBeenCalledExactlyOnceWith(src, { preset: 'auto', withAudio: false });
     });
-    expect(src.preview.getAudioTracks()).toEqual([]);
+    expect(src.preview?.getAudioTracks()).toEqual([]);
     expect(store.getState()).toMatchObject({ phase: 'starting', withAudio: false });
     expect(src.release).not.toHaveBeenCalled();
   });
@@ -472,7 +472,7 @@ describe('ShareButton: the button that was used goes away mid-flow', () => {
     await waitFor(() => {
       expect(onStart).toHaveBeenCalledExactlyOnceWith(src, { preset: 'auto', withAudio: false });
     });
-    expect(src.preview.getAudioTracks()).toEqual([]);
+    expect(src.preview?.getAudioTracks()).toEqual([]);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 

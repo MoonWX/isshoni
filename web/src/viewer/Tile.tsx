@@ -21,7 +21,7 @@ import { WatchersPopover } from './WatchersPopover';
 
 export interface TileProps {
   share: ViewerShare;
-  /** The local preview, for a share this page publishes (share.local). */
+  /** The local preview, for a share this page publishes (share.localPreview). */
   preview?: MediaStream | null | undefined;
   /** The user picked this tile (click, tap, Enter or Space). */
   onPick: (shareId: string) => void;
@@ -45,8 +45,9 @@ export function Tile({ share, preview, onPick, actions, tabStop = true }: TilePr
   const shown = useVisibility(share.id);
   const tabIndex = tabStop ? 0 : -1;
 
-  const stream = share.local ? preview : undefined;
-  const track = share.local ? undefined : media.video;
+  // This page's own share shows its preview stream; the desktop app's own share (docs/m2/03 §10.4) its low layer.
+  const stream = share.localPreview ? preview : undefined;
+  const track = share.localPreview ? undefined : media.video;
   const view = shareView(share, status, stream != null || track !== undefined, frozen);
   const watching = watchingText(t, share);
   let label: string;

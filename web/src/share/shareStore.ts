@@ -5,13 +5,18 @@
 //   idle ─Share click─► picking ──cancelled──► idle
 //                         │ picked
 //                         ▼
-//                     confirming (only for a whole screen with system audio) ──pick again / cancel──► idle
-//                         │ continue, with or without sound
+//                     confirming (see below) ──pick again / cancel──► idle
+//                         │ continue (with or without sound), Go live, Share now
 //                         ▼
 //                     starting ──► live ⇄ reconnecting ──► stopping ──► idle
 //                         │ error
 //                         ▼
 //                      failed ──dismiss──► idle
+//
+// `confirming` has a reason (`confirming`), one step after the other, in this order: a native pick's one-time sheets
+// (docs/m2/03 §10.2, PickedSource.confirm: the first-share sheet, then the Do-not-disturb tip), and the whole-screen
+// warning of a browser pick of a whole screen with system audio (05 §13.3). Each confirm() moves to the next one;
+// after the last the share starts. A cancel at any of them releases the pick.
 //
 // The store drives the first half itself: idle, picking, confirming, and the hand-over to `start` (the room
 // session's startShare, which publishes through platform.sharing.start). The second half is the publisher's
@@ -54,8 +59,14 @@ export interface ShareOutcome {
   readonly notice?: ShareNotice['kind'];
 }
 
-/** What was picked (05 §13.3), without the stream. */
-export type PickedInfo = Pick<PickedSource, 'kind' | 'audioScope' | 'warning'>;
+/** What was picked (05 §13.3), without the stream; a native pick adds the picker's name (local only). */
+export type PickedInfo = Pick<PickedSource, 'kind' | 'audioScope' | 'warning'> & { readonly label?: string };
+
+/**
+ * Why the flow is `confirming`, in the order the steps come: the first-share sheet and the Do-not-disturb tip of a
+ * native pick (docs/m2/03 §10.2), then the whole-screen warning of a browser pick (05 §13.3).
+ */
+export type ConfirmReason = 'first-share' | 'dnd' | 'screen-audio';
 
 /**
  * Publishes a picked source: the room session's startShare (05 §11.1). From the call on, the source is the
@@ -80,7 +91,10 @@ export class ShareCancelledError extends Error {
 export type ShareFlowOutcome =
   /** Back to idle: the picker was cancelled, or the flow was cancelled or overtaken meanwhile. */
   | { readonly step: 'cancelled' }
-  /** A whole screen with system audio: the ScreenAudioWarning decides (confirm, pick again or cancel). */
+  /**
+   * A step stands before the share (ShareFields.confirming): the ScreenAudioWarning or a native sheet decides
+   * (confirm, pick again or cancel).
+   */
   | { readonly step: 'confirming' }
   /** `start` took the source and resolved. */
   | { readonly step: 'started'; readonly picked: PickedInfo; readonly withAudio: boolean }
@@ -95,9 +109,14 @@ export interface ShareFields {
   readonly withAudio: boolean;
   /** The classification of the picked source; null while idle or picking. */
   readonly picked: PickedInfo | null;
+  /** The step the flow waits for while `confirming` (ConfirmReason); null in every other phase. */
+  readonly confirming: ConfirmReason | null;
   /** The sound switch of the share panel (05 §13.7): false while a share with sound sends silence. */
   readonly soundOn: boolean;
-  /** The latest ShareParams (share.start, share.update, quality.hint). Filled by the publisher. */
+  /**
+   * The latest ShareParams (share.start, share.update, quality.hint). Filled by the publisher; null for a native share,
+   * whose publisher connection holds them (docs/m2/03 §9).
+   */
   readonly params: ShareParams | null;
   /** The upload or CPU hint of 05 §13.7. Filled by the publisher. */
   readonly hint: ShareHint | null;
@@ -123,17 +142,22 @@ export interface ShareActions {
   /**
    * Follows a pick that the click handler already started (`platform.sharing.pick()` must be the handler's first
    * statement, so its promise comes in here). idle, failed → picking; from confirming it is "Pick something else":
-   * the current source is released first. Then: cancelled → idle; a whole screen with system audio → confirming;
-   * anything else → starting, through opts.start.
+   * the current source is released first. Then: cancelled → idle; a pick with steps before the share (a native
+   * pick's confirm list, a whole screen with system audio) → confirming; anything else → starting, through
+   * opts.start.
    *
    * While a share is starting or live the pick isn't wanted: its source is released when it arrives.
    */
   pick(picking: Promise<PickedSource | null>, opts: { preset: Preset; start: StartShare }): Promise<ShareFlowOutcome>;
   /**
-   * confirming → starting. Without sound ("Share without sound"), the audio track is stopped and taken out of the
-   * stream first, at this click.
+   * The step the flow waits for is done: confirming → the next step (outcome `confirming`), or → starting after the
+   * last one. At the whole-screen warning `withAudio` is the choice: without sound ("Share without sound") the audio
+   * track is stopped and taken out of the stream first, at this click. The native sheets (Go live, Share now) pass
+   * nothing and keep what was picked.
    */
-  confirm(withAudio: boolean): Promise<ShareFlowOutcome>;
+  confirm(withAudio?: boolean): Promise<ShareFlowOutcome>;
+  /** The preset the share starts with, chosen while picking or confirming (the first-share sheet's picker). */
+  setPreset(preset: Preset): void;
   /**
    * picking, confirming → idle; releases the picked source. A pick that resolves later is released too. The store
    * does this itself when the capture ends while the warning shows (the browser's "Stop sharing" bar).
@@ -160,7 +184,7 @@ export interface ShareActions {
    * Returns false, and changes nothing, while another share is already published or being stopped: the machine
    * follows one share (05 §13.1), and that other share's advance, report and finish are the ones that count.
    */
-  publishing(share: { picked: PickedInfo; preset: Preset; withAudio: boolean; params: ShareParams }): boolean;
+  publishing(share: { picked: PickedInfo; preset: Preset; withAudio: boolean; params: ShareParams | null }): boolean;
   /**
    * starting → live (the first keyframe: the share is live in room.state); live ⇄ reconnecting (the pub PC);
    * any of them → stopping. Ignored while no share is under way, and nothing leaves stopping but finish().
@@ -188,6 +212,7 @@ const IDLE: Omit<ShareFields, 'preset' | 'hostId' | 'panels' | 'notice'> = Objec
   phase: 'idle',
   withAudio: false,
   picked: null,
+  confirming: null,
   soundOn: true,
   params: null,
   hint: null,
@@ -196,13 +221,23 @@ const IDLE: Omit<ShareFields, 'preset' | 'hostId' | 'panels' | 'notice'> = Objec
 });
 
 function infoOf(src: PickedSource): PickedInfo {
-  return { kind: src.kind, audioScope: src.audioScope, warning: src.warning };
+  const info = { kind: src.kind, audioScope: src.audioScope, warning: src.warning };
+  return src.label !== undefined ? { ...info, label: src.label } : info;
+}
+
+/** The steps a pick waits for before its share starts, in order (ConfirmReason). */
+function stepsOf(src: PickedSource): ConfirmReason[] {
+  const steps: ConfirmReason[] = [...(src.confirm ?? [])];
+  if (src.warning === 'screen-with-system-audio') steps.push('screen-audio');
+  return steps;
 }
 
 interface Waiting {
   readonly src: PickedSource;
   readonly start: StartShare;
   readonly unwatch: () => void;
+  /** The steps still to come after the current one (ShareFields.confirming). */
+  readonly next: ConfirmReason[];
 }
 
 export function createShareStore(): ShareStore {
@@ -233,7 +268,8 @@ export function createShareStore(): ShareStore {
      * source ending does.)
      */
     const watchEnded = (src: PickedSource): (() => void) => {
-      const tracks = src.preview.getVideoTracks();
+      // A native pick has no stream here: Go holds its source (docs/m2/03 §10.1).
+      const tracks = src.preview?.getVideoTracks() ?? [];
       const onEnded = (): void => {
         if (waiting?.src === src) get().cancel();
       };
@@ -248,7 +284,7 @@ export function createShareStore(): ShareStore {
       const mine = ++flow;
       published = false;
       const picked = infoOf(src);
-      set({ phase: 'starting', picked, withAudio, error: null });
+      set({ phase: 'starting', picked, withAudio, confirming: null, error: null });
       try {
         await start(src, { preset: get().preset, withAudio });
       } catch (error) {
@@ -301,25 +337,44 @@ export function createShareStore(): ShareStore {
           set({ phase: 'idle' });
           return { step: 'cancelled' };
         }
-        if (src.warning === 'screen-with-system-audio') {
-          waiting = { src, start: opts.start, unwatch: watchEnded(src) };
-          set({ phase: 'confirming', picked: infoOf(src), withAudio: true });
+        const [first, ...next] = stepsOf(src);
+        if (first !== undefined) {
+          waiting = { src, start: opts.start, unwatch: watchEnded(src), next };
+          set({ phase: 'confirming', confirming: first, picked: infoOf(src), withAudio: src.audioScope !== 'none' });
           return { step: 'confirming' };
         }
         return begin(src, opts.start, src.audioScope !== 'none');
       },
 
       async confirm(withAudio) {
-        const taken = get().phase === 'confirming' ? takeWaiting() : null;
-        if (!taken) return { step: 'cancelled' };
+        const { phase, confirming } = get();
+        const current = phase === 'confirming' ? waiting : null;
+        if (current === null) return { step: 'cancelled' };
+        const [step, ...rest] = current.next;
+        if (step !== undefined) {
+          waiting = { ...current, next: rest };
+          set({ confirming: step });
+          return { step: 'confirming' };
+        }
+        const taken = takeWaiting();
+        if (taken === null) return { step: 'cancelled' };
         const { src, start } = taken;
-        if (!withAudio) {
-          for (const track of src.preview.getAudioTracks()) {
-            track.stop();
-            src.preview.removeTrack(track);
+        let sound = get().withAudio;
+        if (confirming === 'screen-audio' && withAudio !== undefined) {
+          sound = withAudio;
+          if (!withAudio && src.preview !== null) {
+            for (const track of src.preview.getAudioTracks()) {
+              track.stop();
+              src.preview.removeTrack(track);
+            }
           }
         }
-        return begin(src, start, withAudio);
+        return begin(src, start, sound);
+      },
+
+      setPreset(preset) {
+        const { phase } = get();
+        if ((phase === 'picking' || phase === 'confirming') && get().preset !== preset) set({ preset });
       },
 
       cancel() {

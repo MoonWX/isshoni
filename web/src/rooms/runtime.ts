@@ -19,7 +19,13 @@
 //   client, then the request) is the logout flow's (auth/logout.ts): the runtime registers its two steps there
 //   with addLogoutStep, session.stopShare() and signal.stop(), and signal.start() as the undo when the request
 //   fails: the session keeps its desired room through a stop(), so that start rejoins it;
-// - a REST call answered 503 server_shutdown tells the banner that the outage is a restart (05 §7.1).
+// - a REST call answered 503 server_shutdown tells the banner that the outage is a restart (05 §7.1);
+// - the desktop's native share outlives the page (docs/m2/03 §9): C2 keeps publishing while the page reloads. Its
+//   provider names it (platform.sharing.current()), and once a room.state of the session's room lists it, the
+//   runtime hands it to the session (RoomSession.adoptShare), which then shows and stops it like one this page
+//   started. The room is the page's: after a reload the route's room is the share's own (a share follows the
+//   page's room, and a switch stops it). platform.sharing.localConnectionIds() (C2) goes to the viewer, which
+//   counts that connection's shares as this page's (connectViewer.ts).
 import type { AppServices } from '../app/context';
 import type { UiStore } from '../app/uiStore';
 import { addLogoutStep } from '../auth/logout';
@@ -28,8 +34,9 @@ import { CodeServerShutdown } from '../protocol/api.gen';
 import { applyInvalidate } from '../protocol/invalidate';
 import { queryKeys } from '../protocol/queryKeys';
 import { ApiError } from '../protocol/rest';
+import type { Platform } from '../platform/types';
 import type { SignalClient } from '../protocol/signal-client';
-import { MessageTypeInvalidate } from '../protocol/types.gen';
+import { MessageTypeInvalidate, type RoomState } from '../protocol/types.gen';
 import { createViewer, type ViewerServices } from '../viewer/services';
 import { createConnection, createConnectionStore, type Stores } from './connection';
 import { connectStats } from './connectStats';
@@ -102,7 +109,11 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
   });
   const session = new RoomSession({ platform, signal, stores, log, media: opts.media ?? defaultMedia(viewer, ui) });
   stores.session = session;
-  const offViewer = connectViewer({ viewer, signal, session, room: stores.room, ui });
+  const localConnectionIds = (): readonly string[] => platform.sharing?.localConnectionIds?.() ?? [];
+  const offViewer = connectViewer({ viewer, signal, session, room: stores.room, ui, localConnectionIds });
+  const offAdopt = stores.room.subscribe((s, prev) => {
+    if (s.state !== prev.state && s.state !== null) adoptShare(platform, session, s.state);
+  });
   const offStats = connectStats({
     viewer,
     room: stores.room,
@@ -171,6 +182,7 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     },
     stop,
     dispose() {
+      offAdopt();
       offStats();
       offViewer();
       offLogoutShares();
@@ -184,6 +196,17 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
       viewer.dispose();
     },
   };
+}
+
+/**
+ * The share the platform publishes beyond this page (the desktop's native share, docs/m2/03 §9) becomes the
+ * session's local share once the room's snapshot lists it. Nothing while the session has a share or starts one.
+ */
+function adoptShare(platform: Platform, session: RoomSession, state: RoomState): void {
+  if (session.share !== null) return;
+  const share = platform.sharing?.current?.() ?? null;
+  if (share === null || share.state === 'ended' || share.shareId === '') return;
+  if (state.roomId === session.roomId && state.shares.some((s) => s.id === share.shareId)) session.adoptShare(share);
 }
 
 const runtimes = new WeakMap<AppServices, RoomRuntime>();

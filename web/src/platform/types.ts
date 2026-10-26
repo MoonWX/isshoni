@@ -190,12 +190,10 @@ export interface PickedSource {
   /** native (M2): null (voice apps are kept out). */
   warning: 'screen-with-system-audio' | 'no-audio' | null;
   /**
-   * Owned by the provider. docs/m2/03 §7.1 makes it `MediaStream | null` (null for a native pick). Not done yet:
-   * share/'s readers (BrowserSharing, BrowserShare, shareStore, SharePanel) and rooms/RoomPage assume a stream, and no
-   * slice's files cover both them and this one, so the change waits for the integrator to assign it (WA32's blocked
-   * items).
+   * The captured stream, owned by the provider; null for a native pick (docs/m2/03 §7.1): the desktop app's engine
+   * captures in Go, and the page never holds the source's media.
    */
-  preview: MediaStream;
+  preview: MediaStream | null;
   /** M2, native: the picker's name for the source; shown on this PC only, never sent. */
   label?: string;
   /** M2, native: one-time sheets to show before going live, in order (docs/m2/03 §10.2). */
@@ -261,8 +259,12 @@ export interface ActiveShare {
 export interface SharingProvider {
   /** browser: 'in-page'; desktop app and Linux agent: 'native' (M2/M4). */
   readonly mode: 'in-page' | 'native';
-  /** Call synchronously from the click handler (transient user activation). null = cancelled. */
-  pick(opts: { preset: Preset }): Promise<PickedSource | null>;
+  /**
+   * Call synchronously from the click handler (transient user activation). null = cancelled. withAudio (native, M2):
+   * the desktop ShareSheet's Share sound switch, which a native pick's audioScope carries ('system' or 'none',
+   * docs/m2/03 §10.2); default true. The browser's picker decides sound itself and ignores it.
+   */
+  pick(opts: { preset: Preset; withAudio?: boolean }): Promise<PickedSource | null>;
   start(src: PickedSource, opts: { preset: Preset; withAudio: boolean }, ctx: ShareContext): Promise<ActiveShare>;
   /** M2, native: the share the app publishes now (e.g. after the page reloaded), or null. */
   current?(): ActiveShare | null;
