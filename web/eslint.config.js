@@ -35,7 +35,15 @@ const noNavigation = [
 
 export default defineConfig(
   // First entry: generated and build-output files are never linted.
-  globalIgnores(['dist/', 'src/protocol/*.gen.ts', 'playwright-report/', 'test-results/']),
+  // The desktop bridge's codes (tygo) and its Wails bindings (`task gen:bindings`) are generated too (docs/m2/03 §6).
+  globalIgnores([
+    'dist/',
+    'src/protocol/*.gen.ts',
+    'src/platform/desktop/*.gen.ts',
+    'src/platform/desktop/bindings/',
+    'playwright-report/',
+    'test-results/',
+  ]),
 
   js.configs.recommended,
 

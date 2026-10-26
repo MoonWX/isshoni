@@ -673,11 +673,40 @@ describe('the transport (docs/m2/03 §7.2, §7.4)', () => {
     expect(sent(1).auth).toBe('Bearer isa_http');
   });
 
-  it('a Wails build without WailsBridge (WA48) rejects its bridge calls with not_implemented', async () => {
+  it('a Wails build calls the bound methods through the Wails runtime, and parses their errors (W12)', async () => {
+    // The pinned runtime (@wailsio/runtime's runtime.js) POSTs {object: 0 (Call), method: 0, args: {call-id,
+    // methodID, args}} to /wails/runtime; a Go error comes back as 422 {message, cause, kind} whose message is the
+    // bridge error's JSON verbatim (transport_http.go's httpError).
+    fetchMock.mockImplementation((input) => {
+      if (!urlOf(input).endsWith('/wails/runtime')) return Promise.resolve(json(200, {}));
+      return Promise.resolve(
+        json(422, {
+          message: '{"code":"server_unreachable","params":{}}',
+          cause: { code: 'server_unreachable', params: {} },
+          kind: 'RuntimeError',
+        }),
+      );
+    });
     const p = new DesktopPlatform(config());
     made.push(p);
-    await expect(p.desktop.bridge.auth.state()).rejects.toMatchObject({ code: 'not_implemented' });
-    await expect(p.apiFetch('/api/v1/info')).rejects.toMatchObject({ code: 'not_implemented' });
-    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(p.desktop.bridge.auth.state()).rejects.toMatchObject({ code: 'server_unreachable' });
+    // At load the runtime also HEADs /wails/custom.js (the Guard lets GET and HEAD of it through, 03 §5.6).
+    const runtimeCalls = fetchMock.mock.calls.map((_, i) => sent(i)).filter((c) => c.url.endsWith('/wails/runtime'));
+    const call = runtimeCalls[0];
+    if (!call) throw new Error('no /wails/runtime request');
+    expect(call.url).toBe(`${location.origin}/wails/runtime`);
+    expect(new Headers(call.init.headers).get('x-wails-client-id')).not.toBe('');
+    const body = JSON.parse(call.init.body as string) as {
+      object: number;
+      method: number;
+      args: { 'call-id': string; methodID: number; args: unknown[] };
+    };
+    expect(body).toMatchObject({ object: 0, method: 0, args: { args: [] } });
+    expect(typeof body.args.methodID).toBe('number');
+    // apiFetch asks for the token through the same transport, and sends nothing to the server when Go refuses.
+    await expect(p.apiFetch('/api/v1/info')).rejects.toMatchObject({ code: 'server_unreachable' });
+    expect(fetchMock.mock.calls.every(([u]) => new URL(urlOf(u), location.href).pathname.startsWith('/wails/'))).toBe(
+      true,
+    );
   });
 });

@@ -236,9 +236,6 @@ func TestAppStartsOverTheBundle(t *testing.T) {
 
 func TestShellIsNotImplementedYetWhereSaid(t *testing.T) {
 	var s wailsShell
-	if err := s.OpenURL("https://example.com"); err == nil {
-		t.Fatal("OpenURL works before its slice")
-	}
 	if err := s.Notify(app.Notification{Title: "x"}); err == nil {
 		t.Fatal("Notify works before its slice")
 	}

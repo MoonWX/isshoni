@@ -5,8 +5,8 @@
 //
 // The shapes are the JSON of the bound services (docs/m2/03 §6.2, §6.3), which follow 02 §11.7 (AuthState), 05 §14.5
 // (FriendsHear) and 06 §8.9 (UpdateStatus). Field names are the wire's. This file is types plus two constants (the
-// event prefix and the list of fire-and-forget methods); WA48's generated bindings must stay assignable to these
-// types.
+// event prefix and the list of fire-and-forget methods). The Go side's DTOs (internal/desktop/bridge) write the same
+// JSON with plain strings where these types name the values; WailsBridge maps the generated bindings onto them.
 //
 // Later (M4): a RelayBridge over 01's same-user relay implements the share and audio parts over messages, so the
 // interface keeps those parts free of anything Wails-specific.

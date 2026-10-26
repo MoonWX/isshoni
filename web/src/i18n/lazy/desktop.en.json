@@ -103,6 +103,51 @@
         "failed": "We couldn't capture the test sound, so friends would hear nothing from this PC.",
         "deviceBusy": "Another app is using your speakers on its own (exclusive mode). Close it, or turn off \"Allow applications to take exclusive control of this device\" in the device's Sound properties, then Try again."
       }
+    },
+    "errors": {
+      "invalid_argument": "isshoni couldn't do that: something it was given isn't valid.",
+      "not_found": "That isn't there any more.",
+      "busy": "Stop sharing first.",
+      "io_error": "isshoni couldn't open that on this PC.",
+      "rate_limited": "Too many tries. Wait a moment and try again.",
+      "feature_disabled": "This server doesn't support that yet.",
+      "not_implemented": "This part of isshoni isn't finished in this build.",
+      "internal": "Something went wrong in isshoni. Try again.",
+      "invalid_address": "That doesn't look like a server address. Check it and try again.",
+      "server_unreachable": "isshoni can't reach this server. Check the address and your connection.",
+      "tls_untrusted": "This server's certificate isn't trusted, so isshoni won't connect to it.",
+      "not_isshoni": "That address isn't an isshoni server.",
+      "server_not_set_up": "This server isn't set up yet. Its admin has to finish the setup in a browser first.",
+      "incompatible_server": "This server and this version of isshoni don't work together.",
+      "too_many_servers": "You've added 20 servers. Remove one first.",
+      "not_linked": "Link this app to the server first.",
+      "publisher_offline": "isshoni can't reach the server to start sharing. Try again in a moment.",
+      "already_sharing": "You're already sharing. Stop that share first.",
+      "not_sharing": "You aren't sharing right now.",
+      "pick_expired": "That pick timed out. Pick what to share again.",
+      "engine": {
+        "permission_denied": "Windows didn't allow isshoni to capture that.",
+        "encoder_lost": "Your PC's video encoder stopped working.",
+        "source_gone": "The window you shared was closed.",
+        "unsupported_os": "Sharing needs Windows 10 22H2 or later.",
+        "no_encoder": "No H.264 encoder works on this PC.",
+        "dependency": "Part of isshoni is missing or damaged. Reinstall isshoni from your server's Download page.",
+        "audio_unavailable": "isshoni can't capture sound on this PC right now.",
+        "audio_not_running": "Sound capture isn't running. Try again.",
+        "stopped": "The share stopped.",
+        "timeout": "isshoni's video engine didn't answer in time. Try again.",
+        "internal": "Something went wrong in isshoni's video engine.",
+        "invalid": "Something went wrong in isshoni's video engine.",
+        "busy": "Something went wrong in isshoni's video engine.",
+        "reason": {
+          "selfWindow": "Pick something other than isshoni.",
+          "driverTooOld": "Update your graphics driver (NVIDIA 531.61 or newer).",
+          "noMediaFoundation": "This edition of Windows (N or KN) needs Microsoft's Media Feature Pack for video.",
+          "blockedByPolicy": "Windows (Smart App Control or your organization's policy) blocked part of isshoni's video engine.",
+          "reinstall": "Part of isshoni is missing or damaged. Reinstall isshoni from your server's Download page.",
+          "deviceRemoved": "Your graphics driver restarted, so the share stopped."
+        }
+      }
     }
   }
 }
