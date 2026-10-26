@@ -2491,13 +2491,13 @@ Once it listens it prints one JSON line `{addr, origin, log}`. `/__e2e/system` a
 when `Auth.AccessToken` was called, the moment that decides whose token it is, §5.8, which `desktop-link.spec`'s
 "no token for A while B was active" asserts on), `activeAtReturn` (for the failure message) and the hash prefix; the
 recording `Shell.Reload` only counts reloads (a spec reloads the page itself). Until the e2e server answers CORS for
-the desktop origins (WA56 wires `httpapi.Deps.DesktopOrigins`; WA47's default is none), `desktop-security.spec`'s
-`/link` and storage case uses a small loopback stand-in server with the e2e server's own `/info` plus `deviceFlow`,
-`/device/password`, `/device/token` and `/device/revoke`; the spec switches to the worker's e2e server by itself once
-that one answers desktop CORS and lists `deviceFlow`, and the stand-in branch can then go. In CI (group 5's
-integration) the `build` job, which has `web/dist`, builds the harness (`CGO_ENABLED=0 go build -trimpath -o
-bin/e2ehost ./internal/desktop/e2ehost`) and uploads it as `e2ehost-linux-amd64`; the `e2e` job downloads it and sets
-`DESKTOP_E2E_BIN` (06 §10.1).
+the desktop origins (WA56 wired `httpapi.Deps.DesktopOrigins` in group 6; WA47's default is none),
+`desktop-security.spec`'s `/link` and storage case uses a small loopback stand-in server with the e2e server's own
+`/info` plus `deviceFlow`, `/device/password`, `/device/token` and `/device/revoke`; the spec switches to the worker's
+e2e server by itself once that one answers desktop CORS and lists `deviceFlow`, and the stand-in branch goes with WA65
+(README WA65's row). In CI (group 5's integration) the `build` job, which has `web/dist`, builds the harness
+(`CGO_ENABLED=0 go build -trimpath -o bin/e2ehost ./internal/desktop/e2ehost`) and uploads it as `e2ehost-linux-amd64`;
+the `e2e` job downloads it and sets `DESKTOP_E2E_BIN` (06 §10.1).
 
 | Spec | Asserts |
 |---|---|

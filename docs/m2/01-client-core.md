@@ -990,10 +990,11 @@ send time just before `WriteRTCP`, so the computed RTT never comes out lower tha
 Pure logic, owned by one goroutine (the share's actor, §11.4); no Pion, no I/O. Time comes in as arguments, so tests
 drive it with fixed instants. **One clock** (README §3 item 43, WF4): every instant the core passes (`Tick`, `Hint`,
 `Live`, `SetLimit`, …) is `time.Now()` when the actor handles the event, never a ticker channel's value, which since
-Go 1.23 is the instant the tick was due, not when the actor took it (`case <-rate.C: s.rateTick(time.Now())`). With
-both clocks mixed, a `Tick` taken late recorded its change up to that lag (0.54 s seen under `-race`) before the engine
-call, while a hint's change was recorded at `time.Now()`, so the next change could reach the engine sooner than the
-guards' interval (§9.4) allows (WA54-R2; D10, §14).
+Go 1.23 is the instant the tick was due, not when the actor took it (`case <-rate.C: s.rateTick(time.Now())`; until WF4
+merges, the actor passes the ticker's value: README §3 item 43). With both clocks mixed, a `Tick` taken late recorded
+its change up to that lag (0.54 s seen under `-race`) before the engine call, while a hint's change was recorded at
+`time.Now()`, so the next change could reach the engine sooner than the guards' interval (§9.4) allows (WA54-R2; D10,
+§14).
 
 ### 9.1 API
 
@@ -1697,8 +1698,9 @@ Session.Next ──► pump goroutine ──► per-kind queues ──► consum
     reach the snapshot with the `EventLayer` of a re-init).
   - Reserved codes (2–5) and unknown codes: dropped (debug log). Audio events never come through `Next` (05).
 - A fatal error from `Next` ends the share with its code and its `Reason` (`EndInfo.Media` and `MediaReason`, §11.9;
-  README §3 item 43), `encoder_lost` included (the engine already tried every candidate, D15), so 03 can tell
-  `device_removed` from a lost encoder (03 §10.5). It is never audio-caused (§5.2).
+  `MediaReason` from WF4; until then it is empty, README §3 item 43), `encoder_lost` included (the engine already tried
+  every candidate, D15), so 03 can tell `device_removed` from a lost encoder (03 §10.5). It is never audio-caused
+  (§5.2).
 
 ### 11.6 Negotiation and PeerConnection recovery
 
@@ -2196,7 +2198,7 @@ The component the client core owns, capture → last packet sent, is measured on
    (full screen).
 4. In the isshoni app: Share → the OS picker → that monitor (Win11: borderless WGC; Win10: Desktop Duplication),
    preset Auto, **Share sound on** (the default, Exclude apps). Wait until the app shows the full layer at 8 Mbit/s
-   (≈ 10 s, the ramp).
+   (≈ 14 s after the share goes live, the ramp, §9.3).
 5. In Chrome (not the isshoni app: its windows are excluded from capture, plan "Own windows"), signed in as **the same
    user**, open the room. Click the share to focus it, then its speaker button: an own share is never made audible
    by focus (M1 05 §12.2), and its audio must be subscribed for Chrome to lip-sync. If Chrome shows "Now watching in
@@ -2353,7 +2355,7 @@ app.)
 | D6 | Hold expiry | server stopped for 35 s → share ends `server-unreachable` at 30 s ± 1 s; engine stopped |
 | D7 | Codec switch | a CB-only viewer joins → `quality.hint{codec: h264/42e0}` → `Reconfigure{Profile: 42e0}` and re-offer; viewer gets CB from a `Reinit` keyframe, whose SPS is Constrained Baseline (profile_idc 66 with constraint_set1), not only the payload type; back to High 60 s after it leaves, the first keyframe after the switch back carrying a High SPS (WA46) |
 | D8 | Layer pausing | no high request for 10 s → `f` inactive: `SetLayerActive(f, false)` in `Calls`, no `f` packets; a high request resumes with a keyframe ≤ 1 s (`SetLayerActive(f, true)` and `SetBitrate(f, target)` in one step, in either order; the core calls `SetBitrate` first, §11.8) |
-| D9 | Uplink congestion | `SetInboundLink` with M1's policer (`NewLink`) at 3 Mbit/s on the publisher: congestion hint ≤ 6 s; applied `f` settles ≤ 2.3 Mbit/s within 15 s; unrecovered loss < 2 % after settling; upload hint "540p" or "720p" event; capacity to 20 Mbit/s → ramps back to 8 Mbit/s ≤ 75 s (README §3 item 44), hint clears. As built (WA54): the script runs the share at its 8 Mbit/s ceiling for 5 s first (longer than the live guard's 2 s, so the core takes the first hint at once, as a share that ramped a while ago does), then the policer limits the uplink for 30 s, then allows 20 Mbit/s. "Settles" means that `f`'s applied target (the engine's call) first comes down to 2.3 Mbit/s or less within 15 s of the limit, and the unrecovered loss is measured from then until the lift; it can't mean "stays there for the rest of the limit": a policer gives no delay signal, so after the 10 s hold the estimate probes upward and passes 2.3 Mbit/s again 13–17 s after its backoff (also with 1.10). "Back" means `f` at its ceiling, the upload hint off and a last congestion hint that lifts the cap; under `-race` on the Mac that took 30–57 s (least when the estimate was growing at the lift, most after a backoff right at it), so the 60 s first written had too little margin (WA54-R1). The Link sits at the core's end of the uplink (§10.1's `sfutest` bullet) |
+| D9 | Uplink congestion | `SetInboundLink` with M1's policer (`NewLink`) at 3 Mbit/s on the publisher: congestion hint ≤ 6 s; applied `f` settles ≤ 2.3 Mbit/s within 15 s; unrecovered loss < 2 % after settling; upload hint "540p" or "720p" event; capacity to 20 Mbit/s → ramps back to 8 Mbit/s ≤ 75 s (README §3 item 44; 60 s until WF5 merges), hint clears. As built (WA54): the script runs the share at its 8 Mbit/s ceiling for 5 s first (longer than the live guard's 2 s, so the core takes the first hint at once, as a share that ramped a while ago does), then the policer limits the uplink for 30 s, then allows 20 Mbit/s. "Settles" means that `f`'s applied target (the engine's call) first comes down to 2.3 Mbit/s or less within 15 s of the limit, and the unrecovered loss is measured from then until the lift; it can't mean "stays there for the rest of the limit": a policer gives no delay signal, so after the 10 s hold the estimate probes upward and passes 2.3 Mbit/s again 13–17 s after its backoff (also with 1.10). "Back" means `f` at its ceiling, the upload hint off and a last congestion hint that lifts the cap; under `-race` on the Mac that took 30–57 s (least when the estimate was growing at the lift, most after a backoff right at it), so the 60 s first written had too little margin (WA54-R1). The Link sits at the core's end of the uplink (§10.1's `sfutest` bullet) |
 | D10 | Re-init encoder | probe `LiveBitrate: false`: during D9's script no two bitrate changes < 10 s apart, none < 30 %; every change is followed by a `Reinit` keyframe. The spacing is measured on the engine's calls (`fake.Call.At`). With the rate tick on the actor's clock (§9, README §3 item 43, WF4), ratectl's guards bound the engine's calls too, and D10 allows them at most Windows' clock step (20 ms) of slack; until WF4 merges it allows 1 s (`callSlack`: 9 s); a change that no viewer saw (the SFU forwarded another layer meanwhile) is logged and skipped, and a keyframe counts as the change's only when neither the GOP nor a keyframe request made it (WA54) |
 | D11 | Pause | `SetPaused(true)`: no media within 50 ms (viewer recorder); `Calls` show `paused true` and `audio_muted true`; `room.state` status `paused`; viewer PLIs swallowed; a viewer joining while paused gets no frame; resume → `audio_muted false` then `paused false` in `Calls`, keyframe ≤ 500 ms, status `live`; a pause set from a web-role connection is reconciled with the same calls |
 | D12 | Preset from another connection | a web-role connection of the user sends `share.update{preset: movie}` → the core reconciles: `share.update` with the same preset, Opus `SetBitrate(audio, 256000)` |
