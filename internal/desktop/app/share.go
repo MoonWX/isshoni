@@ -51,6 +51,14 @@ var (
 	_ publisher = (*session.Session)(nil)
 )
 
+// audioConfigSource is what C2 takes of 05's audio service (*audio.Service): the audio start config of a share
+// with sound, its exclusions included (05 §14.2). Like share.AudioPolicy it is found on Deps.Audio by a type
+// assertion, so deps_test.go asserts that *audio.Service has both: a signature that drifts would otherwise drop
+// 05's calls without a failing build.
+type audioConfigSource interface {
+	AudioConfig() media.AudioConfig
+}
+
 // newSession is C2 for d's engine and servers (03 §6.1's wiring): hello client {desktop, the app's version, the
 // core's OS}, and 05's AudioConfig when Deps.Audio has it.
 func newSession(d Deps) (*session.Session, error) {
@@ -60,7 +68,7 @@ func newSession(d Deps) (*session.Session, error) {
 		Client:  protocol.ClientInfo{Kind: protocol.ClientKindDesktop, Version: version.Version()},
 		Log:     d.Log,
 	}
-	if p, ok := d.Audio.(interface{ AudioConfig() media.AudioConfig }); ok {
+	if p, ok := d.Audio.(audioConfigSource); ok {
 		o.AudioConfig = p.AudioConfig
 	}
 	return session.New(o)

@@ -32,6 +32,8 @@ type Controller struct {
 
 	wg sync.WaitGroup // the shares' watchers and the stops Start makes
 
+	statsMu sync.Mutex // orders syncStats' calls of the clients' WatchServerStats; taken before mu, never under it
+
 	mu         sync.Mutex // guards the fields below
 	closed     bool
 	picking    bool
@@ -292,7 +294,6 @@ func (c *Controller) Start(ctx context.Context, r StartRequest) (View, error) {
 		return View{}, ErrClosed
 	}
 	stopNow := a.cause != ""
-	watch := c.watchStats
 	a.view = c.viewLocked(a, &snap, conn)
 	v := *cloneView(a.view)
 	c.wg.Add(1) // under c.mu, which Close holds when it sets closed: no Add after Close's Wait began
@@ -307,9 +308,7 @@ func (c *Controller) Start(ctx context.Context, r StartRequest) (View, error) {
 		}()
 	}
 	c.mu.Unlock()
-	if watch {
-		client.WatchServerStats(true)
-	}
+	c.syncStats(a) // the wish as it is now, on or off: 01's WatchServerStats is sticky on its client
 	c.remember(origin, r.Preset, a.sheets)
 	c.stateChanged()
 	c.log.Info("share: started", "share_id", snap.ID, "kind", string(v.Kind), "preset", string(r.Preset),
@@ -479,7 +478,8 @@ func (c *Controller) refresh(a *active) {
 
 // ended runs the local steps of every share end once (03 §10.1), also of one the server or the core made: 05's
 // OnShareStopped (then, with their slices, the hotkeys unregistered, the pill hidden, keep-awake off and the tray
-// idle), and the final view.
+// idle), the server stats off on the share's client while the wish is on (no stats.watch between shares; the next
+// Start passes the wish on), and the final view.
 func (c *Controller) ended(a *active) {
 	snap := a.share.Snapshot()
 	conn := a.client.Status().ConnectionID
@@ -493,8 +493,12 @@ func (c *Controller) ended(a *active) {
 	}
 	c.last = cloneView(a.view)
 	reason := a.view.EndReason
-	close(a.done)
+	watched := c.watchStats
 	c.mu.Unlock()
+	if watched {
+		c.syncStats(a)
+	}
+	close(a.done) // after the local steps: Stop returns once they ran
 	c.stateChanged()
 	c.log.Info("share: ended", "share_id", snap.ID, "end_reason", string(reason))
 }
@@ -798,17 +802,41 @@ func (c *Controller) Stats() *Stats {
 }
 
 // WatchServerStats turns 01's server stats on or off (the Details disclosure, 03 §10.3; the bridge counts the
-// disclosures). The wish holds for the running share and for every later one; View.Server is set only while on.
+// disclosures). The wish holds for the running share and for every later one, whose Start passes it to its client;
+// a share's client has them only while that share runs. View.Server is set only while on.
 func (c *Controller) WatchServerStats(on bool) {
 	c.mu.Lock()
 	c.watchStats = on
 	a := c.cur
+	running := a != nil && a.share != nil
 	c.mu.Unlock()
-	if a == nil || a.share == nil {
+	if !running {
 		return
 	}
-	a.client.WatchServerStats(on)
+	c.syncStats(a)
 	c.refresh(a)
+}
+
+// syncStats passes the server-stats wish to a's client (01's WatchServerStats, a sticky switch on the client): on
+// while the wish is on and a is the running share, off once a ended and no other share started. While another share
+// is starting or running, its own Start and WatchServerStats set its client, and a's is left alone. The calls are
+// serialized and each passes the state at its call, so the last call carries the latest wish.
+func (c *Controller) syncStats(a *active) {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	c.mu.Lock()
+	var on bool
+	switch c.cur {
+	case a:
+		on = c.watchStats
+	case nil:
+		on = false
+	default:
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+	a.client.WatchServerStats(on)
 }
 
 // Subscribe calls fn with every Event until cancel is called. fn runs on the controller's goroutines, one call at

@@ -251,8 +251,9 @@ func TestSheets(t *testing.T) {
 }
 
 // TestStartOrder: C2 ready, then 05's OnShareStarted(pid, withAudio), then 01's StartShare with the pick, the
-// preset, audio and Label ""; the controller sends no room or share message of its own (its Client has none: the
-// join before share.start is 01's, itests D1 and D2). The preset becomes serverPrefs[origin].preset.
+// preset, audio and Label "", then the server-stats wish (off) on the share's client; the controller sends no room or
+// share message of its own (its Client has none: the join before share.start is 01's, itests D1 and D2). The preset
+// becomes serverPrefs[origin].preset.
 func TestStartOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -266,6 +267,7 @@ func TestStartOrder(t *testing.T) {
 		want := []string{
 			"audio.OnShareStarted(4120,true)",
 			`core.StartShare(room=lounge,source=pick:1,preset=game,audio=true,label="")`,
+			"core.WatchServerStats(false)",
 		}
 		if got := e.log.get(); !slices.Equal(got, want) {
 			t.Fatalf("calls %q, want %q", got, want)
@@ -1064,6 +1066,42 @@ func TestWatchServerStats(t *testing.T) {
 		e.ctl.WatchServerStats(false)
 		if e.log.count("core.WatchServerStats(false)") != 1 {
 			t.Errorf("calls %q", e.log.get())
+		}
+	})
+}
+
+// TestWatchServerStatsBetweenShares: 01's switch is sticky on the client, so a share's end turns it off there, and
+// a Details disclosure closed between shares (the bridge's off reaching a controller with no share) leaves the next
+// share's client off.
+func TestWatchServerStatsBetweenShares(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		goLive(e.start(t, "lounge", true))
+		synctest.Wait()
+		e.ctl.WatchServerStats(true)
+		e.log.reset()
+		e.ctl.Stop(context.Background(), CauseUser)
+		e.log.order(t, "core.Share.Stop", "core.WatchServerStats(false)")
+		if e.log.count("core.WatchServerStats(true)") != 0 {
+			t.Errorf("stop: %q", e.log.get())
+		}
+
+		e.ctl.WatchServerStats(false) // the disclosure unmounts after the share ended
+		e.log.reset()
+		goLive(e.start(t, "lounge", false))
+		synctest.Wait()
+		if e.log.count("core.WatchServerStats(false)") != 1 || e.log.count("core.WatchServerStats(true)") != 0 {
+			t.Errorf("the next share's client: %q", e.log.get())
+		}
+		if v := e.ctl.Current(); v.Server != nil {
+			t.Errorf("server stats with the wish off: %+v", v.Server)
+		}
+
+		// Without the wish a share's end makes no call.
+		e.log.reset()
+		e.ctl.Stop(context.Background(), CauseUser)
+		if n := e.log.count("core.WatchServerStats("); n != 0 {
+			t.Errorf("end without the wish: %q", e.log.get())
 		}
 	})
 }

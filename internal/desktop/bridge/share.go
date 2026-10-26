@@ -62,7 +62,9 @@ type StartRequest struct {
 
 // ShareView is the native share as the SPA sees it (03 §6.3): Share.Current() and the share.state event. state is
 // picking, starting, live, paused, reconnecting, unreachable, stopping, ended or failed; endReason user, hotkey,
-// tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; liveSince is RFC 3339.
+// tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; liveSince is RFC 3339. server
+// is {layers: protocol.ServerLayerStats[]} while WatchServerStats is on, else null: 03 §6.3's ShareSnapshot.Server
+// (01's server view of this connection's layers), wrapped in an object by WA48's DTO type.
 type ShareView struct {
 	State        string          `json:"state"`
 	ShareID      string          `json:"shareId"`
@@ -82,7 +84,7 @@ type ShareView struct {
 	Encoder      string          `json:"encoder"`
 	HW           bool            `json:"hw"`
 	Layers       []ShareLayer    `json:"layers"`
-	Server       map[string]any  `json:"server"` // 01's server stats while WatchServerStats is on, else null
+	Server       map[string]any  `json:"server"` // {layers: protocol.ServerLayerStats[]} or null, as said above
 	EndReason    *string         `json:"endReason"`
 	Error        *ShareViewError `json:"error"`
 }
