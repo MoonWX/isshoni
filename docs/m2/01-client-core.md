@@ -2112,10 +2112,18 @@ The component the client core owns, capture → last packet sent, is measured on
    back.
 2. **Viewer path** (`web/e2e/latency.spec.ts`, Playwright on Chrome, the e2e job): `isshoni-loadtest -scenario smoke
    -decodable -publishers 1 -subscribers 0` publishes (as `decodable.spec` does, `LOADTEST_BIN`); the Chrome viewer
-   records `requestVideoFrameCallback` metadata for 20 s. When `captureTime` is present (Chrome estimates it from our
-   SRs; sender and viewer share the machine's clock), asserts median `expectedDisplayTime − captureTime` < 150 ms and
-   p95 < 250 ms; otherwise asserts median `expectedDisplayTime − receiveTime` < 100 ms and annotates the test that the
-   capture leg was not measured. This catches timestamp or SR mistakes that make Chrome's jitter buffer grow.
+   records `requestVideoFrameCallback` metadata for 20 s and samples its receivers' `getStats` every 250 ms. The
+   tool's share has its Opus tone, so a frame's leg includes Chrome's lip-sync hold (§12.1), which follows the
+   viewer's audio output: on the Mac 0–32 ms playing to an HDMI display and up to 190 ms to Bluetooth headphones, in
+   PR #41's e2e job (a PulseAudio null sink) up to about 280 ms. The legs are therefore taken less the hold (the video
+   receiver's `jitterBufferTargetDelay − jitterBufferMinimumDelay` per frame). When `captureTime` is present (Chrome
+   estimates it from our SRs; sender and viewer share the machine's clock), asserts median
+   `expectedDisplayTime − captureTime` < 150 ms and p95 < 250 ms; otherwise asserts median
+   `expectedDisplayTime − receiveTime` < 100 ms and annotates the test that the capture leg was not measured. The hold
+   has bounds of its own: its p95 is < 400 ms and exceeds what the audio path explains, max(0, NetEq + output − the
+   video's own delay), by < 60 ms. Without the receivers' stats the legs are asserted as shown. This catches timestamp
+   mistakes that make Chrome's jitter buffer grow, and SR or capture-stamp offsets between a share's audio and video
+   (a hold the audio path doesn't explain).
 
 ## 13. Limits and timeouts
 
