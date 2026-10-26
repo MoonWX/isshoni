@@ -507,10 +507,10 @@ tasks:
 
   lint:keys:
     desc: >-
-      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers and uses only options
-      that OpenSSH 8.1 parses, that the update signers block in internal/update/signers.go equals
-      deploy/keys/update_signers (docs/m2/06 §8.3), and that README.md's "Release signing keys" section lists the
-      fingerprint of each key in them and no other one
+      Check that the key blocks embedded in deploy/install.sh and deploy/install-desktop.ps1 equal
+      deploy/keys/allowed_signers and use only options that OpenSSH 8.1 parses, that the update signers block in
+      internal/update/signers.go equals deploy/keys/update_signers (docs/m2/06 §8.3), and that README.md's "Release
+      signing keys" section lists the fingerprint of each key in them and no other one
     cmds:
       - go -C tools run ./repocheck -root .. keys
 
@@ -1615,8 +1615,8 @@ tasks:
 
   release:keys:
     desc: >-
-      Write deploy/keys/allowed_signers into the key block of deploy/install.sh, check it (lint:keys) and print the
-      keys' fingerprints (deploy/keys/README.md)
+      Write deploy/keys/allowed_signers into the key blocks of deploy/install.sh and deploy/install-desktop.ps1, check
+      them (lint:keys) and print the keys' fingerprints (deploy/keys/README.md)
     cmds:
       - cmd: |
           set -eu
@@ -1668,6 +1668,9 @@ tasks:
           cat "$tmp/install.sh" >deploy/install.sh
           echo "release:keys: wrote $keys into deploy/install.sh"
         silent: true
+      # The desktop script's block (docs/m2/06 §7.1, §7.2): repocheck checks the key file as lint:keys does before
+      # it writes the lines between the markers of install-desktop.ps1's here-string.
+      - go -C tools run ./repocheck -root .. ps1-keys
       - task: lint:keys
 
   release:compat:

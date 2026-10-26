@@ -1,10 +1,12 @@
 # Keep LF line ends in files that are read byte for byte or run by a POSIX shell, also in a Git for Windows checkout
 # (core.autocrlf=true): shell scripts, and the release key list that `task lint:keys` compares with the block embedded
 # in deploy/install.sh (docs/m1/06-deploy-and-ci.md §4.3, §9.4), the update key list that release.yml's verify-windows
-# and check-draft.sh hand to ssh-keygen as it is (docs/m2/06-windows-release.md §8.3, §11.3, §11.4), and the generated
+# and check-draft.sh hand to ssh-keygen as it is (docs/m2/06-windows-release.md §8.3, §11.3, §11.4), the generated
 # copy of the SFU's H.264 parser, which TestSFUParserCopy compares byte for byte with go/format's output (LF) on the
-# windows-go job too.
+# windows-go job too, and install-desktop.ps1, whose bytes the server embeds and serves (docs/m2/06 §7.1) and which
+# `task lint:ps` refuses with CRLF line ends.
 *.sh text eol=lf
+deploy/install-desktop.ps1 text eol=lf
 deploy/keys/allowed_signers text eol=lf
 deploy/keys/update_signers text eol=lf
 internal/media/fake/sfuh264_copy_test.go text eol=lf

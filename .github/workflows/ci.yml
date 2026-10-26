@@ -597,7 +597,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run-protocol == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # gen:bindings:check builds the pinned wails3 CLI when its cache below misses, and its
+    # generator loads the desktop app's packages, which downloads their modules.
+    timeout-minutes: 15
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -608,14 +610,14 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: false # the tools cache below is the only one this job needs
+          cache: false # the tools caches below are the only ones this job needs
 
       # gen:check depends on `task tools`, which builds every pinned tool (golangci-lint and
       # Task included) from source. This caches the built binaries in .bin/ and Task's checksum
       # of tools/go.mod and tools/go.sum in .task/, so on a hit `task tools` is up to date and
       # nothing is compiled. That is about 160 MB on disk, where the module and build caches
       # for the same tools take close to 3 GB: a cold run saves it in seconds, within the
-      # 5-minute timeout, and it uses little of the repository's cache space. Shared with
+      # job's timeout, and it uses little of the repository's cache space. Shared with
       # govulncheck (same key; when both save at once, one of them skips with a note). No
       # restore-keys: binaries of other versions would only be rebuilt.
       - name: Cache the pinned Go tools
@@ -631,8 +633,25 @@ jobs:
         with:
           version: ${{ needs.changes.outputs.task-version }}
 
+      # The wails3 CLI of tools/wails3 (M2 06 §3), which gen:bindings:check builds into .bin/
+      # through release:wails3. Its own key: the tools cache above is shared with govulncheck,
+      # which never builds it. Task's checksum of tools/wails3/go.mod and go.sum comes along, so
+      # that on a hit release:wails3 is up to date.
+      - name: Cache the wails3 CLI
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .bin/wails3
+            .task/checksum/release-wails3
+          key: wails3-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/wails3/go.mod', 'tools/wails3/go.sum') }}
+
       - name: task gen:check (generated TypeScript matches the Go types)
         run: task gen:check
+
+      - name: task gen:bindings:check (the desktop app's bindings match its bound services)
+        # M2 06 §10.1, 03 §6: GOOS=windows wails3 generate bindings, compared with the committed
+        # web/src/platform/desktop/bindings/ (the ubuntu half of Wails checklist row W15).
+        run: task gen:bindings:check
 
   licenses:
     # The license gate of 06 §8.3: go-licenses over ./cmd/... for linux, darwin and windows,
@@ -809,6 +828,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Build bin/e2ehost
+        # The desktop e2e harness (internal/desktop/e2ehost, M2 03 §22.4 A) for the e2e job's
+        # desktop specs (DESKTOP_E2E_BIN): it embeds web/dist, which only this job has, and the
+        # e2e job sets up no Go. Never released.
+        env:
+          CGO_ENABLED: '0'
+        run: go build -trimpath -o bin/e2ehost ./internal/desktop/e2ehost
+
+      - name: Upload bin/e2ehost
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2ehost-linux-amd64
+          path: bin/e2ehost
+          if-no-files-found: error
+          retention-days: 7
+
   e2e:
     # The browser tests of web/e2e (docs/m1/05-web-client.md §19.3) against the build job's
     # binary, which has the web job's SPA embedded. Google Chrome runs headful under Xvfb: only
@@ -825,6 +860,8 @@ jobs:
       ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni
       # decodable.spec's tool (README S89); no Go is set up here to build it.
       LOADTEST_BIN: ${{ github.workspace }}/bin/isshoni-loadtest
+      # The desktop specs' harness (M2 03 §22.4 A, web/e2e/fixtures.ts), built by the build job.
+      DESKTOP_E2E_BIN: ${{ github.workspace }}/bin/e2ehost
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -853,10 +890,16 @@ jobs:
           name: isshoni-loadtest-linux-amd64
           path: bin
 
-      - name: Make bin/isshoni and bin/isshoni-loadtest executable
+      - name: Download bin/e2ehost
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2ehost-linux-amd64
+          path: bin
+
+      - name: Make bin/isshoni, bin/isshoni-loadtest and bin/e2ehost executable
         run: |
           # Artifacts drop the mode bit.
-          chmod +x bin/isshoni bin/isshoni-loadtest
+          chmod +x bin/isshoni bin/isshoni-loadtest bin/e2ehost
           bin/isshoni version
 
       - name: Google Chrome, and Playwright's ffmpeg

@@ -20,8 +20,10 @@ isshoni-release namespaces="isshoni-checksums" ssh-ed25519 AAAA… isshoni-relea
 ```
 
 `deploy/install.sh` carries a copy of the file between its `# BEGIN ALLOWED SIGNERS` and `# END ALLOWED SIGNERS`
-lines; the script has no other way to take a key. `task release:keys` writes that copy, and `task lint:keys` (CI's
-`lint-deploy` job) and the install.sh unit tests fail when the two differ. Never edit the block by hand.
+lines; the script has no other way to take a key. The desktop app's `deploy/install-desktop.ps1` carries the same
+lines between the same markers, inside its `$AllowedSigners` here-string (`docs/m2/06-windows-release.md` §7.1).
+`task release:keys` writes both copies, and `task lint:keys` (CI's `lint-deploy` job) and the install.sh unit tests
+fail when a copy differs from the file. Never edit the blocks by hand.
 
 Only public keys belong here. A private key is never committed, never pasted into an issue or a pull request, and
 lives in exactly two places: the `release` environment's secret, and the owner's offline backup.
@@ -48,20 +50,21 @@ release.yml (its dry run too) refuse to build without it.
    for k in isshoni-release-1 isshoni-release-backup-1; do
      printf 'isshoni-release namespaces="isshoni-checksums" %s\n' "$(cat "/path/to/$k.pub")"
    done > deploy/keys/allowed_signers
-   task release:keys        # copies the file into deploy/install.sh, prints the fingerprints, runs lint:keys
+   task release:keys        # copies the file into deploy/install.sh and deploy/install-desktop.ps1, prints the
+                            # fingerprints, runs lint:keys
    # lint:keys fails until README.md lists them: replace the two "not created yet" cells of README.md's
    # "Release signing keys" table with the printed fingerprints, then check again
    task lint:keys
-   git add deploy/keys/allowed_signers deploy/install.sh README.md
+   git add deploy/keys/allowed_signers deploy/install.sh deploy/install-desktop.ps1 README.md
    git commit -m "Release signing keys"
    ```
-   The change is data only: the key file, the block in `install.sh` and the two fingerprints that
-   `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same) in the "Release signing keys" section of
-   the root `README.md` (06 §9.4). The first `task release:keys` ends with lint:keys' error that README.md does not
-   list them yet; that is expected, and install.sh is already written. `task lint:keys` (CI's too) passes once the
-   section lists each key's fingerprint, no other one, and no row still says a key is not created. Keep the
-   fingerprints: they also go onto the site's `/security` page (06 §10.3), and you compare them in step 5. Merge
-   once `ci-ok` is green.
+   The change is data only: the key file, the blocks in `install.sh` and `install-desktop.ps1` and the two
+   fingerprints that `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same) in the "Release signing
+   keys" section of the root `README.md` (06 §9.4). The first `task release:keys` ends with lint:keys' error that
+   README.md does not list them yet; that is expected, and both scripts are already written. `task lint:keys` (CI's
+   too) passes once the section lists each key's fingerprint, no other one, and no row still says a key is not
+   created. Keep the fingerprints: they also go onto the site's `/security` page (06 §10.3), and you compare them in
+   step 5. Merge once `ci-ok` is green.
 3. **Create the environment `release`** (Settings → Environments → New environment; 06 §8.6 step 4):
    - required reviewers: you, with "Prevent self-review" **off** (you approve your own releases);
    - deployment branches and tags: "Selected branches and tags", with one rule for **tags** `v*` (no branches);

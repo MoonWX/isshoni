@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -54,6 +55,10 @@ func scriptMain() {
 // TestScripts runs testdata/script/*.txtar against the real binary (this test binary, re-executed as isshoni).
 func TestScripts(t *testing.T) {
 	t.Parallel()
+	coverDir := os.Getenv("GOCOVERDIR")
+	if coverDir != "" {
+		t.Cleanup(func() { mergeScriptCoverage(t, coverDir) })
+	}
 	testscript.Run(t, testscript.Params{
 		Dir: "testdata/script",
 		Cmds: map[string]func(*testscript.TestScript, bool, []string){
@@ -84,11 +89,67 @@ func TestScripts(t *testing.T) {
 			if err := os.WriteFile(empty, nil, 0o600); err != nil {
 				return err
 			}
+			// Under go test -cover, each script's programs write their coverage into a GOCOVERDIR of the script's
+			// own (mergeScriptCoverage).
+			if coverDir != "" {
+				own, err := os.MkdirTemp(coverDir, scriptCoverPrefix)
+				if err != nil {
+					return err
+				}
+				env.Setenv("GOCOVERDIR", own)
+			}
 			// Never talk to the machine's /run/isshoni/admin.sock either: the script gets an admin socket path of
 			// its own, where "fakeserver start" serves a fake (fake_test.go).
 			return setupScriptFake(env)
 		},
 	})
+}
+
+// scriptCoverPrefix starts the names of the scripts' own coverage directories inside GOCOVERDIR.
+const scriptCoverPrefix = "testscript-"
+
+// mergeScriptCoverage moves the coverage files of the scripts' own directories into GOCOVERDIR once every script
+// has ended, so that the scripts' coverage counts as before. A script's programs don't write into GOCOVERDIR
+// itself: the coverage runtime names the temporary copy of its meta-data file by the clock alone, so two programs
+// of parallel scripts that exited within one clock tick wrote the same file, and the loser printed "error: coverage
+// meta-data emit failed: … rename … no such file or directory" to the stderr that scripts check is empty. The
+// meta-data file is the same in every directory (one binary), so one that GOCOVERDIR already has stays behind.
+// go test reads only the files directly in GOCOVERDIR, so a directory left behind on an error changes nothing.
+func mergeScriptCoverage(t *testing.T, coverDir string) {
+	root, err := os.OpenRoot(coverDir)
+	if err != nil {
+		t.Errorf("coverage of the scripts: %v", err)
+		return
+	}
+	defer func() { _ = root.Close() }()
+	dirs, err := fs.Glob(root.FS(), scriptCoverPrefix+"*")
+	if err != nil {
+		t.Errorf("coverage of the scripts: %v", err)
+		return
+	}
+	for _, dir := range dirs {
+		files, err := fs.ReadDir(root.FS(), dir)
+		if err != nil {
+			t.Errorf("coverage of the scripts: %v", err)
+			continue
+		}
+		for _, f := range files {
+			name := f.Name()
+			meta := strings.HasPrefix(name, "covmeta.")
+			if !meta && !strings.HasPrefix(name, "covcounters.") {
+				continue
+			}
+			if _, err := root.Stat(name); meta && err == nil {
+				continue
+			}
+			if err := root.Rename(filepath.Join(dir, name), name); err != nil {
+				t.Errorf("coverage of the scripts: %v", err)
+			}
+		}
+		if err := root.RemoveAll(dir); err != nil {
+			t.Errorf("coverage of the scripts: %v", err)
+		}
+	}
 }
 
 // cmdExitCode is the script command "exitcode N PROG [ARGS…]": it runs PROG like exec and fails unless the exit code
