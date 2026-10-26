@@ -71,10 +71,14 @@ const (
 	// most maxFinalLossPct of its video's sequence space for good after the full layer settled (D9).
 	policedFor      = 30 * time.Second
 	maxFinalLossPct = 2.0
-	// recoverWithin: once the limit lifts, the full layer is back at its ceiling and the upload hint off within this
-	// (D9). After a backoff the estimate is held for 10 s, then grows by 15 % a step, and the full layer follows each
-	// step with one of its ramp's, RampEvery apart: from a backoff right at the lift (the estimate's probes hit the
-	// policer about every 25 s) the way back took up to 55 s.
+	// recoverWithin: once the limit lifts, the full layer is back at its ceiling, the upload hint off and the estimate
+	// gone within this (D9). After a backoff the estimate is held for 10 s, then grows by 15.1 % a step, and the full
+	// layer follows each step with one of its ramp's, RampEvery apart (a hint every 3–4 s). Under -race on the Mac the
+	// way back took 30–57 s: least when the estimate was growing at the lift, most after a backoff right at it (the
+	// estimate's probes can hit the policer about every 25 s), with the hold, some 13 steps from about 1.4 Mbit/s and
+	// the upload hint's UploadOff. A second backoff on the next tick that lowers the estimate by less than a hint's
+	// 15 % restarts the hold without one, and the first growth step after it is no hint either: about 4 s more. So
+	// the bound has little margin in that case.
 	recoverWithin = 60 * time.Second
 	// ceilingF is the Auto preset's full layer (M1 02 §8.6), where the ramp ends.
 	ceilingF = 8_000_000
@@ -91,10 +95,26 @@ const (
 	// While the uplink is congested the SFU may forward another layer to every viewer of the full one (its layers
 	// switch on keyframes, 02 §9), and a change then is seen at none.
 	reinitSeenWithin = time.Second
-	// callSlack is how much closer together two engine calls (fake.Call.At) may be than the Ticks ratectl kept its
-	// guards by (ratectl's unit tests check the guards at exact instants). A call follows its Tick by the share
-	// actor's latency, which reached 0.54 s under -race on a loaded machine; Windows' clock moves in steps of up to
-	// 15.6 ms.
+	// A keyframe near a change is the new encoder's only when nothing else made it (sightOf): not the GOP, which
+	// makes a keyframe a whole GOP (gopFull, gopOther) after the layer's last one (fake.Session's GOPs, 04 §9.4's;
+	// a GOP is a whole number of frames, so within half a frame of it: gopSlack is half a frame at 5 fps), and not a
+	// keyframe request of the layer (a PLI or the SFU's layer switch: fake's "keyframe" call), whose keyframe is
+	// captured from keyRequestBefore before the request (the pump's lag) to keyRequestAfter after it (the 250 ms
+	// spacing of forced keyframes, 04 §6.4, and two frames).
+	gopFull          = 4 * time.Second
+	gopOther         = 2 * time.Second
+	gopSlack         = 100 * time.Millisecond
+	keyRequestBefore = 250 * time.Millisecond
+	keyRequestAfter  = 500 * time.Millisecond
+	// callSlack is how much closer together than ReinitMinInterval two engine calls (fake.Call.At) of a layer may
+	// be: D10 asserts ReinitMinInterval − callSlack between them, 9 s, not the 10 s of its acceptance. ratectl keeps
+	// its guards on the instants its Ticks carry, and the share's actor (internal/client/core's share.go) passes it
+	// the rate ticker's value, which since Go 1.23 is when the tick was due, not when the actor took it. A Tick taken
+	// late is recorded as a change up to that lag (0.54 s seen under -race) before the engine call, while a hint's
+	// change is recorded at time.Now(): so the next change can reach the engine less than 10 s after the last one.
+	// The native engine itself spaces bitrate re-inits 10 s apart (04 §6.4, latest value wins), so what users get
+	// keeps the 10 s; the fake applies each call at once. Once the actor passes time.Now() to rateTick, callSlack is
+	// Windows' clock step, 20 ms.
 	callSlack = time.Second
 )
 
@@ -132,7 +152,8 @@ func congestionEngine(seed uint64, reinit bool) fake.EngineConfig {
 // 15 s ("settles"); from then on, while the limit lasts, the viewer loses less than 2 % of the video for good (what
 // neither the core's nor the SFU's retransmissions brought back), although the estimate probes upward again after
 // its hold; and the app's share shows the upload hint at about 540p or 720p. Once the policer allows 20 Mbit/s, the
-// full layer is back at 8 Mbit/s within 60 s, the last congestion hint lifts the cap and the upload hint clears.
+// full layer is back at 8 Mbit/s within 60 s, with the upload hint cleared and a last congestion hint that lifts the
+// cap.
 func TestDesktopUplinkCongestion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D9 runs for about two minutes")
@@ -164,20 +185,22 @@ func TestDesktopUplinkCongestion(t *testing.T) {
 
 	// ---- once the limit lifts ----
 	if tr.recovered.IsZero() {
-		t.Errorf("the full layer is %+v and the upload hint %+v %v after the limit lifted, want 8 Mbit/s and none",
-			layerOf(run.sh.Snapshot(), "f"), run.sh.Snapshot().Upload, recoverWithin)
-	}
-	if last, ok := tr.lastHint(); !ok || last.maxBitrate != 0 {
-		t.Errorf("the last congestion hint is %+v, want one that lifts the cap", last)
+		last, _ := lastCongestion(run.hints(), tr.limitedAt)
+		t.Errorf("%v after the limit lifted the full layer is %+v, the upload hint %+v and the last congestion hint "+
+			"%+v, want 8 Mbit/s, none and one that lifts the cap", recoverWithin, layerOf(run.sh.Snapshot(), "f"),
+			run.sh.Snapshot().Upload, last)
 	}
 	run.bob.check()
 }
 
 // TestDesktopReinitCongestion is D10: D9's script with an encoder that has no live bitrate. The full layer ramps in
 // one step and comes down when the hints say so, but no layer's target changes less than 10 s after its last change
-// or by less than 30 %, and each change is applied as a re-init (the core logs it so): a viewer of the layer gets its
-// keyframe from the new encoder, captured at the change (reinitKeyBefore, reinitKeyAfter). The intervals are measured
-// on the engine's calls, which trail ratectl's Ticks by the share actor's latency (callSlack).
+// or by less than 30 %, and each change is applied as a re-init: the core's rate action says so (ratectl's
+// Action.Reinit), the fake re-initializes the layer for the engine call (its EventLayer, then a Reinit keyframe), and
+// a viewer of the layer gets that keyframe, captured at the change (reinitKeyBefore, reinitKeyAfter) and made by
+// nothing else (sightOf). The intervals are measured on the engine's calls, which ratectl's guards don't bound to
+// the 10 s (callSlack). A change while the SFU forwards another layer is seen at no viewer; the full layer's ramp step
+// and its way back once the limit lifts are, and so is the preview's, which carol watches.
 func TestDesktopReinitCongestion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D10 runs for about two minutes")
@@ -195,9 +218,13 @@ func TestDesktopReinitCongestion(t *testing.T) {
 	tr := run.police()
 
 	changes := map[string][]fake.Call{}
+	requests := map[string][]time.Time{} // each layer's keyframe requests: PLIs and the SFU's layer switches
 	for _, c := range run.sess.Calls() {
-		if c.Op == "bitrate" && c.Layer != media.LayerAudio {
+		switch {
+		case c.Op == "bitrate" && c.Layer != media.LayerAudio:
 			changes[c.Layer] = append(changes[c.Layer], c)
+		case c.Op == "keyframe":
+			requests[c.Layer] = append(requests[c.Layer], c.At)
 		}
 	}
 	if len(changes["f"]) < 2 {
@@ -222,27 +249,34 @@ func TestDesktopReinitCongestion(t *testing.T) {
 					ratectl.ReinitMinChange)
 			}
 			if i > 0 && c.At.Sub(prevAt) < ratectl.ReinitMinInterval-callSlack {
-				t.Errorf("%s's target changed %v after its last change, want at least %v", rid,
-					c.At.Sub(prevAt).Round(time.Millisecond), ratectl.ReinitMinInterval)
+				t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval less "+
+					"callSlack)", rid, c.At.Sub(prevAt).Round(time.Millisecond), ratectl.ReinitMinInterval-callSlack)
 			}
 			action := fmt.Sprintf(`msg="rate action" op=bitrate layer=%s bps=%d active=false reinit=true`, rid, c.Bps)
 			if !strings.Contains(logs, action) {
 				t.Errorf("the core's log has no re-init action for %s's %d bit/s", rid, c.Bps)
 			}
-			switch got, key := framesAround(viewers, run.snap.ID, run.origins.at, rid, c.At); {
-			case !got:
+			switch sight := sightOf(viewers, run.snap.ID, run.origins.at, rid, c.At, requests[rid]); sight {
+			case sightNone:
 				t.Logf("  no viewer got %s within %v of this change: its keyframe can't be seen", rid, reinitSeenWithin)
-			case !key:
+			case sightNoKey:
 				t.Errorf("the viewers got no keyframe of %s captured from %v before to %v after its change to %d bit/s",
 					rid, reinitKeyBefore, reinitKeyAfter, c.Bps)
-			default:
+			case sightUnsure:
+				t.Logf("  the viewers' keyframes of %s at this change may be the GOP's or a keyframe request's", rid)
+			case sightReinit:
 				seen[rid]++
 			}
 			prev, prevAt = c.Bps, c.At
 		}
 	}
 	if seen["f"] < 2 {
-		t.Errorf("the viewers saw %d of the full layer's %d changes, want 2 at least", seen["f"], len(changes["f"]))
+		t.Errorf("the viewers saw the new encoder's keyframe at %d of the full layer's %d changes, want 2 at least",
+			seen["f"], len(changes["f"]))
+	}
+	if len(changes["q"]) > 0 && seen["q"] == 0 {
+		t.Errorf("the viewers saw the new encoder's keyframe at none of the preview's %d changes, want 1 at least",
+			len(changes["q"]))
 	}
 	skips, skipped := run.origins.skips()
 	t.Logf("D10: the first congestion hint %s after the limit; the full layer settled %s after it; the viewer lost "+
@@ -402,14 +436,15 @@ func (r *congestionRun) waitCeiling() {
 type policeTrace struct {
 	limitedAt, liftedAt time.Time
 	hint                loggedHint // the first congestion hint after the limit
-	hints               []loggedHint
 	// settled is when the full layer's target first came down to settledF or less (the engine's call), zero if it
 	// never did while the limit lasted; finalLossPct is what the viewer lost of its video for good from then until
 	// the lift, in percent of its sequence space.
 	settled        time.Time
 	finalLossPct   float64
 	limitedUploads []ratectl.UploadHint // the share's upload hints in EventShare while the limit lasted
-	recovered      time.Time            // the full layer at its ceiling and no upload hint; zero if never
+	// recovered is when the full layer was at its ceiling with no upload hint and a last congestion hint that lifted
+	// the cap; zero if never.
+	recovered time.Time
 }
 
 // police runs D9's script on a share whose full layer has reached its ceiling: steadyFor at it, then a policer of
@@ -455,9 +490,15 @@ func (r *congestionRun) police() *policeTrace {
 		tr.finalLossPct = 100 * float64(lostEnd-settledLost) / float64(liftExp-settledExp)
 	}
 
+	// Recovered: f at its ceiling, the upload hint off, and the estimate gone. The estimate is cleared 1–3 growth
+	// steps after f reaches its ceiling (a cap from 8.3 to 9.1 Mbit/s already gives f its 8 Mbit/s) and the upload
+	// hint 10 s after f passed about 6.2 Mbit/s (ratectl.UploadOff), so either can come last.
 	for deadline := tr.liftedAt.Add(recoverWithin); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 		snap := r.sh.Snapshot()
-		if layerOf(snap, "f").TargetBps >= ceilingF && !snap.Upload.Limited {
+		if layerOf(snap, "f").TargetBps < ceilingF || snap.Upload.Limited {
+			continue
+		}
+		if last, ok := lastCongestion(r.hints(), tr.limitedAt); ok && last.maxBitrate == 0 {
 			tr.recovered = time.Now()
 			break
 		}
@@ -468,8 +509,7 @@ func (r *congestionRun) police() *policeTrace {
 			break
 		}
 	}
-	tr.hints = r.hints()
-	for _, h := range tr.hints {
+	for _, h := range r.hints() {
 		if h.reason == string(protocol.HintReasonCongestion) && !h.at.Before(tr.limitedAt) {
 			tr.hint = h
 			break
@@ -479,7 +519,7 @@ func (r *congestionRun) police() *policeTrace {
 	t.Logf("D9 script: a %d bit/s policer from %v after the ceiling: first congestion hint %s after the limit "+
 		"(%d bit/s); f settled at %d bit/s or less %s after it; the viewer lost %.2f %% for good from then until the "+
 		"lift (%d of %d); %d datagrams lost at the policer (%d of %d bytes passed); back at %d bit/s without an "+
-		"upload hint %s after the lift",
+		"upload hint or a cap %s after the lift",
 		policedCapacity, steadyFor, sinceOrNever(tr.limitedAt, tr.hint.at), tr.hint.maxBitrate, settledF,
 		sinceOrNever(tr.limitedAt, tr.settled), tr.finalLossPct, lostEnd-settledLost, liftExp-settledExp, lost,
 		passed, sent, ceilingF, sinceOrNever(tr.liftedAt, tr.recovered))
@@ -502,10 +542,10 @@ func sinceOrNever(from, at time.Time) string {
 	return at.Sub(from).Round(time.Millisecond).String()
 }
 
-// lastHint returns the last congestion hint of the script.
-func (tr *policeTrace) lastHint() (loggedHint, bool) {
-	for i := len(tr.hints) - 1; i >= 0; i-- {
-		if h := tr.hints[i]; h.reason == string(protocol.HintReasonCongestion) && !h.at.Before(tr.limitedAt) {
+// lastCongestion returns the last congestion hint of hints that came at since or later, and whether there is one.
+func lastCongestion(hints []loggedHint, since time.Time) (loggedHint, bool) {
+	for i := len(hints) - 1; i >= 0; i-- {
+		if h := hints[i]; h.reason == string(protocol.HintReasonCongestion) && !h.at.Before(since) {
 			return h, true
 		}
 	}
@@ -550,12 +590,38 @@ func (r *congestionRun) crossing(capacity int) (fake.Call, bool) {
 	return fake.Call{}, false
 }
 
-// framesAround looks at the frames of layer rid of the share that the viewers got: got says whether one was captured
-// within reinitSeenWithin of at, key whether a keyframe was captured from reinitKeyBefore before at to reinitKeyAfter
-// after it. A frame's capture instant is its Marker's CaptureNS from the engine session's Origin at the time it
-// arrived (originAt).
-func framesAround(viewers []*sfutest.Viewer, shareID string, originAt func(time.Time) time.Time, rid string,
-	at time.Time) (got, key bool) {
+// changeSight is what the viewers saw of a change of a layer (sightOf).
+type changeSight int
+
+const (
+	sightNone   changeSight = iota // no frame of the layer captured within reinitSeenWithin of the change
+	sightNoKey                     // frames, but no keyframe captured in the change's window (reinitKeyBefore/After)
+	sightUnsure                    // keyframes there, but each may be the GOP's or a keyframe request's
+	sightReinit                    // a keyframe there that only the change's re-init explains
+)
+
+// sightOf looks at the frames of layer rid of the share that the viewers got around a change of the layer at at,
+// given the layer's keyframe requests. A frame's capture instant is its Marker's CaptureNS from the engine session's
+// Origin at the time it arrived (originAt). A keyframe captured from reinitKeyBefore before the change to
+// reinitKeyAfter after it is the re-init's when it is forced, not the GOP's (the viewers also got a keyframe of the
+// layer less than a GOP before it: the GOP's comes a whole GOP after the layer's last keyframe, whatever made that
+// one, and CaptureNS keeps its frame grid across re-inits and skips), and no keyframe request of the layer explains
+// it (keyRequestBefore, keyRequestAfter).
+func sightOf(viewers []*sfutest.Viewer, shareID string, originAt func(time.Time) time.Time, rid string,
+	at time.Time, requests []time.Time) changeSight {
+	gop := gopOther
+	if rid == protocol.RIDHigh {
+		gop = gopFull
+	}
+	type key struct {
+		frame uint32
+		ns    int64     // its Marker's CaptureNS
+		at    time.Time // its capture instant
+	}
+	var (
+		got        bool
+		keys, near []key // the layer's keyframes the viewers got; those in the change's window
+	)
 	for _, v := range viewers {
 		for _, rec := range v.Recorders() {
 			if rec.Kind() != webrtc.RTPCodecTypeVideo || rec.StreamID() != shareID {
@@ -565,13 +631,39 @@ func framesAround(viewers []*sfutest.Viewer, shareID string, originAt func(time.
 				if !f.HasMark || f.Mark.RID != rid {
 					continue
 				}
-				d := originAt(f.First).Add(time.Duration(f.Mark.CaptureNS)).Sub(at)
+				captured := originAt(f.First).Add(time.Duration(f.Mark.CaptureNS))
+				d := captured.Sub(at)
 				got = got || (d >= -reinitSeenWithin && d <= reinitSeenWithin)
-				key = key || (f.KeyStart && d >= -reinitKeyBefore && d <= reinitKeyAfter)
+				if !f.KeyStart && !f.Mark.Keyframe {
+					continue
+				}
+				k := key{frame: f.Mark.Frame, ns: f.Mark.CaptureNS, at: captured}
+				keys = append(keys, k)
+				if d >= -reinitKeyBefore && d <= reinitKeyAfter {
+					near = append(near, k)
+				}
 			}
 		}
 	}
-	return got, key
+	switch {
+	case len(near) == 0 && !got:
+		return sightNone
+	case len(near) == 0:
+		return sightNoKey
+	}
+	for _, k := range near {
+		forced := slices.ContainsFunc(keys, func(p key) bool {
+			return p.frame < k.frame && time.Duration(k.ns-p.ns) < gop-gopSlack
+		})
+		requested := slices.ContainsFunc(requests, func(r time.Time) bool {
+			d := k.at.Sub(r)
+			return d >= -keyRequestBefore && d <= keyRequestAfter
+		})
+		if forced && !requested {
+			return sightReinit
+		}
+	}
+	return sightUnsure
 }
 
 // hints returns the quality hints in the core's log.

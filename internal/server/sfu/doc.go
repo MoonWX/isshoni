@@ -242,7 +242,7 @@
 //     cap and an estimate: 80 % of what arrived after loss before repair (LayerUplinkStats.RawLossPct, counted at
 //     each gap), 85 % of the rate once the queueing delay (LayerUplinkStats.QueueDelay: the minimum one-way delay of
 //     each frame's first packet over 500 ms, above a baseline that rises at most 0.5 ms per s) has been 40 ms or more
-//     on two ticks, and 15 % more every 2 s once both are low, until it is none again. Its changes reach the sharer
+//     on two ticks, and 15.1 % more every 2 s once both are low, until it is none again. Its changes reach the sharer
 //     as hints with the reason congestion, at least 15 % and 2 s apart; admin and pause changes go out at once. The
 //     sharer's own pause (share.update{paused}, Share.sharerPaused) makes keyframe requests for the share do nothing
 //     and the estimator skip its ticks; its end asks each watched video layer for a keyframe. The publish PCs keep an
