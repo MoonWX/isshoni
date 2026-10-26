@@ -110,14 +110,14 @@ func newManager(t *testing.T, srv *servertest.Server, store credstore.Store) *de
 // linkManager links mgr for the user behind cookie as the app and the user's browser do (M2 02 §16.2 case 1):
 // Manager.Link returns at linking with the code; the test plays the browser, which looks the code up (network same:
 // the app and the browser both come from the loopback address) and approves it with deviceName linkedName; the
-// manager's first poll, one interval after Link, takes the pair. It fails t unless the manager is linked to that
-// device within one poll interval of the approval, and returns the linked state.
+// manager's first poll, one interval after Link, takes the pair. It fails t unless the manager becomes linked to that
+// device, and returns the linked state. It asserts no timing: case 1, which asks for the link within one poll
+// interval, times its own call.
 func linkManager(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, cookie string) deviceauth.State {
 	t.Helper()
 	if err := mgr.Link(waitCtx(t)); err != nil {
 		t.Fatalf("Manager.Link: %v", err)
 	}
-	started := time.Now()
 	st := mgr.State()
 	if st.Status != deviceauth.StatusLinking || st.Link == nil ||
 		st.Link.VerificationURIComplete != srv.URL+"/link?code="+st.Link.UserCode {
@@ -144,12 +144,6 @@ func linkManager(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, 
 	}, func() string {
 		return fmt.Sprintf("the manager is %s after the approval, want linked", mgr.State().Status)
 	})
-	// The first poll comes one interval after Link and the approval came before it; a second poll could come no
-	// sooner than another interval later.
-	if took := time.Since(started); took >= 2*pollInterval {
-		t.Errorf("the manager was linked %v after Link, want within one poll interval (%v) of the approval", took,
-			pollInterval)
-	}
 	if st.Device == nil || st.Device.ID == "" || st.Device.Name != name || st.User == nil || st.Notice != deviceauth.NoticeNone {
 		t.Fatalf("the linked state has device %+v, user %v, notice %q; want the device named %q, a user, no notice",
 			st.Device, st.User != nil, st.Notice, name)
@@ -158,15 +152,19 @@ func linkManager(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, 
 }
 
 // linkedManager returns a started deviceauth.Manager (memory credential store) that is already linked for the user
-// behind cookie, through Manager.Link and the cookie's lookup and decide (linkManager), and that store, in which a
-// test sees what the app saved. Its AccessToken is core.Auth's; a test that hands it to 01's core wraps
-// SessionEnded, as 03's session adapter does. Closed by t.Cleanup. (DA11)
-func linkedManager(t *testing.T, srv *servertest.Server, cookie string) (*deviceauth.Manager, credstore.Store) {
+// behind cookie, through Manager.Link and the cookie's lookup and decide (linkManager). Its AccessToken is
+// core.Auth's; a test that hands it to 01's core wraps SessionEnded, as 03's session adapter does. Closed by
+// t.Cleanup. (DA11)
+//
+// Its callers are 01's desktop itests (README WA73), which drop the nolint directive below: device_test.go's cases
+// read what the app saved, so they pass their own store to newManager and link with linkManager.
+//
+//nolint:unused // M2 02 §16.2 and §17 fix it for 01's desktop itests (README WA73, group 8)
+func linkedManager(t *testing.T, srv *servertest.Server, cookie string) *deviceauth.Manager {
 	t.Helper()
-	store := credstore.NewMemory()
-	mgr := newManager(t, srv, store)
+	mgr := newManager(t, srv, credstore.NewMemory())
 	linkManager(t, srv, mgr, cookie)
-	return mgr, store
+	return mgr
 }
 
 // appCodeRequest is the test app's POST /api/v1/device/code, proposing the name name (M2 02 §5.2).

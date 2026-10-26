@@ -226,10 +226,17 @@ func TestDeviceManagerLink(t *testing.T) {
 	cookie := sessionCookie(t, w.srv, alice.http.Jar)
 
 	// Case 1. Manager.Link returns at linking, alice's browser looks the code up (network same) and approves it as
-	// "Test PC", and the manager is linked within one poll interval (linkManager); the credential is in its store,
-	// and GET /me/devices lists the device.
-	mgr, store := linkedManager(t, w.srv, cookie)
-	st := mgr.State()
+	// "Test PC" (linkManager), and the manager is linked within one poll interval: its first poll comes one interval
+	// after Link and the approval comes before it, while a second poll could come no sooner than another interval
+	// later. The credential is in its store, and GET /me/devices lists the device.
+	store := credstore.NewMemory()
+	mgr := newManager(t, w.srv, store)
+	start := time.Now()
+	st := linkManager(t, w.srv, mgr, cookie)
+	if took := time.Since(start); took >= 2*pollInterval {
+		t.Errorf("the manager was linked %v after Link, want within one poll interval (%v) of the approval", took,
+			pollInterval)
+	}
 	origin, deviceID := st.Origin, st.Device.ID
 	if c, err := store.Get(origin); err != nil || c.DeviceID != deviceID {
 		t.Fatalf("the app's credential for %s: device %q, %v; want device %s", origin, c.DeviceID, err, deviceID)
@@ -355,12 +362,21 @@ func TestDeviceManagerPassword(t *testing.T) {
 	store := credstore.NewMemory()
 	mgr := newManager(t, w.srv, store)
 
-	// Case 6. A wrong password: 401 invalid_credentials, still unlinked, nothing stored.
-	err := mgr.LinkWithPassword(waitCtx(t), "alice", protocol.Secret("not alice's password"))
+	// Case 6. A wrong password: 401 invalid_credentials, still unlinked, nothing stored. The Manager's error carries
+	// the code, not the HTTP status, so the app's request is first sent once as raw HTTP to see the 401.
+	const wrong = "not alice's password"
+	wrongCall := restCall{method: http.MethodPost, path: "/api/v1/device/password", body: api.DevicePasswordRequest{
+		Username: "alice", Password: wrong, ClientKind: string(protocol.ClientKindDesktop), DeviceName: deviceHostName,
+		OS: string(protocol.ClientOSWindows), AppVersion: deviceAppVersion,
+	}}
+	if raw := rest(t, w.srv, wrongCall).apiError(t, "a wrong password", http.StatusUnauthorized); raw.Code !=
+		api.CodeInvalidCredentials {
+		t.Fatalf("POST /device/password with a wrong password = 401 %s, want invalid_credentials", raw.Code)
+	}
+	err := mgr.LinkWithPassword(waitCtx(t), "alice", protocol.Secret(wrong))
 	var refused *api.Error
-	if !errors.As(err, &refused) || refused.Code != api.CodeInvalidCredentials ||
-		api.StatusOf(refused.Code) != http.StatusUnauthorized {
-		t.Fatalf("LinkWithPassword with a wrong password: %v, want 401 invalid_credentials", err)
+	if !errors.As(err, &refused) || refused.Code != api.CodeInvalidCredentials {
+		t.Fatalf("LinkWithPassword with a wrong password: %v, want invalid_credentials", err)
 	}
 	if st := mgr.State(); st.Status != deviceauth.StatusUnlinked || st.Device != nil {
 		t.Fatalf("after the refused password the manager is %s with device %v, want unlinked", st.Status, st.Device != nil)
