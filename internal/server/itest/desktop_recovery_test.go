@@ -2,6 +2,7 @@ package itest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -280,6 +281,200 @@ func watched(t *testing.T, app *recoveryApp, bob *client, viewer *sfutest.Viewer
 	return sh, snap, video, audio
 }
 
+// resumedSpan is how much of the viewer's video after the keyframe it came back with checkResumedVideo looks at
+// after an ICE restart: enough to take in the layer switch that the SFU usually makes after the outage, about 0.75 s
+// after the keyframe on an idle machine (later on a loaded one).
+const resumedSpan = 2500 * time.Millisecond
+
+// checkResumedVideo checks the viewer's video after a UDP outage of the core, from the first keyframe after the
+// outage on (resumed, waitResumed's), once the Viewer has had the time to ask for what it missed
+// (sfutest.FinalLossAfter, slept here). back is when the network came back. samePC says whether the pub PC that came
+// back is the one the outage cut, its ICE restarted, rather than a rebuilt one.
+//
+// Either way, as D4 asks, the viewer resumes on a keyframe: one arrived whole within 5 s of the network
+// (resumedOn). And every layer switch from the first keyframe on starts on an SPS.
+//
+// A rebuilt PC must also deliver the stream from the keyframe on without a gap or a second copy, as M1's
+// TestUDPBlackHole asks of its share. It has nothing of the outage to repair: the closed PC's NACK responder is gone,
+// the SFU's NACK generator sees no gap on the new tracks, and the SFU continues the viewer's sequence numbers right
+// after the old track's last (a new epoch).
+//
+// After an ICE restart of the same PC, the stream after the keyframe needn't be continuous, unlike M1's
+// TestUDPBlackHole, which checks its share's: D4 asks for no more than the keyframe there. The end of the outage
+// brings a storm of repairs at the core's bitrate, about 4 Mbit/s here where M1's share sends 0.5: the SFU asks for
+// every packet of the outage that its NACK window holds (2048), the core's NACK responder sends all of them that its
+// 4096 packets hold at once, unpaced (over a thousand here), and the SFU forwards them to the viewer, which asks for
+// what is still missing of the gap for a second; the SFU serves that from a budget of a quarter of the layer's rate
+// (M1 02 §9.5). On a loaded machine (CI's runners, under -race) packets after the keyframe are then lost, or come
+// back late, twice when the original was only queued, for as long as the load makes it last: in loaded runs here the
+// last such loss came from under a second to over ten seconds after the keyframe, around when the SFU moved the
+// viewer down a layer for it. Whether the core should send the outage again at all is an open question
+// (internal/client/publish's responder), not something this test settles.
+func checkResumedVideo(t *testing.T, video *sfutest.Recorder, resumed []sfutest.Packet, back time.Time, samePC bool) {
+	t.Helper()
+	first := resumed[0]
+	if samePC {
+		time.Sleep(time.Until(first.Arrival.Add(resumedSpan)))
+	}
+	videoTo := newestSeq(video)
+	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
+
+	key, whole, skipped, err := resumedOn(seqRange(video, first.Seq, videoTo))
+	switch {
+	case whole.IsZero():
+		t.Errorf("no keyframe arrived whole since the network came back: %v", err)
+	case whole.Sub(back) > 5*time.Second:
+		t.Errorf("the keyframe the video resumed on (seq %d) was whole %v after the network, want within 5 s",
+			key.Seq, whole.Sub(back).Round(time.Millisecond))
+	case skipped > 0:
+		t.Logf("the video resumed on the keyframe at seq %d, whole %v after the network; %d keyframes before it "+
+			"arrived in part (the first: %v)", key.Seq, whole.Sub(back).Round(time.Millisecond), skipped, err)
+	}
+
+	checks := []func([]sfutest.Packet) error{sfutest.CheckStartsOnSPS}
+	if !samePC {
+		checks = append(checks, sfutest.CheckContinuous)
+	}
+	since := sfutest.WithoutPartialTail(seqRange(video, first.Seq, videoTo))
+	for _, check := range checks {
+		if err := check(since); err != nil {
+			t.Errorf("the video since the network came back (seq %d–%d): %v", first.Seq, videoTo, err)
+		}
+	}
+}
+
+// resumedOn returns the keyframe that a decoder resumes on after an outage: the first keyframe among a video's
+// packets pkts, in sequence-number order (seqRange's), that arrived whole, and when its last packet arrived. Whole is
+// one run of sequence numbers from the SPS to the RTP marker bit, with the fake marker of a keyframe; a second copy of
+// a packet is no fault (a retransmission that overtook the original, which a jitter buffer drops). skipped counts the
+// keyframes before it that arrived in part, and err says what was wrong with the first of them.
+//
+// It is mostly the first keyframe after the outage (waitResumed's). It isn't when that one is a keyframe of the
+// outage that the core's NACK responder sent again after an ICE restart (checkResumedVideo): such a keyframe can
+// arrive after the resumed stream's first packets but before its keyframe, and in part, when a loaded SFU drops some
+// of the burst it came in. A decoder skips it.
+func resumedOn(pkts []sfutest.Packet) (key sfutest.Packet, whole time.Time, skipped int, err error) {
+	var frames [][]sfutest.Packet // in sequence-number order, without second copies
+	for _, p := range pkts {
+		switch {
+		case p.Dup:
+		case len(frames) == 0 || frames[len(frames)-1][0].TS != p.TS:
+			frames = append(frames, []sfutest.Packet{p})
+		default:
+			frames[len(frames)-1] = append(frames[len(frames)-1], p)
+		}
+	}
+	for _, f := range frames {
+		keyMark := func(p sfutest.Packet) bool { return p.HasMark && p.Mark.Keyframe }
+		if !f[0].KeyStart && !slices.ContainsFunc(f, keyMark) {
+			continue
+		}
+		var bad error
+		for _, check := range []func([]sfutest.Packet) error{
+			sfutest.CheckStartsOnSPS, sfutest.CheckContinuous, sfutest.CheckVideoMarkers,
+		} {
+			if bad = check(f); bad != nil {
+				break
+			}
+		}
+		if bad != nil {
+			if err == nil {
+				err = fmt.Errorf("the keyframe at seq %d (%d packets): %w", f[0].Seq, len(f), bad)
+			}
+			skipped++
+			continue
+		}
+		for _, p := range f {
+			if p.Arrival.After(whole) {
+				whole = p.Arrival
+			}
+		}
+		return f[0], whole, skipped, err
+	}
+	switch {
+	case err != nil:
+	case len(pkts) == 0:
+		err = errors.New("no packets")
+	default:
+		err = fmt.Errorf("no keyframe among seq %d–%d", pkts[0].Seq, pkts[len(pkts)-1].Seq)
+	}
+	return sfutest.Packet{}, time.Time{}, skipped, err
+}
+
+// TestResumedOn checks resumedOn on made-up packets: a keyframe that arrived in part, or without its SPS, is
+// skipped for the next whole one, a second copy of a packet is no fault, and without a whole keyframe it says why.
+func TestResumedOn(t *testing.T) {
+	t0 := time.Now()
+	// frame makes the packets of one fake video frame of n packets from seq on, the i-th arriving at t0+arrive[i] ms
+	// (or t0): a keyframe's first packet carries the SPS, the next one the fake marker; a delta frame's first packet
+	// carries the marker. The last one has the RTP marker bit.
+	frame := func(seq uint16, ts uint32, n int, key bool, arrive ...int) []sfutest.Packet {
+		out := make([]sfutest.Packet, n)
+		for i := range out {
+			p := sfutest.Packet{Seq: seq + uint16(i), TS: ts, Marker: i == n-1, Arrival: t0}
+			if i < len(arrive) {
+				p.Arrival = t0.Add(time.Duration(arrive[i]) * time.Millisecond)
+			}
+			switch {
+			case key && i == 0:
+				p.KeyStart = true
+			case key && i == 1, !key && i == 0:
+				p.Mark, p.HasMark = fake.Marker{RID: "f", Keyframe: key, Frame: ts / 3000}, true
+			}
+			out[i] = p
+		}
+		return out
+	}
+	join := func(parts ...[]sfutest.Packet) []sfutest.Packet { return slices.Concat(parts...) }
+	without := func(pkts []sfutest.Packet, seqs ...uint16) []sfutest.Packet {
+		return slices.DeleteFunc(slices.Clone(pkts), func(p sfutest.Packet) bool { return slices.Contains(seqs, p.Seq) })
+	}
+	dup := func(p sfutest.Packet) []sfutest.Packet { p.Dup, p.RTX = true, true; return []sfutest.Packet{p} }
+
+	key := frame(100, 3000, 5, true, 0, 10, 40, 20, 30)
+	inPart := without(frame(50, 1500, 5, true), 52, 53)
+	noSPS := without(frame(50, 1500, 4, true), 50)
+	tests := []struct {
+		name        string
+		pkts        []sfutest.Packet
+		wantSeq     uint16
+		wantWhole   time.Duration // 0: no keyframe arrived whole
+		wantSkipped int
+		wantErr     string
+	}{
+		{name: "the first keyframe whole", pkts: join(key, frame(105, 6000, 3, false)), wantSeq: 100,
+			wantWhole: 40 * time.Millisecond},
+		{name: "a second copy in it", pkts: join(key[:3], dup(key[1]), key[3:]), wantSeq: 100,
+			wantWhole: 40 * time.Millisecond},
+		{name: "the first keyframe in part", pkts: join(inPart, frame(55, 1800, 2, false), frame(57, 2100, 3, true, 7)),
+			wantSeq: 57, wantWhole: 7 * time.Millisecond, wantSkipped: 1, wantErr: "seq 52–53 missing"},
+		{name: "the first keyframe without its SPS", pkts: join(noSPS, frame(54, 2100, 3, true, 9)),
+			wantSeq: 54, wantWhole: 9 * time.Millisecond, wantSkipped: 1, wantErr: "without an SPS"},
+		{name: "no keyframe whole", pkts: join(without(key, 104), frame(105, 6000, 3, false)), wantSkipped: 1,
+			wantErr: "0 RTP marker bits"},
+		{name: "no keyframe", pkts: frame(105, 6000, 3, false), wantErr: "no keyframe among seq 105–107"},
+		{name: "no packets", wantErr: "no packets"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			k, whole, skipped, err := resumedOn(tc.pkts)
+			switch {
+			case tc.wantWhole == 0 && !whole.IsZero():
+				t.Errorf("resumedOn found the keyframe at seq %d, want none", k.Seq)
+			case tc.wantWhole != 0 && (whole.IsZero() || k.Seq != tc.wantSeq || whole.Sub(t0) != tc.wantWhole):
+				t.Errorf("resumedOn found the keyframe at seq %d, whole at %v, want seq %d at %v (%v)", k.Seq,
+					whole.Sub(t0), tc.wantSeq, tc.wantWhole, err)
+			}
+			if skipped != tc.wantSkipped {
+				t.Errorf("resumedOn skipped %d keyframes, want %d", skipped, tc.wantSkipped)
+			}
+			if got := fmt.Sprint(err); (tc.wantErr == "" && err != nil) || !strings.Contains(got, tc.wantErr) {
+				t.Errorf("resumedOn's error is %v, want one with %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestDesktopSocketKilled is D3: the core's WebSocket dies mid-share, its TCP connection closed under it. The core
 // resumes on one new socket, with its connection id, and nothing is published or negotiated again: one pub offer in
 // all, the share's id unchanged, no room event about it. The share is held meanwhile, and its pub PC, still
@@ -425,14 +620,7 @@ func TestDesktopResumeICERestart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("the audio didn't come back: %v", err)
 	}
-	videoTo := newestSeq(video)
-	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
-	vp := seqRange(video, resumed[0].Seq, videoTo)
-	for _, check := range []func([]sfutest.Packet) error{sfutest.CheckContinuous, sfutest.CheckStartsOnSPS} {
-		if err := check(sfutest.WithoutPartialTail(vp)); err != nil {
-			t.Errorf("the video since the network came back: %v", err)
-		}
-	}
+	checkResumedVideo(t, video, resumed, back, true)
 	bob.waitLive(snap.ID)
 	app.waitState(sh, core.StateLive)
 	t.Logf("the share's states since the outage: %s", app.shareStates(shareMark))
@@ -611,14 +799,7 @@ func desktopBlackHole(t *testing.T, rebuild bool) {
 	}); err != nil {
 		t.Fatalf("the audio didn't come back: %v", err)
 	}
-	videoTo := newestSeq(video)
-	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
-	vp := seqRange(video, resumed[0].Seq, videoTo)
-	for _, check := range []func([]sfutest.Packet) error{sfutest.CheckContinuous, sfutest.CheckStartsOnSPS} {
-		if err := check(sfutest.WithoutPartialTail(vp)); err != nil {
-			t.Errorf("the video since the network came back: %v", err)
-		}
-	}
+	checkResumedVideo(t, video, resumed, back, !rebuild)
 	bob.waitLive(snap.ID)
 	if runs := shareRuns(bob, snap.ID, roomMark); runs != "live stalled live" {
 		t.Errorf("the share went %q in room.state since the outage, want live, stalled, live again", runs)

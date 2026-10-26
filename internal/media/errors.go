@@ -1,9 +1,6 @@
 package media
 
-import (
-	"context"
-	"strings"
-)
+import "context"
 
 // ErrorCode is the kind of an engine failure (01 §5.2). Codes are never renamed or reused.
 type ErrorCode string
@@ -50,23 +47,27 @@ func (e *Error) Error() string {
 	if e == nil {
 		return "media: <nil>"
 	}
-	var b strings.Builder
-	b.WriteString("media: ")
+	if e.Detail == "" {
+		return "media: " + e.Redacted()
+	}
+	return "media: " + e.Redacted() + ": " + e.Detail
+}
+
+// Redacted is e for the logs that users attach to public issues (03 §17, 05 §16): "<op>: <code>", plus " (<reason>)"
+// when it is set, without Error's "media: " and without the Detail, the native message, which can name a path, a
+// window or an app. Without an Op it is "<code>".
+func (e *Error) Redacted() string {
+	if e == nil {
+		return "<nil>"
+	}
+	s := string(e.Code)
 	if e.Op != "" {
-		b.WriteString(e.Op)
-		b.WriteString(": ")
+		s = e.Op + ": " + s
 	}
-	b.WriteString(string(e.Code))
 	if e.Reason != "" {
-		b.WriteString(" (")
-		b.WriteString(e.Reason)
-		b.WriteString(")")
+		s += " (" + e.Reason + ")"
 	}
-	if e.Detail != "" {
-		b.WriteString(": ")
-		b.WriteString(e.Detail)
-	}
-	return b.String()
+	return s
 }
 
 // Is reports whether target is a code sentinel of e: a *Error with the same Code and an empty Op, Reason and
