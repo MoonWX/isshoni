@@ -511,7 +511,9 @@ func TestServerEndRunsLocalStepsOnce(t *testing.T) {
 }
 
 // TestEndReasonTable is 03 §10.1's end-reason table through the controller: 01's EndInfo → state and endReason, a
-// failed share's error as engine.<code> or the protocol code.
+// failed share's error as engine.<code> with 01's detail token as its Reason (the bridge's params.reason: a live
+// share that ends with encoder_lost and device_removed gets 03 §10.5's "Your graphics driver restarted" row, not the
+// code's) or the protocol code.
 func TestEndReasonTable(t *testing.T) {
 	for _, c := range []struct {
 		name   string
@@ -519,30 +521,34 @@ func TestEndReasonTable(t *testing.T) {
 		state  State
 		reason EndReason
 		media  media.ErrorCode
+		token  string // the media error's Reason
 		wire   protocol.ErrorCode
 	}{
-		{"user", core.EndInfo{Reason: core.EndUser, ByThisApp: true}, StateEnded, EndUser, "", ""},
+		{"user", core.EndInfo{Reason: core.EndUser, ByThisApp: true}, StateEnded, EndUser, "", "", ""},
 		{"source-gone", core.EndInfo{Reason: core.EndSourceGone, Media: media.CodeSourceGone}, StateEnded,
-			EndSourceGone, "", ""},
+			EndSourceGone, "", "", ""},
 		{"elsewhere stopped", core.EndInfo{Reason: core.EndServer, Server: protocol.EndReasonStopped}, StateEnded,
-			EndElsewhere, "", ""},
+			EndElsewhere, "", "", ""},
 		{"elsewhere left", core.EndInfo{Reason: core.EndServer, Server: protocol.EndReasonLeft}, StateEnded,
-			EndElsewhere, "", ""},
+			EndElsewhere, "", "", ""},
 		{"stopped by this app", core.EndInfo{Reason: core.EndServer, Server: protocol.EndReasonStopped,
-			ByThisApp: true}, StateEnded, EndServer, "", ""},
+			ByThisApp: true}, StateEnded, EndServer, "", "", ""},
 		{"media_timeout", core.EndInfo{Reason: core.EndServer, Server: protocol.EndReasonMediaTimeout}, StateEnded,
-			EndServer, "", ""},
+			EndServer, "", "", ""},
 		{"room_closed", core.EndInfo{Reason: core.EndServer, Server: protocol.EndReasonRoomClosed}, StateEnded,
-			EndServer, "", ""},
+			EndServer, "", "", ""},
 		{"server-unreachable", core.EndInfo{Reason: core.EndServerUnreachable}, StateEnded, EndServerUnreachable, "",
-			""},
+			"", ""},
 		{"unlinked", core.EndInfo{Reason: core.EndUnlinked, Protocol: protocol.ErrorCodeSessionRevoked}, StateEnded,
-			EndUnlinked, "", ""},
+			EndUnlinked, "", "", ""},
 		{"engine error", core.EndInfo{Reason: core.EndError, Media: media.CodeEncoderLost}, StateFailed, EndError,
-			media.CodeEncoderLost, ""},
+			media.CodeEncoderLost, "", ""},
+		{"device removed", core.EndInfo{Reason: core.EndError, Media: media.CodeEncoderLost,
+			MediaReason: "device_removed"}, StateFailed, EndError, media.CodeEncoderLost, "device_removed", ""},
 		{"protocol error", core.EndInfo{Reason: core.EndError, Protocol: protocol.ErrorCodeReplaced}, StateFailed,
-			EndError, "", protocol.ErrorCodeReplaced},
-		{"error without a code", core.EndInfo{Reason: core.EndError}, StateFailed, EndError, media.CodeInternal, ""},
+			EndError, "", "", protocol.ErrorCodeReplaced},
+		{"error without a code", core.EndInfo{Reason: core.EndError}, StateFailed, EndError, media.CodeInternal, "",
+			""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -561,8 +567,8 @@ func TestEndReasonTable(t *testing.T) {
 				)
 				switch {
 				case c.media != "":
-					if !errors.As(v.Err, &me) || me.Code != c.media {
-						t.Errorf("error %v, want media %s", v.Err, c.media)
+					if !errors.As(v.Err, &me) || me.Code != c.media || me.Reason != c.token {
+						t.Errorf("error %v, want media %s with reason %q", v.Err, c.media, c.token)
 					}
 				case c.wire != "":
 					if !errors.As(v.Err, &pe) || pe.Code != c.wire {
