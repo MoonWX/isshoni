@@ -32,14 +32,14 @@ type Info struct {
 	OS                    string `json:"os"`
 	OSBuild               int    `json:"osBuild"`
 	Arch                  string `json:"arch"`
-	PublisherConnectionID string `json:"publisherConnectionId"` // C2's connection id; "" while it isn't ready (WA58)
+	PublisherConnectionID string `json:"publisherConnectionId"` // C2's connection id; "" while it isn't ready
 	WizardDone            bool   `json:"wizardDone"`
 	Dev                   bool   `json:"dev"`
 }
 
 // Info describes the app. OS is the client OS name of internal/protocol ("windows"; the macOS dev build "macos").
 func (a *App) Info() Info {
-	return Info{
+	info := Info{
 		Version:    version.Version(),
 		OS:         clientOS(),
 		OSBuild:    a.d.OS.OSBuild(),
@@ -47,6 +47,10 @@ func (a *App) Info() Info {
 		WizardDone: a.d.Settings.WizardDone(),
 		Dev:        a.d.InsecureLoopback,
 	}
+	if a.pub != nil {
+		info.PublisherConnectionID = a.pub.ConnectionID()
+	}
+	return info
 }
 
 func clientOS() string {
@@ -59,8 +63,8 @@ func clientOS() string {
 // Heartbeat is the SPA's watchdog beat (W17's fallback, 03 §20): every 5 s. The watchdog itself is README WA68's.
 func (a *App) Heartbeat() {}
 
-// Live reports a live share and its room (03 §11.6's "while live"): the bridge answers busy for what a live share
-// forbids. The share controller fills it (README WA65); until then nothing is ever live.
+// Live reports a share being started or running, and its room (03 §11.6's "while live"): the bridge answers busy
+// for what a live share forbids. It is the share controller's Live.
 func (a *App) Live() (roomID string, live bool) { return a.sharing() }
 
 // OpenExternal opens url in the system browser after 03 §5.5's check (ValidExternalURL); ErrInvalidArgument

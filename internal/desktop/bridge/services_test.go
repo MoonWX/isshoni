@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
@@ -184,12 +185,6 @@ func TestNotImplemented(t *testing.T) {
 		"Auth.SwitchServer":       func() error { return s.Auth.SwitchServer(originA) },
 		"Auth.RemoveServer":       func() error { return s.Auth.RemoveServer(ctx, originA) },
 		"Auth.Unlink":             func() error { _, err := s.Auth.Unlink(ctx); return err },
-		"Share.Pick":              func() error { _, err := s.Share.Pick(ctx); return err },
-		"Share.Start":             func() error { _, err := s.Share.Start(ctx, StartRequest{}); return err },
-		"Share.StopOther":         func() error { return s.Share.StopOther(ctx, "lounge", "s_1") },
-		"Share.SetPaused":         func() error { return s.Share.SetPaused(ctx, true) },
-		"Share.SetPreset":         func() error { return s.Share.SetPreset(ctx, "game") },
-		"Share.SetAudioEnabled":   func() error { return s.Share.SetAudioEnabled(true) },
 		"Audio.FriendsHear":       func() error { _, err := s.Audio.FriendsHear(); return err },
 		"Audio.SoundCheck":        func() error { _, err := s.Audio.SoundCheck(ctx); return err },
 		"Audio.Watch":             func() error { return s.Audio.Watch(true) },
@@ -202,6 +197,25 @@ func TestNotImplemented(t *testing.T) {
 		"Updates.Install":         func() error { return s.Updates.Install(ctx) },
 		"Window.SetFullscreen(∅)": func() error { return (&Window{}).SetFullscreen(true) },
 	}
+	// A Core without a share controller (not *app.App): no share can exist.
+	ns := newTestServices2(t, struct{ Core }{&fakeCore{}}, &buf)
+	maps.Copy(calls, map[string]func() error{
+		"Share.Pick": func() error { _, err := ns.Share.Pick(ctx); return err },
+		"Share.Start": func() error {
+			_, err := ns.Share.Start(ctx, StartRequest{PickID: testPickID, RoomID: "lounge"})
+			return err
+		},
+		"Share.StopOther":       func() error { return ns.Share.StopOther(ctx, "lounge", "s_1") },
+		"Share.SetPaused":       func() error { return ns.Share.SetPaused(ctx, true) },
+		"Share.SetPreset":       func() error { return ns.Share.SetPreset(ctx, "game") },
+		"Share.SetAudioEnabled": func() error { return ns.Share.SetAudioEnabled(true) },
+	})
+	if ns.Share.Current() != nil || ns.Share.Stats() != nil || ns.Share.Stop(ctx) != nil {
+		t.Error("a share without a controller")
+	}
+	ns.Share.Release(testPickID)
+	ns.Share.WatchServerStats(true)
+	ns.Close()
 	for name, call := range calls {
 		err := call()
 		if codeOf(t, err) != codes.CodeNotImplemented {
@@ -212,11 +226,6 @@ func TestNotImplemented(t *testing.T) {
 			t.Errorf("%s: %s doesn't name the method", name, err)
 		}
 	}
-	// What works without the controller: no share exists, so nothing to show or stop.
-	if s.Share.Current() != nil || s.Share.Stats() != nil || s.Share.Stop(ctx) != nil {
-		t.Error("a share before the share controller")
-	}
-	s.Share.Release("p_1")
 }
 
 // TestApp is the App service: the external-URL rule, OS settings pages, Quit's busy, the log and the pending link.
@@ -357,6 +366,9 @@ func TestShareCapabilities(t *testing.T) {
 	s.Share.WatchServerStats(true)
 	if s.Share.serverStats != 1 {
 		t.Fatalf("WatchServerStats count %d, want 1 (never below 0)", s.Share.serverStats)
+	}
+	if got := core.shares.watch; !slices.Equal(got, []bool{true, false, true}) {
+		t.Fatalf("controller WatchServerStats %v: only on 0↔1 changes", got)
 	}
 }
 
