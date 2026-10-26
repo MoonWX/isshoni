@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -37,18 +38,34 @@ func TestRedactText(t *testing.T) {
 			`copy Discord\app-1.0.9999\discord.exe: denied`},
 		{`open c:/users/ada example/appdata/local/temp/isshoni-audiotest-2741/Games/game.exe`, `open Games/game.exe`},
 		{`the work folder ` + testWork + ` is gone`, `the work folder . is gone`},
-		// A sibling whose name starts with the work folder's is not below it.
-		{testWork + `2\x.txt`, `<home>\AppData\Local\Temp\isshoni-audiotest-27412\x.txt`},
+		// A sibling whose name starts with the work folder's is not below it: a path in the profile's temp folder.
+		{testWork + `2\x.txt`, `<home>\AppData\Local\Temp`},
+		{testWork + `2\game.exe crashed`, `<home>\AppData\Local\Temp\game.exe crashed`},
 		// The harness's folder and the profile folder become placeholders; other absolute paths too, keeping a
-		// plain file name of the harness's kinds.
+		// plain file name of the harness's kinds and nothing of the folders in between.
 		{`load ` + testHarness + `\isshoni-media.dll: not found`, `load <harness>\isshoni-media.dll: not found`},
-		{`C:\Users\Ada Example\Downloads\notes.txt`, `<home>\Downloads\notes.txt`},
+		{`C:\Users\Ada Example\Downloads\notes.txt`, `<home>`},
+		{`open C:\Users\Ada Example\Documents\Medical Records\scan.pdf: denied`, `open <home>: denied`},
+		{`C:\Users\Ada Example\Downloads\isshoni-media.dll was blocked`, `<home>\isshoni-media.dll was blocked`},
 		{`open E:\Private Stuff\isshoni-media.dll, then`, `open <path>\isshoni-media.dll, then`},
 		{`read \\fileserver\share\secret.doc`, `read <path>`},
-		// A folder with a space in a profile the redactor doesn't know is still part of the path.
+		// A folder with spaces is part of the path, in a profile the redactor doesn't know too, however many spaces
+		// it has; a path runs to the first character no Windows path holds (Go's PathError puts ": " after it).
 		{`open C:\Users\Bob Jones\AppData\x.dat: The system cannot find`, `open <path>: The system cannot find`},
+		{`E:\Data\My Private Folder\x.bin`, `<path>`},
+		{`(see E:\Data\My Private Folder\x.bin)`, `(see <path>)`},
+		// A collected name inside a path doesn't end it: the path goes first, the names after.
+		{`open E:\Apps\Spotify\Private Project Folder\cache.bin: denied`, `open <path>: denied`},
+		{`E:\Data\` + testLogin + `\Secret Folder\x.json`, `<path>\x.json`},
+		{`\\` + testHost + `\share\Tax Returns\x.dll`, `<path>\x.dll`},
+		{`E:\Games\Elden Ring\eldenring.exe crashed`, `<path>\<name> crashed`},
+		// Two paths in one line are redacted each on its own.
+		{`copy C:\Users\Bob\a b\game.exe to D:\x y\z.dll: denied`,
+			`copy <path>\game.exe to <path>\z.dll: denied`},
 		{`stat /home/someone/build/isshoni-audiotest: no`, `stat <path>/isshoni-audiotest: no`},
+		{`stat /home/someone/My Private Folder/x.bin`, `stat <path>`},
 		{`stat /Users/adaex/x.json`, `stat <home>/x.json`},
+		{`stat /Users/adaex/Medical Records/scan.pdf`, `stat <home>`},
 		// Names: the local user, login, host and domain, and the app and exe names seen in the reports.
 		{`user ` + testDomain + `\` + testLogin + ` on ` + testHost, `user <name> on <name>`},
 		{`Spotify and ELDEN RING were heard; eldenring.exe kept out`,
@@ -61,8 +78,13 @@ func TestRedactText(t *testing.T) {
 		{`median abs timestamp error 3.1 ms > 15; 50 ± 1 packets/s`, `median abs timestamp error 3.1 ms > 15; 50 ± 1 packets/s`},
 	}
 	for _, tc := range tests {
-		if got := rd.text(tc.in); got != tc.want {
+		got := rd.text(tc.in)
+		if got != tc.want {
 			t.Errorf("text(%q)\n got  %q\n want %q", tc.in, got, tc.want)
+		}
+		// What merge's check for an unredacted report looks for is never left in a redacted text.
+		if absPathStart.MatchString(got) {
+			t.Errorf("text(%q) = %q still holds an absolute path", tc.in, got)
 		}
 	}
 }
@@ -142,17 +164,39 @@ func TestRedactReport(t *testing.T) {
 	}
 }
 
-// TestUnredactedProblem: a report whose events still name a non-fixture app (written with -no-redact) is detected,
-// so merge refuses it.
+// TestUnredactedProblem: a report written with -no-redact is detected, so merge refuses it: its events still name a
+// non-fixture app, or (a quiet room: fixture events only) its problems or INFO values still hold an absolute path.
+// The redaction's placeholders and paths relative to the work folder are no absolute paths.
 func TestUnredactedProblem(t *testing.T) {
 	r := report{Cases: []caseReport{{Name: "builtin-voice", Events: []reportEvent{
-		{Code: "session_created", App: "fixture:voice"}, {Code: "x", App: otherRedacted}, {Code: "y"}}}}}
+		{Code: "session_created", App: "fixture:voice"}, {Code: "x", App: otherRedacted}, {Code: "y"}},
+		Problems: []string{`the case could not run: copy <harness>\isshoni-audiotest.exe to Games\game.exe: denied`,
+			`open <path>\isshoni-media.dll, <home>/x.json, <home>\AppData\Local\Temp and <name>: no`},
+		Info: map[string]any{"note": "under Discord/app-1.0/discord.exe", "list": []any{"<path>", 3.5}}}}}
 	if p := unredactedProblem(r); p != "" {
 		t.Fatalf("a redacted report: %s", p)
 	}
-	r.Cases[0].Events = append(r.Cases[0].Events, reportEvent{Code: "session_created", App: "exe:spotify.exe"})
-	if p := unredactedProblem(r); !strings.Contains(p, "-no-redact") {
-		t.Fatalf("an unredacted report: %q", p)
+	unredacted := []func(r *report){
+		func(r *report) {
+			r.Cases[0].Events = append(r.Cases[0].Events, reportEvent{Code: "session_created", App: "exe:spotify.exe"})
+		},
+		func(r *report) {
+			r.Cases[0].Problems = append(r.Cases[0].Problems, `open C:\Users\X\Documents\x.bin: denied`)
+		},
+		func(r *report) { r.Cases[0].Problems = []string{`read \\host\share\x.dll`} },
+		func(r *report) { r.Cases[0].Problems = []string{`stat /home/someone/x.json: no`} },
+		func(r *report) { r.Cases[0].Info = map[string]any{"note": `E:\Data\x.json`} },
+		func(r *report) {
+			r.Cases[0].Info = map[string]any{"list": []any{1.0, map[string]any{"where": `d:/x/y.wav`}}}
+		},
+	}
+	for i, edit := range unredacted {
+		u := report{Cases: []caseReport{{Name: "builtin-voice", Problems: slices.Clone(r.Cases[0].Problems),
+			Events: slices.Clone(r.Cases[0].Events)}}}
+		edit(&u)
+		if p := unredactedProblem(u); !strings.Contains(p, "-no-redact") {
+			t.Errorf("unredacted report %d: %q", i, p)
+		}
 	}
 }
 

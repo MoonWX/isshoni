@@ -282,8 +282,12 @@ func expandArgs(args []string) ([]string, error) {
 }
 
 // readReport reads a gate report strictly: schema v1, no field this harness doesn't know (a merge must not drop
-// what a newer harness wrote), and redacted (05 §18.7).
+// what a newer harness wrote), and redacted (05 §18.7): neither named as a -no-redact report nor holding what the
+// redaction removes (unredactedProblem).
 func readReport(path string) (report, error) {
+	if strings.HasSuffix(strings.ToLower(filepath.Base(path)), unredactedSuffix+".json") {
+		return report{}, fmt.Errorf("%s: the report was written with -no-redact and must not be committed", path)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return report{}, err
@@ -358,13 +362,18 @@ func osBuildLabel(o osInfo) string {
 	return fmt.Sprintf("%s %d.%d", o.Product, o.Build, o.UBR)
 }
 
-// encodeReport is the report's file form: indented JSON with a final newline.
+// encodeReport is the report's file form: indented JSON with a final newline. HTML characters are not escaped, so
+// the redaction's placeholders read "<name>", "<path>", "<home>" and "<harness>" for the owner who checks the file
+// before it is committed.
 func encodeReport(r report) ([]byte, error) {
-	b, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(r); err != nil {
 		return nil, err
 	}
-	return append(b, '\n'), nil
+	return buf.Bytes(), nil
 }
 
 // writeFileAtomic writes data to path through a temporary file in the same folder, so a failed write never leaves

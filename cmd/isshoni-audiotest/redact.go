@@ -18,10 +18,11 @@ import (
 // Most of the report is redacted by construction: fixtures are "fixture:<role>", endpoints {formFactor, bus}, the
 // checks are numbers. What can carry a name is free text (a case's problems, an INFO case's info, an error from the
 // engine or the OS) and the events' app ids. The redactor rewrites every string field of the report: free text has
-// the work folders made relative, the harness folder and the home folders replaced, every name the run collected
-// (the engine's app and exe names, the local user, host and domain names) replaced by "<name>", and any other
-// absolute path replaced by "<path>"; token fields (codes, versions, verdicts) are kept only when they look like
-// tokens. It is portable and tested on every OS (redact_test.go).
+// the work folders made relative, the harness folder and the home folders replaced, any other absolute path (and
+// any path in a home folder) replaced by a placeholder that keeps at most a file name of the harness's kinds, and
+// then every name the run collected (the engine's app and exe names, the local user, host and domain names) replaced
+// by "<name>"; token fields (codes, versions, verdicts) are kept only when they look like tokens. It is portable and
+// tested on every OS (redact_test.go).
 
 // redactInfo is what a driver collected for the redaction during a run: the work folders its fixtures ran in, the
 // folder of the harness itself, and the app and exe names the engine's reports showed (05 §18.7: "names collected
@@ -164,8 +165,10 @@ func harnessVocabulary() map[string]bool {
 }
 
 // text redacts free text: the work folders become relative (a bare work folder "."), the harness folder and the
-// home folders become placeholders, every collected name becomes "<name>", and any other absolute path "<path>"
-// (keeping a plain file name at its end, "<path>\isshoni-media.dll").
+// home folders become placeholders, every other absolute path becomes "<path>" (one in a home folder "<home>"),
+// keeping at most a plain file name at its end ("<path>\isshoni-media.dll"), and then every collected name becomes
+// "<name>". Paths go before names: a name replaced inside a path would end the path there and leave the folders
+// after it in the text.
 func (rd *redactor) text(s string) string {
 	if s == "" {
 		return s
@@ -179,6 +182,7 @@ func (rd *redactor) text(s string) string {
 	for _, h := range rd.homes {
 		s = replacePathPrefix(s, h, redactedHome)
 	}
+	s = redactPaths(s)
 	for _, re := range rd.names {
 		for range 4 { // adjacent matches share a separator: repeat until none is left
 			next := re.ReplaceAllString(s, "${1}"+redactedName+"${3}")
@@ -188,49 +192,89 @@ func (rd *redactor) text(s string) string {
 			s = next
 		}
 	}
-	for _, re := range absPathRes {
-		s = re.ReplaceAllStringFunc(s, redactPath)
-	}
 	return s
 }
 
-// absPathRes find absolute paths in free text: Windows drive paths, UNC paths, and POSIX paths of two or more
-// segments (a diagnostic run on the Mac or Linux). A path runs on over a space while the next word still holds a
-// separator ("C:\Users\Ada Example\AppData\x"), so a folder name with a space is never left behind.
-var absPathRes = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\b[a-z]:[\\/]` + pathRun),
-	regexp.MustCompile(`\\\\[^\s"'<>|*?\\]+\\` + pathRun),
-	regexp.MustCompile(`(?:^|[\s"'(=])/[^\s"'<>|*?/]+/` + pathRun),
+// absPathStart finds where an absolute path starts in free text: a Windows drive path, a UNC path, or a POSIX path
+// of two or more segments (a diagnostic run on the Mac or Linux), which the match takes with the delimiter before
+// it. A redacted text has none left (unredactedProblem relies on it).
+var absPathStart = regexp.MustCompile(`(?i)\b[a-z]:[\\/]|\\\\[^\s"'<>|*?\\/:]+[\\/]|(?:^|[\s"'(=])/[^\s"'<>|*?/:]+/`)
+
+// pathStart is absPathStart plus a path in a home folder, which the home replacement has made "<home>\…".
+var pathStart = regexp.MustCompile(absPathStart.String() + `|` + regexp.QuoteMeta(redactedHome) + `[\\/]`)
+
+// redactPaths replaces every absolute path in s, and every path in a home folder, by its placeholder (redactPath).
+func redactPaths(s string) string {
+	var b strings.Builder
+	for {
+		loc := pathStart.FindStringIndex(s)
+		if loc == nil {
+			b.WriteString(s)
+			return b.String()
+		}
+		start := loc[0]
+		if strings.IndexByte(" \t\n\f\r\"'(=", s[start]) >= 0 {
+			start++ // the delimiter before a POSIX path stays
+		}
+		end := pathEnd(s, start, loc[1])
+		b.WriteString(s[:start])
+		b.WriteString(redactPath(s[start:end]))
+		s = s[end:]
+	}
 }
 
-// pathRun is the rest of an absolute path: path characters, then any number of " word" + separator + more.
-const pathRun = `[^\s"'<>|*?]*(?: +[^\s"'<>|*?\\/]+[\\/][^\s"'<>|*?]*)*`
-
-// safeFileName is a file name the redactor keeps at the end of a redacted path: the harness's own kinds of file.
-var safeFileName = regexp.MustCompile(`(?i)^(?:[a-z0-9._-]{1,64}\.(?:exe|dll|json|wav)|isshoni-audiotest)$`)
-
-// redactPath replaces one absolute path match with "<path>", keeping a leading delimiter the POSIX pattern matched,
-// trailing punctuation, and a safe file name at its end.
-func redactPath(m string) string {
-	lead := ""
-	if m != "" && strings.ContainsRune(" \t\r\n\"'(=", rune(m[0])) {
-		lead, m = m[:1], m[1:]
-	}
-	core := strings.TrimRight(m, ".,:;)]}")
-	tail := m[len(core):]
-	base := core
-	if i := strings.LastIndexAny(core, `\/`); i >= 0 {
-		base = core[i+1:]
-	}
-	out := redactedPath
-	if safeFileName.MatchString(base) && !strings.Contains(base, redactedName) {
-		sep := `\`
-		if strings.HasPrefix(core, "/") {
-			sep = "/"
+// pathEnd is where the path that starts at start (its start match ending at i) ends in s: at the first byte no
+// Windows path segment can hold (a quote, '<', '>', '|', '*', '?', ':', a line end; Go's PathError puts ": " after
+// the path) or at the end of s. Spaces don't end it, since folder names hold them, so words after a path may go with
+// it: over-redaction, never a folder left behind. A ':' that is the next path's drive (" D:\") ends the path before
+// that drive's letter, so the next path is redacted on its own; any other ":\" or ":/" (a URL) is taken along.
+func pathEnd(s string, start, i int) int {
+	for ; i < len(s); i++ {
+		switch s[i] {
+		case '"', '\'', '<', '>', '|', '*', '?', '\r', '\n':
+			return i
+		case ':':
+			if i+1 >= len(s) || (s[i+1] != '\\' && s[i+1] != '/') {
+				return i
+			}
+			if i-2 > start && isASCIILetter(s[i-1]) && !isWordByte(s[i-2]) {
+				return i - 1
+			}
 		}
-		out += sep + base
 	}
-	return lead + out + tail
+	return len(s)
+}
+
+// isASCIILetter and isWordByte are regexp's ASCII letter and \w.
+func isASCIILetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+func isWordByte(c byte) bool    { return isASCIILetter(c) || (c >= '0' && c <= '9') || c == '_' }
+
+// safeFileLead is a file name the redactor keeps at the end of a redacted path, the harness's own kinds of file,
+// when it is the whole last segment or is followed by a space or punctuation (the words a greedy match took along).
+var safeFileLead = regexp.MustCompile(`(?i)^(?:[a-z0-9._-]{1,64}\.(?:exe|dll|json|wav)|isshoni-audiotest)` +
+	`(?:$|[\s,;)\]}]|\.(?:$|\s))`)
+
+// redactPath replaces one path with its placeholder: "<path>", or for a path in a home folder "<home>" (in its temp
+// folder "<home>\AppData\Local\Temp"). The placeholder stands for every folder of the path, however deep; only a
+// safe file name in its last segment is kept (with the words after it), and trailing punctuation.
+func redactPath(m string) string {
+	core := strings.TrimRight(m, " \t.,;)]}")
+	tail := m[len(core):]
+	placeholder := redactedPath
+	if rest, ok := strings.CutPrefix(core, redactedHome); ok {
+		placeholder = redactedHome
+		const temp = `appdata\local\temp`
+		if f := foldPath(rest); len(f) > len(temp) && strings.HasPrefix(f[1:], temp) &&
+			(len(f) == len(temp)+1 || f[len(temp)+1] == '\\') {
+			sep := rest[:1]
+			placeholder = redactedHome + sep + "AppData" + sep + "Local" + sep + "Temp"
+		}
+	}
+	i := strings.LastIndexAny(core, `\/`)
+	if i >= 0 && safeFileLead.MatchString(core[i+1:]) {
+		return placeholder + core[i:] + tail
+	}
+	return placeholder + tail
 }
 
 // replacePathPrefix replaces every occurrence of the folder dir in s, compared case-insensitively (ASCII) with / and
@@ -418,16 +462,45 @@ func redactAppID(id string) string {
 	return otherRedacted
 }
 
-// unredactedProblem is "" when r looks redacted (every event app a fixture's, "other" or ""), else why not: merge
-// refuses a report written with -no-redact, which must never be committed.
+// unredactedProblem is "" when r looks redacted, else why not: merge refuses a report written with -no-redact, which
+// must never be committed. A redacted report has every event app a fixture's, "other" or "", and no absolute path
+// left in its free text (the problems and the INFO values): a quiet room's -no-redact report may have no other app
+// in its events but still name folders in its problems.
 func unredactedProblem(r report) string {
+	const why = ": it was written with -no-redact and must not be committed"
 	for _, c := range r.Cases {
 		for _, e := range c.Events {
 			if e.App != redactEventApp(e.App) {
-				return "the report names a non-fixture app in case " + c.Name + "'s events: it was written with " +
-					"-no-redact and must not be committed"
+				return "the report names a non-fixture app in case " + c.Name + "'s events" + why
 			}
+		}
+		for _, p := range c.Problems {
+			if absPathStart.MatchString(p) {
+				return "the report has an absolute path in case " + c.Name + "'s problems" + why
+			}
+		}
+		if c.Info != nil && valueHasAbsPath(c.Info) {
+			return "the report has an absolute path in case " + c.Name + "'s info" + why
 		}
 	}
 	return ""
+}
+
+// valueHasAbsPath reports whether an INFO value holds a string with an absolute path, at any depth.
+func valueHasAbsPath(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return absPathStart.MatchString(x)
+	case []any:
+		return slices.ContainsFunc(x, valueHasAbsPath)
+	case []string:
+		return slices.ContainsFunc(x, absPathStart.MatchString)
+	case map[string]any:
+		for _, e := range x {
+			if valueHasAbsPath(e) {
+				return true
+			}
+		}
+	}
+	return false
 }

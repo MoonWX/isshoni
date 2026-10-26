@@ -104,10 +104,12 @@ the −50 dBFS absent limit), the sound-check chime 880 + 1320, bursts 2000. All
 
 `run` writes `audiotest-<win10|win11>-<build>-<YYYYMMDD-HHMM>.json` (schema v1, 05 §18.7) and prints one summary
 line. The repository is public, so the report is redacted by default: no user, host, domain or device names;
-endpoints only as `{formFactor, bus}`; paths relative to the fixtures' work folder (other paths become `<path>`, the
-profile folder `<home>`); fixture apps as `fixture:<role>` and every other app as `other`, with no name; any app or
-exe name the engine reported during the run, and the local user and host names, become `<name>` in free text. WAVs
-are written only with `-keep-wav` or by `record`, and are never committed.
+endpoints only as `{formFactor, bus}`; paths relative to the fixtures' work folder, the harness's folder as
+`<harness>`, and any other absolute path as `<path>` (`<home>` when it is in the profile folder), with none of its
+folders and at most a file name of the harness's own kinds (`<path>\isshoni-media.dll`); fixture apps as
+`fixture:<role>` and every other app as `other`, with no name; any app or exe name the engine reported during the
+run, and the local user and host names, become `<name>` in free text. WAVs are written only with `-keep-wav` or by
+`record`, and are never committed.
 
 ## Record the results
 
@@ -115,12 +117,16 @@ On the development machine, merge the manual entries into the report and commit 
 
 ```sh
 isshoni-audiotest merge audiotest-win11-26200-20260101-1200.json manual-*.json
-git mv … cmd/isshoni-audiotest/results/2026-01-01-win11-26200.json   # YYYY-MM-DD-<win10|win11>-<build>.json
+# YYYY-MM-DD-<win10|win11>-<build>.json
+mkdir -p cmd/isshoni-audiotest/results
+cp audiotest-win11-26200-20260101-1200.json cmd/isshoni-audiotest/results/2026-01-01-win11-26200.json
+git add cmd/isshoni-audiotest/results/2026-01-01-win11-26200.json
 ```
 
 Then add a row to the results table below: the date, the OS build with its UBR, the harness and DLL versions, the
-summary line's counts, the manual checks and any notes. Never commit a `-no-redact` report (`merge` refuses one) or a
-WAV.
+summary line's counts, the manual checks and any notes. Never commit a `-no-redact` report or a WAV: `merge` refuses
+a report named `…-unredacted.json`, one whose events name a non-fixture app and one with an absolute path left in its
+problems or INFO values. Read the report before you commit it: the redaction's placeholders show as they are.
 
 ### Manual real-app checks (05 §18.9)
 

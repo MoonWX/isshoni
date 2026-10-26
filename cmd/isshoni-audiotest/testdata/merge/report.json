@@ -33,7 +33,7 @@
     "fail": 0,
     "inconclusive": 0,
     "skip": 0,
-    "info": 1,
+    "info": 2,
     "exit": 0
   },
   "cases": [
@@ -119,6 +119,20 @@
       "engine": [
         "include-set"
       ],
+      "counters": {},
+      "events": []
+    },
+    {
+      "name": "multi-endpoint",
+      "required": false,
+      "result": "INFO",
+      "checks": [],
+      "measured": {},
+      "clicksAtS": [],
+      "problems": [
+        "the case could not run: copy <harness>\\isshoni-audiotest.exe to Games2\\game2.exe: Access is denied (<name>)"
+      ],
+      "engine": [],
       "counters": {},
       "events": []
     },

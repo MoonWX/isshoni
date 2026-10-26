@@ -47,10 +47,14 @@ func goldenReport() report {
 	}
 	c15.Measured = map[string]measure{measureCut: {ValueMs: 58, BudgetMs: budgetCutMs}}
 	c15.Engine = []string{"include-set"}
+	// A case that could not run: its problem carries the redaction's placeholders, which the file shows as they are.
+	cs22, _ := caseByName("multi-endpoint")
+	c22 := inconclusive(cs22, cfg, `the case could not run: copy <harness>\isshoni-audiotest.exe to `+
+		`Games2\game2.exe: Access is denied (<name>)`)
 	c27 := newCaseReport(cs27, cfg)
 	c27.Result = resultInfo
 	c27.Info = map[string]any{"matched": true, "attempts": 37, "captured": false, "gameReason": "pid_reuse"}
-	cases := []caseReport{c2, c15, c27}
+	cases := []caseReport{c2, c15, c22, c27}
 	return report{
 		V: reportVersion, Harness: "v0.2.0-14-g1a2b3c4",
 		DLL: dllInfo{Version: "0.2.0", SHA256: strings.Repeat("3f9a1c0b", 8)},
@@ -168,6 +172,10 @@ func TestMergeGolden(t *testing.T) {
 	if len(r.Manual) != 2 || r.Manual[0] != (manualEntry{Label: "R1", Pass: true}) || r.Manual[1].Label != "R3" {
 		t.Fatalf("manual entries %+v", r.Manual)
 	}
+	// The placeholders read as they are, not as \u003c…\u003e escapes.
+	if !bytes.Contains(want, []byte(`copy <harness>\\isshoni-audiotest.exe`)) || bytes.Contains(want, []byte(`\u003c`)) {
+		t.Fatalf("merged.json escapes the redaction's placeholders:\n%s", want)
+	}
 }
 
 // TestMergeRefuses: an entry from another OS build (product, build or UBR), a label already merged with the other
@@ -222,15 +230,28 @@ func TestMergeRefuses(t *testing.T) {
 		}
 	}
 
-	// A report that isn't redacted, one with an unknown field, and one of another schema version are refused.
+	// A report that isn't redacted (a non-fixture app in its events; fixture events only but an absolute path in a
+	// problem; a -no-redact report's name), one with an unknown field, and one of another schema version are refused.
 	m := writeManual("ok.json", manualFile{Label: "R1", Pass: true, OS: osi})
-	bad := []struct{ name, edit, want string }{
-		{"unredacted", `"app": "exe:spotify.exe"`, "-no-redact"},
-		{"unknown field", `"app": "other", "extra": 1`, "can read"},
+	bad := []struct{ name, old, edit, want string }{
+		{"unredacted", `"app": "other"`, `"app": "exe:spotify.exe"`, "-no-redact"},
+		{"path-in-problem", `"app": "other"`, `"app": "fixture:voice"`, "absolute path in case multi-endpoint"},
+		{"x" + unredactedSuffix, "", "", "-no-redact"},
+		{"unknown field", `"app": "other"`, `"app": "other", "extra": 1`, "can read"},
 	}
 	for _, tc := range bad {
 		p := filepath.Join(dir, tc.name+".json")
-		js := strings.Replace(string(original), `"app": "other"`, tc.edit, 1)
+		js := string(original)
+		if tc.old != "" {
+			js = strings.Replace(js, tc.old, tc.edit, 1)
+		}
+		if tc.name == "path-in-problem" {
+			js = strings.Replace(js, `copy <harness>\\isshoni-audiotest.exe`,
+				`copy C:\\Users\\X\\Downloads\\isshoni-audiotest.exe`, 1)
+			if strings.Contains(js, `"app": "exe:`) || !strings.Contains(js, `C:\\Users`) {
+				t.Fatal("the path-in-problem report is not what the test means")
+			}
+		}
 		if err := os.WriteFile(p, []byte(js), 0o600); err != nil { //nolint:gosec // G703: the test's temp folder
 			t.Fatal(err)
 		}

@@ -7,7 +7,8 @@ import (
 
 // This file is the audiotest report schema and summary line (docs/m2/05-windows-audio.md §18.7). It is portable:
 // the report is built on every OS, redacted by redact.go (the default; -no-redact is for local debugging only),
-// written by run.go and extended with manual entries by merge.go. The JSON field names and order are §18.7's.
+// written by run.go and extended with manual entries by manual.go (merge). The JSON field names and order are
+// §18.7's.
 
 // reportVersion is the schema version written into the report's "v".
 const reportVersion = 1
@@ -42,13 +43,14 @@ type osInfo struct {
 }
 
 // machineInfo is the report's "machine": recorded, not enforced (05 §18.4). Endpoint names are already
-// {formFactor, bus}: no friendly names.
+// {formFactor, bus}: no friendly names. MasterVolume and Muted are the default render endpoint's master volume
+// (0..1) and mute from IAudioEndpointVolume; null when unreadable.
 type machineInfo struct {
 	CPU               string         `json:"cpu"`
 	RenderEndpoints   []endpointInfo `json:"renderEndpoints"`
 	Mic               bool           `json:"mic"`
-	MasterVolume      *float64       `json:"masterVolume"` // null: not read (needs the endpoint volume COM API)
-	Muted             *bool          `json:"muted"`        // null: not read
+	MasterVolume      *float64       `json:"masterVolume"` // null when unreadable
+	Muted             *bool          `json:"muted"`        // null when unreadable
 	DuckingPreference int            `json:"duckingPreference"`
 }
 

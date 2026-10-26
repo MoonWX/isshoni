@@ -167,7 +167,7 @@ type promptState struct {
 //
 // A fixture role's sample is its render session (the active one when it has several); a role with only a
 // microphone session (Steam in case 9) is sampled through that session, flagged capture, which the playback controls
-// skip and the row checks read.
+// skip and the row checks read (finish counts it as active only for a role the case checks no tone of).
 func (c *capture) sample(r media.AudioReport, fh fhState, levels *media.AudioLevels, pids map[uint32]string) {
 	if !c.haveTap {
 		return // times are relative to the first tap chunk: nothing can be placed before it
@@ -350,14 +350,17 @@ func (c *capture) finish(cs caseSpec, in captureEnd) recording {
 		rc.setStamp, rc.setStampOK = c.engineToTap(in.setStamp), true
 	}
 	// The positive controls (05 §18.6): every role the case checks must appear active, and must not exit before its
-	// planned end (or the end of the recording).
+	// planned end (or the end of the recording). A role the case checks a tone of must appear as an active render
+	// session: a fixture that holds the mic but never played proves nothing about its absent checks. Only a role of
+	// the row checks alone (Steam in case 9) counts through its microphone session.
+	playing := playingRoles(cs)
 	for _, role := range checkedRoles(cs) {
 		tr := c.roles[role]
 		if tr == nil {
 			tr = &roleTrack{}
 			c.roles[role] = tr
 		}
-		tr.neverActive = !anyActive(tr)
+		tr.neverActive = !anyActive(tr, slices.Contains(playing, role))
 		exitNS, exited := in.exit[role]
 		span, planned := in.plan[role]
 		if !exited || !planned {
@@ -378,9 +381,10 @@ func (c *capture) finish(cs caseSpec, in captureEnd) recording {
 // exitSlackSec is how much earlier than planned a fixture may exit before it counts as exited early.
 const exitSlackSec = 0.25
 
-func anyActive(tr *roleTrack) bool {
+// anyActive reports whether tr has an active sample; with renderOnly, a microphone session's sample doesn't count.
+func anyActive(tr *roleTrack, renderOnly bool) bool {
 	for _, s := range tr.samples {
-		if s.active {
+		if s.active && (!renderOnly || !s.capture) {
 			return true
 		}
 	}

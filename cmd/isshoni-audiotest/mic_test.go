@@ -265,3 +265,67 @@ func TestCaptureMicSessions(t *testing.T) {
 		t.Fatalf("a capture sample tripped a playback control: %s", p)
 	}
 }
+
+// TestCaptureMicOnlyFixtureNeverPlayed is the positive control for a fixture that plays and holds the mic (05 §18.6):
+// in case 12, Discord Web with only an active microphone session in every sample never played, so its absent check
+// proves nothing and the case is INCONCLUSIVE, not a PASS; with its render session there the same capture passes.
+// Steam (case 9) checks no tone, so its microphone session still counts.
+func TestCaptureMicOnlyFixtureNeverPlayed(t *testing.T) {
+	const dur = 8.0
+	build := func(cs caseSpec, sessions func() []media.AudioSession, pids map[uint32]string) recording {
+		c := newTestCapture()
+		for i := range int64(dur * 100) {
+			c.packet(pcmChunk(1_000_000_000+(i+1)*pcmChunkNS, 0))
+		}
+		apps := []media.AudioApp{
+			{ID: "exe:game.exe", Exe: "game.exe", Verdict: "heard"},
+			{ID: "exe:chrome.exe", Exe: "chrome.exe", Verdict: "kept_out", Reason: "mic", UsesMic: true, Browser: true},
+			{ID: "exe:steam.exe", Exe: "steam.exe", Verdict: "kept_out", Reason: "mic", UsesMic: true},
+		}
+		fh := fhState{prompts: []promptState{{kind: promptBrowserMic, appID: "exe:chrome.exe"}}}
+		for st := 0.0; st <= dur+1e-9; st += 0.25 {
+			c.sample(media.AudioReport{QPCNanos: engineAt(st), Engine: "include-set", Apps: apps,
+				Sessions: sessions()}, fh, nil, pids)
+		}
+		rec := c.finish(cs, captureEnd{dur: dur, plan: planSpans(cs, dur), reparented: true})
+		tone := fadedTone(freqGame, dbToAmp(-18), dur, 0.02)[:int(dur*sampleRate)]
+		rec.left, rec.right = tone, tone // the signal is 1000 Hz only
+		return rec
+	}
+	game := media.AudioSession{PID: 1, Exe: "game.exe", AppID: "exe:game.exe", Flow: "render", State: "active",
+		Verdict: "heard"}
+	webMic := media.AudioSession{PID: 2, Exe: "chrome.exe", AppID: "exe:chrome.exe", Flow: "capture",
+		State: "active", Verdict: "kept_out", Reason: "mic"}
+	webRender := webMic
+	webRender.Flow = "render"
+	tab := media.AudioSession{PID: 3, Exe: "chrome.exe", AppID: "exe:chrome.exe", Flow: "render", State: "active",
+		Verdict: "kept_out", Reason: "mic"}
+	pids := map[uint32]string{1: "game", 2: "discordWeb", 3: "otherTab"}
+	cs := mustCase(t, "browser-mic")
+	cfg := gateConfig{FastPath: true}
+
+	rec := build(cs, func() []media.AudioSession { return []media.AudioSession{game, webMic, tab} }, pids)
+	if !rec.roles["discordWeb"].neverActive {
+		t.Fatal("Discord Web with only a microphone session: want neverActive")
+	}
+	if cr := evaluate(cs, rec, cfg); cr.Result != resultInconclusive ||
+		!strings.Contains(strings.Join(cr.Problems, "|"), "never appeared as an active session") {
+		t.Fatalf("Discord Web never played: want INCONCLUSIVE naming the control, got %s %v", cr.Result, cr.Problems)
+	}
+	rec = build(cs, func() []media.AudioSession { return []media.AudioSession{game, webMic, webRender, tab} }, pids)
+	if cr := evaluate(cs, rec, cfg); cr.Result != resultPass {
+		t.Fatalf("Discord Web played and held the mic: want PASS, got %s %v", cr.Result, cr.Problems)
+	}
+
+	steamCase := mustCase(t, "steam-game")
+	steamMic := media.AudioSession{PID: 4, Exe: "steam.exe", AppID: "exe:steam.exe", Flow: "capture",
+		State: "active", Verdict: "kept_out", Reason: "mic"}
+	rec = build(steamCase, func() []media.AudioSession { return []media.AudioSession{game, steamMic} },
+		map[uint32]string{1: "game", 4: "steam"})
+	if rec.roles["steam"].neverActive {
+		t.Fatal("Steam's microphone session must count: it checks no tone")
+	}
+	if cr := evaluate(steamCase, rec, cfg); cr.Result != resultPass {
+		t.Fatalf("Steam holding the mic: want PASS, got %s %v", cr.Result, cr.Problems)
+	}
+}
