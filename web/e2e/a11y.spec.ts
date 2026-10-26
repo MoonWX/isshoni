@@ -1,8 +1,9 @@
 // a11y.spec (05 §19.3, §16.6): axe (WCAG 2.0 A and AA, 2.1 AA) on the pages a friend meets, against a real server,
 // finds no serious or critical violation, in the light and the dark colour scheme (05 §16.6: AA in both): the login,
-// invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), and the admin's
-// user list. In the room the tile list is reachable with the keyboard and F switches the stage's fullscreen, and the
-// overlay shows the friend's tile as the page receives it and as the server forwards it, with no IP address.
+// invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), the admin's user
+// list, and the device-link page's states (M2 02 §10.1: enter, invalid, confirm with its network note, linked). In
+// the room the tile list is reachable with the keyboard and F switches the stage's fullscreen, and the overlay shows
+// the friend's tile as the page receives it and as the server forwards it, with no IP address.
 //
 // What axe can't judge (a screen reader's reading order, the live regions' timing) is the manual matrix's and the
 // component tests' (05 §19.2, §19.4).
@@ -119,6 +120,45 @@ test('the setup page', async ({ startServer, browser }) => {
   } finally {
     await page.context().close();
   }
+});
+
+test('the device-link page (M2 02 §10.1): enter, invalid, confirm with the network note, linked', async ({
+  server,
+  page,
+}) => {
+  const account = await server.createUser();
+  await server.signIn(page.context(), account);
+  // The browser and the app on different networks: the confirm card shows its warning and the tick (02 §5.3). The
+  // e2e server reads these from X-Forwarded-For (fixtures.ts); link.spec uses 198.18.0.0/16, this test 198.19.0.0/16.
+  await page.context().setExtraHTTPHeaders({ 'X-Forwarded-For': '198.19.0.1' });
+
+  await page.goto(`${server.url}/link`);
+  await pageReady(page, 'Enter the code shown in the isshoni app');
+  await expectAccessible(page, 'the link page: enter');
+
+  // A code nobody was given: invalid, with the code field.
+  await page.getByLabel('Code').fill('bcdfbcdf');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await pageReady(page, "This code doesn't work");
+  await expectAccessible(page, 'the link page: invalid');
+
+  // The app's start, as its Go code sends it: from another address.
+  const res = await fetch(`${server.url}/api/v1/device/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.19.0.2' },
+    body: JSON.stringify({ clientKind: 'desktop', deviceName: 'DESKTOP-A11Y', os: 'windows', appVersion: '0.2.0' }),
+  });
+  expect(res.status, 'POST /api/v1/device/code').toBe(200);
+  const flow = (await res.json()) as { verificationUriComplete: string };
+  await page.goto(flow.verificationUriComplete);
+  await pageReady(page, 'Link the isshoni app?');
+  await expect(page.getByRole('checkbox', { name: 'I started this myself' })).toBeVisible();
+  await expectAccessible(page, 'the link page: confirm, from a different network');
+
+  await page.getByRole('checkbox', { name: 'I started this myself' }).check();
+  await page.getByRole('button', { name: 'Link anyway' }).click();
+  await pageReady(page, 'Linked');
+  await expectAccessible(page, 'the link page: linked');
 });
 
 test('the admin’s user list', async ({ server, page }) => {

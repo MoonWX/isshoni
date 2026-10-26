@@ -1,0 +1,79 @@
+{
+  "link": {
+    "app": {
+      "desktop": {
+        "windows": "isshoni for Windows",
+        "macos": "isshoni for macOS",
+        "linux": "isshoni Linux helper"
+      },
+      "mobile": {
+        "ios": "isshoni for iPhone",
+        "android": "isshoni for Android"
+      },
+      "other": "An isshoni app",
+      "withVersion": "{{app}} {{version}}"
+    },
+    "title": "Link the isshoni app",
+    "checking": "Checking the code",
+    "enter": {
+      "title": "Enter the code shown in the isshoni app",
+      "label": "Code",
+      "hint": "8 letters, like WDJB-MJHT.",
+      "continue": "Continue"
+    },
+    "confirm": {
+      "title": "Link the isshoni app?",
+      "compare": "Make sure it matches the code in the app.",
+      "nameDesktop": "Name for this computer",
+      "nameOther": "Name for this device",
+      "nameHint": "You can rename it later on your Devices page.",
+      "requested": "Requested {{when}} from {{ip}}.",
+      "requestedSame": "Requested {{when}} from {{ip}} (this browser's network). People on the same Wi-Fi or mobile carrier can share one address, so compare the code too.",
+      "different": "This request came from a different network than this browser. Only continue if you started it yourself, for example on another computer or on mobile data.",
+      "unknown": "isshoni couldn't check whether this request came from your network. Only continue if you started it yourself.",
+      "startedMyself": "I started this myself",
+      "actsAs": "The app will act as <b>{{username}}</b> on {{server}}: watch, share and change your settings.",
+      "link": "Link",
+      "linkAnyway": "Link anyway",
+      "dontLink": "Don't link",
+      "signedInAs": "Signed in as {{username}}. Not you?",
+      "signOut": "Sign out"
+    },
+    "name": {
+      "required": "Enter a name.",
+      "too_long": "That's too long for a name: 64 characters at most.",
+      "invalid": "That name has characters that can't be used."
+    },
+    "linked": {
+      "title": "Linked",
+      "body": "Go back to the app; it continues by itself."
+    },
+    "denied": {
+      "title": "Not linked",
+      "body": "The app will show that you said no."
+    },
+    "invalid": {
+      "title": "This code doesn't work"
+    },
+    "rateLimited": {
+      "title": "Too many wrong codes",
+      "body": "Try again in {{minutes}} min."
+    },
+    "devices": {
+      "thisApp": "This app",
+      "linkedOn": "Linked {{date}}",
+      "lastSeen": "Last seen {{when}} from {{ip}}",
+      "lastSeenNoIp": "Last seen {{when}}",
+      "rename": "Rename",
+      "renameLabel": "New name for {{name}}",
+      "save": "Save",
+      "renamed": "Renamed to {{name}}.",
+      "gone": "{{name}} isn't linked anymore.",
+      "remove": "Remove",
+      "removeTitle": "Remove {{name}}?",
+      "removeBody": "{{name}} will be signed out and has to be linked again.",
+      "removeBodyCurrent": "This app will be signed out.",
+      "removed": "Removed {{name}}."
+    }
+  }
+}

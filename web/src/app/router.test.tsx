@@ -161,8 +161,16 @@ describe('the route table (05 §5; M2: docs/m2/03 §7.5)', () => {
 
   it('has a loader for every folder of this build, rooms/ and desktop/ among them', () => {
     const { lazy } = defaultSources();
-    // link/ joins with WA63.
-    expect(Object.keys(lazy).sort()).toEqual(['account', 'admin', 'auth', 'desktop', 'download', 'rooms', 'setup']);
+    expect(Object.keys(lazy).sort()).toEqual([
+      'account',
+      'admin',
+      'auth',
+      'desktop',
+      'download',
+      'link',
+      'rooms',
+      'setup',
+    ]);
     for (const load of Object.values(lazy)) expect(load).toBeTypeOf('function');
   });
 });

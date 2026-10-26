@@ -1,17 +1,23 @@
 import { queryOptions, useMutation, useQuery, type UseQueryResult } from '@tanstack/react-query';
-import { useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode, type SyntheticEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useApp } from '../app/context';
 import { useInfo } from '../app/info';
+import { useMeQuery } from '../app/me';
 import { Notice } from '../auth/Notice';
 import { useLogout } from '../auth/useLogout';
 import { errorMessage } from '../lib/errorText';
 import { formatDateTime, formatRelativeTime, parseWireTime } from '../lib/time';
+import { appWithVersion } from '../link/appName';
+import { checkDeviceName, deviceNameError } from '../link/deviceName';
 import {
   CodeNotFound,
+  CodeValidationFailed,
   type DeviceInfo,
+  type DeviceResponse,
   type DevicesResponse,
+  type RenameDeviceRequest,
   type RevokeOthersResponse,
   type SessionInfo,
   type SessionsResponse,
@@ -19,7 +25,9 @@ import {
 import { queryKeys } from '../protocol/queryKeys';
 import { api, isApiError, type ApiPath } from '../protocol/rest';
 import { Button } from '../ui/Button';
+import { cx } from '../ui/cx';
 import { Dialog } from '../ui/Dialog';
+import { TextField } from '../ui/Field';
 import { Spinner } from '../ui/Spinner';
 import { AccountShell, Section } from './AccountShell';
 import styles from './DevicesPage.module.css';
@@ -37,7 +45,7 @@ export function sessionsQueryOptions() {
   });
 }
 
-/** GET /api/v1/me/devices (03 §12.3 #17): linked apps, empty until M2. */
+/** GET /api/v1/me/devices (03 §12.3 #17; M2 02 §7.2): the linked apps, with `current` for a bearer's own. */
 export function devicesQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.meDevices,
@@ -62,20 +70,28 @@ export function sortSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
  *   says "This browser" and has Sign out, which runs the logout flow (05 §15.1).
  * - "Sign out other browsers" (POST /api/v1/me/sessions/revoke-others) and "Log out everywhere"
  *   (POST /api/v1/auth/logout-everywhere, which ends this session too).
- * - Linked devices: GET /api/v1/me/devices, with Revoke (DELETE /api/v1/me/devices/{id}). The list is empty until
- *   the desktop app exists (M2).
+ * - Linked apps (M2 02 §10.2): GET /api/v1/me/devices. Each row has the app's name, its kind and version
+ *   (link.app.<kind>.<os>), when it was linked, when it was last seen and from where, Rename (an inline field,
+ *   PATCH /api/v1/me/devices/{id}) and Remove (a confirmation, then DELETE /api/v1/me/devices/{id}).
+ *
+ * In M2 the page runs only in a browser with a cookie session (the desktop app opens it in the system browser), so
+ * no app row is `current`. For a later client that shows the page with a bearer (02 §10.2: the mobile apps, M4's
+ * agent), its own row says "This app" and Remove warns that it signs this app out, and the page leaves out what a
+ * bearer can't do: "Sign out other browsers" is cookie-only (POST …/revoke-others is UserSession, 02 §6.4).
  */
 export function DevicesPage() {
   const { t } = useTranslation();
+  // /me answers {device} instead of {session} for a bearer (02 §7.2).
+  const asDevice = useMeQuery().data?.device !== undefined;
   return (
     <AccountShell title={t('account.devices.title')}>
-      <Browsers />
+      <Browsers asDevice={asDevice} />
       <LinkedDevices />
     </AccountShell>
   );
 }
 
-function Browsers() {
+function Browsers({ asDevice }: { asDevice: boolean }) {
   const { t } = useTranslation();
   const { queryClient } = useApp();
   const serverName = useInfo().data?.server.name ?? t('common.appName');
@@ -114,7 +130,7 @@ function Browsers() {
         </ul>
       </ListState>
       <div className={styles.actions}>
-        {hasOthers && (
+        {hasOthers && !asDevice && (
           <RevokeOthers
             onDone={() => {
               heading.current?.focus();
@@ -142,6 +158,14 @@ function LinkedDevices() {
     heading.current?.focus();
   };
 
+  /** A renamed row shows its new name at once; the server's list follows. */
+  const renamed = (device: DeviceInfo): void => {
+    queryClient.setQueryData<DevicesResponse>(queryKeys.meDevices, (old) =>
+      old ? { ...old, devices: old.devices.map((d) => (d.id === device.id ? { ...d, ...device } : d)) } : old,
+    );
+    void queryClient.invalidateQueries({ queryKey: queryKeys.meDevices });
+  };
+
   return (
     <Section heading={t('account.devices.linked.heading')} headingRef={heading}>
       <ListState query={devices}>
@@ -156,6 +180,7 @@ function LinkedDevices() {
                 onGone={() => {
                   gone(device.id);
                 }}
+                onRenamed={renamed}
               />
             ))}
           </ul>
@@ -259,31 +284,276 @@ function SessionRow({ session, onGone }: { session: SessionInfo; onGone: () => v
   );
 }
 
-function DeviceRow({ device, onGone }: { device: DeviceInfo; onGone: () => void }) {
-  const nameId = useId();
+/** "Sep 30, 2026" in the given language. */
+function formatDate(date: Date, lang: string): string {
+  return new Intl.DateTimeFormat(lang, { dateStyle: 'medium' }).format(date);
+}
+
+/** "Linked Sep 30, 2026", with the exact time as a tooltip. Nothing when the server sent no time. */
+function LinkedOn({ at }: { at: string | undefined }) {
+  const { t, i18n } = useTranslation();
+  const date = parseWireTime(at);
+  if (!date) return null;
   return (
-    <li className={styles.row}>
+    <time dateTime={date.toISOString()} title={formatDateTime(date, i18n.language)}>
+      {t('link.devices.linkedOn', { date: formatDate(date, i18n.language) })}
+    </time>
+  );
+}
+
+/** "Last seen 3 minutes ago from 203.0.113.7" (02 §10.2), with the exact time as a tooltip. */
+function DeviceLastSeen({ device }: { device: DeviceInfo }) {
+  const { t, i18n } = useTranslation();
+  const date = parseWireTime(device.lastSeenAt);
+  if (!date) return null;
+  const when = lastSeenText(date, i18n.language);
+  const ip = device.lastIp ?? '';
+  return (
+    <time dateTime={date.toISOString()} title={formatDateTime(date, i18n.language)}>
+      {ip === '' ? t('link.devices.lastSeenNoIp', { when }) : t('link.devices.lastSeen', { when, ip })}
+    </time>
+  );
+}
+
+interface DeviceRowProps {
+  device: DeviceInfo;
+  /** It was removed (here, or already elsewhere): take the row off the list. */
+  onGone: () => void;
+  /** The server renamed it: its answer. */
+  onRenamed: (device: DeviceInfo) => void;
+}
+
+/**
+ * One linked app (02 §10.2): its name ("This app" for the caller's own, a bearer only), the app and its version,
+ * when it was linked, when and where it was last seen, Rename and Remove.
+ */
+function DeviceRow({ device, onGone, onRenamed }: DeviceRowProps) {
+  const { t } = useTranslation();
+  const nameId = useId();
+  const [editing, setEditing] = useState(false);
+  const renameButton = useRef<HTMLButtonElement>(null);
+  /** The rename field just closed: focus goes back to Rename, which is there again. */
+  const [refocus, setRefocus] = useState(false);
+  useEffect(() => {
+    if (!refocus) return;
+    renameButton.current?.focus();
+  }, [refocus]);
+
+  const close = (): void => {
+    setEditing(false);
+    setRefocus(true);
+  };
+
+  return (
+    <li className={cx(styles.row, styles.appRow)}>
       <div className={styles.what}>
-        <p className={styles.name}>
-          <span id={nameId}>{device.name}</span>
+        {editing ? (
+          <RenameForm device={device} onClose={close} onRenamed={onRenamed} onGone={onGone} />
+        ) : (
+          <p className={styles.name}>
+            <span id={nameId}>{device.name}</span>
+            {device.current && <span className={styles.badge}>{t('link.devices.thisApp')}</span>}
+          </p>
+        )}
+        <p className={styles.meta}>
+          <span>{appWithVersion(t, device.clientKind, device.os, device.appVersion)}</span>
+          <LinkedOn at={device.createdAt} />
         </p>
         <p className={styles.meta}>
-          <LastSeen at={device.lastSeenAt} />
-          {device.lastIp !== undefined && device.lastIp !== '' && <span className={styles.ip}>{device.lastIp}</span>}
+          <DeviceLastSeen device={device} />
         </p>
       </div>
-      <RevokeButton
-        path={`/api/v1/me/devices/${encodeURIComponent(device.id)}`}
-        name={device.name}
-        nameId={nameId}
-        onGone={onGone}
-      />
+      {!editing && (
+        <div className={styles.rowActions}>
+          <Button
+            ref={renameButton}
+            aria-describedby={nameId}
+            onClick={() => {
+              setRefocus(false);
+              setEditing(true);
+            }}
+          >
+            {t('link.devices.rename')}
+          </Button>
+          <RemoveDevice device={device} nameId={nameId} onGone={onGone} />
+        </div>
+      )}
     </li>
   );
 }
 
+interface RenameFormProps {
+  device: DeviceInfo;
+  /** Saved, unchanged or cancelled: the row shows the name again. */
+  onClose: () => void;
+  onRenamed: (device: DeviceInfo) => void;
+  onGone: () => void;
+}
+
+/**
+ * Rename, inline (02 §7.2, §10.2): PATCH /api/v1/me/devices/{id} {name} → 200 {device}. Enter saves; Esc and Cancel
+ * close without a request, and so does an unchanged name. 422 {name} shows under the field; 404 not_found means the
+ * app was removed meanwhile, so its row goes.
+ */
+function RenameForm({ device, onClose, onRenamed, onGone }: RenameFormProps) {
+  const { t } = useTranslation();
+  const { ui } = useApp();
+  const [value, setValue] = useState(device.name);
+  const [error, setError] = useState<string | null>(null);
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    input.current?.focus();
+    input.current?.select();
+  }, []);
+
+  const rename = useMutation({
+    mutationFn: (name: string) => {
+      const body: RenameDeviceRequest = { name };
+      return api<DeviceResponse | undefined>('PATCH', `/api/v1/me/devices/${encodeURIComponent(device.id)}`, body);
+    },
+    onSuccess: (res, name) => {
+      const next = res?.device ?? { ...device, name };
+      onRenamed(next);
+      ui.getState().announce(t('link.devices.renamed', { name: next.name }));
+      onClose();
+    },
+    onError: (err) => {
+      if (isApiError(err, CodeNotFound)) {
+        ui.getState().announce(t('link.devices.gone', { name: device.name }));
+        onGone();
+        return;
+      }
+      const field = isApiError(err, CodeValidationFailed) ? err.fields?.['name'] : undefined;
+      setError(field !== undefined ? deviceNameError(field, t) : errorMessage(err, t));
+      input.current?.focus();
+    },
+  });
+
+  const submit = (e: SyntheticEvent): void => {
+    e.preventDefault();
+    if (rename.isPending) return;
+    const name = value.trim();
+    const problem = checkDeviceName(name);
+    if (problem !== null) {
+      setError(deviceNameError(problem, t));
+      input.current?.focus();
+      return;
+    }
+    if (name === device.name) {
+      onClose();
+      return;
+    }
+    setError(null);
+    rename.mutate(name);
+  };
+
+  return (
+    <form className={styles.rename} noValidate onSubmit={submit}>
+      <TextField
+        ref={input}
+        label={t('link.devices.renameLabel', { name: device.name })}
+        name="name"
+        autoComplete="off"
+        spellCheck={false}
+        value={value}
+        onChange={(e) => {
+          setValue(e.target.value);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape' && !rename.isPending) {
+            e.preventDefault();
+            onClose();
+          }
+        }}
+        error={error ?? undefined}
+      />
+      <div className={styles.renameActions}>
+        <Button type="submit" variant="primary" loading={rename.isPending}>
+          {t('link.devices.save')}
+        </Button>
+        <Button disabled={rename.isPending} onClick={onClose}>
+          {t('common.cancel')}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * Remove one linked app (02 §10.2): a confirmation, then DELETE /api/v1/me/devices/{id} → 204. The app is signed
+ * out (its connections close, 02 §6.5) and has to be linked again. A 404 not_found means it was removed already,
+ * which is what was asked for, so the row goes the same way.
+ */
+function RemoveDevice({ device, nameId, onGone }: { device: DeviceInfo; nameId: string; onGone: () => void }) {
+  const { t } = useTranslation();
+  const { ui } = useApp();
+  const [open, setOpen] = useState(false);
+  const remove = useMutation({
+    mutationFn: async () => {
+      try {
+        await api('DELETE', `/api/v1/me/devices/${encodeURIComponent(device.id)}`);
+      } catch (err) {
+        if (!isApiError(err, CodeNotFound)) throw err;
+      }
+    },
+    onSuccess: () => {
+      ui.getState().announce(t('link.devices.removed', { name: device.name }));
+      setOpen(false);
+      onGone();
+    },
+  });
+  // After a success the row is about to leave: the button stays busy rather than inviting a second click.
+  const busy = remove.isPending || remove.isSuccess;
+  const close = (): void => {
+    setOpen(false);
+  };
+  return (
+    <>
+      <Button
+        aria-describedby={nameId}
+        onClick={() => {
+          remove.reset();
+          setOpen(true);
+        }}
+      >
+        {t('link.devices.remove')}
+      </Button>
+      <Dialog
+        open={open}
+        onClose={close}
+        size="sm"
+        title={t('link.devices.removeTitle', { name: device.name })}
+        dismissible={!busy}
+        footer={
+          <>
+            <Button onClick={close} disabled={busy}>
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="danger"
+              loading={busy}
+              onClick={() => {
+                remove.mutate();
+              }}
+            >
+              {t('link.devices.remove')}
+            </Button>
+          </>
+        }
+      >
+        <div className={styles.confirm}>
+          <p>
+            {device.current ? t('link.devices.removeBodyCurrent') : t('link.devices.removeBody', { name: device.name })}
+          </p>
+          {remove.isError && <Notice>{errorMessage(remove.error, t)}</Notice>}
+        </div>
+      </Dialog>
+    </>
+  );
+}
+
 interface RevokeButtonProps {
-  /** The session or device: DELETE it. */
+  /** The session: DELETE it. */
   path: ApiPath;
   /** The row's name, for the messages. */
   name: string;
@@ -294,8 +564,8 @@ interface RevokeButtonProps {
 }
 
 /**
- * Revoke one browser or linked device: DELETE → 204. A 404 not_found means it was signed out already (it expired,
- * or another tab revoked it), which is what was asked for, so the row goes the same way.
+ * Revoke one browser: DELETE → 204. A 404 not_found means it was signed out already (it expired, or another tab
+ * revoked it), which is what was asked for, so the row goes the same way.
  */
 function RevokeButton({ path, name, nameId, onGone }: RevokeButtonProps) {
   const { t } = useTranslation();

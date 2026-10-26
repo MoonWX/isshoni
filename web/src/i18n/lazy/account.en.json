@@ -59,7 +59,7 @@
       },
       "linked": {
         "heading": "Linked devices",
-        "empty": "Nothing is linked yet. Apps you sign in to with this account, like the isshoni desktop app when it arrives, show up here."
+        "empty": "Nothing is linked yet. When you link the isshoni app to this account, it shows up here."
       }
     },
     "notifications": {
