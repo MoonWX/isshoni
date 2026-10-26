@@ -3,7 +3,6 @@ package itest
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -11,7 +10,6 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/MoonWX/isshoni/internal/client/core"
-	"github.com/MoonWX/isshoni/internal/client/publish"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/fake"
 	"github.com/MoonWX/isshoni/internal/protocol"
@@ -125,32 +123,14 @@ func TestDesktopShareAndWatch(t *testing.T) {
 	}) {
 		t.Errorf("EventShare snapshots %+v, want one of the live share", evs)
 	}
-	// The live counters fire no EventShare (§11.10): over a second of media, each EventShare that comes changed a field
-	// that isn't one. The ramp is still stepping the full layer's target every RampEvery until 8 Mbit/s (01 §9.3), and
-	// its third step, 8 s after live, falls in this second.
+	// The live counters fire no EventShare (§11.10): a second of media, and nothing else changes.
 	time.Sleep(500 * time.Millisecond) // the coalescing of the last watcher change
 	quiet := len(app.shareEvents())
 	time.Sleep(time.Second)
-	evs := app.shareEvents()
-	for i := max(quiet, 1); i < len(evs); i++ {
-		if reflect.DeepEqual(withoutCounters(evs[i]), withoutCounters(evs[i-1])) {
-			t.Errorf("EventShare fired in a second of media alone, for live counters only: %+v after %+v", evs[i],
-				evs[i-1])
-		}
+	if evs := app.shareEvents(); len(evs) != quiet {
+		t.Errorf("EventShare fired %d times in a second of media alone: %+v", len(evs)-quiet, evs[quiet:])
 	}
 	bob.check()
-}
-
-// withoutCounters returns snap without its live counters (01 §11.10), which fire no EventShare.
-func withoutCounters(snap core.ShareSnapshot) core.ShareSnapshot {
-	snap.AudioSentBps, snap.Server = 0, nil
-	snap.Layers = slices.Clone(snap.Layers)
-	for i := range snap.Layers {
-		l := &snap.Layers[i]
-		l.SentBps, l.FPS, l.FPSIn = 0, 0, 0
-		l.CaptureToSend, l.EngineLatency = publish.LatencyStats{}, publish.LatencyStats{}
-	}
-	return snap
 }
 
 // layerOf returns a snapshot's layer rid (a zero one when it has none).

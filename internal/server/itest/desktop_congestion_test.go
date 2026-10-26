@@ -241,10 +241,11 @@ func TestDesktopReinitCongestion(t *testing.T) {
 					ratectl.ReinitMinChange)
 			}
 			if i > 0 {
-				t.Logf("  %v after its last change", c.At.Sub(prevAt))
-				if c.At.Sub(prevAt) < ratectl.ReinitMinInterval {
+				gap := c.At.Sub(prevAt)
+				t.Logf("  %v after %s's last change", gap, rid)
+				if gap < ratectl.ReinitMinInterval {
 					t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval)",
-						rid, c.At.Sub(prevAt), ratectl.ReinitMinInterval)
+						rid, gap, ratectl.ReinitMinInterval)
 				}
 			}
 			action := fmt.Sprintf(`msg="rate action" op=bitrate layer=%s bps=%d active=false reinit=true`, rid, c.Bps)
