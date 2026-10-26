@@ -9,6 +9,9 @@
 // 4. The focused share → `high`.
 // 5. In fullscreen, every non-focused share → `off` (IntersectionObserver can't see that they're covered).
 // 6. Other shares: visible → `low`, not visible (off-screen, scrolled away, unmounted) → `off`.
+// 7. M2 (docs/m2/03 §10.4): a local share without a preview of the page's own (the desktop app's share, published
+//    by its C2) is subscribed by the same rules, but with `low` at most and audio always `off`: its tile and the stage
+//    show the preview layer (360p15, about 0.3 Mbps), and the app never plays its own sound.
 //
 // subscriptions.ts builds the inputs from viewerStore and gives the result to the session's SubscriptionSync, which
 // sends the changes in one subscribe.update (05 §12.3). The rules are written out with this slice (S47), which
@@ -30,6 +33,11 @@ export const PAGE_HIDDEN_OFF_MS = 10_000;
 export interface LayerInputs {
   /** Live or stalled shares, excluding the ones this page publishes (viewerStore: the shares that aren't `local`). */
   remoteShares: string[];
+  /**
+   * M2: the local shares that have no preview of this page's own (viewerStore: `local` but not `localPreview`; the
+   * desktop app's share, docs/m2/03 §10.4). Default none.
+   */
+  localShares?: string[];
   focused: string | null;
   audible: string | null;
   /** IntersectionObserver, ≥ 10% visible. */
@@ -48,11 +56,19 @@ function videoLayer(shareId: string, i: LayerInputs): VideoLayer {
   return i.visible[shareId] === true ? VideoLayerLow : VideoLayerOff; // rule 6
 }
 
-/** The desired video layer and audio of every remote share: {shareId, video, audio}, in the order of remoteShares. */
+/**
+ * The desired video layer and audio of every remote share, in the order of remoteShares, then of every local share
+ * without a preview (rule 7): {shareId, video, audio}.
+ */
 export function desiredSubscriptions(i: LayerInputs): SubscriptionWant[] {
-  return i.remoteShares.map((shareId) => ({
+  const remote = i.remoteShares.map((shareId): SubscriptionWant => ({
     shareId,
     video: videoLayer(shareId, i),
     audio: shareId === i.audible ? AudioStateOn : AudioStateOff, // rule 1
   }));
+  const local = (i.localShares ?? []).map((shareId): SubscriptionWant => {
+    const video = videoLayer(shareId, i);
+    return { shareId, video: video === VideoLayerHigh ? VideoLayerLow : video, audio: AudioStateOff }; // rule 7
+  });
+  return [...remote, ...local];
 }

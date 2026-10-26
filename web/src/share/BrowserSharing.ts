@@ -38,7 +38,7 @@ import {
   type Preset,
   type ShareParams,
 } from '../protocol/types.gen';
-import { BrowserShare } from './BrowserShare';
+import { BrowserShare, isCaptured } from './BrowserShare';
 import { canSendH264 } from './codecPrefs';
 import { PublisherPC, type PublisherPCDeps, type PublisherSignal } from './PublisherPC';
 import { isConnectionLost, newRef, requestShareStart } from './recovery';
@@ -143,6 +143,8 @@ export class BrowserSharing implements SharingProvider {
     const { roomId } = ctx;
     // 01's SignalClient in the app: the wait of recovery.ts reads its state; a bare SignalClientLike can't wait.
     const signal: PublisherSignal = ctx.signal;
+    // Every pick of this provider has its stream; a pick without one (a native pick) has nothing to publish here.
+    if (!isCaptured(src)) throw new LocalError('capture_failed');
     const stream = src.preview;
     const [video] = stream.getVideoTracks();
     if (video === undefined || hasEnded(video)) throw new LocalError('capture_failed');

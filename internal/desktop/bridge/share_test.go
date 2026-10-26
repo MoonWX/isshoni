@@ -82,6 +82,15 @@ func TestShareViewJSON(t *testing.T) {
 	if got := s.Share.Current(); got.Error.Code != "share_limit" || got.Error.Params["limit"] != 2 {
 		t.Errorf("wire error %+v", got.Error)
 	}
+	// A live share's engine end with its detail token (core's EndInfo.MediaReason through share's endError, README
+	// WF4): params.reason carries it, so 03 §10.5's device_removed row applies.
+	v = share.View{State: share.StateFailed, EndReason: share.EndError, Err: &media.Error{
+		Code: media.CodeEncoderLost, Reason: "device_removed", Op: "share"}}
+	core.shares.set(func(f *fakeShares) { f.current = &v })
+	if got := s.Share.Current(); got.Error.Code != string(codes.CodeEngineEncoderLost) ||
+		got.Error.Params["reason"] != "device_removed" {
+		t.Errorf("engine end with a reason %+v", got.Error)
+	}
 	core.shares.set(func(f *fakeShares) { f.current = nil })
 	if s.Share.Current() != nil {
 		t.Error("a view without a share")

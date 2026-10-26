@@ -254,6 +254,7 @@ describe('the production build', () => {
   it.each([
     ['admin', ['admin']],
     ['account', ['account']],
+    ['link', ['link']],
     ['setup', ['setup']],
   ])('keeps the lazy namespace %s out of the initial chunks', (ns) => {
     for (const module of [`i18n/lazy/${ns}.en.json`, `i18n/lazy/${ns}.ts`]) {
@@ -268,6 +269,9 @@ describe('the production build', () => {
     ['account', 'account'],
     ['download', 'account'],
     ['setup', 'setup'],
+    // The approval page, and the Devices page's app rows (M2 02 §10.2).
+    ['link', 'link'],
+    ['account', 'link'],
   ])("the %s folder's chunk brings the %s namespace with it", (folder, ns) => {
     const loaded = folderChunks(folder);
     for (const module of [`i18n/lazy/${ns}.en.json`, `i18n/lazy/${ns}.ts`]) {

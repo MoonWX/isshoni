@@ -11,7 +11,7 @@
 // Later (M4): a RelayBridge over 01's same-user relay implements the share and audio parts over messages, so the
 // interface keeps those parts free of anything Wails-specific.
 import type { DeviceRef, User } from '../../protocol/api.gen';
-import type { ClientOS, Preset, ShareKind } from '../../protocol/types.gen';
+import type { ClientOS, Preset, ServerLayerStats, ShareKind } from '../../protocol/types.gen';
 import type { HelloRefusal, SessionEndCode, ShareHint, ShareStatsSample } from '../types';
 
 /** Go's event names carry this prefix (docs/m2/03 §6.3), so they never collide with Wails' own. */
@@ -114,7 +114,12 @@ export interface ShareCaps {
   audioBackend: 'process-loopback' | 'endpoint' | 'none';
 }
 
-/** A source picked in the OS picker, held by Go for 120 s until Start or Release. */
+/**
+ * A source picked in the OS picker, held by Go until Start or Release, at most 300 s from the pick (docs/m2/03 §10.1,
+ * 04's pick-token life), so a friend who reads the first-share sheet or follows the DND tip into Windows Settings
+ * comes back to a pick that still works. (The picker itself closes after 120 s without a choice: Share.Pick() then
+ * answers null.)
+ */
 export interface Picked {
   pickId: string;
   kind: ShareKind;
@@ -184,8 +189,11 @@ export interface ShareView {
   encoder: string;
   hw: boolean;
   layers: ShareLayerView[];
-  /** 01's server stats while Share.WatchServerStats is on, else null. */
-  server: Record<string, unknown> | null;
+  /**
+   * 01's view of this connection's layers (protocol.ServerLayerStats, the server's stats message) while
+   * Share.WatchServerStats is on, else null.
+   */
+  server: { layers: ServerLayerStats[] } | null;
   endReason: ShareEndReason | null;
   error: BridgeErrorJSON | null;
 }
@@ -364,7 +372,8 @@ export interface UpdateStatus {
 // ---- Events (docs/m2/03 §6.3; the names here are without the isshoni: prefix) ----
 
 export interface BridgeEvents {
-  'share.state': ShareView;
+  /** null: there is no share (the controller's Current() is null: before any, or a pick in progress was settled). */
+  'share.state': ShareView | null;
   /** `at` is set by the transport on receipt (performance.now()). */
   'share.stats': ShareStatsSample;
   'share.notice': ShareNotice;

@@ -122,6 +122,14 @@ type ShareEvents = {
   hint: ShareHint | null;
 };
 
+/** An in-page pick: a PickedSource whose stream the page holds (a native pick has none, docs/m2/03 §7.1). */
+export type CapturedSource = PickedSource & { readonly preview: MediaStream };
+
+/** Whether a pick carries the page's own capture (every pick of BrowserSharing does). */
+export function isCaptured(src: PickedSource): src is CapturedSource {
+  return src.preview !== null;
+}
+
 export interface BrowserShareDeps {
   /**
    * ShareContext.signal: 01's SignalClient in the app. The capture hold follows its state; a bare SignalClientLike
@@ -135,8 +143,8 @@ export interface BrowserShareDeps {
    */
   store: ShareStore | null;
   log: Logger;
-  /** The picked source; the share's from here on, released when it ends. */
-  src: PickedSource;
+  /** The picked source, with its stream; the share's from here on, released when it ends. */
+  src: CapturedSource;
   /** The room it is published in. */
   roomId: string;
   /** share.start's answer. */
@@ -173,7 +181,7 @@ export class BrowserShare implements ActiveShare, ShareRecovery {
   readonly #publisher: PublisherPC;
   readonly #store: ShareStore | null;
   readonly #log: Logger;
-  readonly #src: PickedSource;
+  readonly #src: CapturedSource;
   readonly #roomId: string;
   readonly #onEnded: (share: BrowserShare) => void;
   readonly #emitter = createEmitter<ShareEvents>();

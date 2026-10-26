@@ -1,7 +1,7 @@
 # isshoni server configuration for `task dev` (docs/m1/06-deploy-and-ci.md §7.3). Not for production.
 #
 # The server runs in off mode (plain HTTP) on 127.0.0.1:8080; Vite serves the web app on http://localhost:5173 and
-# proxies /api and /ws here, so the public URL is the Vite origin. localhost is a secure context, so screen capture,
+# proxies /api, /ws, /healthz and /install-desktop.{ps1,sh} here, so the public URL is the Vite origin. localhost is a secure context, so screen capture,
 # service workers and Secure cookies work in Chrome, Edge and Firefox. Relative paths are resolved against the
 # working directory (the repository root under Task); the server creates .dev/ on first start.
 

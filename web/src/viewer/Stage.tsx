@@ -26,7 +26,7 @@ import { WatchersPopover } from './WatchersPopover';
 export interface StageProps {
   /** The focused share; null shows `empty`. */
   share: ViewerShare | null;
-  /** The local preview, when the focused share is one this page publishes (share.local). */
+  /** The local preview, when the focused share is one this page publishes (share.localPreview). */
   preview?: MediaStream | null | undefined;
   /** What an empty stage shows (05 §11.2): "Nobody is sharing yet." and the like. */
   empty?: ReactNode;
@@ -100,8 +100,9 @@ function FocusedStage({
     return onDoublePress(el, onToggleFullscreen);
   }, [onToggleFullscreen]);
 
-  const stream = share.local ? preview : undefined;
-  const track = share.local ? undefined : media.video;
+  // This page's own share shows its preview stream; the desktop app's own share (docs/m2/03 §10.4) its low layer.
+  const stream = share.localPreview ? preview : undefined;
+  const track = share.localPreview ? undefined : media.video;
   const view = shareView(share, status, stream != null || track !== undefined, frozen);
   const title = shareTitle(t, share);
   const extra = controls != null && controls !== false;

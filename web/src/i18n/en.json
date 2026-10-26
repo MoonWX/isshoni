@@ -102,7 +102,8 @@
     "tile": {
       "watch": "Watch {{title}}, {{watching}}",
       "watchOwn": "Watch your share from another device, {{watching}}",
-      "preview": "Show your preview on the stage, {{watching}}"
+      "preview": "Show your preview on the stage, {{watching}}",
+      "lowPreview": "Preview: what friends see"
     },
     "stage": {
       "watching": "Now watching: {{title}}",
@@ -1110,13 +1111,13 @@
     "backup_newer": "That backup comes from a newer version of isshoni.",
     "restore_in_progress": "A restore is already running.",
     "insufficient_storage": "The server is out of disk space.",
-    "invalid_token": "Your sign-in expired. Log in again.",
+    "invalid_token": "This app's sign-in expired. Link the app again.",
     "authorization_pending": "Waiting for you to approve this device.",
     "slow_down": "Checking too often. Wait a moment.",
     "access_denied": "The device link was declined.",
     "expired_token": "The device code expired. Start again.",
     "invalid_grant": "Your sign-in doesn't work anymore. Log in again.",
-    "device_code_invalid": "That code doesn't work or has expired.",
+    "device_code_invalid": "This code is wrong, was already used or has expired. Start again in the app.",
     "local": {
       "connection_lost": "The connection dropped before the server answered.",
       "request_timeout": "The server didn't answer in time.",

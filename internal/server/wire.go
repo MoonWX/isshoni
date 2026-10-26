@@ -17,6 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/MoonWX/isshoni/deploy"
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -207,7 +208,7 @@ const (
 // (04 §6.2), the transfer accounting and the release check (04 §11.3, §11.5), doctor (04 §13.1), the dashboard and
 // the REST routes of ops, and the admin socket's server. It opens and starts nothing; Start serves what it builds,
 // and runs the push service, the transfer accounting and the release check with the server's other work
-// (startBackground).
+// (startBackground). Before all that it checks the embedded desktop install script (checkDesktopScripts, M2 06 §7.4).
 //
 // A server without a site (ip mode before a public address is known, 04 §7.4) has no accounts, no API, no hub and
 // no push service: each needs the public origin, and the router answers 421 to every request but the health
@@ -217,6 +218,9 @@ const (
 // found no local address to bind them on either does it have no SFU, and a failing check "media" next to
 // "public_ip" (wireMedia).
 func (s *Server) wire(ctx context.Context) error {
+	if err := checkDesktopScripts(s.desktopScripts()); err != nil {
+		return err
+	}
 	// The wall clock, not Deps.Now: how old an answer is has nothing to do with what time the accounts think it is.
 	s.health.AddCheck("db", newDBCheck(s.run, s.store.Ping, time.Now).ready)
 
@@ -645,6 +649,31 @@ func (s *Server) spaStatus(path string) int {
 	}
 	s.setupDone.Store(true)
 	return http.StatusNotFound
+}
+
+// desktopScripts is the value of the router's RouterOptions.Desktop (M2 06 §7.4), for routerOptions to pass on:
+// deploy/install-desktop.ps1 as embedded in the binary, the site's origin and this binary's version. The router writes
+// the last two into the script's prefill block once, when it is built: they are fixed for the process (M1 04 §6.2). A
+// server without a site passes an empty origin, which leaves the server out of the script; its router answers 421 to
+// all but the health endpoints anyway.
+func (s *Server) desktopScripts() *httpapi.DesktopScripts {
+	return &httpapi.DesktopScripts{PS1: deploy.InstallDesktopPS1, Origin: s.site.Origin, Version: version.Version()}
+}
+
+// checkDesktopScripts renders d at startup, as the router will (M2 06 §7.4). An embedded script without a valid
+// prefill block is a build defect that no restart fixes, so serve refuses to start: the refusal is a
+// *config.OperatorError (it wraps config.ErrNeedsOperator, on which serve exits 78, and the render error) with no
+// Reason, since it concerns no file of the data directory. httpapi's test renders the committed file, so a release
+// never gets here.
+func checkDesktopScripts(d *httpapi.DesktopScripts) error {
+	if _, err := httpapi.RenderInstallPS1(d.PS1, d.Origin, d.Version); err != nil {
+		return &config.OperatorError{
+			Message: "this binary's install-desktop.ps1 can't be served: " + err.Error(),
+			Fix:     "this is a build defect: build isshoni again from an unmodified checkout, or use a release artifact",
+			Err:     err,
+		}
+	}
+	return nil
 }
 
 // setupHint logs how to finish setup while no admin account exists (04 §6.1 step 10, 03 §7.8). The setup token

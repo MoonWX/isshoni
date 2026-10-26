@@ -1,17 +1,18 @@
 // /account/devices (05 §15.2) against MSW: the list of browser sessions (03 §12.3 #14), revoking one (#15), "Sign
-// out other browsers" (#16), "Log out everywhere" (#4), this browser's Sign out, and the linked devices (#17, #18),
-// which M1's server always answers with an empty list.
+// out other browsers" (#16), "Log out everywhere" (#4), this browser's Sign out, and the linked apps (#17, #18 and
+// M2's #52, M2 02 §10.2): each app's row, Rename, Remove with its confirmation, the "This app" badge only when
+// `current` is true, and the cookie-only action left out for a bearer.
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
-import { HttpResponse } from 'msw';
+import { http, HttpResponse } from 'msw';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { CHANNEL_NAME } from '../app/session';
 import { networkError, noContent, onPost } from '../auth/testing/harness';
 import { formatDateTime } from '../lib/time';
-import type { SessionInfo } from '../protocol/api.gen';
+import type { DeviceInfo, Me, SessionInfo } from '../protocol/api.gen';
 import { queryKeys } from '../protocol/queryKeys';
-import { apiError } from '../test/msw';
+import { apiError, apiPath, meFixture, server } from '../test/msw';
 import { lastSeenText, sortSessions } from './DevicesPage';
 import {
   deviceFixture,
@@ -457,19 +458,66 @@ describe('DevicesPage: log out everywhere', () => {
   });
 });
 
-describe('DevicesPage: linked devices', () => {
+describe('DevicesPage: linked apps (M2 02 §10.2)', () => {
   function linked(): HTMLElement {
     return screen.getByRole('region', { name: 'Linked devices' });
   }
 
-  it('is empty in M1: says that nothing is linked, with nothing to revoke', async () => {
+  async function appRows(): Promise<HTMLElement[]> {
+    return within(linked()).findAllByRole('listitem');
+  }
+
+  /** A server-side list of apps that GET, PATCH and DELETE act on, as the real endpoints do. */
+  interface AppList {
+    devices: DeviceInfo[];
+    /** How often GET /api/v1/me/devices was asked. */
+    readonly gets: { calls: number };
+    /** The ids DELETE /api/v1/me/devices/{id} was asked for. */
+    readonly deleted: string[];
+    /** The PATCH /api/v1/me/devices/{id} requests. */
+    readonly renamed: { id: string; body: unknown }[];
+  }
+
+  function mockApps(initial: DeviceInfo[]): AppList {
+    const state: AppList = {
+      devices: initial,
+      gets: onGet('/api/v1/me/devices', () => HttpResponse.json({ devices: state.devices })),
+      deleted: onDelete('/api/v1/me/devices/:id', (id) => {
+        state.devices = state.devices.filter((d) => d.id !== id);
+        return noContent();
+      }),
+      renamed: onPatch('/api/v1/me/devices/:id', (id, body) => {
+        const name = (body as { name: string }).name;
+        state.devices = state.devices.map((d) => (d.id === id ? { ...d, name } : d));
+        const device = state.devices.find((d) => d.id === id);
+        return device ? HttpResponse.json({ device }) : apiError(404, { code: 'not_found' });
+      }),
+    };
+    return state;
+  }
+
+  let PC: DeviceInfo;
+  let LAPTOP: DeviceInfo;
+
+  beforeEach(() => {
+    PC = deviceFixture({ lastSeenAt: new Date(Date.now() - 2 * 60 * MINUTE).toISOString() });
+    LAPTOP = deviceFixture({
+      id: 'e1e2e3e4e5e6',
+      name: 'Alex-Laptop',
+      os: 'macos',
+      appVersion: '0.3.0',
+      lastIp: '198.51.100.23',
+    });
+  });
+
+  it('is empty without a linked app: says so, with nothing to remove', async () => {
     mockSessions([THIS]);
     const devices = mockDevices();
     renderAccount('/account/devices');
     await ready();
     expect(
       await within(linked()).findByText(
-        'Nothing is linked yet. Apps you sign in to with this account, like the isshoni desktop app when it arrives, show up here.',
+        'Nothing is linked yet. When you link the isshoni app to this account, it shows up here.',
       ),
     ).toBeInTheDocument();
     expect(devices.calls).toBe(1);
@@ -477,38 +525,293 @@ describe('DevicesPage: linked devices', () => {
     expect(within(linked()).queryByRole('button')).not.toBeInTheDocument();
   });
 
-  it('lists a linked device and revokes it', async () => {
+  it('lists each app: its name, the app and version, when it was linked, and when and where it was last seen', async () => {
     mockSessions([THIS]);
-    let devices = [
-      deviceFixture({ lastSeenAt: new Date(Date.now() - 2 * 60 * MINUTE).toISOString() }),
-      deviceFixture({ id: 'e1e2e3e4e5e6', name: 'Alex-Laptop', lastIp: '198.51.100.23' }),
-    ];
-    const gets = onGet('/api/v1/me/devices', () => HttpResponse.json({ devices }));
-    const deleted = onDelete('/api/v1/me/devices/:id', (id) => {
-      devices = devices.filter((d) => d.id !== id);
-      return noContent();
-    });
+    mockApps([PC, LAPTOP]);
+    renderAccount('/account/devices');
+    await ready();
+    const [pc, laptop, ...rest] = await appRows();
+    expect(rest).toEqual([]);
+    if (!pc || !laptop) throw new Error('expected two rows');
+
+    expect(within(pc).getByText('Alex-PC')).toBeInTheDocument();
+    expect(within(pc).getByText('isshoni for Windows 0.2.0')).toBeInTheDocument();
+    const linkedOn = within(pc).getByText(/^Linked /);
+    expect(linkedOn.tagName).toBe('TIME');
+    expect(linkedOn).toHaveTextContent(
+      `Linked ${new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(PC.createdAt ?? ''))}`,
+    );
+    expect(linkedOn).toHaveAttribute('title', formatDateTime(new Date(PC.createdAt ?? ''), 'en'));
+    const seen = within(pc).getByText('Last seen 2 hours ago from 203.0.113.7');
+    expect(seen.tagName).toBe('TIME');
+    expect(seen).toHaveAttribute('datetime', PC.lastSeenAt);
+    // Every row's buttons say the same: the row's name tells them apart.
+    expect(within(pc).getByRole('button', { name: 'Rename' })).toHaveAccessibleDescription('Alex-PC');
+    expect(within(pc).getByRole('button', { name: 'Remove' })).toHaveAccessibleDescription('Alex-PC');
+    // A cookie session's list: no app is this one.
+    expect(within(pc).queryByText('This app')).not.toBeInTheDocument();
+
+    expect(within(laptop).getByText('Alex-Laptop')).toBeInTheDocument();
+    expect(within(laptop).getByText('isshoni for macOS 0.3.0')).toBeInTheDocument();
+    expect(within(laptop).getByText('Last seen now from 198.51.100.23')).toBeInTheDocument();
+    expect(within(linked()).queryByText(/Nothing is linked yet/)).not.toBeInTheDocument();
+  });
+
+  it('leaves out what the server did not send, and names an app it doesn’t know', async () => {
+    mockSessions([THIS]);
+    mockApps([
+      {
+        id: 'u1u2u3u4u5u6',
+        name: 'Something new',
+        clientKind: 'agent',
+        current: false,
+      },
+      deviceFixture({ id: 'p1p2p3p4p5p6', name: 'Phone', clientKind: 'mobile', os: 'ios', lastIp: '' }),
+    ]);
+    renderAccount('/account/devices');
+    await ready();
+    const [bare, phone] = await appRows();
+    if (!bare || !phone) throw new Error('expected two rows');
+    expect(within(bare).getByText('An isshoni app')).toBeInTheDocument();
+    expect(within(bare).queryByText(/^Linked /)).not.toBeInTheDocument();
+    expect(within(bare).queryByText(/^Last seen/)).not.toBeInTheDocument();
+    expect(within(phone).getByText('isshoni for iPhone 0.2.0')).toBeInTheDocument();
+    expect(within(phone).getByText('Last seen now')).toBeInTheDocument();
+  });
+
+  it('shows "This app" and its own Remove wording only for the caller’s own app (current: a bearer)', async () => {
+    mockSessions([THIS]);
+    mockApps([{ ...PC, current: true }, LAPTOP]);
+    renderAccount('/account/devices');
+    const user = await ready();
+    const [mine, laptop] = await appRows();
+    if (!mine || !laptop) throw new Error('expected two rows');
+    expect(within(mine).getByText('This app')).toBeInTheDocument();
+    expect(within(laptop).queryByText('This app')).not.toBeInTheDocument();
+
+    await user.click(within(mine).getByRole('button', { name: 'Remove' }));
+    const dialog = screen.getByRole('dialog', { name: 'Remove Alex-PC?' });
+    expect(within(dialog).getByText('This app will be signed out.')).toBeInTheDocument();
+    expect(within(dialog).queryByText(/has to be linked again/)).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    await user.click(within(laptop).getByRole('button', { name: 'Remove' }));
+    expect(
+      within(screen.getByRole('dialog', { name: 'Remove Alex-Laptop?' })).getByText(
+        'Alex-Laptop will be signed out and has to be linked again.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('removes an app after a confirmation: Cancel changes nothing, Remove signs it out and its row goes', async () => {
+    mockSessions([THIS]);
+    const apps = mockApps([PC, LAPTOP]);
     const { services } = renderAccount('/account/devices');
     const user = await ready();
-    const [pc, laptop] = await within(linked()).findAllByRole('listitem');
-    if (!pc || !laptop) throw new Error('expected two rows');
-    expect(within(pc).getByText('Alex-PC')).toBeInTheDocument();
-    expect(within(pc).getByText('Last active 2 hours ago')).toBeInTheDocument();
-    expect(within(pc).getByText('203.0.113.7')).toBeInTheDocument();
-    expect(within(pc).getByRole('button', { name: 'Revoke' })).toHaveAccessibleDescription('Alex-PC');
-    expect(within(linked()).queryByText(/Nothing is linked yet/)).not.toBeInTheDocument();
+    const [pc] = await appRows();
+    if (!pc) throw new Error('expected rows');
 
-    await user.click(within(pc).getByRole('button', { name: 'Revoke' }));
+    await user.click(within(pc).getByRole('button', { name: 'Remove' }));
+    let dialog = screen.getByRole('dialog', { name: 'Remove Alex-PC?' });
+    expect(dialog).toHaveAttribute('open');
+    expect(within(dialog).getByText('Alex-PC will be signed out and has to be linked again.')).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(dialog).not.toHaveAttribute('open');
+    expect(apps.deleted).toEqual([]);
+
+    await user.click(within(pc).getByRole('button', { name: 'Remove' }));
+    dialog = screen.getByRole('dialog', { name: 'Remove Alex-PC?' });
+    await user.click(within(dialog).getByRole('button', { name: 'Remove' }));
     await waitFor(() => {
       expect(within(linked()).queryByText('Alex-PC')).not.toBeInTheDocument();
     });
-    expect(deleted).toEqual(['d1d2d3d4d5d6']);
+    expect(apps.deleted).toEqual(['d1d2d3d4d5d6']);
     expect(within(linked()).getByText('Alex-Laptop')).toBeInTheDocument();
     expect(within(linked()).getByRole('heading', { name: 'Linked devices' })).toHaveFocus();
-    expect(services.ui.getState().announcements.polite?.text).toBe('Signed out Alex-PC.');
+    expect(services.ui.getState().announcements.polite?.text).toBe('Removed Alex-PC.');
+    await waitFor(() => {
+      expect(apps.gets.calls).toBe(2);
+    });
+  });
+
+  it('not_found (404) on a remove: it was removed already, so the row goes just the same', async () => {
+    mockSessions([THIS]);
+    let devices = [PC];
+    onGet('/api/v1/me/devices', () => HttpResponse.json({ devices }));
+    // The app was removed on the server after the list was loaded (another tab, or it signed itself out).
+    const asked = onDelete('/api/v1/me/devices/:id', (id) => {
+      devices = devices.filter((d) => d.id !== id);
+      return apiError(404, { code: 'not_found' });
+    });
+    const { services } = renderAccount('/account/devices');
+    const user = await ready();
+    const [pc] = await appRows();
+    if (!pc) throw new Error('expected rows');
+    await user.click(within(pc).getByRole('button', { name: 'Remove' }));
+    await user.click(
+      within(screen.getByRole('dialog', { name: 'Remove Alex-PC?' })).getByRole('button', { name: 'Remove' }),
+    );
+    await waitFor(() => {
+      expect(within(linked()).queryByText('Alex-PC')).not.toBeInTheDocument();
+    });
+    expect(asked).toEqual(['d1d2d3d4d5d6']);
+    expect(services.ui.getState().toasts).toEqual([]);
+  });
+
+  it.each([
+    ['the server fails', () => apiError(500, { code: 'internal', requestId: 'req-7f3a' }), /Reference: req-7f3a/],
+    ['there is no connection', networkError, /You're offline\. Check your connection\./],
+  ])('keeps the row and says why in the dialog when %s; the dialog can try again', async (_name, respond, reason) => {
+    mockSessions([THIS]);
+    let devices = [PC];
+    onGet('/api/v1/me/devices', () => HttpResponse.json({ devices }));
+    let fail = true;
+    const asked = onDelete('/api/v1/me/devices/:id', (id) => {
+      if (fail) return respond();
+      devices = devices.filter((d) => d.id !== id);
+      return noContent();
+    });
+    renderAccount('/account/devices');
+    const user = await ready();
+    const [pc] = await appRows();
+    if (!pc) throw new Error('expected rows');
+    await user.click(within(pc).getByRole('button', { name: 'Remove' }));
+    const dialog = screen.getByRole('dialog', { name: 'Remove Alex-PC?' });
+    await user.click(within(dialog).getByRole('button', { name: 'Remove' }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(reason);
+    expect(dialog).toHaveAttribute('open');
+    expect(within(linked()).getByText('Alex-PC')).toBeInTheDocument();
+
+    fail = false;
+    await user.click(within(dialog).getByRole('button', { name: 'Remove' }));
+    await waitFor(() => {
+      expect(within(linked()).queryByText('Alex-PC')).not.toBeInTheDocument();
+    });
+    expect(asked).toHaveLength(2);
+  });
+
+  it('renames inline: the trimmed name goes to the server, the row shows it, and focus returns to Rename', async () => {
+    mockSessions([THIS]);
+    const apps = mockApps([PC, LAPTOP]);
+    const { services } = renderAccount('/account/devices');
+    const user = await ready();
+    const [pc] = await appRows();
+    if (!pc) throw new Error('expected rows');
+
+    await user.click(within(pc).getByRole('button', { name: 'Rename' }));
+    const field = within(pc).getByLabelText('New name for Alex-PC');
+    expect(field).toHaveFocus();
+    expect(field).toHaveValue('Alex-PC');
+    // The row's buttons make way for Save and Cancel.
+    expect(within(pc).queryByRole('button', { name: 'Remove' })).not.toBeInTheDocument();
+    await user.clear(field);
+    await user.type(field, '  Gaming PC  {Enter}');
+
+    await waitFor(() => {
+      expect(within(pc).getByText('Gaming PC')).toBeInTheDocument();
+    });
+    expect(apps.renamed).toEqual([{ id: 'd1d2d3d4d5d6', body: { name: 'Gaming PC' } }]);
+    expect(within(pc).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(within(pc).getByRole('button', { name: 'Rename' })).toHaveFocus();
+    expect(within(pc).getByRole('button', { name: 'Rename' })).toHaveAccessibleDescription('Gaming PC');
+    expect(services.ui.getState().announcements.polite?.text).toBe('Renamed to Gaming PC.');
+  });
+
+  it('closes the rename field without a request on Esc, on Cancel and for an unchanged name', async () => {
+    mockSessions([THIS]);
+    const apps = mockApps([PC]);
+    renderAccount('/account/devices');
+    const user = await ready();
+    const [pc] = await appRows();
+    if (!pc) throw new Error('expected rows');
+
+    await user.click(within(pc).getByRole('button', { name: 'Rename' }));
+    await user.type(within(pc).getByLabelText('New name for Alex-PC'), 'X{Escape}');
+    expect(within(pc).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(within(pc).getByText('Alex-PC')).toBeInTheDocument();
+    expect(within(pc).getByRole('button', { name: 'Rename' })).toHaveFocus();
+
+    await user.click(within(pc).getByRole('button', { name: 'Rename' }));
+    await user.click(within(pc).getByRole('button', { name: 'Cancel' }));
+    expect(within(pc).queryByRole('textbox')).not.toBeInTheDocument();
+
+    await user.click(within(pc).getByRole('button', { name: 'Rename' }));
+    const field = within(pc).getByLabelText('New name for Alex-PC');
+    await user.clear(field);
+    await user.type(field, ' Alex-PC {Enter}');
+    expect(within(pc).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(apps.renamed).toEqual([]);
+  });
+
+  it.each([
+    ['an empty name, before anything is sent', '   ', null, 'Enter a name.'],
+    [
+      'a name over 64 characters, before anything is sent',
+      'x'.repeat(65),
+      null,
+      "That's too long for a name: 64 characters at most.",
+    ],
+    ['422 {name: invalid}', 'Bad​Name', 'invalid', "That name has characters that can't be used."],
+    ['422 with a code without a text of its own', 'Odd', 'not_allowed', 'Check the highlighted fields.'],
+  ])('shows the problem under the field: %s', async (_name, typed, serverCode, shown) => {
+    mockSessions([THIS]);
+    mockApps([PC]);
+    const sent: unknown[] = [];
+    onPatch('/api/v1/me/devices/:id', (_id, body) => {
+      sent.push(body);
+      return apiError(422, { code: 'validation_failed', fields: { name: serverCode ?? 'invalid' } });
+    });
+    renderAccount('/account/devices');
+    const user = await ready();
+    const [pc] = await appRows();
+    if (!pc) throw new Error('expected rows');
+    await user.click(within(pc).getByRole('button', { name: 'Rename' }));
+    const field = within(pc).getByLabelText('New name for Alex-PC');
+    await user.clear(field);
+    await user.type(field, `${typed}{Enter}`);
+
+    await waitFor(() => {
+      expect(field).toHaveAccessibleDescription(shown);
+    });
+    expect(field).toHaveAttribute('aria-invalid', 'true');
+    expect(field).toHaveFocus();
+    expect(sent).toHaveLength(serverCode === null ? 0 : 1);
+  });
+
+  it('says why a rename failed under the field (a server error), and a 404 takes the row away', async () => {
+    mockSessions([THIS]);
+    // The laptop was removed on the server after the list was loaded.
+    let devices = [PC, LAPTOP];
+    const gets = onGet('/api/v1/me/devices', () => HttpResponse.json({ devices }));
+    onPatch('/api/v1/me/devices/:id', (id) => {
+      if (id === PC.id) return apiError(500, { code: 'internal', requestId: 'req-7f3a' });
+      devices = devices.filter((d) => d.id !== id);
+      return apiError(404, { code: 'not_found' });
+    });
+    const { services } = renderAccount('/account/devices');
+    const user = await ready();
+    const [pc, laptop] = await appRows();
+    if (!pc || !laptop) throw new Error('expected rows');
+
+    await user.click(within(pc).getByRole('button', { name: 'Rename' }));
+    await user.type(within(pc).getByLabelText('New name for Alex-PC'), '2{Enter}');
+    await waitFor(() => {
+      expect(within(pc).getByLabelText('New name for Alex-PC')).toHaveAccessibleDescription(
+        'Something went wrong on the server. Reference: req-7f3a',
+      );
+    });
+
+    await user.click(within(laptop).getByRole('button', { name: 'Rename' }));
+    await user.type(within(laptop).getByLabelText('New name for Alex-Laptop'), '2{Enter}');
+    await waitFor(() => {
+      expect(within(linked()).queryByText('Alex-Laptop')).not.toBeInTheDocument();
+    });
+    expect(services.ui.getState().announcements.polite?.text).toBe("Alex-Laptop isn't linked anymore.");
+    // The list comes from the server again, without it.
     await waitFor(() => {
       expect(gets.calls).toBe(2);
     });
+    expect(within(linked()).queryByText('Alex-Laptop')).not.toBeInTheDocument();
   });
 
   it('says why the list could not be loaded, without taking the browsers list with it', async () => {
@@ -523,3 +826,50 @@ describe('DevicesPage: linked devices', () => {
     expect(await rows()).toHaveLength(3);
   });
 });
+
+describe('DevicesPage for a bearer (02 §10.2: room for later clients)', () => {
+  it('leaves out "Sign out other browsers", which is cookie-only; Log out everywhere stays', async () => {
+    // GET /me for a bearer: {device} instead of {session} (02 §7.2).
+    const bearer: Me = { ...meFixture(), device: deviceFixture({ current: true }) };
+    delete bearer.session;
+    mockSessions(ALL.map((s) => ({ ...s, current: false })));
+    mockDevices([deviceFixture({ current: true })]);
+    renderAccount('/account/devices', { me: bearer });
+    await ready();
+    expect(await rows()).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: 'Sign out other browsers' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Log out everywhere' })).toBeInTheDocument();
+    // No browser is this one for a bearer: each has Revoke, none Sign out.
+    expect(within(browsers()).queryByRole('button', { name: 'Sign out' })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Linked devices' })).getByText('This app')).toBeInTheDocument();
+  });
+
+  it('a cookie session keeps "Sign out other browsers"', async () => {
+    mockSessions(ALL);
+    mockDevices();
+    renderAccount('/account/devices');
+    await ready();
+    await rows();
+    expect(screen.getByRole('button', { name: 'Sign out other browsers' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Installs a PATCH handler for a path with one `:id` segment that records each id and JSON body and answers with
+ * respond(id, body). Returns the recorded calls.
+ */
+function onPatch(
+  path: `/api/${string}`,
+  respond: (id: string, body: unknown) => Response | Promise<Response>,
+): { id: string; body: unknown }[] {
+  const calls: { id: string; body: unknown }[] = [];
+  server.use(
+    http.patch(apiPath(path), async ({ params, request }) => {
+      const id = String(params['id']);
+      const body: unknown = await request.json();
+      calls.push({ id, body });
+      return respond(id, body);
+    }),
+  );
+  return calls;
+}

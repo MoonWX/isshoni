@@ -5,8 +5,9 @@
 // It is in the entry chunk (detect.ts imports it) and stays under 4 KB gzip (size.node.test.ts): it imports neither
 // the Wails runtime nor the generated bindings. The bridge's transport (wails/WailsBridge.ts, or http/HttpBridge.ts
 // for transport "http") loads with a dynamic import() started in the constructor, and calls made before it arrives
-// wait for it (lazyBridge.ts); the rarely used actions (actions.ts) load when first used. For the same reason its
-// private members are TypeScript's, not #private ones, which the build target lowers into helpers.
+// wait for it (lazyBridge.ts); the rarely used actions (actions.ts) load when first used, and platform.sharing's
+// DesktopSharing loads at once in a chunk of its own (lazySharing.ts). For the same reason its private members are
+// TypeScript's, not #private ones, which the build target lowers into helpers.
 import { createLogger } from '../../lib/log';
 import { CodeInvalidToken, CodeUnauthenticated } from '../../protocol/api.gen';
 import { detectCaps } from '../../protocol/codecs';
@@ -30,6 +31,7 @@ import type { NativeBridge } from './bridge';
 import type { DesktopConfig } from './config';
 import { bridgeErrorCode } from './errors';
 import { lazyBridge } from './lazyBridge';
+import { lazySharing } from './lazySharing';
 import { installLinkInterception } from './links';
 import { createPrefixedStorage, serverStoragePrefix, staleServerKeys } from './storage';
 import { createTokens, type Tokens } from './tokens';
@@ -37,7 +39,10 @@ import { createTokens, type Tokens } from './tokens';
 export interface DesktopPlatformOptions {
   /** The bridge itself (tests); default: the transport bridge.js names, loaded with a dynamic import(). */
   bridge?: NativeBridge;
-  /** Makes platform.sharing (WA65's DesktopSharing goes here); default: none, sharing is null. */
+  /**
+   * Makes platform.sharing; default: DesktopSharing (docs/m2/03 §10.2), loaded on demand (lazySharing.ts). Windows
+   * and the dev and e2e builds (the fake engine) share; capabilities().canShare says whether this PC can.
+   */
   sharing?: (bridge: NativeBridge) => SharingProvider | null;
   /** Installs the link interception of docs/m2/03 §5.5 (default true). */
   interceptLinks?: boolean;
@@ -108,7 +113,11 @@ export class DesktopPlatform implements Platform {
       signalStopped: (err) => import('./actions').then((m) => m.signalStopped(desktop, err)),
     };
     this.desktop = desktop;
-    this.sharing = opts.sharing?.(bridge) ?? null;
+    this.sharing = opts.sharing
+      ? opts.sharing(bridge)
+      : lazySharing(bridge, (err) => {
+          this.log.error('desktop: sharing failed to load', { err });
+        });
     this.disposeLinks =
       opts.interceptLinks === false
         ? () => undefined

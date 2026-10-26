@@ -11,7 +11,8 @@
 //   are shown, and what is not shown gets no video: away from the room page nothing is mounted, so every video
 //   goes off while the audible share keeps playing (05 §11.1). "Shown" is viewerStore.visible, which the stage and
 //   the tiles write (useVisibility.ts).
-// - A share this page publishes is never subscribed (05 §12.2).
+// - A share this page publishes is never subscribed (05 §12.2). The desktop app's own share, which its C2 publishes
+//   and the page has no preview of, is subscribed at the low layer at most and never with audio (docs/m2/03 §10.4).
 import type { SubscriptionWant } from '../protocol/types.gen';
 import { desiredSubscriptions, PAGE_HIDDEN_OFF_MS, type LayerInputs } from './layerPolicy';
 import type { ViewerServices } from './services';
@@ -30,6 +31,7 @@ export function layerInputs(s: ViewerData, now: number): LayerInputs {
   const shown = s.focusedShareId !== null && s.visible[s.focusedShareId] === true;
   return {
     remoteShares: s.shares.filter((share) => !share.local).map((share) => share.id),
+    localShares: s.shares.filter((share) => share.local && !share.localPreview).map((share) => share.id),
     focused: shown ? s.focusedShareId : null,
     audible: s.audibleShareId,
     visible: s.visible,

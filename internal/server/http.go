@@ -116,6 +116,7 @@ func (s *Server) routerOptions() httpapi.RouterOptions {
 		Gate:           s.gate,
 		API:            s.deps.API,
 		WS:             s.deps.WS,
+		Desktop:        s.desktopScripts(), // GET /install-desktop.ps1, pre-filled for this site (M2 06 §7.4)
 		Logger:         slog.New(&expected503s{Handler: s.log.Handler(), gate: s.gate}),
 	}
 	// isshoni_http_responses_total{route,class} (04 §9.2, §11.2). A server that has not built its metrics yet (a

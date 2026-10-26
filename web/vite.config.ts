@@ -12,7 +12,8 @@ import { resolveBuildVersion, versionPlugin } from './build/version-plugin.ts';
 // One version per build (06 §7.2): env ISSHONI_VERSION, else 0.0.0-dev.
 const version = resolveBuildVersion();
 
-// `task dev:server` listens here (06 §7.3); the dev proxy sends /api, /ws and /healthz to it.
+// `task dev:server` listens here (06 §7.3); the dev proxy sends /api, /ws, /healthz and the desktop install scripts
+// (M2 06 §7.4) to it.
 const DEV_SERVER = process.env['ISSHONI_DEV_SERVER'] ?? 'http://127.0.0.1:8080';
 
 export default defineConfig({
@@ -34,6 +35,9 @@ export default defineConfig({
       '/api': { target: DEV_SERVER, changeOrigin: false },
       '/ws': { target: DEV_SERVER, changeOrigin: false, ws: true },
       '/healthz': { target: DEV_SERVER, changeOrigin: false },
+      // The server answers these, never the SPA (M2 06 §7.4): .ps1 pre-filled for http://localhost:5173, .sh a 404.
+      '/install-desktop.ps1': { target: DEV_SERVER, changeOrigin: false },
+      '/install-desktop.sh': { target: DEV_SERVER, changeOrigin: false },
     },
   },
   test: {

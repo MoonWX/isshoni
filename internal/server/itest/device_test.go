@@ -1,15 +1,20 @@
 package itest
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/client/compat"
+	"github.com/MoonWX/isshoni/internal/client/credstore"
+	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server"
@@ -17,11 +22,14 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/signal/signaltest"
 )
 
-// The device-auth integration cases of docs/m2/02-device-auth.md §16.2 on servertest with the real wiring (README
-// WA56): cases 1–3 and 5 with raw HTTP in place of deviceauth.Manager (WA64 brings the manager and cases 4 and 6–8),
-// and cases 9–12, raw HTTP only. TestDeviceOrigins and TestDeviceSockets add what README WA56 asks of the real
-// wiring: the desktop origins on REST and on the hub, and the pre-auth refund. Every test checks that it leaves no
-// goroutine behind (case 8's goleak, over the whole file); TestMain checks the package once more.
+// The device-auth integration cases of docs/m2/02-device-auth.md §16.2 on servertest with the real wiring. README
+// WA56 wrote cases 1–3 and 5 with raw HTTP (TestDeviceLink, TestDeviceClientOutdated), which check the server's
+// answers step by step, and cases 9–12, raw HTTP only. README WA64 runs cases 1–7 with the real deviceauth.Manager
+// and 01's Go signal client on the manager's tokens: TestDeviceManagerLink (cases 1–4 and 7) and
+// TestDeviceManagerPassword (cases 6 and 5). TestDeviceOrigins and TestDeviceSockets add what README WA56 asks of the
+// real wiring: the desktop origins on REST and on the hub, and the pre-auth refund. Every test checks that it leaves
+// no goroutine behind (case 8's goleak, over the whole file, the managers' goroutines included); TestMain checks the
+// package once more.
 
 // revokeWithin is how soon a device's sockets close after its revocation committed (README WA56).
 const revokeWithin = 100 * time.Millisecond
@@ -204,6 +212,309 @@ func TestDeviceClientOutdated(t *testing.T) {
 	if _, err := tab.Hello(waitCtx(t), signaltest.DefaultHello()); err != nil {
 		t.Errorf("a web hello of version 0.1.0 below the floor: %v, want a welcome", err)
 	}
+}
+
+// TestDeviceManagerLink is cases 1–4 and 7 with the real deviceauth.Manager (README WA64): the device flow through
+// Manager.Link; the app's two connections on the manager's tokens as one participant; a rename on the Devices page
+// reaching both connections' user.connections; the removal of the device moving the manager to unlinked/signed_out
+// with its store emptied; and a relink whose spent refresh token, presented from outside the manager after the
+// manager refreshed, ends the link with refresh_reused at the manager's next refresh.
+func TestDeviceManagerLink(t *testing.T) {
+	noLeaks(t)
+	w := newWorld(t, servertest.Options{})
+	alice := w.member("alice")
+	cookie := sessionCookie(t, w.srv, alice.http.Jar)
+
+	// Case 1. Manager.Link returns at linking, alice's browser looks the code up (network same) and approves it as
+	// "Test PC" (linkManager), and the manager is linked within one poll interval: its first poll comes one interval
+	// after Link and the approval comes before it, while a second poll could come no sooner than another interval
+	// later. The credential is in its store, and GET /me/devices lists the device.
+	store := credstore.NewMemory()
+	mgr := newManager(t, w.srv, store)
+	start := time.Now()
+	st := linkManager(t, w.srv, mgr, cookie)
+	if took := time.Since(start); took >= 2*pollInterval {
+		t.Errorf("the manager was linked %v after Link, want within one poll interval (%v) of the approval", took,
+			pollInterval)
+	}
+	origin, deviceID := st.Origin, st.Device.ID
+	if c, err := store.Get(origin); err != nil || c.DeviceID != deviceID {
+		t.Fatalf("the app's credential for %s: device %q, %v; want device %s", origin, c.DeviceID, err, deviceID)
+	}
+	if list := devices(t, w.srv, cookie); len(list) != 1 || list[0].ID != deviceID || list[0].Name != linkedName ||
+		list[0].ClientKind != string(protocol.ClientKindDesktop) || list[0].AppVersion != deviceAppVersion {
+		t.Fatalf("GET /me/devices = %+v, want the one device %s named %q", list, deviceID, linkedName)
+	}
+
+	// Case 2. 01's Go signal client with Options.Token = the manager's AccessToken(ctx, false): the app's own
+	// connection (publisher, no Origin) and its SPA's (viewer, the webview's origin) on the same token join the
+	// Lounge as one participant, and user.connections names the device on both (01 C08, WA27, has merged). Both
+	// resume after a dropped socket, as the app's do (case 7).
+	app := connectApp(t, w.srv, mgr, "alice's app", deviceDial{role: protocol.RolePublisher, resumes: true}, "lounge")
+	spa := connectApp(t, w.srv, mgr, "alice's app's SPA",
+		deviceDial{role: protocol.RoleViewer, origin: protocol.DesktopAssetOriginWindows, resumes: true}, "lounge")
+	both := []string{app.connID(), spa.connID()}
+	slices.Sort(both)
+	for _, d := range []*deviceConn{app, spa} {
+		eventually(t, func() bool {
+			st := d.roomState()
+			return len(st.Participants) == 1 && slices.Equal(connIDs(st.Participants[0]), both)
+		}, func() string {
+			return fmt.Sprintf("%s: room.state participants %+v, want alice once with connections %q", d.name,
+				d.roomState().Participants, both)
+		})
+	}
+	waitDeviceNames(t, linkedName, app, spa)
+
+	// Case 7. Alice renames the device on the Devices page. The hub learns of it at its next Revalidate of each
+	// connection, which picks up the device's current name (M2 02 §6.3) and sends user.connections. The hub's
+	// 5-minute tick runs on the real clock, which the test can't advance; the resume handshake runs the same
+	// Revalidate, so the test cuts both sockets and the connections resume with the new name.
+	const renamed = "Living room PC"
+	var res api.DeviceResponse
+	rest(t, w.srv, restCall{method: http.MethodPatch, path: "/api/v1/me/devices/" + deviceID, cookie: cookie,
+		body: api.RenameDeviceRequest{Name: renamed}}).decodeAs(t, "the rename on the Devices page", http.StatusOK, &res)
+	if res.Device.ID != deviceID || res.Device.Name != renamed {
+		t.Fatalf("the rename answered device %s named %q, want %s named %q", res.Device.ID, res.Device.Name, deviceID, renamed)
+	}
+	for _, d := range []*deviceConn{app, spa} {
+		d.killSocket()
+	}
+	for _, d := range []*deviceConn{app, spa} {
+		eventually(t, func() bool { return d.resumes() == 1 },
+			func() string {
+				return fmt.Sprintf("%s resumed %d times after its socket was cut, want 1", d.name, d.resumes())
+			})
+	}
+	waitDeviceNames(t, renamed, app, spa)
+
+	// Case 3. Alice removes the device: both sockets get error{session_revoked} (TestDeviceLink checks the 4401 close
+	// and its 100 ms bound), and the app's SessionEnded(session_revoked) refreshes, gets invalid_grant and returns
+	// unlinked with signed_out; the store is empty, and AccessToken asks for a relink.
+	rest(t, w.srv, restCall{method: http.MethodDelete, path: "/api/v1/me/devices/" + deviceID, cookie: cookie}).
+		expect(t, "removing the device", http.StatusNoContent)
+	for _, d := range []*deviceConn{app, spa} {
+		if sc, _ := d.waitStopped(); sc.Err == nil || sc.Err.Code != protocol.ErrorCodeSessionRevoked ||
+			sc.Err.Scope != protocol.ErrorScopeSession {
+			t.Errorf("%s stopped with %+v, want error session_revoked in scope session", d.name, sc.Err)
+		}
+	}
+	ended := mgr.SessionEnded(waitCtx(t), protocol.ErrorCodeSessionRevoked)
+	if ended.Status != deviceauth.StatusUnlinked || ended.Notice != deviceauth.NoticeSignedOut || ended.Device != nil {
+		t.Fatalf("SessionEnded(session_revoked) after the removal = %s/%q with device %v, want unlinked/signed_out",
+			ended.Status, ended.Notice, ended.Device != nil)
+	}
+	wantNoCredential(t, store)
+	if _, err := mgr.AccessToken(waitCtx(t), false); !errors.Is(err, deviceauth.ErrNotLinked) || !relinkRequired(err) {
+		t.Errorf("AccessToken after the removal: %v, want ErrNotLinked with RelinkRequired() true", err)
+	}
+
+	// Case 4. The app links again. Another holder copies its refresh token P from the credential store; the manager
+	// refreshes (P → C); then the copy is presented. P is spent, its child C unused and the spend less than 120 s
+	// old, so the server takes the restart grace path: the copy gets a pair, C is superseded and C's access token
+	// deleted (M2 02 §6.2). The app's next hello fails with unauthenticated, the core's forced refresh within 10 s of
+	// the manager's own answers the same token (02 §11.4), and after the second unauthenticated the core reports
+	// SessionEnded: the manager's next refresh presents C, which is reuse: the device is revoked and the manager
+	// unlinked with refresh_reused.
+	linkManager(t, w.srv, mgr, cookie)
+	copied := storedRefresh(t, store, origin)
+	before, err := mgr.AccessToken(waitCtx(t), false)
+	if err != nil {
+		t.Fatalf("AccessToken after the relink: %v", err)
+	}
+	after, err := mgr.AccessToken(waitCtx(t), true)
+	if err != nil {
+		t.Fatalf("the manager's refresh: %v", err)
+	}
+	if after == before || storedRefresh(t, store, origin) == copied {
+		t.Fatalf("the manager's refresh kept its access token (%v) or its refresh token (%v), want both new",
+			after == before, storedRefresh(t, store, origin) == copied)
+	}
+	var grace api.DeviceTokenResponse
+	refreshDevice(t, w.srv, copied, "").decodeAs(t, "the copied refresh token", http.StatusOK, &grace)
+	checkPair(t, "the copied refresh token", grace)
+	if _, err := dialApp(t, w.srv, mgr, "alice's app after the copy was used",
+		deviceDial{role: protocol.RolePublisher}); !isProtocolError(err, protocol.ErrorCodeUnauthenticated) {
+		t.Fatalf("the app's hello after the grace path: %v, want unauthenticated", err)
+	}
+	ended = mgr.SessionEnded(waitCtx(t), protocol.ErrorCodeUnauthenticated)
+	if ended.Status != deviceauth.StatusUnlinked || ended.Notice != deviceauth.NoticeRefreshReused {
+		t.Fatalf("the manager's refresh after the reuse = %s/%q, want unlinked/refresh_reused", ended.Status, ended.Notice)
+	}
+	wantNoCredential(t, store)
+	if list := devices(t, w.srv, cookie); len(list) != 0 {
+		t.Errorf("GET /me/devices after the reuse = %+v, want none", list)
+	}
+	rest(t, w.srv, restCall{method: http.MethodGet, path: "/api/v1/me", bearer: protocol.Secret(grace.AccessToken)}).
+		wantInvalidToken(t, "GET /me with the copy's access token after the reuse")
+}
+
+// TestDeviceManagerPassword is cases 6 and 5 with the real deviceauth.Manager (README WA64): LinkWithPassword, refused
+// for a wrong password and linked with the right one (linked_via password, device.linked {via: password}); then an
+// admin's minClientVersion above the app's version makes the next dial get client_outdated, which
+// Manager.HelloRefused turns into incompatible with update_app/min_client_version.
+func TestDeviceManagerPassword(t *testing.T) {
+	noLeaks(t)
+	w := newWorld(t, servertest.Options{})
+	alice := w.member("alice")
+	cookie := sessionCookie(t, w.srv, alice.http.Jar)
+	admin := sessionCookie(t, w.srv, w.srv.Client.Jar)
+	store := credstore.NewMemory()
+	mgr := newManager(t, w.srv, store)
+
+	// Case 6. A wrong password: 401 invalid_credentials, still unlinked, nothing stored. The Manager's error carries
+	// the code, not the HTTP status, so the app's request is first sent once as raw HTTP to see the 401.
+	const wrong = "not alice's password"
+	wrongCall := restCall{method: http.MethodPost, path: "/api/v1/device/password", body: api.DevicePasswordRequest{
+		Username: "alice", Password: wrong, ClientKind: string(protocol.ClientKindDesktop), DeviceName: deviceHostName,
+		OS: string(protocol.ClientOSWindows), AppVersion: deviceAppVersion,
+	}}
+	if raw := rest(t, w.srv, wrongCall).apiError(t, "a wrong password", http.StatusUnauthorized); raw.Code !=
+		api.CodeInvalidCredentials {
+		t.Fatalf("POST /device/password with a wrong password = 401 %s, want invalid_credentials", raw.Code)
+	}
+	err := mgr.LinkWithPassword(waitCtx(t), "alice", protocol.Secret(wrong))
+	var refused *api.Error
+	if !errors.As(err, &refused) || refused.Code != api.CodeInvalidCredentials {
+		t.Fatalf("LinkWithPassword with a wrong password: %v, want invalid_credentials", err)
+	}
+	if st := mgr.State(); st.Status != deviceauth.StatusUnlinked || st.Device != nil {
+		t.Fatalf("after the refused password the manager is %s with device %v, want unlinked", st.Status, st.Device != nil)
+	}
+	wantNoCredential(t, store)
+
+	// The right password: linked, the credential stored, the device listed and linked by password in the store and
+	// in the audit log.
+	if err := mgr.LinkWithPassword(waitCtx(t), "alice", protocol.Secret(password)); err != nil {
+		t.Fatalf("LinkWithPassword: %v", err)
+	}
+	st := mgr.State()
+	if st.Status != deviceauth.StatusLinked || st.Device == nil || st.Device.Name != deviceHostName || st.User == nil ||
+		st.User.Username != "alice" || st.Notice != deviceauth.NoticeNone {
+		t.Fatalf("after LinkWithPassword the manager is %s/%q with device %+v, user %v; want linked to alice's %q",
+			st.Status, st.Notice, st.Device, st.User != nil, deviceHostName)
+	}
+	deviceID := st.Device.ID
+	if c, err := store.Get(st.Origin); err != nil || c.DeviceID != deviceID {
+		t.Fatalf("the app's credential: device %q, %v; want device %s", c.DeviceID, err, deviceID)
+	}
+	if list := devices(t, w.srv, cookie); len(list) != 1 || list[0].ID != deviceID || list[0].Name != deviceHostName {
+		t.Errorf("GET /me/devices = %+v, want the one device %s named %q", list, deviceID, deviceHostName)
+	}
+	if via := linkedVia(t, w.srv, deviceID); via != "password" {
+		t.Errorf("the device's linked_via is %q, want password", via)
+	}
+	var page api.AuditPage
+	rest(t, w.srv, restCall{method: http.MethodGet, path: "/api/v1/admin/audit?action=device.linked", cookie: admin}).
+		decodeAs(t, "the audit log", http.StatusOK, &page)
+	if len(page.Entries) != 1 || page.Entries[0].Target == nil || page.Entries[0].Target.ID != deviceID ||
+		page.Entries[0].Detail["via"] != "password" {
+		t.Errorf("the audit log has %d device.linked rows (%+v), want one for device %s with via password",
+			len(page.Entries), page.Entries, deviceID)
+	}
+
+	// Case 5. The admin sets minClientVersion above the app's version: the app's next dial gets client_outdated, and
+	// Manager.HelloRefused with that error enters incompatible with update_app/min_client_version, after which
+	// AccessToken asks for an update. /info agrees (Recheck), and the credential is kept.
+	rest(t, w.srv, restCall{method: http.MethodPatch, path: "/api/v1/admin/settings", cookie: admin,
+		body: map[string]string{"minClientVersion": "0.3.0"}}).expect(t, "the admin's new floor", http.StatusOK)
+	_, err = dialApp(t, w.srv, mgr, "alice's app below the floor", deviceDial{role: protocol.RolePublisher})
+	var outdated *protocol.Error
+	if !errors.As(err, &outdated) || outdated.Code != protocol.ErrorCodeClientOutdated {
+		t.Fatalf("the app's hello of version %s below the floor: %v, want client_outdated", deviceAppVersion, err)
+	}
+	mgr.HelloRefused(outdated)
+	if st := mgr.State(); st.Status != deviceauth.StatusIncompatible || st.Compat.Verdict != compat.UpdateApp ||
+		st.Compat.Reason != compat.ReasonMinClientVersion {
+		t.Fatalf("after HelloRefused(client_outdated) the manager is %s with %+v, want incompatible, update_app, "+
+			"min_client_version", st.Status, st.Compat)
+	}
+	if _, err := mgr.AccessToken(waitCtx(t), false); !errors.Is(err, deviceauth.ErrIncompatible) || !updateRequired(err) {
+		t.Errorf("AccessToken while incompatible: %v, want ErrIncompatible with UpdateRequired() true", err)
+	}
+	st, err = mgr.Recheck(waitCtx(t))
+	if err != nil || st.Status != deviceauth.StatusIncompatible || st.Compat.Verdict != compat.UpdateApp ||
+		st.Compat.Reason != compat.ReasonMinClientVersion || st.Compat.MinClientVersion != "0.3.0" {
+		t.Errorf("Recheck under the floor = %s with %+v, %v; want incompatible, update_app, min_client_version, floor 0.3.0",
+			st.Status, st.Compat, err)
+	}
+	if _, err := store.Get(st.Origin); err != nil {
+		t.Errorf("the credential while incompatible: %v, want it kept", err)
+	}
+}
+
+// waitDeviceNames waits until the newest user.connections of each of the app's connections lists exactly these
+// connections, each as a desktop connection named name (M2 01 §10.4).
+func waitDeviceNames(t *testing.T, name string, conns ...*deviceConn) {
+	t.Helper()
+	ids := map[string]bool{}
+	for _, d := range conns {
+		ids[d.connID()] = true
+	}
+	for _, d := range conns {
+		eventually(t, func() bool {
+			list := d.userConns()
+			if len(list) != len(conns) {
+				return false
+			}
+			for _, c := range list {
+				if !ids[c.ID] || c.Kind != protocol.ClientKindDesktop || c.DeviceName != name {
+					return false
+				}
+			}
+			return true
+		}, func() string {
+			return fmt.Sprintf("%s: user.connections %+v, want the app's %d connections named %q", d.name, d.userConns(),
+				len(conns), name)
+		})
+	}
+}
+
+// storedRefresh returns the refresh token that the app's credential store holds for origin.
+func storedRefresh(t *testing.T, store credstore.Store, origin string) protocol.Secret {
+	t.Helper()
+	c, err := store.Get(origin)
+	if err != nil {
+		t.Fatalf("the app's credential: %v", err)
+	}
+	return protocol.Secret(c.RefreshToken)
+}
+
+// wantNoCredential fails t unless the app's credential store is empty.
+func wantNoCredential(t *testing.T, store credstore.Store) {
+	t.Helper()
+	if origins, err := store.List(); err != nil || len(origins) != 0 {
+		t.Errorf("the app's credential store holds %d credentials (%v), want none", len(origins), err)
+	}
+}
+
+// relinkRequired and updateRequired read an Auth error's chain as 01's core does (01 §11.2): the methods that say
+// "link again" and "update".
+func relinkRequired(err error) bool {
+	var r interface{ RelinkRequired() bool }
+	return errors.As(err, &r) && r.RelinkRequired()
+}
+
+func updateRequired(err error) bool {
+	var u interface{ UpdateRequired() bool }
+	return errors.As(err, &u) && u.UpdateRequired()
+}
+
+// linkedVia reads a device's linked_via from the running server's database (M2 02 §4.1), which no REST answer shows:
+// a read-only connection beside the server's own (the database is in WAL mode).
+func linkedVia(t *testing.T, srv *servertest.Server, deviceID string) string {
+	t.Helper()
+	path := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(filepath.ToSlash(srv.Cfg.Paths().DB))
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var via string
+	if err := db.QueryRowContext(waitCtx(t), "SELECT linked_via FROM devices WHERE id = ?", deviceID).Scan(&via); err != nil {
+		t.Fatalf("reading the device's linked_via: %v", err)
+	}
+	return via
 }
 
 // TestDeviceGraceThenSupersededChild is case 9: a refresh P → C with an exchangeId; at +100 s on the server's clock

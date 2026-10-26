@@ -45,6 +45,9 @@ type RouterOptions struct {
 	API http.Handler
 	// WS is 01's *signal.Hub, mounted at GET /ws with the read deadline cleared. nil answers 404 not_found (tests).
 	WS http.Handler
+	// Desktop is what GET /install-desktop.ps1 serves (M2 06 §7.4), rendered once by NewRouter. nil:
+	// /install-desktop.ps1 answers 404 (tests that don't set it). /install-desktop.sh answers 404 either way.
+	Desktop *DesktopScripts
 	// Observer receives one call per response (step 4). ops.Metrics implements it; the wiring passes it in, so
 	// httpapi never imports ops. nil drops the observations.
 	Observer RouteObserver
@@ -119,6 +122,7 @@ func NewRouter(opts RouterOptions) *Router {
 	if opts.WS != nil {
 		rt.mux.Handle("GET /ws", rt.wsMount(opts.WS))
 	}
+	rt.registerDesktopScripts(opts.Desktop)
 
 	h := http.Handler(rt.mux)
 	chain := rt.chain()
@@ -131,9 +135,10 @@ func NewRouter(opts RouterOptions) *Router {
 
 // Handle registers a route on the router's mux, inside the global chain. Patterns use Go 1.22+ ServeMux syntax
 // ("GET /healthz"). Like http.ServeMux.Handle, it panics on an invalid or conflicting pattern; the router itself
-// holds only "/", "/api/v1/" and, with RouterOptions.WS, "GET /ws", so "/healthz", "/readyz" and "/api/…" can be
-// registered with or without a method. A request for a reserved path that no route matches (another method, say)
-// gets JSON 404 not_found. Routes under /api/v1/ are 03's: register them with API.Handle, which adds 03's chain.
+// holds only "/", "/api/v1/", "GET /install-desktop.ps1", "/install-desktop.sh" and, with RouterOptions.WS,
+// "GET /ws", so "/healthz", "/readyz" and "/api/…" can be registered with or without a method. A request for a
+// reserved path that no route matches (another method, say) gets JSON 404 not_found. Routes under /api/v1/ are 03's:
+// register them with API.Handle, which adds 03's chain.
 func (rt *Router) Handle(pattern string, h http.Handler) { rt.mux.Handle(pattern, h) }
 
 // isReservedPath reports a path that belongs to the server, not the SPA (04 §9.5): /api and everything under it

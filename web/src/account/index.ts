@@ -13,8 +13,11 @@
 // Screen steps nor a banner to dismiss.
 //
 // The pages' texts, the `account` namespace, come with this chunk and not with the main bundle (05 §16.5): the
-// import below adds them to the catalog before the router has any of the pages. RoomPush.tsx imports it too.
+// import below adds them to the catalog before the router has any of the pages. RoomPush.tsx imports it too. The
+// Devices page's app rows (M2 02 §10.2) name apps as the approval page does, link.app.<kind>.<os>, and their own
+// texts are link.devices.*: the `link` namespace comes with this chunk as well.
 import '../i18n/lazy/account';
+import '../i18n/lazy/link';
 
 export { AccountPage } from './AccountPage';
 export { DevicesPage } from './DevicesPage';

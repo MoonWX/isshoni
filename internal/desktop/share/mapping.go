@@ -45,7 +45,8 @@ func stateOf(s *core.ShareSnapshot) State {
 //	any other server                           server (e.g. media_timeout)
 //	server-unreachable                         server-unreachable (01's 30 s hold ran out)
 //	unlinked                                   unlinked (C2's session adapter told 02, 03 §9)
-//	error                                      failed: engine.<media code> when EndInfo names one, else the protocol code
+//	error                                      failed: engine.<media code> with params.reason MediaReason when
+//	                                           EndInfo names one, else the protocol code
 func endOf(e *core.EndInfo, cause Cause) (State, EndReason, error) {
 	if e == nil { // an ended snapshot always has its EndInfo; a missing one is the controller's own stop
 		return StateEnded, causeReason(cause), nil
@@ -81,12 +82,14 @@ func causeReason(c Cause) EndReason {
 	return EndUser
 }
 
-// endError is a failed share's error: the media code (engine.<code>; 01's EndInfo carries no detail token, so
-// params.reason is empty), else the protocol code, else internal.
+// endError is a failed share's error: the media code with 01's detail token (EndInfo.MediaReason), which the
+// bridge sends as engine.<code> with params.reason, so 03 §10.5's reason rows apply to a live share's end too
+// (encoder_lost with device_removed: "Your graphics driver restarted" with Share again, not the code's "Your PC's
+// video encoder stopped working"); else the protocol code, else internal.
 func endError(e *core.EndInfo) error {
 	switch {
 	case e.Media != "":
-		return &media.Error{Code: e.Media, Op: "share"}
+		return &media.Error{Code: e.Media, Reason: e.MediaReason, Op: "share"}
 	case e.Protocol != "":
 		return &protocol.Error{Code: e.Protocol}
 	}

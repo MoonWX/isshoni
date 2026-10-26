@@ -58,8 +58,7 @@
         "confirm": "Log out everywhere"
       },
       "linked": {
-        "heading": "Linked devices",
-        "empty": "Nothing is linked yet. Apps you sign in to with this account, like the isshoni desktop app when it arrives, show up here."
+        "heading": "Linked devices"
       }
     },
     "notifications": {

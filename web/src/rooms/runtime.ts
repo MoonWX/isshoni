@@ -19,7 +19,16 @@
 //   client, then the request) is the logout flow's (auth/logout.ts): the runtime registers its two steps there
 //   with addLogoutStep, session.stopShare() and signal.stop(), and signal.start() as the undo when the request
 //   fails: the session keeps its desired room through a stop(), so that start rejoins it;
-// - a REST call answered 503 server_shutdown tells the banner that the outage is a restart (05 §7.1).
+// - a REST call answered 503 server_shutdown tells the banner that the outage is a restart (05 §7.1);
+// - the desktop's native share outlives the page (docs/m2/03 §9): C2 keeps publishing while the page reloads. Its
+//   provider names it (platform.sharing.current()); a share this page hasn't held makes its room the page's room
+//   (RoomSession.followShareRoom: the UI goes there, as for a server's redirect), and once a room.state of that room
+//   lists it, the runtime hands it to the session (RoomSession.adoptShare), which then shows and stops it like one
+//   this page started (a share follows the page's room, and a switch stops it). This is checked when the provider is
+//   ready, whenever it says its share or connections changed (platform.sharing.onChange: its chunk and Go's answers
+//   can come after the room's snapshot, and a quiet room sends no other), with every room.state and when the desired
+//   room changes. platform.sharing.localConnectionIds() (C2) goes to the viewer, which counts that connection's
+//   shares as this page's, again on every such change (connectViewer.ts).
 import type { AppServices } from '../app/context';
 import type { UiStore } from '../app/uiStore';
 import { addLogoutStep } from '../auth/logout';
@@ -28,8 +37,9 @@ import { CodeServerShutdown } from '../protocol/api.gen';
 import { applyInvalidate } from '../protocol/invalidate';
 import { queryKeys } from '../protocol/queryKeys';
 import { ApiError } from '../protocol/rest';
+import type { ActiveShare, Platform } from '../platform/types';
 import type { SignalClient } from '../protocol/signal-client';
-import { MessageTypeInvalidate } from '../protocol/types.gen';
+import { MessageTypeInvalidate, type RoomState } from '../protocol/types.gen';
 import { createViewer, type ViewerServices } from '../viewer/services';
 import { createConnection, createConnectionStore, type Stores } from './connection';
 import { connectStats } from './connectStats';
@@ -37,7 +47,7 @@ import { connectViewer } from './connectViewer';
 import { lazySubscriber } from './lazySubscriber';
 import { loadRoomMedia } from './loadMedia';
 import { RoomSession, type SessionMedia } from './RoomSession';
-import { createRoomStore } from './roomStore';
+import { createRoomStore, type RoomStore } from './roomStore';
 
 export interface RoomRuntime {
   readonly signal: SignalClient;
@@ -102,7 +112,18 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
   });
   const session = new RoomSession({ platform, signal, stores, log, media: opts.media ?? defaultMedia(viewer, ui) });
   stores.session = session;
-  const offViewer = connectViewer({ viewer, signal, session, room: stores.room, ui });
+  const localConnectionIds = (): readonly string[] => platform.sharing?.localConnectionIds?.() ?? [];
+  const onLocalChange = (fn: () => void): (() => void) => platform.sharing?.onChange?.(fn) ?? (() => undefined);
+  const offViewer = connectViewer({
+    viewer,
+    signal,
+    session,
+    room: stores.room,
+    ui,
+    localConnectionIds,
+    onLocalChange,
+  });
+  const offAdopt = followPlatformShare(platform, session, stores.room);
   const offStats = connectStats({
     viewer,
     room: stores.room,
@@ -171,6 +192,7 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     },
     stop,
     dispose() {
+      offAdopt();
       offStats();
       offViewer();
       offLogoutShares();
@@ -183,6 +205,65 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
       // The page's <audio> element goes with the runtime.
       viewer.dispose();
     },
+  };
+}
+
+/**
+ * The share the platform publishes beyond this page (the desktop's native share, docs/m2/03 §9): when the session
+ * holds no share, one in another room than the desired one sends the UI to its room, once per share and never for a
+ * share this page held (it started or adopted it, and a switch the user confirmed stops it); one in the desired room
+ * becomes the session's local share once the room's snapshot lists it. Returns the function that stops following.
+ */
+function followPlatformShare(platform: Platform, session: RoomSession, room: RoomStore): () => void {
+  const sharing = platform.sharing;
+  if (sharing?.current === undefined) return () => undefined;
+  /** The shares this page held, started or sent the UI after: their room is never the page's again by itself. */
+  const followed = new WeakSet<ActiveShare>();
+  let stopped = false;
+
+  const current = (): ActiveShare | null => {
+    if (stopped || session.share !== null) return null;
+    const share = sharing.current?.() ?? null;
+    return share === null || share.state === 'ended' ? null : share;
+  };
+  const adopt = (share: ActiveShare, state: RoomState | null): void => {
+    if (state === null || share.shareId === '') return;
+    if (state.roomId === session.roomId && state.shares.some((s) => s.id === share.shareId)) session.adoptShare(share);
+  };
+  const check = (): void => {
+    const share = current();
+    const desired = session.roomId;
+    // No room is wanted yet: the page's first join checks again.
+    if (share === null || desired === null) return;
+    const shareRoom = share.roomId ?? '';
+    if (shareRoom !== '' && shareRoom !== desired) {
+      // Once: refused, it is the share this page is starting itself (session.share isn't set yet).
+      if (!followed.has(share)) session.followShareRoom(shareRoom);
+      followed.add(share);
+      return;
+    }
+    adopt(share, room.getState().state);
+  };
+
+  const offs = [
+    session.on('share', (share) => {
+      if (share !== null) followed.add(share);
+    }),
+    room.subscribe((s, prev) => {
+      // A new snapshot adopts at once; a new desired room is checked once the store's update is through, since a
+      // redirect writes the store again.
+      if (s.state !== prev.state && s.state !== null) {
+        const share = current();
+        if (share !== null) adopt(share, s.state);
+      }
+      if (s.roomId !== prev.roomId) queueMicrotask(check);
+    }),
+    sharing.onChange?.(check) ?? (() => undefined),
+  ];
+  sharing.ready?.().then(check, () => undefined);
+  return () => {
+    stopped = true;
+    for (const off of offs) off();
   };
 }
 

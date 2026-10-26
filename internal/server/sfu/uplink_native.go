@@ -18,10 +18,11 @@ import (
 // passing (internal/server/itest's desktop_congestion_test.go). README WA54 tuned one of them: nativeGrowth is 1.151,
 // not §10.1's 1.10. A step of just over 15 % is a hint of its own (nativeHintMinChange) that the sharer's ramp
 // follows in one of its steps (ratectl.RampFactor, 115); steps of 10 % went out in pairs, +21 % about every 5 s, and
-// after a backoff right at the end of D9's 3 Mbit/s limit the way back to 8 Mbit/s took more than D9's 60 s. The
-// extra 0.1 % keeps every step a hint whatever the rounding: with exactly 1.15, 2.3 % of the estimates (some of those
-// ≡ 10 mod 20 bit/s) grew by round(1.15 e) − e, one bit/s short of congestionDue's round(0.15 e) (655 370 → 753 675
-// is 98 305 against 98 306), and that step waited for the next one.
+// after a backoff right at the end of D9's 3 Mbit/s limit the way back to 8 Mbit/s took more than D9's 60 s (its
+// bound then; README WF5 made it 75 s, because ratectl.RampEvery had to be 3 s for D19). The extra 0.1 % keeps every
+// step a hint whatever the rounding: with exactly 1.15, 2.3 % of the estimates (some of those ≡ 10 mod 20 bit/s) grew
+// by round(1.15 e) − e, one bit/s short of congestionDue's round(0.15 e) (655 370 → 753 675 is 98 305 against
+// 98 306), and that step waited for the next one.
 const (
 	nativeLossHigh        = 10.0                   // percent of raw loss that backs off on one tick
 	nativeLossMid         = 3.0                    // percent of raw loss that backs off on two consecutive ticks
@@ -47,9 +48,14 @@ const (
 	// measures less than it sends while its 2 s average catches up), and the estimate stays as it is.
 	nativeResumeGrace = 3 * time.Second
 	// nativeGrowthEvery is the least time between two growth steps, and nativeGrowthRate the share of the estimate
-	// that must arrive for one: an estimate that the sharer doesn't fill says nothing about more.
+	// that must arrive for one: an estimate that the sharer doesn't fill says nothing about more. README WF5 made it
+	// 0.75 (§10.1 had 0.85) for the re-init encoders, whose layers take only changes of 30 % or more (01 §9.4): at
+	// 0.85 the estimate could stop growing at as little as 1/0.85 ≈ 1.18 × the rate, where the full layer's step up
+	// to it (the estimate less the preview's share) was under 30 %, and from then on neither moved (D10). At or below
+	// 1/1.3 an estimate that stops growing is always a step of 30 % or more for the full layer: with rate = f + q,
+	// (rate/0.75 − q) / f = 1.33 + 0.33 q/f.
 	nativeGrowthEvery = 2 * time.Second
-	nativeGrowthRate  = 0.85
+	nativeGrowthRate  = 0.75
 	// nativeCeilingSlack: the estimate is cleared once a growth step takes it to the sum of the preset's ceilings
 	// times this.
 	nativeCeilingSlack = 1.1
@@ -76,14 +82,21 @@ const HintReasonCongestion = "congestion"
 // decision and the cap of the current estimate but run no row, so a streak of consecutive ticks counts each second
 // once and one second of loss or delay is never two.
 //
-// Each tick looks at the active video layers (the ones the policy hasn't paused): rate is the sum of their bitrates,
-// loss their raw loss weighted by bitrate, delay the full layer's QueueDelay (else the preview layer's; −1 when
-// neither is active or known). The rows of M2 01 §10.1 are checked top-down and the first that matches decides:
+// Each tick looks at the active video layers (the ones the policy hasn't paused): rate is the sum of their bitrates
+// (2 s averages), arrived the sum of what arrived of them in the last second, loss their raw loss weighted by bitrate,
+// delay the full layer's QueueDelay (else the preview layer's; −1 when neither is active or known). The rows of M2 01
+// §10.1 are checked top-down and the first that matches decides:
 //
 //   - rate below nativeMinRate, the sharer's own pause (Share.sharerPaused), or within nativeResumeGrace of a layer
 //     resume: unchanged. Such a tick has no verdict, so it also ends every streak of consecutive ticks below.
 //   - loss ≥ nativeLossHigh on this tick, or ≥ nativeLossMid on two consecutive ticks: max(nativeMinCap,
-//     nativeBackoff × rate × (1 − loss/100)), growth held for nativeHold.
+//     nativeBackoff × arrived), growth held for nativeHold (README WF5). The lost packets are already out of arrived
+//     (LayerUplinkStats.arrived): §10.1's row as first written, nativeBackoff × rate × (1 − loss/100), counted the
+//     loss a second time, and 20 % loss with 5 Mbit/s arriving gave 3.2 Mbit/s instead of 4. And it is the last
+//     second's, not rate's 2 s average, which still carries what the sharer sent before the bottleneck began to lose
+//     it: from the average, the backoffs at D9's 3 Mbit/s policer came down to 0.8 × what passes in steps, and the
+//     last step, less than a hint's 15 % below what the sharer had been told, never reached it, so the full layer
+//     often stayed above the 2.3 Mbit/s D9 asks for.
 //   - delay ≥ nativeDelayHigh on two consecutive ticks: max(nativeMinCap, nativeDelayBackoff × rate), growth held.
 //   - an estimate set, loss < nativeLossLow and delay < nativeDelayLow (or unknown) on two consecutive ticks each,
 //     rate ≥ nativeGrowthRate × the estimate, nativeGrowthEvery since the last growth and not held: the estimate ×
@@ -132,16 +145,17 @@ func (p *nativeUplink) Tick(s ShareUplinkStats) UplinkDecision {
 // step runs the rows of M2 01 §10.1 on one tick's stats.
 func (p *nativeUplink) step(s ShareUplinkStats, now int64) {
 	var (
-		rate  int
-		lossW float64
-		delay = time.Duration(-1)
-		full  bool
+		rate, arrived int
+		lossW         float64
+		delay         = time.Duration(-1)
+		full          bool
 	)
 	for _, l := range s.Layers {
 		if l.RID == ridFull && p.paused {
 			continue // the policy paused it: what it measures is the sharer stopping
 		}
 		rate += l.Bitrate
+		arrived += l.arrived
 		lossW += l.RawLossPct * float64(l.Bitrate)
 		switch l.RID {
 		case ridFull:
@@ -163,7 +177,7 @@ func (p *nativeUplink) step(s ShareUplinkStats, now int64) {
 	streak(&p.delayLow, delay < nativeDelayLow) // unknown (−1) counts as low
 	switch {
 	case loss >= nativeLossHigh || p.lossMid >= 2:
-		p.backOff(max(nativeMinCap, int(math.Round(nativeBackoff*float64(rate)*(1-loss/100)))), now)
+		p.backOff(max(nativeMinCap, int(math.Round(nativeBackoff*float64(arrived)))), now) // after the loss
 	case p.delayHigh >= 2:
 		p.backOff(max(nativeMinCap, int(math.Round(nativeDelayBackoff*float64(rate)))), now)
 	case p.estimate > 0 && p.lossLow >= 2 && p.delayLow >= 2 &&

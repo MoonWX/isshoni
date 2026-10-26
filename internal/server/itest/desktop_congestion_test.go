@@ -74,13 +74,16 @@ const (
 	maxFinalLossPct = 2.0
 	// recoverWithin: once the limit lifts, the full layer is back at its ceiling, the upload hint off and the estimate
 	// gone within this (D9). After a backoff the estimate is held for 10 s, then grows by 15.1 % a step, and the full
-	// layer follows each step with one of its ramp's, RampEvery apart (a hint every 3–4 s). Under -race on the Mac the
-	// way back took 30–57 s: least when the estimate was growing at the lift, most after a backoff right at it (the
-	// estimate's probes can hit the policer about every 25 s), with the hold, some 13 steps from about 1.4 Mbit/s and
-	// the upload hint's UploadOff. A second backoff on the next tick that lowers the estimate by less than a hint's
-	// 15 % restarts the hold without one, and the first growth step after it is no hint either: about 4 s more. So
-	// the bound has little margin in that case.
-	recoverWithin = 60 * time.Second
+	// layer follows each step with one of its ramp's, RampEvery apart (a step every 3–3.5 s). The way back takes
+	// longest after a backoff right at the lift (the estimate's probes reach the policer about every 20–25 s): the
+	// hold, some 12–14 ramp steps from about 1.4–1.9 Mbit/s, and the upload hint's UploadOff after the last of them.
+	// Each time the policer loses, the estimate backs off to 80 % of what arrived in the last second (about 2.2 Mbit/s)
+	// and, in every run here, 2–3 s later once more, as the policer still lost some of the lower rate: to about
+	// 1.7 Mbit/s, which restarts the hold. The bound was 60 s; README WF5 made it 75 s, because RampEvery must stay 3 s
+	// for D19 (01 §9.6 has 2 s; README WA54), which costs D9 about 10 s: with WA54's loss row the way back took up to
+	// 57 s at 3 s and 45 s at 2 s. With WF5's (the loss counted once, on the last second's arrivals) it took 29–54 s in
+	// five runs under -race on the Mac.
+	recoverWithin = 75 * time.Second
 	// ceilingF is the Auto preset's full layer (M1 02 §8.6), where the ramp ends.
 	ceilingF = 8_000_000
 	// rampWithin bounds the wait for the ramp to reach ceilingF from live: RampDelay and four RampEvery (01 §9.3),
@@ -103,16 +106,6 @@ const (
 	// repaired with retransmissions, which it may lose too while the share sends more than it lets through: a viewer
 	// can then miss a keyframe for good (the SFU asks for another one, 02 §9.7).
 	keyPassWithin = time.Second
-	// callSlack is how much closer together than ReinitMinInterval two engine calls (fake.Call.At) of a layer may
-	// be: D10 asserts ReinitMinInterval − callSlack between them, 9 s, not the 10 s of its acceptance. ratectl keeps
-	// its guards on the instants its Ticks carry, and the share's actor (internal/client/core's share.go) passes it
-	// the rate ticker's value, which since Go 1.23 is when the tick was due, not when the actor took it. A Tick taken
-	// late is recorded as a change up to that lag (0.54 s seen under -race) before the engine call, while a hint's
-	// change is recorded at time.Now(): so the next change can reach the engine less than 10 s after the last one.
-	// The native engine itself spaces bitrate re-inits 10 s apart (04 §6.4, latest value wins), so what users get
-	// keeps the 10 s; the fake applies each call at once. Once the actor passes time.Now() to rateTick, callSlack is
-	// Windows' clock step, 20 ms.
-	callSlack = time.Second
 )
 
 // The script and bounds of D19.
@@ -149,8 +142,8 @@ func congestionEngine(seed uint64, reinit bool) fake.EngineConfig {
 // 15 s ("settles"); from then on, while the limit lasts, the viewer loses less than 2 % of the video for good (what
 // neither the core's nor the SFU's retransmissions brought back), although the estimate probes upward again after
 // its hold; and the app's share shows the upload hint at about 540p or 720p. Once the policer allows 20 Mbit/s, the
-// full layer is back at 8 Mbit/s within 60 s, with the upload hint cleared and a last congestion hint that lifts the
-// cap.
+// full layer is back at 8 Mbit/s within 75 s (recoverWithin), with the upload hint cleared and a last congestion hint
+// that lifts the cap.
 func TestDesktopUplinkCongestion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D9 runs for about two minutes")
@@ -195,8 +188,9 @@ func TestDesktopUplinkCongestion(t *testing.T) {
 // or by less than 30 %, and each change is applied as a re-init: the core's rate action says so (ratectl's
 // Action.Reinit), and for the engine call the engine hands the core the layer's EventLayer and then the new
 // encoder's Reinit keyframe, within reinitWithin and once per change (engineTap: the source, before anything on the
-// way could lose it). The intervals are measured on the engine's calls, which ratectl's guards don't bound to the
-// 10 s (callSlack).
+// way could lose it). The intervals are measured on the engine's calls (fake.Call.At), against the full
+// ReinitMinInterval: the share's actor gives ratectl time.Now() and re-arms its rate timer after each Tick's engine
+// calls (internal/client/core's share.go), so ratectl's guards bound the engine's calls too.
 //
 // What the viewers get of those keyframes is the end-to-end evidence (sightOf, by the keyframe's capture time, so
 // that nothing else's keyframe can stand in for it): a viewer that watched the layer across a change got its Reinit
@@ -260,9 +254,13 @@ func TestDesktopReinitCongestion(t *testing.T) {
 				t.Errorf("%s's target changed by %.1f %% (%d → %d bit/s), want at least %d %%", rid, step, prev, c.Bps,
 					ratectl.ReinitMinChange)
 			}
-			if i > 0 && c.At.Sub(prevAt) < ratectl.ReinitMinInterval-callSlack {
-				t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval less "+
-					"callSlack)", rid, c.At.Sub(prevAt).Round(time.Millisecond), ratectl.ReinitMinInterval-callSlack)
+			if i > 0 {
+				gap := c.At.Sub(prevAt)
+				t.Logf("  %v after %s's last change", gap, rid)
+				if gap < ratectl.ReinitMinInterval {
+					t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval)",
+						rid, gap, ratectl.ReinitMinInterval)
+				}
 			}
 			prev, prevAt = c.Bps, c.At
 			action := fmt.Sprintf(`msg="rate action" op=bitrate layer=%s bps=%d active=false reinit=true`, rid, c.Bps)

@@ -22,15 +22,24 @@
 // <dialog> gives the focus back to the control that opened it only when it is closed while still in the page
 // (05 §16.6).
 //
-// ?focus=<shareId> (05 §12.2) is the viewer's: its layout reads the link and picks the share.
+// ?focus=<shareId> (05 §12.2) is the viewer's: its layout reads the link and picks the share. ?conntest=1 opens the
+// connection test and is dropped from the URL (docs/m2/03 §7.6: the desktop app's "Test connection" opens the room
+// with it in the browser).
+//
+// Share is offered by capabilities().canShare (docs/m2/03 §7.6, useShareAvailability), read asynchronously; a desktop
+// that can't share shows it disabled, described by the engine's reason (§10.5). In the desktop app
+// (platform.sharing.mode 'native', docs/m2/03 §10) the Share button and the panel are share/native/'s
+// (rooms/lazyNative.ts); the app's own share, which its C2 publishes, counts as this page's for "already sharing
+// from another tab or device" (platform.sharing.localConnectionIds()), and that sheet's Stop it asks C2 to stop the
+// other share (platform.sharing.stopOther), since this page's connection is a viewer.
 //
 // Web Push (05 §16.3, README S77): the in-app browser banner above the page (auth/InAppBrowserBanner.tsx, nothing
 // in a real browser) and account/'s push prompts (RoomPushSlots.tsx: the push state, the iOS Home Screen sheet,
 // notification clicks; the notifications card is the stage's, in the empty state).
 import { DoorClosed, MonitorUp } from 'lucide-react';
-import { Suspense, useCallback, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useParams } from 'react-router';
+import { useParams, useSearchParams } from 'react-router';
 
 import { RoomPushPrompts } from '../account/RoomPushSlots';
 import { useApp } from '../app/context';
@@ -47,8 +56,9 @@ import { Button } from '../ui/Button';
 import { Spinner } from '../ui/Spinner';
 import { ConnectionBanner } from './ConnectionBanner';
 import { ConnTestDialog } from './ConnTestDialog';
-import { useLocalShare, useRoom, useRoomSession } from './hooks';
+import { useLocalShare, useRoom, useRoomSession, useShareAvailability } from './hooks';
 import { RoomStage, ShareButton, SharePanel, TapToStartPill } from './lazyMedia';
+import { NativeShareButton, NativeShareDisabled, NativeSharePanel } from './lazyNative';
 import { PeoplePanel } from './PeoplePanel';
 import { RoomHeader } from './RoomHeader';
 import styles from './RoomPage.module.css';
@@ -80,6 +90,24 @@ export function RoomPage() {
   const sharing = share !== null;
   const [peopleOpen, setPeopleOpen] = useState(false);
   const [testOpen, setTestOpen] = useState(false);
+  const availability = useShareAvailability(platform);
+  const native = platform.sharing?.mode === 'native';
+
+  // ?conntest=1 (docs/m2/03 §7.6): the connection test, and the parameter goes from the URL.
+  const [search, setSearch] = useSearchParams();
+  const conntest = search.get('conntest') === '1';
+  if (conntest && !testOpen) setTestOpen(true);
+  useEffect(() => {
+    if (!conntest) return;
+    setSearch(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('conntest');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [conntest, setSearch]);
 
   // The people panel shows room.state: it goes when the snapshot does, and stays closed when one comes back.
   if (peopleOpen && state === null) setPeopleOpen(false);
@@ -90,16 +118,22 @@ export function RoomPage() {
 
   const startShare = useCallback<StartShare>((src, opts) => session.startShare(src, opts), [session]);
 
-  // This user's share from another tab or device (05 §13.1): the share sheet offers to stop it.
+  // This user's share from another tab or device (05 §13.1): the share sheet offers to stop it. The platform's other
+  // local connections (the desktop app's C2) are this page's own (docs/m2/03 §10.2).
+  const localIds = platform.sharing?.localConnectionIds?.() ?? [];
   const elsewhereId =
     state !== null && userId !== null && connectionId !== null
-      ? (findShareElsewhere(state.shares, { userId, connectionId })?.id ?? null)
+      ? (findShareElsewhere(state.shares, { userId, connectionIds: [connectionId, ...localIds] })?.id ?? null)
       : null;
-  const shareElsewhere = useMemo<ShareElsewhere | null>(
-    () =>
-      elsewhereId === null ? null : { onStop: () => signal.request(MessageTypeShareStop, { shareId: elsewhereId }) },
-    [elsewhereId, signal],
-  );
+  const sharingProvider = platform.sharing;
+  const stateRoomId = state?.roomId ?? null;
+  const shareElsewhere = useMemo<ShareElsewhere | null>(() => {
+    if (elsewhereId === null) return null;
+    const stopOther = sharingProvider?.stopOther?.bind(sharingProvider);
+    // The desktop's page is a viewer: C2 sends the share.stop (Share.StopOther).
+    if (stopOther !== undefined && stateRoomId !== null) return { onStop: () => stopOther(stateRoomId, elsewhereId) };
+    return { onStop: () => signal.request(MessageTypeShareStop, { shareId: elsewhereId }) };
+  }, [elsewhereId, signal, sharingProvider, stateRoomId]);
 
   // The preview's key follows the share's id, which a re-publish changes (01 §10.6; useLocalShare re-renders then).
   const shareId = share?.shareId;
@@ -151,9 +185,10 @@ export function RoomPage() {
         <Suspense fallback={null}>
           <TapToStartPill viewer={viewer} />
         </Suspense>
-        {platform.sharing !== null && !failed && (
-          // The same button until the chunk is there, so the header doesn't move. No button for a room that
-          // refused the user: there is nothing to share into.
+        {platform.sharing !== null && !failed && (availability?.canShare !== false || native) && (
+          // The same button until the chunk is there and the platform said whether it can share, so the header
+          // doesn't move. No button for a room that refused the user: there is nothing to share into. A desktop
+          // that can't share keeps it disabled, with the reason (docs/m2/03 §10.5).
           <Suspense
             fallback={
               <Button variant="primary" icon={<MonitorUp />} disabled>
@@ -161,7 +196,17 @@ export function RoomPage() {
               </Button>
             }
           >
-            <ShareButton onStart={startShare} elsewhere={shareElsewhere} label={t('room.share.start')} />
+            {availability === null ? (
+              <Button variant="primary" icon={<MonitorUp />} disabled>
+                {t('room.share.start')}
+              </Button>
+            ) : !availability.canShare ? (
+              <NativeShareDisabled reason={availability.reason} label={t('room.share.start')} />
+            ) : native ? (
+              <NativeShareButton onStart={startShare} elsewhere={shareElsewhere} label={t('room.share.start')} />
+            ) : (
+              <ShareButton onStart={startShare} elsewhere={shareElsewhere} label={t('room.share.start')} />
+            )}
           </Suspense>
         )}
       </RoomHeader>
@@ -182,6 +227,7 @@ export function RoomPage() {
               placeholder={state === null ? <Joining /> : undefined}
               onStartShare={startShare}
               shareElsewhere={shareElsewhere}
+              shareAvailability={availability}
               onTestConnection={openTest}
               roomName={name}
             />
@@ -190,9 +236,14 @@ export function RoomPage() {
       </main>
       {platform.sharing !== null && (
         // Mounted while the page is: it shows a share from "Starting…" on, and one that failed until it is
-        // dismissed. Nothing while the page shares nothing, so no placeholder either.
+        // dismissed. Nothing while the page shares nothing, so no placeholder either. Also where the PC can't
+        // share: the desktop app's share that outlived a reload still shows.
         <Suspense fallback={null}>
-          <SharePanel share={share} onStop={stopShare} watchers={watchers} onTestConnection={openTest} />
+          {native ? (
+            <NativeSharePanel share={share} onStop={stopShare} watchers={watchers} onStart={startShare} />
+          ) : (
+            <SharePanel share={share} onStop={stopShare} watchers={watchers} onTestConnection={openTest} />
+          )}
         </Suspense>
       )}
       <PeoplePanel

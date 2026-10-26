@@ -104,6 +104,65 @@
         "deviceBusy": "Another app is using your speakers on its own (exclusive mode). Close it, or turn off \"Allow applications to take exclusive control of this device\" in the device's Sound properties, then Try again."
       }
     },
+    "share": {
+      "sheet": {
+        "title": "Share your screen",
+        "presetHint": "Optimize for",
+        "sound": "Share sound",
+        "picking": "Choose what to share in the Windows picker…",
+        "share": "Share"
+      },
+      "first": {
+        "title": "Ready to go live?",
+        "friendsSee": "Friends will see: {{label}}",
+        "goLive": "Go live"
+      },
+      "dnd": {
+        "title": "Sharing your whole screen?",
+        "body": "Turn on Do not disturb so notifications don't show up for friends. Allow isshoni in priority notifications, so its warnings still reach you.",
+        "openSettings": "Open Do not disturb settings",
+        "shareNow": "Share now"
+      },
+      "panel": {
+        "live": "You're live · {{label}} · {{preset}} · {{watching}}",
+        "paused": "Paused · nothing new leaves your PC; friends see \"Paused\" and hear nothing",
+        "resume": "Resume",
+        "reconnecting": "Reconnecting…",
+        "unreachable": "Can't reach the server's media port",
+        "testConnection": "Test connection",
+        "minimized": "Your shared window is minimized: friends see the last picture",
+        "encoderFallback": "Switched to {{encoder}}"
+      },
+      "details": {
+        "toggle": "Details",
+        "shortcut": "Ctrl+Shift+D",
+        "encoder": "Encoder",
+        "encoderValue": "{{encoder}} ({{kind}})",
+        "hardware": "hardware",
+        "software": "software",
+        "none": "Not known yet",
+        "layers": "Layers",
+        "layer": "{{rid}}: {{width}} × {{height}} @ {{fps}}",
+        "bitrate": "target {{target}} kbit/s, sent {{sent}} kbit/s",
+        "latency": "capture to send p50 {{p50}} ms, p95 {{p95}} ms",
+        "server": "The server's view",
+        "serverLayer": "{{rid}}: {{kbps}} kbit/s, {{loss}} % lost",
+        "serverWaiting": "Asking the server…"
+      },
+      "errors": {
+        "seeWhy": "Opens in your browser but not here? See why",
+        "captureSettings": "Open Windows settings",
+        "tryAgain": "Try again",
+        "troubleshooting": "How to fix this",
+        "download": "Open download page",
+        "shareAgain": "Share again",
+        "pickAgain": "Pick again",
+        "serverUnreachable": "Your share stopped: isshoni couldn't reach the server for 30 seconds. Check your connection and share again.",
+        "sharingSettings": "Settings → Sharing",
+        "logs": "Open logs folder"
+      },
+      "unavailable": "Sharing isn't available on this PC. {{reason}}"
+    },
     "errors": {
       "invalid_argument": "isshoni couldn't do that: something it was given isn't valid.",
       "not_found": "That isn't there any more.",

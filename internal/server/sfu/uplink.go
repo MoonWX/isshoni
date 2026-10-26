@@ -55,6 +55,10 @@ type LayerUplinkStats struct {
 	// QueueDelay is the layer's queueing-delay trend (M2 01 §10.1, delayTrend): the minimum one-way delay of the
 	// last 500 ms above its slowly rising baseline; −1 when unknown.
 	QueueDelay time.Duration
+	// arrived is what arrived of the layer in the ticker's last second alone, in bit/s: the rate nativeUplink's loss
+	// row backs off from (M2 01 §10.1). Bitrate's 2 s average still carries some of what the sharer sent before the
+	// bottleneck began losing it.
+	arrived int
 }
 
 // UplinkDecision is what an UplinkPolicy decided.
@@ -204,7 +208,7 @@ func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
 			RID: slot.String(), Bitrate: int(l.stats.bitrate.Load()),
 			LossPct: math.Float64frombits(l.stats.lossPct.Load()), Jitter: l.jitterNow(),
 			RawLossPct: math.Float64frombits(l.stats.rawLossPct.Load()),
-			QueueDelay: time.Duration(l.stats.queueDelay.Load()),
+			QueueDelay: time.Duration(l.stats.queueDelay.Load()), arrived: int(l.stats.arrived.Load()),
 		}
 		for _, dt := range viewers {
 			if dt.interest.Load()&(1<<slot) != 0 {

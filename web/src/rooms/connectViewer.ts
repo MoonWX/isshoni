@@ -14,7 +14,15 @@
 //   the room page no tile is shown, so every video goes off while the audible share keeps playing (05 §11.1).
 // - "bo started sharing [Watch]" (createWatchToast) takes the session's announcement over while the user has picked
 //   a tile (owner decision, 05 §24.1).
+// - The shares of the platform's other local connections (the desktop app's C2, docs/m2/03 §10.4:
+//   platform.sharing.localConnectionIds()) are this page's own too: the viewer marks them local, never audible and
+//   never focused by itself, and subscribes to their preview layer only. Those ids can become known after the
+//   snapshot that lists the share (C2's share starts or is adopted, the provider's chunk or Go's answer comes late),
+//   so the snapshot is synced again whenever the session's local share changes and whenever the platform says its
+//   local connections may have (onLocalChange: platform.sharing.onChange), without waiting for a room.state that a
+//   quiet room may never send.
 import type { UiStore } from '../app/uiStore';
+import type { ActiveShare } from '../platform/types';
 import type { SignalClient } from '../protocol/signal-client';
 import { attachViewer, syncRoom, type ViewerServices } from '../viewer/services';
 import { attachSubscriptions } from '../viewer/subscriptions';
@@ -27,16 +35,35 @@ export interface ConnectViewerDeps {
   viewer: ViewerServices;
   /** `on` brings subscribe.status; `notify` sends the codec wait's caps.update (attachViewer, 05 §10.6). */
   signal: Pick<SignalClient, 'on' | 'notify'>;
-  session: Pick<RoomSession, 'onRoomEvent' | 'subscriptions'>;
+  session: Pick<RoomSession, 'onRoomEvent' | 'subscriptions'> & Partial<Pick<RoomSession, 'on'>>;
   room: RoomStore;
   ui: UiStore;
+  /** The platform's other connections whose shares are this page's (platform.sharing.localConnectionIds()). */
+  localConnectionIds?: () => readonly string[];
+  /** Calls fn whenever localConnectionIds() may answer differently (platform.sharing.onChange); returns its off. */
+  onLocalChange?: (fn: () => void) => () => void;
 }
 
 /** Nobody: for the sync that empties the viewer, which reads no ids. */
 const NO_SELF: ViewerSelf = { userId: '', connectionId: '' };
 
 /** Connects the viewer to the session. Returns the function that disconnects it. */
-export function connectViewer({ viewer, signal, session, room, ui }: ConnectViewerDeps): () => void {
+export function connectViewer({
+  viewer,
+  signal,
+  session,
+  room,
+  ui,
+  localConnectionIds = () => [],
+  onLocalChange = () => () => undefined,
+}: ConnectViewerDeps): () => void {
+  /** Who this page is, with the platform's local connections as they are known now. */
+  const selfOf = (s: RoomStoreState): ViewerSelf => ({
+    userId: s.userId ?? '',
+    connectionId: s.connectionId ?? '',
+    localConnectionIds: localConnectionIds(),
+  });
+
   const sync = (s: RoomStoreState, prev: RoomStoreState): void => {
     // Only a new snapshot. The connection's ids change with a welcome, before the room.state that follows it; the
     // snapshot of before is not read again with them (its shares belong to the old connection id).
@@ -47,11 +74,27 @@ export function connectViewer({ viewer, signal, session, room, ui }: ConnectView
       return;
     }
     // Both ids are set by the welcome that came before any room.state.
-    syncRoom(viewer, s.state, { userId: s.userId ?? '', connectionId: s.connectionId ?? '' });
+    syncRoom(viewer, s.state, selfOf(s));
+  };
+
+  /** The same snapshot again, with the local connections as they are now. */
+  const resync = (): void => {
+    const s = room.getState();
+    if (s.state !== null) syncRoom(viewer, s.state, selfOf(s));
+  };
+  /** The local share and its changes (a re-publish, C2 reconnecting as a new connection). */
+  let offShare: (() => void) | undefined;
+  const followShare = (share: ActiveShare | null): void => {
+    offShare?.();
+    offShare = share?.on('state', resync);
+    resync();
   };
 
   const offs = [
     room.subscribe(sync),
+    session.on?.('share', followShare) ?? (() => undefined),
+    () => offShare?.(),
+    onLocalChange(resync),
     attachViewer(signal, viewer),
     attachSubscriptions(viewer, session.subscriptions),
     session.onRoomEvent(createWatchToast({ viewer, ui, selfUserId: () => room.getState().userId })),

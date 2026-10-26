@@ -31,7 +31,7 @@ describe.each(['production', 'development'] as const)('the catalog in %s mode', 
     const i18n = initI18n();
     expect(i18n.t('common.appName')).toBe('isshoni');
     expect(i18n.exists('errors.unknown')).toBe(true);
-    for (const key of ['admin.title', 'account.back', 'setup.steps.label']) {
+    for (const key of ['admin.title', 'account.back', 'setup.steps.label', 'link.confirm.title']) {
       expect(i18n.exists(key)).toBe(false);
       // What a page would show without its namespace: the bare key.
       expect(i18n.t(key)).toBe(key);
@@ -42,6 +42,7 @@ describe.each(['production', 'development'] as const)('the catalog in %s mode', 
     ['./lazy/admin', 'admin.title', 'Admin'],
     ['./lazy/account', 'account.back', 'Back to isshoni'],
     ['./lazy/setup', 'setup.steps.label', 'Setup'],
+    ['./lazy/link', 'link.confirm.title', 'Link the isshoni app?'],
   ])('%s adds its namespace when it runs', async (module, key, text) => {
     const { initI18n } = await freshI18n(mode);
     const i18n = initI18n();
@@ -61,6 +62,9 @@ describe('a lazy page folder, in production mode', () => {
     ['account', () => import('../account/index'), ['account.back', 'account.title']],
     ['download', () => import('../download/index'), ['account.download.title', 'account.back']],
     ['setup', () => import('../setup/index'), ['setup.steps.label', 'setup.admin.title']],
+    ['link', () => import('../link/index'), ['link.confirm.title', 'link.app.desktop.windows']],
+    // The Devices page's app rows name apps as the approval page does (M2 02 §10.2).
+    ['account (the link texts of its app rows)', () => import('../account/index'), ['link.devices.rename']],
   ])('%s/ has its namespace once its entry module has run', async (_folder, load, keys) => {
     const { initI18n } = await freshI18n('production');
     const i18n = initI18n();
@@ -79,6 +83,7 @@ describe('a lazy page folder, in production mode', () => {
     expect(i18n.exists('account.back')).toBe(true);
     expect(i18n.exists('admin.title')).toBe(false);
     expect(i18n.exists('setup.steps.label')).toBe(false);
+    expect(i18n.exists('link.confirm.title')).toBe(false);
   });
 });
 
