@@ -262,8 +262,22 @@ func TestReservedNames(t *testing.T) {
 		"ISSHONI_DEV_SERVER", "ISSHONI_LOADTEST_PASSWORD",
 	}
 	want = append(want, desktopEnvNames[2:]...) // M2 06 §7.3 after M1's; its first two names are M1's already
-	if got := ReservedEnvNames(); !slices.Equal(got, want) {
+	for _, d := range devEnvNames {
+		want = append(want, d.name) // then WF7's
+	}
+	got := ReservedEnvNames()
+	if !slices.Equal(got, want) {
 		t.Errorf("ReservedEnvNames = %v, want 04 §4.2's list %v", got, want)
+	}
+	seen := map[string]bool{}
+	for _, n := range got {
+		if seen[n] {
+			t.Errorf("%s is listed twice", n)
+		}
+		seen[n] = true
+		if !strings.HasPrefix(n, "ISSHONI_") || strings.ToUpper(n) != n {
+			t.Errorf("%s is not an upper-case ISSHONI_* name", n)
+		}
 	}
 }
 
@@ -288,5 +302,68 @@ func TestDesktopEnvNamesNotWarned(t *testing.T) {
 	}
 	if ws := mustLoad(t, "", env).Warnings(); len(ws) != 0 {
 		t.Errorf("warnings:%s\nwant none", problemList(ws))
+	}
+}
+
+// devEnvNames are the ISSHONI_* names that M2's desktop dev and e2e builds, tasks and tests read and that 06 §7.3
+// doesn't list (WF7), in ReservedEnvNames' order, each with where the repository reads it. They were found by
+// grepping every tracked file outside docs/ for ISSHONI_ names; header guards, window globals (__ISSHONI_…__) and the
+// deliberately unknown names of tests are not env names. The M0 spikes' signing variables are not listed.
+var devEnvNames = []struct{ name, readBy string }{
+	{"ISSHONI_DESKTOP_DEV_URL", "cmd/isshoni-desktop/flavor_dev.go, set by task desktop:dev (M2 03 §5.3)"},
+	{"ISSHONI_FAKE_AUDIO", "cmd/isshoni-desktop/engine_fake.go, internal/desktop/e2ehost, web/e2e (M2 05 §13.3)"},
+	{"ISSHONI_E2E_CDP_PORT", "web/e2e/cdp, and cmd/isshoni-desktop/flavor_e2e.go from WA72 on (M2 03 §22.4)"},
+	{"ISSHONI_E2E_DATA_DIR", "web/e2e/cdp, and cmd/isshoni-desktop/flavor_e2e.go from WA72 on (M2 03 §22.4)"},
+	{"ISSHONI_DESKTOP_EXE", "web/e2e/cdp: the e2e build of isshoni.exe the CDP spec starts"},
+	{"ISSHONI_CDP_ENDPOINT", "web/e2e/cdp: a running app the CDP spec attaches to"},
+	{"ISSHONI_NATIVE_PRESETS", "Taskfile.yml native:build"},
+	{"ISSHONI_NATIVE_TEST", "Taskfile.yml native:build"},
+	{"ISSHONI_NATIVE_BUILD_PS1", "Taskfile.yml native:build"},
+	{"ISSHONI_FFMPEG_BUILD_PS1", "Taskfile.yml ffmpeg:build"},
+	{"ISSHONI_CHECKLIST_OUT", "cmd/isshoni-desktop/checklist_test.go (M2 03 §3.2)"},
+	{"ISSHONI_CHECKLIST_W19_PORT", "cmd/isshoni-desktop/checklist_test.go (M2 03 §3.2)"},
+	{"ISSHONI_CHECKLIST_W19_PIPE", "cmd/isshoni-desktop/checklist_test.go (M2 03 §3.2)"},
+	{"ISSHONI_DESKTOP_TEST_CHILD", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_DESKTOP_TEST_ID", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_DESKTOP_TEST_RUNNING", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_DESKTOP_TEST_OUT", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_WINOS_TEST_CHILD", "internal/desktop/winos/winos_windows_test.go"},
+	{"ISSHONI_WINOS_TEST_ID", "internal/desktop/winos/winos_windows_test.go"},
+	{"ISSHONI_WINOS_TEST_OUT", "internal/desktop/winos/winos_windows_test.go"},
+	{"ISSHONI_APPLOG_CRASH_CHILD", "internal/desktop/applog/applog_test.go"},
+	{"ISSHONI_MEDIATEST_MUTANT", "internal/media/mediatest/mutant_test.go"},
+}
+
+// The server never warns about the names M2's desktop dev and e2e builds, tasks and tests read (WF7, after README
+// WA66's note): running task desktop:dev, an e2e run or a native build in the shell the server runs in leaves the
+// server's log alone. The names are matched exactly, so an unlisted name of the same families still warns.
+func TestDevEnvNamesNotWarned(t *testing.T) {
+	env := make([]string, 0, len(devEnvNames))
+	for _, d := range devEnvNames {
+		if !slices.Contains(ReservedEnvNames(), d.name) {
+			t.Errorf("%s (read by %s) is not a reserved name", d.name, d.readBy)
+		}
+		env = append(env, d.name+"=1")
+	}
+	if ws := mustLoad(t, "", env).Warnings(); len(ws) != 0 {
+		t.Errorf("warnings:%s\nwant none", problemList(ws))
+	}
+
+	unknown := []string{
+		"ISSHONI_E2E_NOT_A_NAME", "ISSHONI_NATIVE_NOT_A_NAME", "ISSHONI_FAKE_AUDIOS", "ISSHONI_DESKTOP_DEV",
+	}
+	for _, n := range unknown {
+		env = append(env, n+"=1")
+	}
+	ws := mustLoad(t, "", env).Warnings()
+	var names []string
+	for _, w := range ws {
+		if w.Severity != SeverityWarning || w.Source.Kind != SourceEnv || w.Message != "is not a config key; it is ignored" {
+			t.Errorf("warning %+v, want an unknown env warning", w)
+		}
+		names = append(names, w.Source.Name)
+	}
+	if !slices.Equal(names, unknown) {
+		t.Errorf("warned about %v, want %v", names, unknown)
 	}
 }
