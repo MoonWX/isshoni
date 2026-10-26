@@ -482,7 +482,9 @@ unique.
   timestamp, best effort, like sessions, 03 §7.4). `MaybeRotate` does nothing for a bearer principal (as built).
 - A bearer request **ignores cookies completely**: the `Cookie` header is not read, and the cross-origin half of 03
   §7.5's CSRF check is skipped (there is no ambient credential to forge). The `Content-Type: application/json` rule
-  still applies to unsafe methods.
+  still applies to unsafe methods, and it comes before the token (WA47): an unsafe bearer request with the wrong
+  `Content-Type` is 415 `unsupported_media_type` whatever its token, as on the cookie path, where the CSRF step's
+  `Content-Type` check comes before the cookie.
 
 ### 6.2 Refresh: `POST /api/v1/device/token` with `grantType: refresh_token`
 
@@ -635,12 +637,17 @@ brings scoped tokens (*later*).
    A request from any other origin passes untouched; its preflight reaches the route lookup and gets M1's 405, as now.
    (PUT is added to 03 §7.5's list for `PUT /push/preferences`.) Answers of 04's global chain (421, the shutdown 503, a
    recovered 500) carry no CORS headers; the SPA sees a network error and retries, which is what it does for those.
+   As built (WA47): this step sets its headers on the response before the handler runs, so the recover step, when a
+   panic left nothing sent, deletes `Access-Control-Allow-Origin` and `Access-Control-Expose-Headers` with the
+   handler's own headers before it answers 500 (`Vary: Origin` stays).
 1. Body limit; 2. no-store; 3. route lookup: as built.
 4. **Credentials** (replaces M1's `rejectAuthorization`): `Public` routes skip to step 5 without reading the header. On
    any other route, a request **with** an `Authorization` header takes the bearer path: §6.1 (401 `invalid_token`), no
    CSRF step, the principal is the device; a `UserSession` or `Admin` route then answers 403 `{credential:
    "session"}` as in the table (after the token checked out, so a bad token is still 401). A request **without** it
-   takes M1's cookie path (steps 5–7), and a `UserDevice` route answers 403 after the cookie authenticated.
+   takes M1's cookie path (steps 5–7), and a `UserDevice` route answers 403 after the cookie authenticated. The bearer
+   path's order as built (WA47): the `Cookie` header dropped unread; for unsafe methods the `Content-Type` rule (415);
+   the token (401 `invalid_token`, or 500); the access check (403); the handler, with no rotation.
 5. CSRF (cookie path and `Public` routes); 6. authenticate (cookie path); 7. rotate; 8. access (`Admin`: 403
    `forbidden` for a non-admin cookie session; a bearer never gets this far on an `Admin` route); 9. the handler.
 
@@ -849,9 +856,12 @@ server (the constant `api.InfoFeatureDeviceFlow` exists since M1):
 subscriptions go; audit `device.revoked {via: "app"}`; its connections close (`device_revoked`); `{UserID}: devices`.
 
 `PATCH /api/v1/me/devices/{id}` `{"name": "Gaming PC"}` → `200 {"device": DeviceInfo}`. Audit `device.renamed {from,
-to}`; `{UserID}: devices`. A name equal to the current one changes nothing and writes nothing.
+to}`; `{UserID}: devices`. A name equal to the current one changes nothing and writes nothing. As built (WA47), the
+notification goes after every 200, an unchanged name included: `auth.RenameDevice` doesn't report whether it renamed,
+so an unchanged name costs the user's SPAs one refetch.
 
-`GET /api/v1/me` for a bearer (03 §12.4.3 planned it) has `device` instead of `session`:
+`GET /api/v1/me` for a bearer (03 §12.4.3 planned it) has `device` instead of `session`, with exactly the fields of
+the example (no `lastSeenAt` or `lastIp`; WA47):
 
 ```json
 {"user": {"id": "k3m9p2qxw7ht", "username": "Alex", "role": "admin", "createdAt": "2026-10-01T12:00:00.000Z"},
@@ -1040,12 +1050,16 @@ by a real request (or the janitor) and found in `GET /api/v1/admin/audit` with i
 row came with the store (group 2's integration fix, since the store names the action from WA19 on): a "later" row
 targeting `device`, with no actors listed, until WA47's `TestAuditCoverage` produces it. Group 4's integration added
 `device.renamed` (`inAuth`) and marked `device.refresh_reused` `sec` and `inAuth` (36 actions): auth writes both
-(WA39), and they stay "later" rows until WA47's `TestAuditCoverage` produces them.
+(WA39), and they stay "later" rows until WA47's `TestAuditCoverage` produces them. As built (WA47): it produces every
+row above, so none is "later" any more, and the table's `inAuth` field went with the last rows that used it. The
+device cap is reached with 20 inserted device rows, and `device.expired` comes from an inserted device without a
+refresh token (one left 90 days without a refresh) when the janitor runs; every other row comes from a real REST call.
 
 **Admin alert**: `refresh_token_reused` (03 §7.11), after the commit, to every admin with `adminAlerts` on.
 
-**Notifications** (`invalidate` topics, 03 §12.5): `{UserID}: devices` after a device is linked, renamed or revoked
-(any `via`), and after a reuse. Approve and deny notify nothing (the approval page has the answer).
+**Notifications** (`invalidate` topics, 03 §12.5): `{UserID}: devices` after a device is linked, renamed (every 200 of
+#52, §7.2) or revoked (any `via`), and after a reuse. Approve and deny notify nothing (the approval page has the
+answer). `httpapi` sends all of them, and those of M1's session routes, through one helper (`devicesChanged`; WA47).
 
 **Logs** (README §4 Logging): `info` "device linked" with `user_id`, `device_id` and `via`; `warn` "refresh token
 reused, device revoked" with `user_id`, `device_id` and `remote_ip` (a security event); throttle lines as in §5.5.
@@ -1609,7 +1623,7 @@ shapes (field names as below; 03-desktop-app owns the binding code and the scree
 | `HelloRefused(origin, {code, params})` | `AuthState` | `Manager.HelloRefused` for C1's `client_outdated` and `protocol_unsupported`, with the same origin rule as `SessionEnded` |
 | `Unlink()` | `{confirmed: bool}` | `false`: the server wasn't reached; the UI says "Remove {device} on your Devices page to finish" |
 | `Servers()` | `ServerEntry[]` | |
-| `AddServer(origin)` | `{origin, requestedOrigin, existing}` | `Servers.Add`, only after the confirmation of §12.3; the server becomes active and 03 reloads the window at `/desktop/setup?link=1`, so the page, its `bridge.js` and every token call name the new server before its link step (03 §8.2) |
+| `AddServer(origin)` | — | `Servers.Add`, only after the confirmation of §12.3; the server becomes active and 03 reloads the window at `/desktop/setup?link=1`, so the page, its `bridge.js` and every token call name the new server before its link step (03 §8.2). `Servers.Add`'s `{origin, requestedOrigin, existing}` stays in Go: the page that called is reloaded, so 03 §6.2 binds `Auth.AddServer` with no result (WA48) |
 | `SwitchServer(origin)`, `RemoveServer(origin)` | — | every change of the active server reloads the window once (also a switch to a known server that isn't linked), so no loaded page outlives its server (03 §5.8) |
 | `Recheck()` | `AuthState` | `Manager.Recheck`: re-runs `compat.FromInfo` |
 
@@ -1885,7 +1899,7 @@ with the code (`TestBelow` in `internal/version/semver_test.go`, unchanged rows 
   | `up_to_date` | "No newer version is available yet" |
   | `off` | "Update checks are turned off", or "Update checks are turned off by your administrator" when `PolicyOff` |
   | `disabled` | "This build doesn't update itself" |
-  | `error` | the `update.error.<code>` text (06-windows-release §8.10) |
+  | `error` | the `desktop.update.error.<code>` text (06-windows-release §8.10, README §3 item 42) |
 
   Every state except `ready` and `downloading` also shows **Get it from your server's Download page**, which opens
   `origin + "/download"` in the system browser (`platform.openExternal`), never in the webview: the bundled SPA's own

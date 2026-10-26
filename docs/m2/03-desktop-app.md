@@ -101,7 +101,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 
 | # | Behavior of the pinned Wails on Windows | How it is checked | Fallback |
 |---|---|---|---|
-| W1 | The asset origin is `http://wails.localhost` | CDP e2e asserts `location.origin == protocol.DesktopAssetOriginWindows` and that this value is in `protocol.DesktopOrigins()` (02 §6.4) | Change the constant in 02's `internal/protocol/desktop.go` one release before an app uses it (02 §6.4) |
+| W1 | The asset origin is `http://wails.localhost` | CDP e2e asserts `location.origin == protocol.DesktopAssetOriginWindows`; that this value is in `protocol.DesktopOrigins()` (02 §6.4) needs no webview and is `internal/protocol`'s `TestDesktopOrigins` (`DesktopOrigins()[0] == DesktopAssetOriginWindows`; WA48's CDP skeleton names it in the row) | Change the constant in 02's `internal/protocol/desktop.go` one release before an app uses it (02 §6.4) |
 | W2 | `window.isSecureContext` is true there | CDP e2e | None needed: `DesktopPlatform` skips the NeedsHttps check (§7.2) and WebRTC works in any context |
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
@@ -111,11 +111,11 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
 | W9 | WebView2 settings: DevTools off in production builds, default context menu off, zoom control off, browser accelerator keys off, general autofill and password save off, status bar off, swipe navigation off, external drop off | CDP e2e per setting where observable; else manual | The SPA-level mitigations of §5.4 |
 | W10 | The main window's native handle (HWND) is available to Go | Go test on Windows | `FindWindowExW` by the window class Wails registers, on the UI thread |
-| W11 | Bound methods may take `context.Context` first, cancelled when the JS call is cancelled | Bindings test | No context; each method bounds its own work (§6.2 timeouts) |
-| W12 | A Go `error` rejects the JS promise with `err.Error()` in its message, verbatim | Bindings test | Methods return `{result, error}` structs instead (one code change in `bridge`) |
+| W11 | Bound methods may take `context.Context` first, cancelled when the JS call is cancelled | Bindings test. **Holds at beta.34 (WA48)**, without a window: `cmd/isshoni-desktop`'s `TestBindingContextIsTheCalls` calls the bound `Auth.Link` through Wails' own `Bindings` and `BoundMethod.Call` (`application.New` creates no native app; `Run` would), cancels the call's context, and the method's context ends with `context.Canceled` and the call answers `internal {reason: cancelled}` (§6.4). The real webview's half is the `isshoni_hw` `TestWailsChecklist` on the owner's PC, not run yet | No context; each method bounds its own work (§6.2 timeouts) |
+| W12 | A Go `error` rejects the JS promise with `err.Error()` in its message, verbatim | Bindings test. **Holds at beta.34 (WA48)**, without a window: `TestBindingErrorIsVerbatim`: a bound method's `*bridge.Error` comes back as a `RuntimeError` `CallError` whose message is the error's JSON exactly and whose cause is the same object, as the HTTP transport answers it; the page's half (the runtime rejects with that message, which `toBridgeError` parses) is `WailsBridge.test.ts`. The real webview: `TestWailsChecklist`, as W11 | Methods return `{result, error}` structs instead (one code change in `bridge`) |
 | W13 | WebView2 user data folder and additional browser arguments can be set | CDP e2e: audio plays without a click (autoplay flag) | Environment `WEBVIEW2_USER_DATA_FOLDER` and `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` set by Go before the webview starts (unusable at beta.34, which overwrites both in every build, §5.4; the app sets both through Wails' options) |
 | W14 | Quit runs our shutdown hook before the process exits (share stopped, close 1000 sent) | Go test with a fake share | Our tray Quit stops the share first, then calls Wails' quit |
-| W15 | `.bin/wails3 generate bindings` (TypeScript) is deterministic and OS-independent for our services | CI: generate on ubuntu and macOS, diff | Commit the bindings generated on one OS only (Linux CI) |
+| W15 | `.bin/wails3 generate bindings` (TypeScript) is deterministic and OS-independent for our services | CI: generate on ubuntu and macOS, diff. **The macOS half holds (WA48, group 5's integration)**: `task gen:bindings:check` (`GOOS=windows`) regenerates the committed `web/src/platform/desktop/bindings/` without a diff on the Mac, and `TestGeneratedBindingsMatchTheServices` checks, without the CLI, that every generated function calls the method id Wails gives the same Go method and every bound method has one. The ubuntu half is `ci.yml`'s `protocol` job (group 5's integration), whose first run, in the group PR, decides it | Commit the bindings generated on one OS only (Linux CI) |
 | W16 | Element fullscreen inside WebView2 plus `Window.SetFullscreen(true)` fills the screen and returns cleanly on Esc | CDP e2e + manual | CSS pseudo-fullscreen (`fullscreen: 'none'`, as M1 has for browsers without the API) |
 | W17 | A WebView2 process failure is reported (or the page is reloaded) | Manual: kill a renderer in Task Manager | Our watchdog: the SPA calls `App.Heartbeat` every 5 s; 15 s without one → `Shell.Reload()` |
 | W18 | Tray icon, tooltip and menu can be changed at runtime; left click is reported | Manual + Go test of the view model | Rebuild the tray item on every change |
@@ -635,6 +635,19 @@ over `*app.App`, registered in `main.go` with `application.NewService`. Argument
 TypeScript types come from the bindings generator (`web/src/platform/desktop/bindings/`, committed, drift-checked
 like tygo's output).
 
+As built (WA48): `bridge.New(bridge.Deps{…})` builds the seven services, and `shell.go`'s `registerServices` registers
+each with `application.NewService` between `application.New` and `Run` (`main.go` calls it once the app exists); a
+service missing there gets no binding. Argument and result types use plain strings for the enum-like values (05's
+`FriendsHear` and `AppRule` go out as they are); the generated TypeScript types them as strings, so `WailsBridge` checks
+its arguments against the generated signatures and casts results to `bridge.ts`'s unions (§7.4). `main.go` passes
+`update.PolicyDisabled` as `Deps.PolicyOff` (§14.2's `updates.policyOff`). Methods whose slice hasn't landed answer
+`not_implemented` (README §4): `Auth.Unlink`, `AddServer`, `SwitchServer` and `RemoveServer` until WA71 (they need the
+app's reload and share stop), `Share.Pick`, `Start`, `StopOther`, `SetPaused`, `SetPreset` and `SetAudioEnabled` until
+WA58 (`Current` and `Stats` answer null and `Stop` and `Release` do nothing until then), `Settings.Update`, `Hotkeys`,
+`TestHotkey` and `Updates.*` until WA84; `Audio.*` work over 05's service once `main.go` passes it as `Deps.Audio`
+(WA77). `Share.Capabilities` already answers from the probe: each usable encoder kind once, in 04's order (the probe
+lists a kind once per adapter), with `reason` the media code when `canShare` is false.
+
 | Service.Method | In → out | Errors | Notes |
 |---|---|---|---|
 | `App.Info()` | → `AppInfo {version, os, osBuild, arch, publisherConnectionId, wizardDone, dev}` | — | `publisherConnectionId` is `core.Status().ConnectionID` of C2, "" while it isn't ready |
@@ -701,7 +714,9 @@ README §7 Q8), so nothing in the bridge or the SPA can set an audio mode. Sound
 ### 6.3 Events (Go → SPA)
 
 Names carry the prefix `isshoni:` (not shown below) so they never collide with Wails' own. Every stateful event has
-a pull method; the SPA subscribes first and then pulls, so it misses nothing.
+a pull method; the SPA subscribes first and then pulls, so it misses nothing. As built (WA48): the services' events go
+out through the shell's `Emit` (`bridge.Deps.Emit`); none is registered with `application.RegisterEvent`, because
+the pinned Wails drops an event whose data type isn't exactly the registered one.
 
 | Event | Payload | When | Pull |
 |---|---|---|---|
@@ -766,13 +781,22 @@ parses the rejection's message into `BridgeError {code, params}` (W12). Codes ar
 |---|---|---|
 | `invalid_argument` | a bad argument (`params.field`) | `desktop.errors.invalid_argument` |
 | `not_found`, `busy`, `io_error`, `rate_limited`, `feature_disabled` | as named | `desktop.errors.*` |
+| `not_implemented` (`params.method`, the bound name, when the bridge itself answers it), `internal` (`params.reason`: `timeout` or `cancelled` when that is all there is to say) | a method whose slice hasn't landed (README §4; no release has one); a bug, a transport failure, a deadline that ran out | `desktop.errors.*` |
 | `invalid_address`, `server_unreachable`, `tls_untrusted`, `not_isshoni`, `server_not_set_up`, `incompatible_server` (`params.verdict`, `reason`, `serverVersion`, `minClientVersion`: 02 §13.2's `compat.Check`), `too_many_servers` | server probe and `Auth` (§8.1) | `desktop.errors.*`; `incompatible_server` by `verdict` (02 §13.3) |
 | `not_linked` | no credential for the active server | the link step (§8.2) |
 | `publisher_offline` | C2 isn't ready within 10 s | `desktop.errors.publisher_offline` |
 | `already_sharing`, `not_sharing`, `pick_expired` | share controller | `desktop.errors.*` |
-| `engine.` + 01's `media.ErrorCode` (01 §5.2): `engine.permission_denied`, `engine.encoder_lost`, `engine.source_gone`, `engine.unsupported_os`, `engine.no_encoder`, `engine.dependency`, `engine.internal`, `engine.invalid`, `engine.busy`; `params.reason` = `media.Error.Reason` (04 §5.7's detail token: `pick_expired`, `self_window`, `driver_too_old`, `no_media_foundation`, `blocked_by_policy`, `missing`, `version`, `abi`, …; `""` when none) | the engine (§10.5) | `desktop.errors.engine.*`, chosen by code and then by `params.reason` (§10.5's reason rows win over the code's row); `invalid` and `busy` share `internal`'s text; an unknown media code or reason is shown with its code's text, else `internal`'s; `engine.cancelled` is never surfaced (`Pick` returns `null`) |
+| `engine.` + 01's `media.ErrorCode` (01 §5.2): `engine.permission_denied`, `engine.encoder_lost`, `engine.source_gone`, `engine.unsupported_os`, `engine.no_encoder`, `engine.dependency`, `engine.internal`, `engine.invalid`, `engine.busy`, and (WA48) every other media code but `cancelled`: `engine.audio_unavailable`, `engine.audio_not_running`, `engine.stopped`, `engine.timeout`, each with its text; `params.reason` = `media.Error.Reason` (04 §5.7's detail token: `pick_expired`, `self_window`, `driver_too_old`, `no_media_foundation`, `blocked_by_policy`, `missing`, `version`, `abi`, …; `""` when none) | the engine (§10.5) | `desktop.errors.engine.*`, chosen by code and then by `params.reason` (§10.5's reason rows win over the code's row); `invalid` and `busy` share `internal`'s text; an unknown media code or reason is shown with its code's text, else `internal`'s; `engine.cancelled` is never surfaced (`Pick` returns `null`) |
 | `update.` + 06's code (06 §8.10), plus `update.not_ready` | `Updates.*` | `desktop.update.error.<code>` |
 | any 01 §12.1 wire code; the M1 REST codes `Auth.LinkWithPassword` passes through (`invalid_credentials`, `account_pending`, `account_disabled`, `server_busy`, `validation_failed` with `params.fields`) | passed through from C2 or 02 | `errors.<code>` (M1 catalog); `validation_failed` also shows M1's `fieldErrors.<field>.<code>` under each field |
+
+As built (WA48, `bridge/errors.go`): every service maps its Go errors through one table. A deadline that ran out is
+`internal {reason: timeout}`, because a method's own bound (`Audio.SoundCheck`'s 10 s, a local file) is no server's
+fault; only `Auth`, whose deadlines bound calls to a server, makes it `server_unreachable`. A call the page cancelled
+(W11) is `internal {reason: cancelled}`, which nobody reads. 02's `ErrOffline`, `ErrNetwork` and `ErrBadResponse`
+are `server_unreachable`; an error no rule knows is `internal`, logged once at WARN with its cause (the packages below
+never put a token, password, name or path into an error's text). Params hold codes and numbers only, never English.
+The update codes' texts are `desktop.update.error.<code>` (README §3 item 42), written with the update screens (WA82).
 
 ---
 
@@ -987,9 +1011,14 @@ export type PromptAnswer = 'keep-out' | 'include';        // decide; dismissing 
 // No audio-mode type or method: M2 has no "All sound" mode (§6.2).
 ```
 
-- **`WailsBridge`** (M2): the generated bindings plus `@wailsio/runtime`'s `Events.On`; errors parsed per §6.4. Until
-  WA48 generates the bindings, `wails/WailsBridge.ts` is a stub that throws `BridgeError` `not_implemented`, so the
-  dynamic import has a target; every bridge call of a real Wails build rejects with `not_implemented` meanwhile.
+- **`WailsBridge`** (M2): the generated bindings plus `@wailsio/runtime`'s `Events.On`; errors parsed per §6.4. As
+  built (WA48, `wails/WailsBridge.ts`, which replaced WA32's stub): every method calls the generated binding of the
+  same Go method, so a renamed, removed or re-typed Go argument fails the typecheck; results are cast to `bridge.ts`'s
+  types, which keep the string unions the Go side documents (the generated classes type them as plain strings); a
+  rejection's message is parsed into a `BridgeError` (W12), and a Wails `TypeError` or `ReferenceError` (a binding out
+  of step with Go) becomes `internal`; the fire-and-forget methods log their failures, as `HttpBridge` does; events
+  are `isshoni:<name>`, and `share.stats` gets `at` on receipt. `DesktopPlatform` loads it by dynamic `import()` only
+  for `transport: "wails"`, so the runtime and the bindings stay out of the entry chunk.
 - **`HttpBridge`** (M2, e2e only in practice), served by `internal/desktop/e2ehost` (§22.4) on the asset origin and
   selected only by `bridge.js`'s `transport`, which only `e2ehost` sets to `"http"`. The wire: a call is `POST
   /__bridge/call` with `Content-Type: application/json` and `{"service", "method", "args"}`, where `service` and
@@ -999,9 +1028,10 @@ export type PromptAnswer = 'keep-out' | 'include';        // decide; dismissing 
   `internal`). Events: an `EventSource` on `/__bridge/events`, opened at once, each message's data `{"name":
   "isshoni:<event>", "data": <payload>}`.
 - **The DTO types** (`AuthState`, `ShareView`, `FriendsHear`, `SettingsView`, `UpdateStatus`, …) are written by hand in
-  `platform/desktop/bridge.ts` from 02 §11.7, this doc's §6.2–§6.3 and §14.2, 05 §14.5 and 06 §8.9 until WA48's
-  generated bindings exist. `share.stats` and its event follow §6.3's `ShareStatsSample`, with `at` set by the
-  transport on receipt (`performance.now()`).
+  `platform/desktop/bridge.ts` from 02 §11.7, this doc's §6.2–§6.3 and §14.2, 05 §14.5 and 06 §8.9, and stay so with
+  WA48's generated bindings, whose classes have the same fields with plain strings for the unions (above).
+  `share.stats` and its event follow §6.3's `ShareStatsSample`, with `at` set by the transport on receipt
+  (`performance.now()`).
 - *Later (M4)*: a `RelayBridge` over 01's same-user relay (`share.request`, `share.status`, `exclusions.*`) lets a
   browser page drive the Linux agent through the same `DesktopSharing` code. Nothing of it is built now; the interface
   is shaped so its `share` and `audio` parts can be implemented over messages.
@@ -1928,7 +1958,8 @@ Also part of the contract:
 
 Every per-PC file is under `%LOCALAPPDATA%\isshoni\`, which `--purge-data` removes (§13.4); nothing is in the
 roaming profile (device ids, pill positions per monitor and the Credential Manager entries are per PC). §22.4 B's
-temporary profile therefore needs only `%LOCALAPPDATA%` (and a test credential prefix).
+temporary profile therefore needs only another data root (and a test credential prefix); since the app reads
+`FOLDERID_LocalAppData`, never the environment, the e2e build takes it from `ISSHONI_E2E_DATA_DIR` (WA72).
 
 ### 14.2 `settings.json` (schema 1)
 
@@ -2161,13 +2192,18 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 - The texts of `RequireBrowser`'s "Opened in your browser" screen and the Offline screen's "Switch server" are in the
   entry chunk, where the lazy `desktop` namespace isn't loaded, so they are four `common.*` keys in `en.json`
   (`back`, `openedInBrowser.title`, `openedInBrowser.body`, `screens.offline.switchServer`; WA42).
-- Error codes of §6.4 map to `desktop.errors.<code>` (the wire codes they pass through keep M1's `errors.<code>`).
-  The codes are constants of a small stdlib-only package, `internal/desktop/bridge/codes`, which `tygo.yaml` exports
-  to `web/src/platform/desktop/codes.gen.ts`; `check:i18n`'s error-code rule reads that file like `types.gen.ts`, so a
-  new code without a text fails the check (`engine.internal`, `engine.invalid` and `engine.busy` each have a key; the
-  last two point to the same text). The reason texts of §10.5 are keys `desktop.errors.engine.reason.<reason>`
-  (`selfWindow`, `driverTooOld`, `noMediaFoundation`, `blockedByPolicy`, and `reinstall` for `missing`, `version` and
-  `abi`; `pick_expired` has none, it reopens the picker silently).
+- Error codes of §6.4 map to `desktop.errors.<code>` (the wire codes they pass through keep M1's `errors.<code>`). The
+  codes are constants of a small stdlib-only package, `internal/desktop/bridge/codes`, which `tygo.yaml` exports to
+  `web/src/platform/desktop/codes.gen.ts`; a test reads that file, so a new code without a text fails `test:web`
+  (`engine.internal`, `engine.invalid` and `engine.busy` each have a key; the last two point to the same text). The
+  reason texts of §10.5 are keys `desktop.errors.engine.reason.<reason>` (`selfWindow`, `driverTooOld`,
+  `noMediaFoundation`, `blockedByPolicy`, `deviceRemoved` for §10.5's `device_removed` row (WA48), and `reinstall` for
+  `missing`, `version` and `abi`; `pick_expired` has none, it reopens the picker silently). As built (WA48): the rule
+  lives in `web/src/platform/desktop/codes.node.test.ts`, which `test:web` runs, not in `check-i18n.mjs`, which doesn't
+  read `codes.gen.ts` (no M2 slice lists `web/scripts/`); every code but the `update.*` ones needs its
+  `desktop.errors.<code>` text. The `update.*` codes' texts are `desktop.update.error.<code>` (§6.4), which WA82 writes
+  with the update screens; it drops the test's `update.*` exemption, so from then on every update code needs its text
+  too (README WA82's row).
 
 ### 18.2 Accessibility
 
@@ -2406,6 +2442,23 @@ wails.localhost 127.0.0.1:<harness port>"`, so the unmodified server accepts the
 `/ws` and 02's CORS) and no server knob is added. If that proves impossible, 02 is asked for a `servertest`-only hook,
 never a config key. The CSP of a dev/e2e build allows the http loopback server (§5.3).
 
+As built (WA48, `internal/desktop/e2ehost`): the flags are `-listen` (default `127.0.0.1:0`), `-data` (default a
+new temporary folder, removed at exit), `-server <origin>` (added and made active at start, standing in for the add
+step until WA71), `-origin` (default `DesktopAssetOriginWindows`), `-reload-delay`, and `-lock-resume`/`-lock-stop`
+(accepted, used once the share controller takes them, WA68); arguments after the flags are the app's command line.
+Once it listens it prints one JSON line `{addr, origin, log}`. `/__e2e/system` also takes `resume`, `end-session` and
+`display-change`. Each token record in `/__e2e/state` has `origin` (asked for), `activeOrigin` (the active server
+when `Auth.AccessToken` was called, the moment that decides whose token it is, §5.8, which `desktop-link.spec`'s
+"no token for A while B was active" asserts on), `activeAtReturn` (for the failure message) and the hash prefix; the
+recording `Shell.Reload` only counts reloads (a spec reloads the page itself). Until the e2e server answers CORS for
+the desktop origins (WA56 wires `httpapi.Deps.DesktopOrigins`; WA47's default is none), `desktop-security.spec`'s
+`/link` and storage case uses a small loopback stand-in server with the e2e server's own `/info` plus `deviceFlow`,
+`/device/password`, `/device/token` and `/device/revoke`; the spec switches to the worker's e2e server by itself once
+that one answers desktop CORS and lists `deviceFlow`, and the stand-in branch can then go. In CI (group 5's
+integration) the `build` job, which has `web/dist`, builds the harness (`CGO_ENABLED=0 go build -trimpath -o
+bin/e2ehost ./internal/desktop/e2ehost`) and uploads it as `e2ehost-linux-amd64`; the `e2e` job downloads it and sets
+`DESKTOP_E2E_BIN` (06 §10.1).
+
 | Spec | Asserts |
 |---|---|
 | `desktop-link.spec` | wizard: server address → confirm → device code, QR code and short URL shown → a second browser context signed in on the server approves at `/link` → sound step (05's fake: `captured`) → voice step (`voiceApps` from the scenario) → the room; a denied code shows "declined"; the password path: "Sign in with username and password instead", a wrong password shows the error and clears the field, the right one links; an unknown server delivered as `--server` shows "Add server {host}?" and the harness records no request to it before Add, and after Add (same host) the link step follows with no confirm step. **Second server, no token crosses**: with the page in a room on server A (C1 open) and a second e2e server B from `fixtures.ts` (its own port and data dir), the harness started with `-reload-delay=2s`: add B through `--server`, Add; during the delay the spec creates a room on A (A's `invalidate` makes the page refetch `['rooms']` from A) and closes C1 through Playwright's `page.routeWebSocket` (C1 reconnects and resumes), so the page's refetch and C1's resume hello reach A while B is active; then B's link step renders on B's `bridge.js` and is approved. Asserted: no request to A (`page.on('request')`, the `Authorization` header) and no `hello` to A (`page.on('websocket')`, `framesent`) carries a token whose hash `/__e2e/state` lists for B; the harness lists no token handed out for origin A while B was active; the window reloaded exactly once, at `/desktop/setup?link=1` |
@@ -2424,7 +2477,13 @@ with `-tags e2e`: the fake engine with 05's audio scenarios (as in A), http serv
 `WEBVIEW2_*` scrub off, DevTools on, and `credstore.Open(credstore.Options{Prefix: "isshoni-test:<random>:"})` whose
 entries are deleted at exit (never the user's `isshoni:v1:` entries). The spec starts an `isshoni` server
 (`tls.mode=off` on `127.0.0.1`), launches the app with `--relaunched` (so Playwright keeps its process), a remote
-debugging port and a temporary `%LOCALAPPDATA%`, and attaches with `chromium.connectOverCDP`. **The port can't come
+debugging port and a temporary data root, and attaches with `chromium.connectOverCDP`. **The data root can't come
+through `LOCALAPPDATA`** either (WA48's review): the app reads `FOLDERID_LocalAppData` through the shell's known
+folder, never from the environment, so `flavor_e2e.go` (WA72) also takes the data root from the e2e-only
+`ISSHONI_E2E_DATA_DIR`, and the port from `ISSHONI_E2E_CDP_PORT`. WA48's skeleton (`web/e2e/cdp/`) sets both, seeds
+`isshoni\settings.json` there with `closeToTray: true` (W7 then needs no live share) and fails before any test unless
+the app wrote into that folder (its log file or WebView2 profile): an e2e build that ignored it would use the owner's
+real servers, settings and WebView2 profile. **The port can't come
 through `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`**: at beta.34 Wails overwrites that variable (and
 `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`) in every build (§5.4), e2e builds included. WA72 adds an e2e-only path instead:
 `flavor_e2e.go` reads the port from an e2e-only variable or flag and appends `--remote-debugging-port=<port>` to
