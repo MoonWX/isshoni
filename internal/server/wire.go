@@ -651,34 +651,30 @@ func (s *Server) spaStatus(path string) int {
 	return http.StatusNotFound
 }
 
-// desktopScripts is the router's RouterOptions.Desktop (M2 06 §7.4): deploy/install-desktop.ps1 as embedded in the
-// binary, the site's origin and this binary's version. The router writes the last two into the script's prefill block
-// once, when it is built: they are fixed for the process (M1 04 §6.2). A server without a site passes an empty
-// origin, which leaves the server out of the script; its router answers 421 to all but the health endpoints anyway.
+// desktopScripts is the value of the router's RouterOptions.Desktop (M2 06 §7.4), for routerOptions to pass on:
+// deploy/install-desktop.ps1 as embedded in the binary, the site's origin and this binary's version. The router writes
+// the last two into the script's prefill block once, when it is built: they are fixed for the process (M1 04 §6.2). A
+// server without a site passes an empty origin, which leaves the server out of the script; its router answers 421 to
+// all but the health endpoints anyway.
 func (s *Server) desktopScripts() *httpapi.DesktopScripts {
 	return &httpapi.DesktopScripts{PS1: deploy.InstallDesktopPS1, Origin: s.site.Origin, Version: version.Version()}
 }
 
 // checkDesktopScripts renders d at startup, as the router will (M2 06 §7.4). An embedded script without a valid
-// prefill block is a build defect that no restart fixes, so serve refuses to start (exit 78); httpapi's test renders
-// the committed file, so a release never gets here.
+// prefill block is a build defect that no restart fixes, so serve refuses to start: the refusal is a
+// *config.OperatorError (it wraps config.ErrNeedsOperator, on which serve exits 78, and the render error) with no
+// Reason, since it concerns no file of the data directory. httpapi's test renders the committed file, so a release
+// never gets here.
 func checkDesktopScripts(d *httpapi.DesktopScripts) error {
 	if _, err := httpapi.RenderInstallPS1(d.PS1, d.Origin, d.Version); err != nil {
-		return &desktopScriptError{err: err}
+		return &config.OperatorError{
+			Message: "this binary's install-desktop.ps1 can't be served: " + err.Error(),
+			Fix:     "this is a build defect: build isshoni again from an unmodified checkout, or use a release artifact",
+			Err:     err,
+		}
 	}
 	return nil
 }
-
-// desktopScriptError is checkDesktopScripts' refusal. It wraps config.ErrNeedsOperator, on which serve exits 78
-// (NeedsOperator), and the render error.
-type desktopScriptError struct{ err error }
-
-func (e *desktopScriptError) Error() string {
-	return "server: this binary's install-desktop.ps1 can't be served: " + e.err.Error() +
-		"\n  fix: this is a build defect: build isshoni again from an unmodified checkout, or use a release artifact"
-}
-
-func (e *desktopScriptError) Unwrap() []error { return []error{config.ErrNeedsOperator, e.err} }
 
 // setupHint logs how to finish setup while no admin account exists (04 §6.1 step 10, 03 §7.8). The setup token
 // itself is never logged: `isshoni setup-url` prints it.
