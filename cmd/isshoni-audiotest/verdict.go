@@ -4,54 +4,65 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sort"
 	"strings"
 )
 
 // This file is the portable verdict logic of the audiotest (docs/m2/05-windows-audio.md §18.6). evaluate turns a
 // recording and a case into a caseReport: it runs the analyzer's present/absent and short-window rules, the click
-// check, the measured cut and onset, the positive controls and the engine and banner expectations, and decides
-// PASS, FAIL, INCONCLUSIVE or SKIP. It takes already-recorded data, so it runs on every OS and is the subject of the
-// analyzer and verdict tests (05 §19.1). The Windows driver (driver_windows.go) builds the recording; the special
-// cases 20, 21 and 27 are built by the driver itself (they decode Opus or measure timestamps) and never reach here.
+// check, the measured cut and onset, the session lag and fast-path exit, the positive controls and the engine and
+// banner expectations, and decides PASS, FAIL, INCONCLUSIVE or SKIP. It takes already-recorded data, so it runs on
+// every OS and is the subject of the analyzer and verdict tests (05 §19.1). The Windows driver (driver_windows.go)
+// builds the recording through capture.go; the special cases 20, 21 and 27 are scored in special.go.
 
 // recording is what one run produced, in a form the portable verdict can read. Times are seconds relative to the
-// recording's start (1 s after the case's initial fixtures run, 05 §18.5). The Windows driver maps engine-clock
-// events (firstRenderNs, session_created, the recorder's SetExclusions stamps) to these seconds with the offset of
-// 05 §13.2 before filling this struct.
+// recording's start (the first tap chunk, about 1 s after the case's initial fixtures run, 05 §18.5). The capture
+// maps engine-clock times (firstRenderNs, session_created, the recorder's SetExclusions stamps) to these seconds
+// with the offset of 05 §13.2.
 type recording struct {
-	left, right []float64 // the PCM tap, 48 kHz
+	left, right []float64 // the PCM tap, 48 kHz, gaps zero-padded
 	recordDur   float64   // the recording length in seconds (the "to the end" bound)
+	tap0NS      int64     // the first tap chunk's capture time (session clock)
 
-	reparented  bool     // every fixture was started under explorer.exe (05 §18.3)
-	silenceFail bool     // the silence pre-check failed (another app is playing, 05 §18.4)
-	lostGapMs   int      // the largest gap in PCM-tap capture times beyond one 10 ms chunk (05 §18.6: > 30 ms loses)
-	foreign     []string // non-fixture apps heard with peak > −60 dBFS during a window (redacted; 05 §18.6)
+	reparented   bool            // every fixture was started under explorer.exe (05 §18.3)
+	silenceFail  bool            // the silence pre-check failed (another app is playing, 05 §18.4)
+	keptOutOther bool            // a non-fixture process was kept out (the fast-path cases' premise, 05 §18.4)
+	lostGapMs    int             // the largest gap in PCM-tap capture times no new grid explains (05 §18.6)
+	foreign      []foreignSample // non-fixture apps heard with peak > −60 dBFS (05 §18.6)
 
-	roles       map[string]*roleTrack // per fixture role, sampled every 250 ms
+	roles       map[string]*roleTrack // per fixture role, from the sessions of its pid, sampled every 250 ms
+	roleApp     map[string]string     // role → the app id of its sessions (events name apps by id)
+	roleStart   map[string]float64    // role → when its process started
 	engineAt    []engineSample        // the report's engine per sample
-	bannerAt    []bannerSample        // the report's banner codes per sample
-	events      []recEvent            // engine events (session_created, …), redacted
+	bannerAt    []bannerSample        // the service's banner codes per sample
+	events      []recEvent            // engine events at or after the case's watcher start, each once
 	firstRender map[string]float64    // role → the fixture's logged first-render time
 	setStamp    float64               // the recorder's SetExclusions stamp for the rule change (case 15's T_set)
 	setStampOK  bool
-	driverMeas  map[string]int // the driver's measurements in ms (sessionLagMs, fastpathExitMs)
 	counters    map[string]int // the final report's mixer counters (fastpathLateCuts, …)
+	opus        []opusPkt      // the Opus packets (case 21)
 }
 
 // roleTrack is one fixture's history in the report samples.
 type roleTrack struct {
 	neverActive bool              // the fixture never appeared as an active session
 	exitedEarly bool              // the fixture exited before its planned end (05 §18.6)
-	samples     []roleSampleState // the report samples, oldest first
+	samples     []roleSampleState // the report samples in which its pid had a session, oldest first
 }
 
-// roleSampleState is one report sample for one fixture role.
+// roleSampleState is one report sample for one fixture role: its session (by pid) and the app row of that session's
+// app id.
 type roleSampleState struct {
 	t       float64
-	active  bool
-	verdict string // "heard" | "kept_out" | "not_captured" | "pending" | "" (absent from the report)
+	active  bool   // the session's state is "active"
+	verdict string // the session's: "heard" | "kept_out" | "not_captured" | "pending"
 	reason  string
-	detail  string
+	note    string // "" | "covered" | "no_handle"
+
+	row        bool // the report had a row for the session's app id
+	rowVerdict string
+	rowReason  string
+	rowDetail  string
 }
 
 // engineSample is the report's engine at one sample.
@@ -60,17 +71,17 @@ type engineSample struct {
 	value string
 }
 
-// bannerSample is the report's banner codes at one sample.
+// bannerSample is the banner codes at one sample.
 type bannerSample struct {
 	t     float64
 	codes []string
 }
 
-// recEvent is one engine event, redacted: its time in seconds, its code, and the fixture role it names (or "").
+// recEvent is one engine event: its time in seconds, its code, and the app id it names ("" for engine-wide events).
 type recEvent struct {
 	t    float64
 	code string
-	role string
+	app  string
 }
 
 // resolveBound resolves b to a time in seconds. isTo marks the "to" bound, whose zero value means the end of the
@@ -103,92 +114,148 @@ func (rec recording) resolveBound(b bound, isTo bool) (float64, bool) {
 	}
 }
 
-// sessionCreated is the time of the first session_created event that names role.
+// sessionCreated is the time of role's session_created event: the first one that names the role's app id at or
+// after the role's process started (so an earlier fixture of the same app, or of an earlier case, never counts).
 func (rec recording) sessionCreated(role string) (float64, bool) {
+	app, ok := rec.roleApp[role]
+	if !ok {
+		return 0, false
+	}
+	from := math.Inf(-1)
+	if s, ok := rec.roleStart[role]; ok {
+		from = s
+	} else if fr, ok := rec.firstRender[role]; ok {
+		from = fr
+	}
 	for _, e := range rec.events {
-		if e.code == "session_created" && e.role == role {
+		if e.code == "session_created" && e.app == app && e.t >= from {
 			return e.t, true
 		}
 	}
 	return 0, false
 }
 
-// inconclusive builds an INCONCLUSIVE caseReport with one problem.
-func inconclusive(cs caseSpec, cfg gateConfig, format string, args ...any) caseReport {
+// newCaseReport is an empty report for cs with every list and map set, so the JSON has [] and {} rather than null.
+func newCaseReport(cs caseSpec, cfg gateConfig) caseReport {
 	return caseReport{
-		Name: cs.name, Required: cs.requiredUnder(cfg), Result: resultInconclusive,
-		Problems: []string{fmt.Sprintf(format, args...)}, Measured: map[string]measure{},
-		Counters: map[string]int{}, ClicksAt: []float64{},
+		Name: cs.name, Required: cs.requiredUnder(cfg), Checks: []checkReport{}, Measured: map[string]measure{},
+		ClicksAt: []float64{}, Problems: []string{}, Engine: []string{}, Counters: map[string]int{},
+		Events: []reportEvent{},
 	}
 }
 
-// evaluate runs the portable verdict for a non-special case (05 §18.6). A FAIL is downgraded to INCONCLUSIVE only by
-// the premises below ("the premise couldn't be proven"), never by "it was close".
-func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
-	// Premises: an unproven premise is INCONCLUSIVE, not FAIL (05 §18.6).
+// withResult sets cr's result as it counts for the gate (05 §18.10's effectiveResult).
+func withResult(cs caseSpec, cfg gateConfig, cr caseReport, result string) caseReport {
+	cr.Result = effectiveResult(cs, cfg, result)
+	return cr
+}
+
+// inconclusive builds an INCONCLUSIVE caseReport with one problem.
+func inconclusive(cs caseSpec, cfg gateConfig, format string, args ...any) caseReport {
+	cr := newCaseReport(cs, cfg)
+	cr.Problems = append(cr.Problems, fmt.Sprintf(format, args...))
+	return withResult(cs, cfg, cr, resultInconclusive)
+}
+
+// skipped builds a SKIP caseReport with one problem (05 §18.4: a missing precondition).
+func skipped(cs caseSpec, cfg gateConfig, problem string) caseReport {
+	cr := newCaseReport(cs, cfg)
+	cr.Problems = append(cr.Problems, problem)
+	return withResult(cs, cfg, cr, resultSkip)
+}
+
+// premiseProblem is the first unproven premise of rec for cs, or "" (05 §18.6: an unproven premise is
+// INCONCLUSIVE, not FAIL).
+func premiseProblem(cs caseSpec, rec recording) string {
 	switch {
 	case !rec.reparented:
-		return inconclusive(cs, cfg, "fixtures weren't reparented under explorer.exe")
+		return "fixtures weren't reparented under explorer.exe"
 	case rec.silenceFail:
-		return inconclusive(cs, cfg, "the silence pre-check failed: another app is playing")
+		return "the silence pre-check failed: other apps are playing"
 	case rec.lostGapMs > 30:
-		return inconclusive(cs, cfg, "the harness lost audio: a %d ms gap in PCM-tap capture", rec.lostGapMs)
-	case len(rec.foreign) > 0:
-		return inconclusive(cs, cfg, "another app was heard during a window")
+		return fmt.Sprintf("the harness lost audio: a %d ms gap in PCM-tap capture", rec.lostGapMs)
+	case cs.forceFastPath && rec.keptOutOther:
+		return "a non-fixture process is kept out (named on the console): quit voice apps before the fast-path cases"
 	}
-
-	// Every fixture that plays a tone (a check with a role) must have appeared active and not exited early.
-	for _, role := range playingRoles(cs) {
+	windowFrom := rec.expectFrom(cs)
+	for _, f := range rec.foreign {
+		if f.t >= windowFrom && f.t <= rec.recordDur {
+			return "another app was heard during the window"
+		}
+	}
+	for _, role := range checkedRoles(cs) {
 		tr := rec.roles[role]
 		switch {
 		case tr == nil || tr.neverActive:
-			return inconclusive(cs, cfg, "a fixture never appeared as an active playing app")
+			return "a fixture never appeared as an active session"
 		case tr.exitedEarly:
-			return inconclusive(cs, cfg, "a fixture exited early — it may never have played")
+			return "a fixture exited early: it may never have played"
 		}
 	}
+	return ""
+}
 
-	cr := caseReport{
-		Name: cs.name, Required: cs.requiredUnder(cfg), Measured: map[string]measure{},
-		Counters: cloneCounters(rec.counters), ClicksAt: []float64{}, Problems: []string{},
-		Engine: enginesSeen(rec), Events: redactEvents(rec.events),
+// expectFrom is where cs's engine, banner and foreign-app checks start (zero = 1.5 s).
+func (rec recording) expectFrom(cs caseSpec) float64 {
+	if t, ok := rec.resolveBound(cs.expectFrom, false); ok && t > 0 {
+		return t
+	}
+	return 1.5
+}
+
+// evaluate runs the portable verdict for a non-special case (05 §18.6). A FAIL is downgraded to INCONCLUSIVE only by
+// the premises ("the premise couldn't be proven"), never by "it was close".
+func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
+	if p := premiseProblem(cs, rec); p != "" {
+		return inconclusive(cs, cfg, "%s", p)
 	}
 
-	m := mono(rec.left, rec.right)
-	fail := false
-
-	// Resolve and evaluate the checks. P_min is the lowest present level, so compute levels first.
-	type pending struct {
-		spec  checkSpec
-		from  float64
-		to    float64
-		level float64
-	}
-	var pend []pending
-	pMin := 0.0
-	for _, c := range cs.checks {
+	// Resolve every event-relative window and measurement first: an event that never happened is INCONCLUSIVE.
+	type window struct{ from, to float64 }
+	wins := make([]window, len(cs.checks))
+	for i, c := range cs.checks {
 		from, ok1 := rec.resolveBound(c.from, false)
 		to, ok2 := rec.resolveBound(c.to, true)
 		if !ok1 || !ok2 {
 			return inconclusive(cs, cfg, "an event-relative window never resolved: a fixture didn't start")
 		}
-		level := toneLevelDB(segment(m, sampleRate, from, to), sampleRate, c.freq)
-		if c.expect == expectPresent && level < pMin {
-			pMin = level
-		}
-		pend = append(pend, pending{spec: c, from: from, to: to, level: level})
+		wins[i] = window{from, to}
 	}
-	for _, p := range pend {
-		rep := checkReport{Freq: p.spec.freq, From: p.from, To: toReported(p.spec.to, p.to), Expect: p.spec.expect,
-			LevelDB: roundDB(p.level)}
-		switch p.spec.expect {
+	for _, ms := range cs.measures {
+		if !rec.measureEventsHappened(ms) {
+			return inconclusive(cs, cfg, "the event %s is measured from never happened: a fixture didn't start", ms.key)
+		}
+	}
+
+	cr := newCaseReport(cs, cfg)
+	cr.Counters = cloneCounters(rec.counters)
+	cr.Engine = enginesSeen(rec)
+	cr.Events = redactEvents(rec.events, rec.roleApp)
+
+	m := mono(rec.left, rec.right)
+	fail := false
+
+	// P_min is the lowest present level, so compute every level first.
+	levels := make([]float64, len(cs.checks))
+	pMin := 0.0
+	for i, c := range cs.checks {
+		levels[i] = toneLevelDB(segment(m, sampleRate, wins[i].from, wins[i].to), sampleRate, c.freq)
+		if c.expect == expectPresent && levels[i] < pMin {
+			pMin = levels[i]
+		}
+	}
+	for i, c := range cs.checks {
+		w := wins[i]
+		rep := checkReport{Freq: c.freq, From: round3(w.from), To: toReported(c.to, w.to), Expect: c.expect,
+			LevelDB: roundDB(levels[i])}
+		switch c.expect {
 		case expectPresent:
-			rep.Pass = p.level >= presentMinDB
+			rep.Pass = levels[i] >= presentMinDB
 		case expectAbsent:
-			maxShort, atS := shortWindow(segment(m, sampleRate, p.from, p.to), sampleRate, p.spec.freq)
+			maxShort, atS := shortWindow(segment(m, sampleRate, w.from, w.to), sampleRate, c.freq)
 			rep.MaxShortDB = roundDB(maxShort)
-			rep.MaxShortAtS = round3(p.from + atS)
-			rep.Pass = p.level <= absentMaxDB && p.level <= pMin-absentMarginDB && maxShort <= absentMaxDB
+			rep.MaxShortAtS = round3(w.from + atS + shortWindowSec/2) // the window's centre
+			rep.Pass = levels[i] <= absentMaxDB && levels[i] <= pMin-absentMarginDB && maxShort <= absentMaxDB
 		default: // info
 			rep.Pass = true
 		}
@@ -198,7 +265,13 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 		cr.Checks = append(cr.Checks, rep)
 
 		// Positive control for the check's fixture role, over the check's window (05 §18.6).
-		if problem := rec.controlProblem(p.spec, p.from, p.to); problem != "" {
+		if problem := rec.controlProblem(c, w.from, w.to); problem != "" {
+			cr.Problems = append(cr.Problems, problem)
+			fail = true
+		}
+	}
+	for _, rc := range cs.rowChecks {
+		if problem := rec.rowCheckProblem(rc); problem != "" {
 			cr.Problems = append(cr.Problems, problem)
 			fail = true
 		}
@@ -217,10 +290,11 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 		}
 	}
 
-	// Engine and banner expectations in every sample (05 §18.6).
+	// Engine and banner expectations in every sample of the window (05 §18.6).
+	from := rec.expectFrom(cs)
 	if cs.engineThroughout != "" {
 		for _, e := range rec.engineAt {
-			if e.value != cs.engineThroughout {
+			if e.t >= from && e.t <= rec.recordDur && e.value != cs.engineThroughout {
 				cr.Problems = append(cr.Problems, fmt.Sprintf("engine was %q at %.2fs, want %q throughout", e.value,
 					e.t, cs.engineThroughout))
 				fail = true
@@ -230,7 +304,7 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 	}
 	if cs.bannerThroughout != "" {
 		for _, b := range rec.bannerAt {
-			if !slices.Contains(b.codes, cs.bannerThroughout) {
+			if b.t >= from && b.t <= rec.recordDur && !slices.Contains(b.codes, cs.bannerThroughout) {
 				cr.Problems = append(cr.Problems, fmt.Sprintf("banner %q missing from the sample at %.2fs",
 					cs.bannerThroughout, b.t))
 				fail = true
@@ -239,7 +313,7 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 		}
 	}
 
-	// Measured cut/onset and the driver's session-lag and fast-path-exit values (05 §17, §18.6).
+	// Measured cut/onset, session lag and fast-path exit (05 §17, §18.6).
 	for _, ms := range cs.measures {
 		value, ok := rec.measureValue(ms, m)
 		if !ok {
@@ -263,82 +337,158 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 		}
 	}
 
-	cr.Result = resultPass
+	result := resultPass
 	if fail {
-		cr.Result = resultFail
+		result = resultFail
 	}
-	cr.Result = effectiveResult(cs, cfg, cr.Result)
-	return cr
+	return withResult(cs, cfg, cr, result)
 }
 
-// controlProblem checks the positive control a check implies about its fixture role over [from, to] (05 §18.6):
-// every sample where the role is active must have the expected verdict (and reason and detail when given). It
-// returns "" when the control holds, else a redacted problem.
+// controlProblem checks the positive control a check implies about its fixture role over [from, to] (05 §18.6): a
+// present check's fixture must not be kept_out in any sample where it is active; an absent check's must be kept_out
+// (or the expected not_captured) with the expected reason in every such sample. It returns "" when the control holds,
+// else a redacted problem.
 func (rec recording) controlProblem(c checkSpec, from, to float64) string {
-	if c.role == "" {
-		return "" // a harness-played frequency has no fixture row
-	}
 	want := c.ctl
 	if want == "" {
 		switch c.expect {
 		case expectPresent:
-			want = controlHeard
+			want = controlNotKeptOut
 		case expectAbsent:
 			want = controlKeptOut
 		default:
-			return "" // an info check without an explicit control asserts nothing about the row
+			want = controlNone
 		}
+	}
+	if c.role == "" || want == controlNone {
+		return ""
 	}
 	tr := rec.roles[c.role]
 	if tr == nil {
 		return "a fixture never appeared in the report"
 	}
 	for _, s := range tr.samples {
-		if s.t < from || (to > 0 && s.t > to) || !s.active {
+		if s.t < from || s.t > to || !s.active {
+			continue
+		}
+		if want == controlNotKeptOut {
+			if s.verdict == controlKeptOut {
+				return fmt.Sprintf("a fixture was kept_out at %.2fs in a present window", s.t)
+			}
 			continue
 		}
 		if s.verdict != want {
-			return fmt.Sprintf("a fixture was %q in its window, want %q", s.verdict, want)
+			return fmt.Sprintf("a fixture was %q at %.2fs in its window, want %q", s.verdict, s.t, want)
 		}
 		if c.reason != "" && s.reason != c.reason {
-			return fmt.Sprintf("a fixture's reason was %q, want %q", s.reason, c.reason)
-		}
-		if c.detail != "" && !strings.EqualFold(s.detail, c.detail) {
-			return fmt.Sprintf("a fixture's detail was %q, want %q", s.detail, c.detail)
+			return fmt.Sprintf("a fixture's reason was %q at %.2fs, want %q", s.reason, s.t, c.reason)
 		}
 	}
 	return ""
 }
 
-// measureValue is the measured value in ms for ms, and whether it could be measured (05 §18.6).
-func (rec recording) measureValue(ms measureSpec, m []float64) (int, bool) {
-	switch ms.kind {
-	case measureFromDriver:
-		v, ok := rec.driverMeas[ms.key]
-		return v, ok
-	default: // measureFromAudio
-		ev, ok := rec.resolveBound(ms.event, false)
-		if !ok {
-			return 0, false
+// rowCheckProblem checks a row or session expectation (05 §18.5) in every sample at or after its start where the
+// role's session is active; at least one such sample must exist.
+func (rec recording) rowCheckProblem(rc rowCheck) string {
+	from, _ := rec.resolveBound(firstNonZero(rc.from, at(1.5)), false)
+	tr := rec.roles[rc.role]
+	if tr == nil {
+		return "a fixture never appeared in the report"
+	}
+	seen := false
+	for _, s := range tr.samples {
+		if s.t < from || s.t > rec.recordDur || !s.active {
+			continue
 		}
-		cutS, cutOK, onsetS, onsetOK := measuredCutOnset(m, sampleRate, ms.freq, ev)
-		switch ms.key {
-		case measureCut:
-			if !cutOK {
-				return 0, true // the tone was already silent at the event: a 0 ms cut
-			}
-			return int(math.Round((cutS - ev) * 1000)), true
-		case measureOnset:
-			if !onsetOK {
-				return 0, false
-			}
-			return int(math.Round((onsetS - ev) * 1000)), true
+		seen = true
+		if rc.note != "" && s.note != rc.note {
+			return fmt.Sprintf("a fixture's session note was %q at %.2fs, want %q", s.note, s.t, rc.note)
 		}
-		return 0, false
+		if rc.verdict == "" && rc.reason == "" && rc.detail == "" {
+			continue
+		}
+		switch {
+		case !s.row:
+			return fmt.Sprintf("a fixture's app row was missing at %.2fs", s.t)
+		case rc.verdict != "" && s.rowVerdict != rc.verdict:
+			return fmt.Sprintf("a fixture's app row was %q at %.2fs, want %q", s.rowVerdict, s.t, rc.verdict)
+		case rc.reason != "" && s.rowReason != rc.reason:
+			return fmt.Sprintf("a fixture's app row reason was %q at %.2fs, want %q", s.rowReason, s.t, rc.reason)
+		case rc.detail != "" && !strings.EqualFold(s.rowDetail, rc.detail):
+			return fmt.Sprintf("a fixture's app row detail at %.2fs is not the expected app", s.t)
+		}
+	}
+	if !seen {
+		return "a fixture's session was never active in its row check's window"
+	}
+	return ""
+}
+
+// measureEventsHappened reports whether the events ms is measured from exist (an absent one is INCONCLUSIVE).
+func (rec recording) measureEventsHappened(ms measureSpec) bool {
+	switch ms.key {
+	case measureSessionLag:
+		_, ok1 := rec.sessionCreated(ms.role)
+		_, ok2 := rec.firstRender[ms.role]
+		return ok1 && ok2
+	case measureFastpathExit:
+		_, ok := rec.sessionCreated(ms.role)
+		return ok
+	default:
+		_, ok := rec.resolveBound(ms.event, false)
+		return ok
 	}
 }
 
-// playingRoles are the fixture roles a case plays a tone from (a check with a role): each must appear active.
+// measureValue is the measured value in ms for ms, and whether it could be measured (05 §18.6, §18.7).
+func (rec recording) measureValue(ms measureSpec, m []float64) (int, bool) {
+	switch ms.key {
+	case measureSessionLag:
+		// session lag = the voice app's session_created − its own logged firstRenderNs (05 §18.5 case 5).
+		created, ok1 := rec.sessionCreated(ms.role)
+		fr, ok2 := rec.firstRender[ms.role]
+		if !ok1 || !ok2 {
+			return 0, false
+		}
+		return int(math.Round((created - fr) * 1000)), true
+	case measureFastpathExit:
+		// The first fastpath_exit since the voice app started, minus its session_created (≤ 15 ms, §17).
+		created, ok := rec.sessionCreated(ms.role)
+		if !ok {
+			return 0, false
+		}
+		from := created
+		if s, ok := rec.roleStart[ms.role]; ok {
+			from = s
+		}
+		for _, e := range rec.events {
+			if e.code == "fastpath_exit" && e.t >= from {
+				return int(math.Round((e.t - created) * 1000)), true
+			}
+		}
+		return 0, false
+	}
+	ev, ok := rec.resolveBound(ms.event, false)
+	if !ok {
+		return 0, false
+	}
+	cutS, cutOK, onsetS, onsetOK := measuredCutOnset(m, sampleRate, ms.freq, ev)
+	switch ms.key {
+	case measureCut:
+		if !cutOK {
+			return 0, true // the tone was already silent at the event: a 0 ms cut
+		}
+		return int(math.Round((cutS - ev) * 1000)), true
+	case measureOnset:
+		if !onsetOK {
+			return 0, false
+		}
+		return int(math.Round((onsetS - ev) * 1000)), true
+	}
+	return 0, false
+}
+
+// playingRoles are the fixture roles a case checks a tone of (a check with a role): each must appear active.
 func playingRoles(cs caseSpec) []string {
 	var out []string
 	for _, c := range cs.checks {
@@ -349,9 +499,20 @@ func playingRoles(cs caseSpec) []string {
 	return out
 }
 
+// checkedRoles are the playing roles plus the roles of the row checks: the positive controls cover all of them.
+func checkedRoles(cs caseSpec) []string {
+	out := playingRoles(cs)
+	for _, rc := range cs.rowChecks {
+		if !slices.Contains(out, rc.role) {
+			out = append(out, rc.role)
+		}
+	}
+	return out
+}
+
 // enginesSeen is the distinct engine values across the report samples, in first-seen order.
 func enginesSeen(rec recording) []string {
-	var out []string
+	out := []string{}
 	for _, e := range rec.engineAt {
 		if e.value != "" && !slices.Contains(out, e.value) {
 			out = append(out, e.value)
@@ -360,14 +521,29 @@ func enginesSeen(rec recording) []string {
 	return out
 }
 
-// redactEvents maps engine events to redacted report events (05 §18.7): the time in ms, the code, and the fixture
-// role (already redacted to "fixture:<role>" by the driver, or "").
-func redactEvents(events []recEvent) []reportEvent {
+// redactEvents maps engine events to redacted report events (05 §18.7): the time in ms, the code, and the app as
+// "fixture:<role>" for a fixture's app id (roles sharing an app id show the first by name), "other" for any other
+// app, "" for an engine-wide event.
+func redactEvents(events []recEvent, roleApp map[string]string) []reportEvent {
+	roles := make([]string, 0, len(roleApp))
+	for role := range roleApp {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	appRole := map[string]string{}
+	for _, role := range roles {
+		if _, ok := appRole[roleApp[role]]; !ok {
+			appRole[roleApp[role]] = role
+		}
+	}
 	out := make([]reportEvent, 0, len(events))
 	for _, e := range events {
 		app := ""
-		if e.role != "" {
-			app = fixturePrefix + e.role
+		if e.app != "" {
+			app = otherRedacted
+			if role, ok := appRole[e.app]; ok {
+				app = fixturePrefix + role
+			}
 		}
 		out = append(out, reportEvent{TMs: int(math.Round(e.t * 1000)), Code: e.code, App: app})
 	}
@@ -382,7 +558,7 @@ func cloneCounters(c map[string]int) map[string]int {
 	return out
 }
 
-// firstNonZero returns b when it is set, else def (used for the click window's default start).
+// firstNonZero returns b when it is set, else def (used for the default window starts).
 func firstNonZero(b, def bound) bound {
 	if b.event == "" && b.abs == 0 {
 		return def

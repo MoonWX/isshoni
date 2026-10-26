@@ -10,16 +10,16 @@ func TestSummaryLine(t *testing.T) {
 	r := report{
 		Harness: "v0.2.0-14-g1a2b3c4",
 		DLL:     dllInfo{Version: "0.2.0", SHA256: "3f9a1c0b7d2e9f00112233"},
-		OS:      osInfo{Product: "win11", Build: 26200, UBR: 6899, Edition: "Pro"},
 		Gate:    true,
 		Summary: summary{Pass: 21, Info: 2, Exit: 0},
+		OS:      osInfo{Product: "win11", Build: 26200, UBR: 6899, Edition: "Professional"},
 	}
 	got := summaryLine(r)
 	for _, want := range []string{
 		"isshoni-audiotest v0.2.0-14-g1a2b3c4",
 		"DLL 0.2.0 sha256:3f9a1c0b7d2e", // shortened to 12 hex
 		"Windows 11 Pro 26200.6899",
-		"21/23 PASS", "0 FAIL", "2 INFO", "gate=PASS",
+		"21/21 PASS", "0 FAIL", "2 INFO", "gate=PASS", // INFO is not in the total (05 §18.7's 24/24 with 2 INFO)
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("summary line %q missing %q", got, want)
@@ -71,7 +71,8 @@ func TestReportJSONShape(t *testing.T) {
 			MaxShortDB: -128.4, MaxShortAtS: 6.31, Pass: true}},
 		Measured: map[string]measure{measureCut: {ValueMs: 58, BudgetMs: 100}},
 		ClicksAt: []float64{}, Counters: map[string]int{"underruns": 0},
-		Events: redactEvents([]recEvent{{t: 1.21, code: "stream_running", role: "game"}}),
+		Events: redactEvents([]recEvent{{t: 1.21, code: "stream_running", app: "exe:game.exe"}},
+			map[string]string{"game": "exe:game.exe"}),
 	}
 	r := report{V: 1, Harness: "dev", Gate: true, GateCfg: gateConfig{FastPath: true},
 		Summary: summarize([]caseReport{cr}, 0), Cases: []caseReport{cr}}

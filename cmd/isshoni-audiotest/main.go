@@ -13,6 +13,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -59,17 +60,27 @@ func main() {
 }
 
 // cmdSelfcheck runs the portable analyzer self-test, then the engine self-check (Windows). On an OS without the
-// engine it runs the analyzer only and skips the engine part (05 §18.2 runs on CI Windows).
+// engine it runs the analyzer only and skips the engine part; on Windows a DLL that doesn't load (missing, wrong
+// ABI, an export missing, the test hooks unresolved) fails it with exit 1 (05 §18.2 runs it on CI Windows).
 func cmdSelfcheck(w io.Writer) int {
+	return selfcheckWith(w, newDriver)
+}
+
+// selfcheckWith is cmdSelfcheck with the driver constructor injected (tests).
+func selfcheckWith(w io.Writer, open func(driverOptions) (driver, error)) int {
 	fmt.Fprintln(w, "isshoni-audiotest selfcheck")
 	if err := analyzerSelfCheck(w); err != nil {
 		fmt.Fprintln(w, "analyzer self-check failed:", err)
 		return exitFail
 	}
-	drv, err := newDriver(driverOptions{})
-	if err != nil {
+	drv, err := open(driverOptions{})
+	if errors.Is(err, errUnsupportedOS) {
 		fmt.Fprintln(w, "  engine self-check skipped:", err)
 		return exitAllPass
+	}
+	if err != nil {
+		fmt.Fprintln(w, "engine self-check failed:", err)
+		return exitFail
 	}
 	defer func() { _ = drv.close() }()
 	if err := drv.selfCheck(w); err != nil {

@@ -164,3 +164,39 @@ func measuredCutOnset(m []float64, fs, freq, tEvent float64) (cutS float64, cutO
 	}
 	return cutS, cutOK, onsetS, onsetOK
 }
+
+// The silence pre-check's limits (05 §18.4): before a case, 1 s of endpoint loopback must have every case frequency
+// at or below −70 dBFS and an overall RMS at or below −60 dBFS.
+const (
+	silenceToneMaxDB = -70.0
+	silenceRMSMaxDB  = -60.0
+)
+
+// silenceProblem checks the silence pre-check on 1 s of endpoint loopback (mono): it returns "" when every frequency
+// of freqs is at or below −70 dBFS and the RMS at or below −60 dBFS, else what was heard.
+func silenceProblem(m []float64, freqs []float64) string {
+	if len(m) < sampleRate/2 {
+		return "the silence pre-check captured too little audio"
+	}
+	for _, f := range freqs {
+		if db := toneLevelDB(m, sampleRate, f); db > silenceToneMaxDB {
+			return "a case frequency is already playing"
+		}
+	}
+	if db := rmsDB(m); db > silenceRMSMaxDB {
+		return "the loopback is not silent"
+	}
+	return ""
+}
+
+// rmsDB is the RMS of x in dBFS (relative to full scale 1.0).
+func rmsDB(x []float64) float64 {
+	if len(x) == 0 {
+		return silenceFloorDB
+	}
+	var sum float64
+	for _, v := range x {
+		sum += v * v
+	}
+	return 20 * math.Log10(math.Max(math.Sqrt(sum/float64(len(x))), 1e-10))
+}

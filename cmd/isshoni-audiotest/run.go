@@ -32,15 +32,19 @@ type runOptions struct {
 }
 
 // runCases is the body of the `run` subcommand. It returns the process exit code (05 §18.2's 0–4). A setup error
-// (no engine, no DLL, no endpoint) is exit 4; otherwise the gate rule decides.
+// (no engine, no DLL) is exit 4; otherwise the gate rule decides.
 func runCases(w io.Writer, opts runOptions) int {
-	drv, err := newDriver(driverOptions{keepWAV: opts.keepWAV})
+	drv, err := newDriver(driverOptions{keepWAV: opts.keepWAV, console: w})
 	if err != nil {
 		fmt.Fprintln(w, "setup error:", err)
 		return exitSetup
 	}
 	defer func() { _ = drv.close() }()
+	return runWith(w, drv, opts)
+}
 
+// runWith runs the selected cases on drv, writes the report and prints the summary line.
+func runWith(w io.Writer, drv driver, opts runOptions) int {
 	dll, osi, mach, err := drv.env()
 	if err != nil {
 		fmt.Fprintln(w, "setup error:", err)
@@ -56,26 +60,14 @@ func runCases(w io.Writer, opts runOptions) int {
 	if opts.long {
 		fmt.Fprintln(w, "note: -long (soak) cases are added by WA62b and are not in this build")
 	}
-
-	reports := make([]caseReport, 0, len(selected))
-	for _, cs := range selected {
-		var cr caseReport
-		if cs.special != "" {
-			cr, err = drv.runSpecial(cs, cfg)
-			if err != nil {
-				cr = inconclusive(cs, cfg, "the case could not run: %s", err)
-			}
-		} else {
-			rec, rerr := drv.runCase(cs, cfg)
-			if rerr != nil {
-				cr = inconclusive(cs, cfg, "the case could not run: %s", rerr)
-			} else {
-				cr = evaluate(cs, rec, cfg)
-			}
-		}
-		reports = append(reports, cr)
+	if opts.noRedact {
+		fmt.Fprintln(w, "note: -no-redact is added by WA62b; this build writes the redacted report")
+	}
+	if len(mach.RenderEndpoints) == 0 {
+		fmt.Fprintln(w, "note: no active render endpoint: every case is SKIP (05 §18.4)")
 	}
 
+	reports := runSelected(drv, selected, cfg, len(mach.RenderEndpoints) > 0)
 	exit := exitCode(reports)
 	r := report{
 		V: reportVersion, Harness: harnessVer(), DLL: dll, OS: osi, Machine: mach,
@@ -89,6 +81,48 @@ func runCases(w io.Writer, opts runOptions) int {
 	}
 	fmt.Fprintln(w, summaryLine(r))
 	return exit
+}
+
+// baselineBroken is the problem every case after a failed case 1 carries (05 §18.5).
+const baselineBroken = "case 1 (baseline-endpoint) failed: the audio setup is broken, not isshoni"
+
+// runSelected runs the cases in order (05 §18.4, §18.5): without an active render endpoint every case is SKIP; once
+// case 1 FAILs, every later case is INCONCLUSIVE without running.
+func runSelected(drv driver, selected []caseSpec, cfg gateConfig, haveEndpoint bool) []caseReport {
+	reports := make([]caseReport, 0, len(selected))
+	broken := false
+	for _, cs := range selected {
+		var cr caseReport
+		switch {
+		case !haveEndpoint:
+			cr = skipped(cs, cfg, "no active render endpoint")
+		case broken:
+			cr = inconclusive(cs, cfg, "%s", baselineBroken)
+		default:
+			cr = runOne(drv, cs, cfg)
+		}
+		if cs.num == 1 && cr.Result == resultFail {
+			broken = true
+		}
+		reports = append(reports, cr)
+	}
+	return reports
+}
+
+// runOne runs one case on drv and scores it; a case that could not run is INCONCLUSIVE.
+func runOne(drv driver, cs caseSpec, cfg gateConfig) caseReport {
+	if cs.special != "" {
+		cr, err := drv.runSpecial(cs, cfg)
+		if err != nil {
+			return inconclusive(cs, cfg, "the case could not run: %s", err)
+		}
+		return withResult(cs, cfg, cr, cr.Result)
+	}
+	rec, err := drv.runCase(cs, cfg)
+	if err != nil {
+		return inconclusive(cs, cfg, "the case could not run: %s", err)
+	}
+	return evaluate(cs, rec, cfg)
 }
 
 // selectCases is the cases to run: the explicit -case list (by name or number), or every case in the table.

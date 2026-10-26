@@ -5,7 +5,8 @@ package main
 // multi-endpoint case 22 and the soak case 23 are added by WA62b. M3 and M4 add their own fixtures later.
 //
 // A case is pure data: its checks drive the portable verdict (verdict.go) on a recording, and its fixture plan
-// drives the Windows driver (driver_windows.go). The frequencies are 05 §18.3's (all −18 dBFS, ≥ 90 Hz apart).
+// drives the Windows driver (driver_windows.go, through fixtureplan.go). The frequencies are 05 §18.3's (all
+// −18 dBFS, ≥ 90 Hz apart).
 
 // The fixture frequencies (05 §18.3).
 const (
@@ -17,6 +18,7 @@ const (
 	freqSelf       = 907  // isshoni's own playback (and the late isshoni child of case 26)
 	freqChimeLow   = 880  // case 27's sound-check chime partials (§11.3)
 	freqChimeHigh  = 1320
+	freqBursts     = 2000 // case 20's bursts (im_test_render_bursts)
 )
 
 // requirement is how a case contributes to the gate exit code (05 §18.5, §18.10).
@@ -37,12 +39,21 @@ const (
 	expectInfo    = "info"
 )
 
-// The positive-control verdicts a check asserts about its fixture role (05 §18.6, §12.1).
+// The positive-control verdicts a check asserts about its fixture role (05 §18.6, §12.1). controlNotKeptOut is a
+// present check's control (§18.6: "must not be kept_out in any sample inside that check's window"); controlNone
+// asserts nothing about the verdict (the endpoint engine keeps the policy's verdict while it hears every app, so
+// cases 1 and 19 check the sound and the engine, not the row).
 const (
 	controlHeard       = "heard"
 	controlKeptOut     = "kept_out"
 	controlNotCaptured = "not_captured"
+	controlNotKeptOut  = "not_kept_out"
+	controlNone        = "none"
 )
+
+// selfRole is the role of the harness's own process: it plays a tone itself in cases 4 and 10 (05 §18.5), and its
+// rows are isshoni's.
+const selfRole = "self"
 
 // eventTSet names the recorder's SetExclusions stamp as a window bound or a measurement event (case 15's T_set).
 const eventTSet = "T_set"
@@ -69,9 +80,9 @@ func end() bound { return bound{} }
 // afterTSet is a bound at the recorder's SetExclusions stamp plus offset seconds.
 func afterTSet(offset float64) bound { return bound{event: eventTSet, offset: offset} }
 
-// checkSpec is one frequency check of a case (05 §18.5, §18.6). role is the fixture role that plays freq ("" =
-// harness-played, no positive control). ctl overrides the control verdict derived from expect (present → heard,
-// absent → kept_out); reason and detail are the expected report reason and detail for that control.
+// checkSpec is one frequency check of a case (05 §18.5, §18.6). role is the fixture role that plays freq (selfRole
+// for the harness itself). ctl overrides the control derived from expect (present → not kept out, absent → kept
+// out, info → none); reason is the expected session reason for that control.
 type checkSpec struct {
 	freq   float64
 	from   bound
@@ -80,40 +91,45 @@ type checkSpec struct {
 	role   string
 	ctl    string
 	reason string
-	detail string
+}
+
+// rowCheck is an app-row or session expectation for a fixture role (05 §18.5: "Discord row kept_out/builtin", "the
+// child's session note = covered"): every report sample at or after from (zero = 1.5 s) in which the role's session
+// is active must show it. verdict, reason and detail are the app row's (looked up by the session's app id); note is
+// the session's. An empty field asserts nothing.
+type rowCheck struct {
+	role    string
+	verdict string
+	reason  string
+	detail  string
+	note    string
+	from    bound
 }
 
 // measureSpec is one event-relative value a case records and asserts (05 §17, §18.6, §18.7).
 type measureSpec struct {
-	key    string // measureCut | measureOnset | measureSessionLag | measureFastpathExit
-	freq   float64
-	event  bound // the event the measurement is relative to (cut/onset only)
-	budget int   // ms
-	// kind is how the value is obtained: measureFromAudio (cut/onset from the tap) or measureFromDriver
-	// (sessionLagMs, fastpathExitMs, which the engine events give).
-	kind int
+	key    string  // measureCut | measureOnset | measureSessionLag | measureFastpathExit
+	freq   float64 // cut/onset only
+	event  bound   // the event a cut or onset is measured from
+	role   string  // session lag and fast-path exit: the fixture whose session_created and firstRenderNs count
+	budget int     // ms
 }
 
-const (
-	measureFromAudio  = iota // cut/onset computed from the tap by the verdict
-	measureFromDriver        // the driver fills the value from engine events/firstRenderNs
-)
-
-// fixtureStep is one fixture the Windows driver starts for a case (05 §18.3). It is declarative data; the driver
-// interprets it (driver_windows.go). role is the fixture's redacted id ("fixture:<role>"). Steps nest through child.
+// fixtureStep is one fixture the Windows driver starts for a case (05 §18.3). It is declarative data; fixtureplan.go
+// turns it into a `fixture` command line. role is the fixture's redacted id ("fixture:<role>"). Steps nest through
+// child: a step with a child is a spawn, which can play a tone itself (`spawn -tone`).
 type fixtureStep struct {
-	role           string
-	exe            string // relative path under the work folder, e.g. `Discord\app-1.0.9999\discord.exe`
-	verb           string // verbTone | verbIdle | verbSpawn | verbReusePID | verbBursts | verbEndpointTone
-	freqs          []float64
-	amp            float64 // 0 = the default −18 dBFS
-	at             float64 // start time relative to recording start; ≤ 0 = before it
-	dur            float64 // tone length (s); 0 = until the case ends
-	mic            bool
-	orphanAfter    float64 // > 0: the process exits this long after starting (orphan case)
-	child          *fixtureStep
-	underExplorer  bool // top-level fixtures are reparented under explorer.exe; a harness-own child is not
-	logFirstRender bool // the fixture prints {"firstRenderNs": N} before its first PlaySoundW
+	role          string
+	exe           string    // relative path under the work folder, e.g. `Discord\app-1.0.9999\discord.exe`
+	verb          string    // verbTone | verbIdle | verbSpawn
+	freqs         []float64 // the tone (a spawn's -tone)
+	amp           float64   // 0 = the default −18 dBFS
+	at            float64   // start time relative to the recording start; ≤ 0 = with its parent (top level: at the settle)
+	dur           float64   // how long it plays or lives (s); 0 = until the case ends
+	mic           bool
+	orphanAfter   float64 // > 0: a spawn exits this long after it started (orphan case)
+	child         *fixtureStep
+	underExplorer bool // top-level fixtures are reparented under explorer.exe; a harness-own child is not
 }
 
 // The fixture verbs (05 §18.3).
@@ -133,14 +149,19 @@ type caseSpec struct {
 	desc string
 	req  requirement
 
-	checks   []checkSpec
-	measures []measureSpec
+	checks    []checkSpec
+	rowChecks []rowCheck
+	measures  []measureSpec
 
-	// engineThroughout, if set, must be the report's engine in every sample of the case ("include-set",
-	// "exclude-self", "endpoint"); "" = any.
+	// engineThroughout, if set, must be the report's engine in every sample inside [expectFrom, end]
+	// ("include-set", "exclude-self", "endpoint"); "" = any. 05 §18.6 limits the expectations to the window: right
+	// after Start the engine can still be "none", or (with the fail-probe flag) the include set until the probe
+	// fails.
 	engineThroughout string
-	// bannerThroughout, if set, must be present in every sample's banners (case 19: exclusion-unavailable).
+	// bannerThroughout, if set, must be present in every sample's banners inside [expectFrom, end] (case 19).
 	bannerThroughout string
+	// expectFrom is where the engine and banner expectations start (zero = 1.5 s, the default check window).
+	expectFrom bound
 	// counterZero are report counters that must stay 0 (case 5's fastpathLateCuts).
 	counterZero []string
 
@@ -151,7 +172,8 @@ type caseSpec struct {
 	noClick   bool
 
 	// forceFastPath makes the engine run with Exclusions.FastPath on regardless of the shipped default (cases 4, 5,
-	// 26 test the fast path even when the release ships it off, §18.10).
+	// 26 test the fast path even when the release ships it off, §18.10). Such a case is INCONCLUSIVE when a
+	// non-fixture process is kept out (05 §18.4).
 	forceFastPath bool
 	// failProbe makes the engine behave as if the startup probe failed (IM_AUDIOF_TEST_FAIL_PROBE: cases 1, 19).
 	failProbe bool
@@ -159,12 +181,15 @@ type caseSpec struct {
 	seedInclude []string
 	// viewer, if set, is a SetViewerBrowser call the case makes (case 11, 24): {connID, family, os}.
 	viewer *viewerCall
+	// selfTone, if set, is a frequency the harness plays itself through PlaySoundW for the whole case, from the
+	// settle on (cases 4 and 10): isshoni's own playback, role selfRole.
+	selfTone float64
 
 	// special, if set, routes the case to the driver's own handler instead of the tone verdict: "timestamps"
 	// (case 20), "opus" (case 21), "pid-reuse" (case 27).
 	special string
 
-	// fixtures is the Windows fixture plan (driver_windows.go).
+	// fixtures is the Windows fixture plan (fixtureplan.go, driver_windows.go).
 	fixtures []fixtureStep
 }
 
@@ -175,17 +200,37 @@ type viewerCall struct {
 
 // present and absent build the common checks over the default window [1.5 s, end].
 func present(freq float64, role string) checkSpec {
-	return checkSpec{freq: freq, from: at(1.5), to: end(), expect: expectPresent, role: role, ctl: controlHeard}
+	return checkSpec{freq: freq, from: at(1.5), to: end(), expect: expectPresent, role: role, ctl: controlNotKeptOut}
 }
 
 func absent(freq float64, role string) checkSpec {
 	return checkSpec{freq: freq, from: at(1.5), to: end(), expect: expectAbsent, role: role, ctl: controlKeptOut}
 }
 
-// harnessAbsent is an absent check for a frequency the harness itself plays (no fixture role, so no control).
-func harnessAbsent(freq float64) checkSpec {
-	return checkSpec{freq: freq, from: at(1.5), to: end(), expect: expectAbsent}
+// selfAbsent is an absent check for a frequency the harness itself plays (cases 4 and 10): its session must be
+// active and kept out with reason isshoni.
+func selfAbsent(freq float64) checkSpec {
+	return checkSpec{freq: freq, from: at(1.5), to: end(), expect: expectAbsent, role: selfRole, ctl: controlKeptOut,
+		reason: "isshoni"}
 }
+
+// The fixture paths of 05 §18.3's work-folder layout.
+const (
+	exeGame      = `Games\game.exe`
+	exeGame2     = `Games2\game2.exe`
+	exeDiscord   = `Discord\app-1.0.9999\discord.exe`
+	exeVoiceHelp = `Discord\app-1.0.9999\voicehelper.exe`
+	exeAudioHelp = `Discord\app-1.0.9999\audiohelper.exe`
+	exeTeamSpeak = `TeamSpeak\teamspeak.exe`
+	exeTeams     = `Teams\ms-teams.exe`
+	exeWebView2  = `WebView2Runtime\msedgewebview2.exe`
+	exeEdge      = `Microsoft\Edge\Application\msedge.exe`
+	exeFakeVoice = `FakeVoice\fakevoice.exe`
+	exeLauncherX = `LauncherX\launcherx.exe`
+	exeBrowser   = `Browser\browser.exe`
+	exeSelfWV    = `SelfWebView\msedgewebview2.exe`
+	exeBursts    = `Bursts\bursts.exe`
+)
 
 // cases returns the case table of the cases WA62a owns, in case-number order (05 §18.5). WA62b appends 9, 12–14, 22
 // and 23.
@@ -195,10 +240,15 @@ func cases() []caseSpec {
 			num: 1, name: "baseline-endpoint", req: reqYes, failProbe: true,
 			desc:             "endpoint engine (fail-probe); game and a voice app both heard: the audio setup works",
 			engineThroughout: "endpoint",
-			checks:           []checkSpec{present(freqGame, "game"), present(freqVoice, "voice")},
+			checks: []checkSpec{
+				present(freqGame, "game"),
+				// The endpoint engine hears Discord while the planner keeps the policy's verdict (kept_out/builtin):
+				// the sound and engine "endpoint" are what this case proves, not the row.
+				{freq: freqVoice, from: at(1.5), to: end(), expect: expectPresent, role: "voice", ctl: controlNone},
+			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("voice", `Discord\app-1.0.9999\discord.exe`, freqVoice),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("voice", exeDiscord, freqVoice),
 			},
 		},
 		{
@@ -209,9 +259,10 @@ func cases() []caseSpec {
 				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "voice",
 					ctl: controlKeptOut, reason: "builtin"},
 			},
+			rowChecks: []rowCheck{{role: "voice", verdict: controlKeptOut, reason: "builtin"}},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("voice", `Discord\app-1.0.9999\discord.exe`, freqVoice),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("voice", exeDiscord, freqVoice),
 			},
 		},
 		{
@@ -221,20 +272,21 @@ func cases() []caseSpec {
 				present(freqGame, "game"), absent(freqVoice, "voice"), absent(freqVoice2, "voice2"),
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("voice", `Discord\app-1.0.9999\discord.exe`, freqVoice),
-				explorerTone("voice2", `TeamSpeak\teamspeak.exe`, freqVoice2),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("voice", exeDiscord, freqVoice),
+				explorerTone("voice2", exeTeamSpeak, freqVoice2),
 			},
 		},
 		{
 			num: 4, name: "fast-path", req: reqFastPath, forceFastPath: true, engineThroughout: "exclude-self",
-			desc: "the fast path: one EXCLUDE stream on isshoni's tree; every other app heard from its first sample",
+			selfTone: freqSelf,
+			desc:     "the fast path: one EXCLUDE stream on isshoni's tree; every other app heard from its first sample",
 			checks: []checkSpec{
-				present(freqGame, "game"), present(freqLateGame, "game2"), harnessAbsent(freqSelf),
+				present(freqGame, "game"), present(freqLateGame, "game2"), selfAbsent(freqSelf),
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("game2", `Games2\game2.exe`, freqLateGame),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("game2", exeGame2, freqLateGame),
 			},
 		},
 		{
@@ -242,130 +294,119 @@ func cases() []caseSpec {
 			desc: "a voice app that starts mid-share never leaks under the fast path; the session lag is measured",
 			checks: []checkSpec{
 				present(freqGame, "game"),
-				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "voice", ctl: controlKeptOut},
+				absent(freqVoice, "voice"),
 			},
 			measures: []measureSpec{
-				{key: measureFastpathExit, budget: budgetFastpathExitMs, kind: measureFromDriver},
-				{key: measureSessionLag, budget: budgetSessionLagMs, kind: measureFromDriver},
+				{key: measureFastpathExit, role: "voice", budget: budgetFastpathExitMs},
+				{key: measureSessionLag, role: "voice", budget: budgetSessionLagMs},
 			},
 			counterZero: []string{"fastpathLateCuts"},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "voice", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbTone, freqs: []float64{freqVoice},
-					at: 3, underExplorer: true, logFirstRender: true},
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("game2", exeGame2, freqLateGame), // "as 4 without 907"
+				{role: "voice", exe: exeDiscord, verb: verbTone, freqs: []float64{freqVoice}, at: 3,
+					underExplorer: true},
 			},
 		},
 		{
 			num: 6, name: "helper-tree", req: reqYes,
 			desc: "a grandchild helper and a shared-runtime helper of voice apps are both kept out",
 			checks: []checkSpec{
-				present(freqGame, "game"), absent(freqVoice, "voiceHelper"), absent(freqVoice2, "teamsRuntime"),
+				present(freqGame, "game"), absent(freqVoice, "audiohelper"), absent(freqVoice2, "teamsRuntime"),
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "discord", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbSpawn, underExplorer: true,
-					child: &fixtureStep{role: "voicehelper", exe: `Discord\app-1.0.9999\voicehelper.exe`, verb: verbSpawn,
-						child: &fixtureStep{role: "voiceHelper", exe: `Discord\app-1.0.9999\audiohelper.exe`,
-							verb: verbTone, freqs: []float64{freqVoice}}}},
-				{role: "teams", exe: `Teams\ms-teams.exe`, verb: verbSpawn, underExplorer: true,
-					child: &fixtureStep{role: "teamsRuntime", exe: `WebView2Runtime\msedgewebview2.exe`,
-						verb: verbTone, freqs: []float64{freqVoice2}}},
+				explorerTone("game", exeGame, freqGame),
+				{role: "discord", exe: exeDiscord, verb: verbSpawn, underExplorer: true,
+					child: &fixtureStep{role: "voicehelper", exe: exeVoiceHelp, verb: verbSpawn,
+						child: &fixtureStep{role: "audiohelper", exe: exeAudioHelp, verb: verbTone,
+							freqs: []float64{freqVoice}}}},
+				{role: "teams", exe: exeTeams, verb: verbSpawn, underExplorer: true,
+					child: &fixtureStep{role: "teamsRuntime", exe: exeWebView2, verb: verbTone,
+						freqs: []float64{freqVoice2}}},
 			},
 		},
 		{
 			num: 7, name: "late-helper", req: reqYes,
-			desc: "a helper that a late-started voice app spawns is kept out from its first sample",
+			desc: "a helper that a running voice app spawns mid-share is kept out from its first sample",
 			checks: []checkSpec{
 				present(freqGame, "game"),
-				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "helper", ctl: controlKeptOut},
+				absent(freqVoice, "helper"),
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "discord", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbSpawn, at: 3, underExplorer: true,
-					child: &fixtureStep{role: "helper", exe: `Discord\app-1.0.9999\audiohelper.exe`, verb: verbTone,
-						freqs: []float64{freqVoice}, logFirstRender: true}},
+				explorerTone("game", exeGame, freqGame),
+				// discord.exe runs from the start and spawns its helper at t = 3 s (`spawn -at 4`, 05 §18.5).
+				{role: "discord", exe: exeDiscord, verb: verbSpawn, underExplorer: true,
+					child: &fixtureStep{role: "helper", exe: exeAudioHelp, verb: verbTone,
+						freqs: []float64{freqVoice}, at: 3}},
 			},
 		},
 		{
 			num: 8, name: "late-app", req: reqYes,
 			desc: "an app that starts mid-share is heard within 500 ms of its session; the onset has no click",
 			checks: []checkSpec{
-				{freq: freqLateGame, from: at(3.5), to: at(5.8), expect: expectPresent, role: "game2", ctl: controlHeard},
+				{freq: freqLateGame, from: at(3.5), to: at(5.8), expect: expectPresent, role: "game2",
+					ctl: controlNotKeptOut},
 			},
 			measures: []measureSpec{
 				{key: measureOnset, freq: freqLateGame, event: bound{event: sessionPrefix + "game2"},
-					budget: budgetOnsetMs, kind: measureFromAudio},
+					budget: budgetOnsetMs},
 			},
 			fixtures: []fixtureStep{
-				{role: "discord", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbIdle, underExplorer: true},
-				{role: "game2", exe: `Games2\game2.exe`, verb: verbTone, freqs: []float64{freqLateGame}, at: 3, dur: 3,
-					underExplorer: true, logFirstRender: true},
+				{role: "discord", exe: exeDiscord, verb: verbIdle, underExplorer: true},
+				{role: "game2", exe: exeGame2, verb: verbTone, freqs: []float64{freqLateGame}, at: 3, dur: 3,
+					underExplorer: true},
 			},
 		},
 		{
-			num: 10, name: "isshoni-self", req: reqYes,
+			num: 10, name: "isshoni-self", req: reqYes, selfTone: freqBrowserTab,
 			desc: "isshoni's own playback and its WebView2 child are never captured",
 			checks: []checkSpec{
 				present(freqGame, "game"),
-				harnessAbsent(freqBrowserTab),
+				selfAbsent(freqBrowserTab),
 				{freq: freqSelf, from: at(1.5), to: end(), expect: expectAbsent, role: "selfWebview",
 					ctl: controlKeptOut, reason: "isshoni"},
 			},
+			rowChecks: []rowCheck{
+				{role: selfRole, verdict: controlKeptOut, reason: "isshoni"},
+				{role: "selfWebview", verdict: controlKeptOut, reason: "isshoni"},
+			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
+				explorerTone("game", exeGame, freqGame),
 				// The self WebView is the harness's own child (not reparented), with a child that plays 907.
-				{role: "selfWebviewParent", exe: `SelfWebView\msedgewebview2.exe`, verb: verbSpawn,
-					child: &fixtureStep{role: "selfWebview", exe: `SelfWebView\msedgewebview2.exe`, verb: verbTone,
+				{role: "selfWebviewParent", exe: exeSelfWV, verb: verbSpawn,
+					child: &fixtureStep{role: "selfWebview", exe: exeSelfWV, verb: verbTone,
 						freqs: []float64{freqSelf}}},
 			},
 		},
-		{
-			num: 11, name: "viewer-browser", req: reqYes,
-			desc:   "a browser that plays the user's isshoni viewer is kept out whole, reason viewer",
-			viewer: &viewerCall{connID: "c_test1", family: "edge", os: "windows"},
-			checks: []checkSpec{
-				present(freqGame, "game"),
-				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "isshoniTab",
-					ctl: controlKeptOut, reason: "viewer"},
-				{freq: freqBrowserTab, from: at(1.5), to: end(), expect: expectAbsent, role: "otherTab",
-					ctl: controlKeptOut, reason: "viewer"},
-			},
-			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "edge", exe: `Microsoft\Edge\Application\msedge.exe`, verb: verbSpawn, underExplorer: true,
-					child: &fixtureStep{role: "isshoniTab", exe: `Microsoft\Edge\Application\msedge.exe`, verb: verbTone,
-						freqs: []float64{freqVoice}}},
-				{role: "edge2", exe: `Microsoft\Edge\Application\msedge.exe`, verb: verbTone,
-					freqs: []float64{freqBrowserTab}, underExplorer: true},
-			},
-		},
+		viewerCase(11, "viewer-browser", "a browser that plays the user's isshoni viewer is kept out whole, reason viewer",
+			nil),
 		{
 			num: 15, name: "runtime-rule", req: reqYes,
 			desc: "adding a keep-out rule mid-share fades the app out within 100 ms, with no click",
 			checks: []checkSpec{
 				present(freqGame, "game"),
 				{freq: freqVoice, from: at(1.5), to: at(4.0), expect: expectPresent, role: "fakevoice",
-					ctl: controlHeard},
+					ctl: controlNotKeptOut},
 				{freq: freqVoice, from: afterTSet(0.1), to: end(), expect: expectAbsent, role: "fakevoice",
 					ctl: controlKeptOut},
 			},
 			measures: []measureSpec{
-				{key: measureCut, freq: freqVoice, event: afterTSet(0), budget: budgetCutMs, kind: measureFromAudio},
+				{key: measureCut, freq: freqVoice, event: afterTSet(0), budget: budgetCutMs},
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("fakevoice", `FakeVoice\fakevoice.exe`, freqVoice),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("fakevoice", exeFakeVoice, freqVoice),
 			},
 		},
 		{
 			num: 16, name: "app-boundary", req: reqYes,
 			desc: "an app a voice app launched (another folder) is still heard",
 			checks: []checkSpec{
-				{freq: freqGame, from: at(1.5), to: end(), expect: expectPresent, role: "browser", ctl: controlHeard},
+				present(freqGame, "browser"),
 			},
 			fixtures: []fixtureStep{
-				{role: "discord", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbSpawn, underExplorer: true,
-					child: &fixtureStep{role: "browser", exe: `Browser\browser.exe`, verb: verbTone,
+				{role: "discord", exe: exeDiscord, verb: verbSpawn, underExplorer: true,
+					child: &fixtureStep{role: "browser", exe: exeBrowser, verb: verbTone,
 						freqs: []float64{freqGame}}},
 			},
 		},
@@ -375,14 +416,16 @@ func cases() []caseSpec {
 			checks: []checkSpec{
 				present(freqGame, "game"),
 				absent(freqVoice, "discord"),
-				{freq: freqLateGame, from: at(1.5), to: end(), expect: expectInfo, role: "launcherx",
-					ctl: controlNotCaptured, reason: "tree", detail: "Discord"},
+				// 683's level is recorded only (INFO: not heard by design, §6.2); the row check below is required.
+				{freq: freqLateGame, from: at(1.5), to: end(), expect: expectInfo, role: "launcherx", ctl: controlNone},
 			},
+			rowChecks: []rowCheck{{role: "launcherx", verdict: controlNotCaptured, reason: "tree", detail: "Discord"}},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "launcherx", exe: `LauncherX\launcherx.exe`, verb: verbTone, freqs: []float64{freqLateGame},
+				explorerTone("game", exeGame, freqGame),
+				// LauncherX plays 683 itself (`spawn -tone 683`) and starts discord.exe, which plays 440.
+				{role: "launcherx", exe: exeLauncherX, verb: verbSpawn, freqs: []float64{freqLateGame},
 					underExplorer: true,
-					child: &fixtureStep{role: "discord", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbTone,
+					child: &fixtureStep{role: "discord", exe: exeDiscord, verb: verbTone,
 						freqs: []float64{freqVoice}}},
 			},
 		},
@@ -390,13 +433,11 @@ func cases() []caseSpec {
 			num: 18, name: "orphan", req: reqYes,
 			desc: "a helper whose parent exits mid-share stays kept out (lineage cache)",
 			checks: []checkSpec{
-				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "voicehelper",
-					ctl: controlKeptOut},
+				absent(freqVoice, "voicehelper"),
 			},
 			fixtures: []fixtureStep{
-				{role: "discord", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbSpawn, orphanAfter: 4,
-					underExplorer: true,
-					child: &fixtureStep{role: "voicehelper", exe: `Discord\app-1.0.9999\voicehelper.exe`, verb: verbTone,
+				{role: "discord", exe: exeDiscord, verb: verbSpawn, orphanAfter: 4, underExplorer: true,
+					child: &fixtureStep{role: "voicehelper", exe: exeVoiceHelp, verb: verbTone,
 						freqs: []float64{freqVoice}}},
 			},
 		},
@@ -405,19 +446,18 @@ func cases() []caseSpec {
 			desc:             "a failed probe falls back to endpoint loopback with a banner, and really captures",
 			engineThroughout: "endpoint", bannerThroughout: "exclusion-unavailable",
 			checks: []checkSpec{
-				present(freqGame, "game"), present(freqVoice, "discord"),
+				present(freqGame, "game"),
+				// As case 1: the endpoint engine hears Discord; its row keeps the policy's verdict.
+				{freq: freqVoice, from: at(1.5), to: end(), expect: expectPresent, role: "discord", ctl: controlNone},
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("discord", `Discord\app-1.0.9999\discord.exe`, freqVoice),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("discord", exeDiscord, freqVoice),
 			},
 		},
 		{
 			num: 20, name: "timestamps", req: reqYes, special: "timestamps", noClick: true,
 			desc: "PCM-tap onset times match im_test_render_bursts' predicted device-position times",
-			fixtures: []fixtureStep{
-				{role: "bursts", verb: verbBursts},
-			},
 		},
 		{
 			num: 21, name: "opus", req: reqYes, special: "opus", noClick: true,
@@ -426,47 +466,37 @@ func cases() []caseSpec {
 				present(freqGame, "game"), absent(freqVoice, "discord"),
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("discord", `Discord\app-1.0.9999\discord.exe`, freqVoice),
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("discord", exeDiscord, freqVoice),
 			},
 		},
-		{
-			num: 24, name: "viewer-browser-included", req: reqYes,
-			desc:        "a saved Include for the viewer's browser is still kept out (the viewer rule beats it)",
-			viewer:      &viewerCall{connID: "c_test1", family: "edge", os: "windows"},
-			seedInclude: []string{"exe:msedge.exe"},
-			checks: []checkSpec{
-				present(freqGame, "game"),
-				{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "isshoniTab",
-					ctl: controlKeptOut, reason: "viewer"},
-				{freq: freqBrowserTab, from: at(1.5), to: end(), expect: expectAbsent, role: "otherTab",
-					ctl: controlKeptOut, reason: "viewer"},
-			},
-			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "edge", exe: `Microsoft\Edge\Application\msedge.exe`, verb: verbSpawn, underExplorer: true,
-					child: &fixtureStep{role: "isshoniTab", exe: `Microsoft\Edge\Application\msedge.exe`, verb: verbTone,
-						freqs: []float64{freqVoice}}},
-				{role: "edge2", exe: `Microsoft\Edge\Application\msedge.exe`, verb: verbTone,
-					freqs: []float64{freqBrowserTab}, underExplorer: true},
-			},
-		},
+		viewerCase(24, "viewer-browser-included",
+			"a saved Include for the viewer's browser is still kept out (the viewer rule beats it)",
+			[]string{"exe:msedge.exe"}),
 		{
 			num: 25, name: "late-child-heard", req: reqYes,
 			desc: "a late child of a heard app, in the same folder, is covered by the app's stream and heard",
 			checks: []checkSpec{
 				present(freqGame, "game"),
 				{freq: freqLateGame, from: at(3.6), to: end(), expect: expectPresent, role: "gameChild",
-					ctl: controlHeard},
+					ctl: controlNotKeptOut},
+			},
+			rowChecks: []rowCheck{
+				{role: "gameChild", note: "covered", from: at(3.6)},
+				{role: "game", verdict: controlHeard},
 			},
 			measures: []measureSpec{
 				{key: measureOnset, freq: freqLateGame, event: bound{event: sessionPrefix + "gameChild"},
-					budget: budgetOnsetMs, kind: measureFromAudio},
+					budget: budgetOnsetMs},
 			},
 			fixtures: []fixtureStep{
-				{role: "game", exe: `Games\game.exe`, verb: verbTone, freqs: []float64{freqGame}, underExplorer: true,
-					child: &fixtureStep{role: "gameChild", exe: `Games\game.exe`, verb: verbTone,
-						freqs: []float64{freqLateGame}, at: 3, logFirstRender: true}},
+				// An idle voice app forces the include set: with the fast path on and nothing kept out but
+				// isshoni, the engine would be exclude-self, which has no include stream to cover the child.
+				{role: "discord", exe: exeDiscord, verb: verbIdle, underExplorer: true},
+				// `Games\game.exe spawn -tone 1000 -at 4 Games\game.exe tone -f 683` (05 §18.5).
+				{role: "game", exe: exeGame, verb: verbSpawn, freqs: []float64{freqGame}, underExplorer: true,
+					child: &fixtureStep{role: "gameChild", exe: exeGame, verb: verbTone,
+						freqs: []float64{freqLateGame}, at: 3}},
 			},
 		},
 		{
@@ -478,27 +508,51 @@ func cases() []caseSpec {
 					ctl: controlKeptOut, reason: "isshoni"},
 			},
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				explorerTone("game2", `Games2\game2.exe`, freqLateGame),
-				{role: "selfWebview", exe: `SelfWebView\msedgewebview2.exe`, verb: verbTone, freqs: []float64{freqSelf},
-					at: 3, logFirstRender: true},
+				explorerTone("game", exeGame, freqGame),
+				explorerTone("game2", exeGame2, freqLateGame),
+				// The harness's own child (not reparented), started at t = 3 s.
+				{role: "selfWebview", exe: exeSelfWV, verb: verbTone, freqs: []float64{freqSelf}, at: 3},
 			},
 		},
 		{
 			num: 27, name: "pid-reuse-tree", req: reqInfo, special: "pid-reuse", noClick: true,
 			desc: "whether Windows follows a reused PID into a heard app's tree (decides §5.2's loose union)",
 			fixtures: []fixtureStep{
-				explorerTone("game", `Games\game.exe`, freqGame),
-				{role: "launcherx", exe: `LauncherX\launcherx.exe`, verb: verbSpawn, orphanAfter: 2,
-					underExplorer: true,
-					child: &fixtureStep{role: "reuseVoice", exe: `Discord\app-1.0.9999\discord.exe`, verb: verbTone,
+				explorerTone("game", exeGame, freqGame),
+				// A (launcherx) exits at 2 s; B (a built-in voice app) plays the chime partials of §11.3.
+				{role: "launcherx", exe: exeLauncherX, verb: verbSpawn, orphanAfter: 2, underExplorer: true,
+					child: &fixtureStep{role: "reuseVoice", exe: exeDiscord, verb: verbTone,
 						freqs: []float64{freqChimeLow, freqChimeHigh}}},
 			},
 		},
 	}
 }
 
-// explorerTone is a top-level fixture (reparented under explorer.exe) that plays one tone.
+// viewerCase is cases 11 and 24 (05 §18.5): `msedge.exe` (spawn) → msedge.exe (`spawn -tone 440`, the "isshoni tab")
+// → msedge.exe playing 797 (the "other tab"), and the game; the whole browser is kept out with reason viewer.
+// seedInclude is case 24's saved Include.
+func viewerCase(num int, name, desc string, seedInclude []string) caseSpec {
+	return caseSpec{
+		num: num, name: name, req: reqYes, desc: desc, seedInclude: seedInclude,
+		viewer: &viewerCall{connID: "c_test1", family: "edge", os: "windows"},
+		checks: []checkSpec{
+			present(freqGame, "game"),
+			{freq: freqVoice, from: at(1.5), to: end(), expect: expectAbsent, role: "isshoniTab",
+				ctl: controlKeptOut, reason: "viewer"},
+			{freq: freqBrowserTab, from: at(1.5), to: end(), expect: expectAbsent, role: "otherTab",
+				ctl: controlKeptOut, reason: "viewer"},
+		},
+		fixtures: []fixtureStep{
+			explorerTone("game", exeGame, freqGame),
+			{role: "edge", exe: exeEdge, verb: verbSpawn, underExplorer: true,
+				child: &fixtureStep{role: "isshoniTab", exe: exeEdge, verb: verbSpawn, freqs: []float64{freqVoice},
+					child: &fixtureStep{role: "otherTab", exe: exeEdge, verb: verbTone,
+						freqs: []float64{freqBrowserTab}}}},
+		},
+	}
+}
+
+// explorerTone is a top-level fixture (reparented under explorer.exe) that plays one tone for the whole case.
 func explorerTone(role, exe string, freq float64) fixtureStep {
 	return fixtureStep{role: role, exe: exe, verb: verbTone, freqs: []float64{freq}, underExplorer: true}
 }

@@ -35,6 +35,13 @@ func TestRecorderStamps(t *testing.T) {
 	if !ok || last != 3_000_000 {
 		t.Fatalf("last stamp %d (ok=%v), want 3000000", last, ok)
 	}
+	// Case 15 reads the count before its SetAppDecision and takes the next stamp as T_set (05 §18.5).
+	if s, ok := rec.stampAt(1); !ok || s != 2_000_000 {
+		t.Fatalf("stamp 1 is %d (ok=%v), want 2000000", s, ok)
+	}
+	if _, ok := rec.stampAt(3); ok {
+		t.Fatal("a stamp that wasn't recorded yet exists")
+	}
 
 	// Other AudioController methods still reach the engine (the recorder embeds it).
 	if _, err := rec.AudioReport(context.Background()); err != nil {

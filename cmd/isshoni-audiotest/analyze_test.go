@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"testing"
 )
@@ -63,19 +64,39 @@ func TestShortWindowBurstFailsAbsent(t *testing.T) {
 
 // TestFadedToneNeverTrips907 is 05 §19.1's "a −18 dBFS 1000 Hz tone with 5 ms and 10 ms linear fade-ins and
 // fade-outs, and with its onsets, never trips a short-window absent check at 907 Hz; a tone with S1's 20 ms WAV
-// fades doesn't either".
+// fades doesn't either". The tone sits inside silence, so the 50 ms windows span its onset and its cut, at every
+// offset of the 10 ms hop (7-sample steps).
+//
+// The 5 ms linear fade (the mixer's onset ramp, 05 §9.5) measures about −44 dBFS at 907 Hz, over the −50 dBFS limit:
+// 05 §18.6's "at most about −64 dBFS" doesn't hold, so an absent check at 907 Hz can FAIL on a correct engine when a
+// 1000 Hz onset or cut lands in its window. That needs a spec decision (the integrator's write-back: move isshoni's
+// tone at least 200 Hz from 1000 Hz, or leave windows that overlap a present tone's onset or cut out of the
+// short-window maximum); until then the 5 ms case is skipped with its measured value, and the 10 ms and 20 ms fades
+// must pass.
 func TestFadedToneNeverTrips907(t *testing.T) {
 	for _, fadeMs := range []float64{5, 10, 20} {
-		m := fadedTone(freqGame, dbToAmp(-18), 1.0, fadeMs/1000)
-		// Whole-window at 907 and the short-window maximum both stay well below −50 dBFS.
-		if whole := toneLevelDB(m, sampleRate, freqSelf); whole > absentMaxDB {
-			t.Fatalf("%.0f ms fade: 907 Hz whole-window %.1f dB trips absent", fadeMs, whole)
-		}
-		maxShort, atS := shortWindow(m, sampleRate, freqSelf)
-		if maxShort > absentMaxDB {
-			t.Fatalf("%.0f ms fade: 907 Hz short-window max %.1f dB at %.3f s trips absent (want ≤ %.0f)",
-				fadeMs, maxShort, atS, absentMaxDB)
-		}
+		t.Run(fmt.Sprintf("%.0fms", fadeMs), func(t *testing.T) {
+			tone := fadedTone(freqGame, dbToAmp(-18), 1.0, fadeMs/1000)
+			worst, worstAt := silenceFloorDB, 0.0
+			for k := range int(shortHopSec*sampleRate) / 7 {
+				m := make([]float64, 3*sampleRate)
+				copyInto(m, tone, sampleRate+k*7)
+				if whole := toneLevelDB(m, sampleRate, freqSelf); whole > absentMaxDB {
+					t.Fatalf("907 Hz whole-window %.1f dB trips absent", whole)
+				}
+				if maxShort, atS := shortWindow(m, sampleRate, freqSelf); maxShort > worst {
+					worst, worstAt = maxShort, atS
+				}
+			}
+			if worst > absentMaxDB && fadeMs == 5 {
+				t.Skipf("05 §18.6 spec issue (escalated): a 5 ms linear onset/cut reads %.1f dB at 907 Hz (window "+
+					"at %.3f s), over %.0f dB", worst, worstAt, absentMaxDB)
+			}
+			if worst > absentMaxDB {
+				t.Fatalf("907 Hz short-window max %.1f dB at %.3f s trips absent (want ≤ %.0f)", worst, worstAt,
+					absentMaxDB)
+			}
+		})
 	}
 }
 
@@ -106,8 +127,8 @@ func TestClickDetection(t *testing.T) {
 	}
 }
 
-// TestMeasuredCutOnset is 05 §18.6's "measured cut and onset of a synthetic step lie within 20 ms of the true time
-// (cut late, onset early)".
+// TestMeasuredCutOnset is 05 §19.1's "measured cut and onset of a synthetic step lie within 20 ms of the true time
+// (cut late, onset early, as §18.6 says)".
 func TestMeasuredCutOnset(t *testing.T) {
 	fs := float64(sampleRate)
 	// Onset: silent until 1.0 s, then a −18 dBFS 1 kHz tone to 2 s. Event at 0.95 s.
@@ -117,8 +138,8 @@ func TestMeasuredCutOnset(t *testing.T) {
 	if !ok {
 		t.Fatal("no onset found")
 	}
-	if onsetS < 1.0-0.02 || onsetS > 1.0+0.03 {
-		t.Fatalf("onset at %.3f s, want near the 1.0 s tone start (early)", onsetS)
+	if onsetS < 1.0-0.02 || onsetS > 1.0 {
+		t.Fatalf("onset at %.3f s, want in [0.980, 1.000] (at most 20 ms early)", onsetS)
 	}
 
 	// Cut: a −18 dBFS tone for 1.05 s then silence. Event at 1.0 s.
@@ -128,8 +149,8 @@ func TestMeasuredCutOnset(t *testing.T) {
 	if !cutOK {
 		t.Fatal("no cut found")
 	}
-	if cutS < 1.0 || cutS > 1.05+0.03 {
-		t.Fatalf("cut at %.3f s, want near the 1.05 s tone end (late)", cutS)
+	if cutS < 1.05 || cutS > 1.05+0.02 {
+		t.Fatalf("cut at %.3f s, want in [1.050, 1.070] (at most 20 ms late)", cutS)
 	}
 }
 
@@ -161,4 +182,26 @@ func fadedTone(freq, amp, seconds, fadeSec float64) []float64 {
 		x[i] = amp * g * math.Sin(2*math.Pi*freq*float64(i)/sampleRate)
 	}
 	return x
+}
+
+// TestSilenceProblem is 05 §18.4's silence pre-check: a case frequency above −70 dBFS or an RMS above −60 dBFS fails
+// it; digital silence and a faint off-frequency hum pass.
+func TestSilenceProblem(t *testing.T) {
+	freqs := []float64{freqGame, freqVoice}
+	if p := silenceProblem(make([]float64, sampleRate), freqs); p != "" {
+		t.Fatalf("digital silence: %s", p)
+	}
+	hum := sineAt(sampleRate, 50, dbToAmp(-75))
+	if p := silenceProblem(hum, freqs); p != "" {
+		t.Fatalf("a −75 dBFS 50 Hz hum: %s", p)
+	}
+	if p := silenceProblem(sineAt(sampleRate, freqVoice, dbToAmp(-65)), freqs); p == "" {
+		t.Fatal("a −65 dBFS 440 Hz tone passed the pre-check")
+	}
+	if p := silenceProblem(sineAt(sampleRate, 3000, dbToAmp(-40)), freqs); p == "" {
+		t.Fatal("a −40 dBFS 3 kHz tone (RMS −43 dBFS) passed the pre-check")
+	}
+	if p := silenceProblem(make([]float64, 100), freqs); p == "" {
+		t.Fatal("too little audio passed the pre-check")
+	}
 }

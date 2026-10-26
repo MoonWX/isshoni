@@ -8,21 +8,23 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 
 	"github.com/MoonWX/isshoni/internal/desktop/audio"
 	"github.com/MoonWX/isshoni/internal/media"
@@ -33,18 +35,16 @@ import (
 // isshoni-media.dll through native.Open, wraps it in the SetExclusions recorder, drives it through the desktop audio
 // policy service (internal/desktop/audio.Service, the app's own rules, prompts and FriendsHear), starts the
 // fixtures as children of explorer.exe, starts an audio-only session itself and records the PCM tap. The analyzer,
-// the verdict and the report are the portable core's; this file only produces a recording for them.
+// the capture bookkeeping, the verdict and the report are the portable core's; this file only produces their input.
 //
 // It builds on Windows only (the native engine exists only there, 04 §12.1). The Mac and CI ubuntu/macOS use
 // driver_other.go and run the analyzer and verdict tests. This driver's cases run on the owner's PC right after
 // group 6 merges (README WA62a).
 
-// The capture layout: one PCM-tap chunk is 10 ms of 48 kHz stereo float32 (05 §10.2, media.KindPCM).
 const (
-	pcmChunkFrames = 480
-	pcmChunkBytes  = pcmChunkFrames * 2 * 4
-	settleSec      = 1.0 // the recording starts 1 s after the initial fixtures run (05 §18.5)
-	reportEverySec = 0.25
+	reportEverySec = 0.25 // the report sample period (05 §18.6)
+	silenceCapture = 2.0  // the silence pre-check session's length (s): the probe, then 1 s of endpoint loopback
+	pidReuseLife   = 180  // case 27's fixture lifetime (s): the reuse loop can take a while
 )
 
 // winDriver is the Windows driver.
@@ -56,8 +56,8 @@ type winDriver struct {
 	closed bool
 }
 
-// newDriver loads the engine (native.Open) and resolves its test hooks (05 §18.1). The DLL dir is driverOptions.dllDir
-// or the executable's folder.
+// newDriver loads the engine (native.Open) and resolves its test hooks (05 §18.1). Any failure (the DLL missing, the
+// wrong ABI, an export missing) is a setup error, never errUnsupportedOS.
 func newDriver(opt driverOptions) (driver, error) {
 	// Resolve the engine's dependencies from its folder and System32 only (04 §13.3, done by native.Open).
 	eng, err := native.Open(native.Options{Logger: slog.New(slog.DiscardHandler)})
@@ -80,6 +80,19 @@ func (d *winDriver) close() error {
 	return d.eng.Close()
 }
 
+// engineNow is the engine clock (im_clock().mono_ns) in ns.
+func (d *winDriver) engineNow() int64 {
+	ns, _ := d.hooks.EngineClockNS()
+	return ns
+}
+
+// say writes a local note to the console (never into the report).
+func (d *winDriver) say(format string, args ...any) {
+	if d.opt.console != nil {
+		fmt.Fprintf(d.opt.console, format+"\n", args...)
+	}
+}
+
 // env is the report's environment (05 §18.7): the DLL version and SHA-256, the OS, and the machine. Names are
 // redacted (no machine name, no absolute paths).
 func (d *winDriver) env() (dllInfo, osInfo, machineInfo, error) {
@@ -88,9 +101,7 @@ func (d *winDriver) env() (dllInfo, osInfo, machineInfo, error) {
 	if sum, err := dllSHA256(""); err == nil {
 		dll.SHA256 = sum
 	}
-	osi := readOSInfo()
-	mach := d.readMachine()
-	return dll, osi, mach, nil
+	return dll, readOSInfo(), d.readMachine(), nil
 }
 
 // dllSHA256 is the hex SHA-256 of isshoni-media.dll in dir (dir "" = the executable's folder), compared with
@@ -107,7 +118,7 @@ func dllSHA256(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -115,23 +126,26 @@ func dllSHA256(dir string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// readMachine is the report's machine (05 §18.4, recorded, not enforced). An empty RenderEndpoints list (none
+// active, or no report) makes every case SKIP with exit 3 (05 §18.4, §18.8).
 func (d *winDriver) readMachine() machineInfo {
-	m := machineInfo{RenderEndpoints: []endpointInfo{}}
-	// A one-shot report gives the endpoint counts and the device state without a live session.
+	m := machineInfo{RenderEndpoints: []endpointInfo{}, CPU: readCPUVendor(), DuckingPreference: readDuckingPref()}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	if r, err := d.eng.AudioReport(ctx); err == nil {
-		m.Mic = r.Device.CaptureEndpoints > 0
-		for range r.Device.RenderEndpoints {
-			m.RenderEndpoints = append(m.RenderEndpoints, endpointInfo{FormFactor: "unknown", Bus: "unknown"})
-		}
+	r, err := d.eng.AudioReport(ctx)
+	if err != nil {
+		d.say("note: no audio report (%v): no render endpoint is known", err)
+		return m
 	}
-	m.DuckingPreference = -1
+	m.Mic = r.Device.CaptureEndpoints > 0
+	for range r.Device.RenderEndpoints {
+		m.RenderEndpoints = append(m.RenderEndpoints, endpointInfo{FormFactor: "unknown", Bus: "unknown"})
+	}
 	return m
 }
 
 // selfCheck loads the DLL (done in newDriver), checks the probe, and starts and stops the watcher without sound
-// (05 §18.2). native.Open already checked im_version and every export.
+// (05 §18.2). native.Open already checked im_version and every export, the audio and im_test_* ones included.
 func (d *winDriver) selfCheck(w io.Writer) error {
 	fmt.Fprintln(w, "  engine: loaded, version and exports ok")
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -142,7 +156,7 @@ func (d *winDriver) selfCheck(w io.Writer) error {
 	fmt.Fprintln(w, "  engine: probe ok")
 	ctl, ok := any(d.eng).(media.AudioController)
 	if !ok {
-		return fmt.Errorf("the engine is not an AudioController")
+		return errors.New("the engine is not an AudioController")
 	}
 	if err := ctl.WatchAudio(ctx, media.Exclusions{}); err != nil {
 		return fmt.Errorf("watch: %w", err)
@@ -151,7 +165,6 @@ func (d *winDriver) selfCheck(w io.Writer) error {
 		return fmt.Errorf("unwatch: %w", err)
 	}
 	fmt.Fprintln(w, "  engine: watcher start/stop ok")
-	// The analyzer must also run under selfcheck (05 §18.2): decode nothing, just prove the Goertzel path.
 	if _, err := d.hooks.EngineClockNS(); err != nil {
 		return fmt.Errorf("engine clock: %w", err)
 	}
@@ -168,34 +181,38 @@ func (d *winDriver) probe(w io.Writer) error {
 	}
 	r, _ := d.eng.AudioReport(ctx)
 	fmt.Fprintf(w, "engine: %s · audio backend: %s\n", d.eng.Info().Name, p.Audio.Backend)
-	fmt.Fprintf(w, "probe: result=%s osBuild=%d renderEndpoints=%d captureEndpoints=%d\n",
-		r.Probe.Result, r.Probe.OSBuild, r.Device.RenderEndpoints, r.Device.CaptureEndpoints)
+	fmt.Fprintf(w, "probe: result=%s osBuild=%d renderEndpoints=%d captureEndpoints=%d duckingPreference=%d\n",
+		r.Probe.Result, r.Probe.OSBuild, r.Device.RenderEndpoints, r.Device.CaptureEndpoints, readDuckingPref())
 	return nil
 }
 
-// apps prints "What friends hear" with the built-in rules, as text (05 §18.2).
+// apps prints "What friends hear" with the built-in rules, as text on stdout only (05 §18.2): the app's name, its
+// verdict, reason and detail. It is a local listing for the owner (WA35's check: Discord, a browser and a Steam game
+// with the right verdicts), so it names apps; nothing is written to disk.
 func (d *winDriver) apps(w io.Writer) error {
-	svc, rec, stop, err := d.newService(audio.DefaultSettings(), nil)
+	svc, _, stop, err := d.newService(audio.DefaultSettings(), nil)
 	if err != nil {
 		return err
 	}
 	defer stop()
-	_ = rec
 	if err := svc.Watch(true); err != nil {
 		return err
 	}
 	time.Sleep(1500 * time.Millisecond) // let the watcher publish a report
 	fh := svc.FriendsHear()
-	fmt.Fprintf(w, "%-28s %-12s %s\n", "APP", "VERDICT", "WHY")
-	for _, row := range fh.Heard {
-		fmt.Fprintf(w, "%-28s %-12s %s\n", redactAppID(row.ID), "heard", "")
+	fmt.Fprintf(w, "%-32s %-13s %-15s %s\n", "APP", "VERDICT", "REASON", "DETAIL")
+	list := func(rows []audio.AppRow, verdict string) {
+		for _, row := range rows {
+			name := row.Name
+			if name == "" {
+				name = row.ID
+			}
+			fmt.Fprintf(w, "%-32s %-13s %-15s %s\n", name, verdict, row.Reason, row.Detail)
+		}
 	}
-	for _, row := range fh.KeptOut {
-		fmt.Fprintf(w, "%-28s %-12s %s\n", redactAppID(row.ID), "kept out", row.Reason)
-	}
-	for _, row := range fh.NotCaptured {
-		fmt.Fprintf(w, "%-28s %-12s %s\n", redactAppID(row.ID), "not captured", row.Reason)
-	}
+	list(fh.Heard, "heard")
+	list(fh.KeptOut, "kept out")
+	list(fh.NotCaptured, "not captured")
 	return nil
 }
 
@@ -204,12 +221,9 @@ func (d *winDriver) apps(w io.Writer) error {
 func (d *winDriver) newService(settings audio.Settings, viewer *viewerCall) (*audio.Service, *recorder, func(), error) {
 	ctl, ok := any(d.eng).(media.AudioController)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("the engine is not an AudioController")
+		return nil, nil, nil, errors.New("the engine is not an AudioController")
 	}
-	rec := newRecorder(ctl, func() int64 {
-		ns, _ := d.hooks.EngineClockNS()
-		return ns
-	})
+	rec := newRecorder(ctl, d.engineNow)
 	svc := audio.New(rec, &memStore{s: settings}, audio.SelfInfo{PID: uint32(os.Getpid())}, d.log) //nolint:gosec // G115: a PID fits in uint32
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -245,86 +259,251 @@ func (m *memStore) SaveAudioSettings(s audio.Settings) error {
 	return nil
 }
 
-// runCase runs one tone case and returns its recording (05 §18.5). It is the full pipeline: fixtures under
-// explorer, the silence pre-check, an audio-only session with the tap, the report samples and the clock mapping.
-func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
+// caseSetup is what a case's preparation leaves for its recording: the service, the recorder, the work folder and
+// the premises checked before any fixture started.
+type caseSetup struct {
+	svc         *audio.Service
+	rec         *recorder
+	work        string
+	self        string
+	watchNS     int64
+	silenceFail bool
+	keptOutPre  bool
+	cleanup     []func()
+}
+
+func (s *caseSetup) close() {
+	for i := len(s.cleanup) - 1; i >= 0; i-- {
+		s.cleanup[i]()
+	}
+}
+
+// prepare starts the service with the case's settings, copies every fixture exe (and extra) into a fresh work
+// folder before any recording (05 §18.3), starts the watcher, and runs the preconditions of 05 §18.4: the kept-out
+// check for the fast-path cases (named on the console) and the silence pre-check.
+func (d *winDriver) prepare(cs caseSpec, cfg gateConfig, extra ...string) (*caseSetup, error) {
 	settings := audio.DefaultSettings()
 	settings.FastPath = cfg.FastPath || cs.forceFastPath
 	for _, id := range cs.seedInclude {
 		settings.AppRules[id] = audio.DecisionInclude
 	}
+	s := &caseSetup{}
 	svc, rec, stop, err := d.newService(settings, cs.viewer)
 	if err != nil {
-		return recording{}, err
+		return nil, err
 	}
-	defer stop()
+	s.svc, s.rec = svc, rec
+	s.cleanup = append(s.cleanup, stop)
 
 	work, err := os.MkdirTemp("", "isshoni-audiotest-")
 	if err != nil {
-		return recording{}, err
+		s.close()
+		return nil, err
 	}
-	defer removeAllRetry(work)
-
-	// Copy every fixture exe up front, before any recording (05 §18.3: a first-run AV scan must not land in a window).
-	self, _ := os.Executable()
-	roleExe := map[string]string{}
-	for _, step := range cs.fixtures {
-		if err := copyFixtures(self, work, step, roleExe); err != nil {
-			return recording{}, err
+	s.work = work
+	s.cleanup = append(s.cleanup, func() { removeAllRetry(work) })
+	if s.self, err = os.Executable(); err != nil {
+		s.close()
+		return nil, err
+	}
+	for _, rel := range append(copyList(cs), extra...) {
+		if err := copyExe(s.self, filepath.Join(work, rel)); err != nil {
+			s.close()
+			return nil, err
 		}
 	}
 
 	if err := svc.Watch(true); err != nil {
-		return recording{}, err
+		s.close()
+		return nil, err
 	}
+	s.watchNS = d.engineNow()
 
-	// Silence pre-check (05 §18.4): 1 s of loopback with every case frequency quiet.
-	silenceFail := d.silencePreCheck(cs)
-
-	fx := newFixtureRun(work, roleExe)
-	defer fx.killAll()
-	// Start the fixtures due at or before the recording start.
-	recStart := time.Now().Add(time.Duration(settleSec * float64(time.Second)))
-	for i := range cs.fixtures {
-		if cs.fixtures[i].at <= 0 {
-			fx.start(&cs.fixtures[i])
+	// 05 §18.4: no non-fixture process may be kept out for the fast-path cases (no fixture runs yet).
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	r, err := rec.AudioReport(ctx)
+	cancel()
+	if err == nil {
+		if others := keptOutNames(r); len(others) > 0 {
+			s.keptOutPre = true
+			if cs.forceFastPath {
+				d.say("  %s: kept out, quit it for the fast-path cases: %s", cs.name, strings.Join(others, ", "))
+			}
 		}
 	}
-	time.Sleep(time.Until(recStart))
 
-	// Start the audio-only session with the service's rules plus the tap and the test flags.
+	if problem := d.silencePreCheck(svc, caseFreqs(cs)); problem != "" {
+		s.silenceFail = true
+		d.say("  %s: silence pre-check: %s", cs.name, problem)
+	}
+	return s, nil
+}
+
+// keptOutNames are the names of the apps and sessions a report keeps out for any reason but isshoni (05 §18.4's
+// fast-path precondition), for the console.
+func keptOutNames(r media.AudioReport) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name == "" {
+			name = "(unnamed)"
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for _, a := range r.Apps {
+		if a.Verdict == controlKeptOut && a.Reason != "isshoni" {
+			add(a.Name)
+		}
+	}
+	for _, s := range r.Sessions {
+		if s.Verdict == controlKeptOut && s.Reason != "isshoni" {
+			add(s.Exe)
+		}
+	}
+	return out
+}
+
+// silencePreCheck captures endpoint loopback (an audio-only session with IM_AUDIOF_TEST_FAIL_PROBE and the tap)
+// before a case and checks its last second (05 §18.4): every case frequency ≤ −70 dBFS and the RMS ≤ −60 dBFS. The
+// first second covers the startup probe, whose own −60 dBFS 997 Hz tone plays before the engine falls back to the
+// endpoint. It returns "" when quiet.
+func (d *winDriver) silencePreCheck(svc *audio.Service, freqs []float64) string {
+	ac := svc.AudioConfig()
+	ac.TapPCM = true
+	ac.TestFlags |= imAudiofTestFailProbe
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess, err := d.eng.Start(ctx, media.Config{Audio: &ac})
+	if err != nil {
+		return "the loopback session could not start: " + err.Error()
+	}
+	defer func() { _ = sess.Stop() }()
+	c := newCapture(0, 0)
+	deadline := time.Now().Add(secs(silenceCapture + 2))
+	for c.now() < silenceCapture && time.Now().Before(deadline) {
+		pctx, pcancel := context.WithTimeout(ctx, 60*time.Millisecond)
+		pkt, err := sess.Next(pctx)
+		pcancel()
+		if err == nil {
+			c.packet(pkt)
+		}
+	}
+	return silenceProblem(segment(mono(c.left, c.right), sampleRate, silenceCapture-1, 0), freqs)
+}
+
+// imAudiofTestFailProbe is IM_AUDIOF_TEST_FAIL_PROBE (05 §4.1): the engine behaves as if the startup probe failed.
+const imAudiofTestFailProbe = 0x80000000
+
+// runCase runs one tone case and returns its recording (05 §18.5): the preparation (copies, watcher,
+// preconditions), the fixtures under explorer, the harness's own tone, an audio-only session with the tap, the late
+// fixtures and mid-run calls timed from the recording's first tap chunk, the report samples, and the recording.
+func (d *winDriver) runCase(cs caseSpec, cfg gateConfig) (recording, error) {
+	setup, err := d.prepare(cs, cfg)
+	if err != nil {
+		return recording{}, err
+	}
+	defer setup.close()
+	svc, rec := setup.svc, setup.rec
+
+	caseDur := caseDuration(cs)
+	fx := newFixtureRun(setup.work, d.engineNow)
+	defer fx.killAll()
+	if cs.selfTone > 0 {
+		// isshoni's own playback (05 §18.5 cases 4 and 10): this process plays, from the settle to past the end.
+		fx.addSelf()
+		if err := playTone([]float64{cs.selfTone}, 0.125, caseDur+settleSec+1); err != nil {
+			return recording{}, fmt.Errorf("the harness's own tone: %w", err)
+		}
+		defer stopSound()
+	}
+	for i := range cs.fixtures {
+		if step := &cs.fixtures[i]; step.at <= 0 {
+			fx.start(step, fixtureArgs(step, setup.work, caseDur))
+		}
+	}
+	time.Sleep(secs(settleSec))
+
+	// The audio-only session with the service's rules plus the tap and the test flags (05 §18.1).
 	ac := svc.AudioConfig()
 	ac.TapPCM = true
 	if cs.failProbe {
-		ac.TestFlags |= 0x80000000 // IM_AUDIOF_TEST_FAIL_PROBE
+		ac.TestFlags |= imAudiofTestFailProbe
 	}
-	svc.OnShareStarted(0, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	svc.OnShareStarted(0, true)
+	defer svc.OnShareStopped()
 	sess, err := d.eng.Start(ctx, media.Config{Audio: &ac})
 	if err != nil {
 		return recording{}, fmt.Errorf("start the audio session: %w", err)
 	}
 	defer func() { _ = sess.Stop() }()
+	offset := d.clockOffset(sess)
+	capt := newCapture(offset, setup.watchNS)
 
-	offset := d.clockOffset(sess) // engine clock − session clock (epoch_ns)
+	tSetIndex := int64(-1)
+	scheduled := false
+	deadline := time.Now().Add(secs(caseDur + 5))
+	nextReport := time.Now()
+	for capt.now() < caseDur && time.Now().Before(deadline) {
+		if capt.haveTap && !time.Now().Before(nextReport) {
+			d.sample(capt, svc, rec, fx)
+			nextReport = nextReport.Add(secs(reportEverySec))
+		}
+		pctx, pcancel := context.WithTimeout(ctx, 60*time.Millisecond)
+		pkt, err := sess.Next(pctx)
+		pcancel()
+		if err != nil {
+			continue // a pull timeout between packets
+		}
+		capt.packet(pkt)
+		if !scheduled && capt.haveTap {
+			nextReport = time.Now()
+			// t = 0 is the first tap chunk's capture time; its wall time is now minus how long ago that was.
+			scheduled = true
+			lag := max(d.engineNow()-(capt.tap0+offset), 0)
+			go fx.schedule(ctx, cs, time.Now().Add(-time.Duration(lag)), caseDur, svc, rec, sess, &tSetIndex)
+		}
+	}
+	d.sample(capt, svc, rec, fx)
+	cancel()
+	fx.killAll()
 
-	dur := caseDuration(cs)
-	capt := newCapture(cs, roleExe, rec, offset)
-	// Fire the late fixtures and the mid-run service calls as the recording progresses.
-	go fx.schedule(cs, recStart, svc)
-
-	d.captureLoop(ctx, sess, svc, cs, dur, capt)
-	svc.OnShareStopped()
-
-	out := capt.finish(dur, fx.reparented(), fx.firstRenders())
-	out.silenceFail = silenceFail
+	end := fx.end(cs, caseDur)
+	end.silenceFail, end.keptOutPre = setup.silenceFail, setup.keptOutPre
+	if n := atomic.LoadInt64(&tSetIndex); n >= 0 {
+		end.setStamp, end.setStampOK = rec.stampAt(int(n))
+	}
+	if others := capt.keptOutOthers(); len(others) > 0 && cs.forceFastPath {
+		d.say("  %s: kept out during the case, quit it for the fast-path cases: %s", cs.name,
+			strings.Join(others, ", "))
+	}
+	out := capt.finish(cs, end)
 	if d.opt.keepWAV != "" {
 		if err := os.MkdirAll(d.opt.keepWAV, 0o750); err == nil {
 			_ = writeWAV(filepath.Join(d.opt.keepWAV, cs.name+".wav"), interleave(out.left, out.right))
 		}
 	}
 	return out, nil
+}
+
+// sample takes one report sample: the engine report, FriendsHear's banners and the app levels, with the fixtures'
+// pids as known now (05 §18.6).
+func (d *winDriver) sample(capt *capture, svc *audio.Service, rec *recorder, fx *fixtureRun) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	r, err := rec.AudioReport(ctx)
+	if err != nil {
+		return
+	}
+	var levels *media.AudioLevels
+	if l, err := rec.AudioLevels(ctx); err == nil {
+		levels = &l
+	}
+	capt.sample(r, bannerCodesOf(svc.FriendsHear()), levels, fx.pidMap())
 }
 
 // interleave merges two channels into interleaved stereo float32 for writeWAV.
@@ -340,33 +519,9 @@ func interleave(left, right []float64) []float32 {
 // clockOffset samples the engine clock and the session clock back to back (05 §13.2): offset = EngineClockNS() −
 // Session.Now(), i.e. the session's epoch in the engine clock. An engine-clock time E maps to a tap time E − offset.
 func (d *winDriver) clockOffset(sess media.Session) int64 {
-	eng, _ := d.hooks.EngineClockNS()
+	eng := d.engineNow()
 	return eng - sess.Now()
 }
-
-// captureLoop reads the session's packets for dur seconds and samples the report every 250 ms (05 §18.4, §18.6).
-func (d *winDriver) captureLoop(ctx context.Context, sess media.Session, svc *audio.Service, cs caseSpec, dur float64,
-	capt *capture) {
-	deadline := time.Now().Add(time.Duration(dur * float64(time.Second)))
-	nextReport := time.Now()
-	for time.Now().Before(deadline) {
-		if time.Now().After(nextReport) {
-			capt.sampleReport(svc, cs)
-			nextReport = nextReport.Add(time.Duration(reportEverySec * float64(time.Second)))
-		}
-		pctx, pcancel := context.WithTimeout(ctx, 60*time.Millisecond)
-		pkt, err := sess.Next(pctx)
-		pcancel()
-		if err != nil {
-			continue // a 50 ms pull timeout between packets
-		}
-		capt.packet(pkt)
-	}
-}
-
-// silencePreCheck captures 1 s of loopback before a case and reports whether another app is playing (05 §18.4). On
-// this build it is a conservative no-op (returns false); the real loopback check is the owner's quiet-room setup.
-func (d *winDriver) silencePreCheck(cs caseSpec) bool { return false }
 
 // runSpecial runs a case the driver scores itself: timestamps (case 20), opus (case 21) and pid-reuse (case 27).
 func (d *winDriver) runSpecial(cs caseSpec, cfg gateConfig) (caseReport, error) {
@@ -382,196 +537,277 @@ func (d *winDriver) runSpecial(cs caseSpec, cfg gateConfig) (caseReport, error) 
 	}
 }
 
-// caseDuration is how long a case records (seconds): the latest fixture end plus a margin, at least 6 s.
-func caseDuration(cs caseSpec) float64 {
-	d := 6.0
-	var walk func(s *fixtureStep)
-	walk = func(s *fixtureStep) {
-		end := s.at
-		if s.dur > 0 {
-			end += s.dur
-		} else {
-			end += 6
-		}
-		if end+2 > d {
-			d = end + 2
-		}
-		if s.child != nil {
-			walk(s.child)
-		}
-	}
-	for i := range cs.fixtures {
-		walk(&cs.fixtures[i])
-	}
-	if d > 12 {
-		d = 12
-	}
-	return d
-}
-
 // ---------------------------------------------------------------- fixtures
 
-// fixtureRun tracks the fixture processes a case starts, for scheduling and cleanup.
+// trackedProc is one fixture process the harness holds a handle on: to see it exit (the "exited early" control) and
+// to kill it at the end of the case without ever touching a reused pid.
+type trackedProc struct {
+	role string
+	pid  uint32
+	mu   sync.Mutex
+	h    windows.Handle // 0 once the process exited and the handle was closed
+	done chan struct{}
+}
+
+// fixtureRun tracks the fixture processes a case starts: their pids and roles, their logged times, and their exits.
 type fixtureRun struct {
-	work    string
-	roleExe map[string]string
+	work  string
+	clock func() int64
 
 	mu            sync.Mutex
-	procs         []*os.Process
+	closed        bool
 	allReparented bool
-	firstRenderNS map[string]int64 // role → the fixture's logged first-render time (engine clock ns)
+	pids          map[uint32]string
+	procs         []*trackedProc
+	byRole        map[string]*trackedProc
+	cmds          []*exec.Cmd
+	firstRender   map[string]int64
+	started       map[string]int64
+	exit          map[string]int64
+	onsets        []int64
+	wg            sync.WaitGroup
 }
 
-func newFixtureRun(work string, roleExe map[string]string) *fixtureRun {
-	return &fixtureRun{work: work, roleExe: roleExe, allReparented: true, firstRenderNS: map[string]int64{}}
+func newFixtureRun(work string, clock func() int64) *fixtureRun {
+	return &fixtureRun{
+		work: work, clock: clock, allReparented: true, pids: map[uint32]string{}, byRole: map[string]*trackedProc{},
+		firstRender: map[string]int64{}, started: map[string]int64{}, exit: map[string]int64{},
+	}
 }
 
-func (f *fixtureRun) reparented() bool {
+// addSelf registers the harness's own process as selfRole (it plays a tone itself, cases 4 and 10).
+func (f *fixtureRun) addSelf() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.allReparented
+	f.pids[windows.GetCurrentProcessId()] = selfRole
 }
 
-// start launches a top-level fixture (and its child tree) now. When the step logs its first render, the fixture's
-// stdout is scanned for the {"firstRenderNs": N} line and recorded against the step's role.
-func (f *fixtureRun) start(step *fixtureStep) {
-	args := fixtureArgs(step)
-	exe := f.roleExe[step.role]
-	if exe == "" {
-		exe = filepath.Join(f.work, step.exe)
-	}
-	proc, reparented, stdout := startProcess(exe, args, step.underExplorer, step.logFirstRender)
-	f.mu.Lock()
-	if proc != nil {
-		f.procs = append(f.procs, proc)
-	}
-	if step.underExplorer {
-		f.allReparented = f.allReparented && reparented
-	}
-	f.mu.Unlock()
-	if stdout != nil {
-		go f.scanFirstRender(step.role, stdout)
-	}
-}
-
-// scanFirstRender reads the fixture's stdout for its {"firstRenderNs": N} line (05 §18.3).
-func (f *fixtureRun) scanFirstRender(role string, r io.ReadCloser) {
-	defer r.Close()
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		var line struct {
-			FirstRenderNS int64 `json:"firstRenderNs"`
-		}
-		if json.Unmarshal(sc.Bytes(), &line) == nil && line.FirstRenderNS != 0 {
-			f.mu.Lock()
-			f.firstRenderNS[role] = line.FirstRenderNS
-			f.mu.Unlock()
-			return
-		}
-	}
-}
-
-// firstRenders returns a copy of the logged first-render times (engine clock ns).
-func (f *fixtureRun) firstRenders() map[string]int64 {
+// pidMap is a copy of the fixtures' pid → role map.
+func (f *fixtureRun) pidMap() map[uint32]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make(map[string]int64, len(f.firstRenderNS))
-	for k, v := range f.firstRenderNS {
+	out := make(map[uint32]string, len(f.pids))
+	for k, v := range f.pids {
 		out[k] = v
 	}
 	return out
 }
 
-// schedule starts the late fixtures and makes the mid-run service calls (case 15's rule change, 05 §18.5).
-func (f *fixtureRun) schedule(cs caseSpec, recStart time.Time, svc *audio.Service) {
-	// Late fixtures.
-	for i := range cs.fixtures {
-		step := &cs.fixtures[i]
-		if step.at <= 0 {
-			continue
-		}
-		go func(s *fixtureStep) {
-			time.Sleep(time.Until(recStart.Add(time.Duration(s.at * float64(time.Second)))))
-			f.start(s)
-		}(step)
-	}
-	// Case 15: the rule change at t = 4 s.
-	if cs.name == "runtime-rule" {
-		go func() {
-			time.Sleep(time.Until(recStart.Add(4 * time.Second)))
-			_ = svc.SetAppDecision("exe:fakevoice.exe", audio.DecisionKeepOut)
-		}()
-	}
+// start launches a top-level fixture step with args (fixtureArgs) now.
+func (f *fixtureRun) start(step *fixtureStep, args []string) {
+	f.startExe(step.role, filepath.Join(f.work, step.exe), args, step.underExplorer)
 }
 
-func (f *fixtureRun) killAll() {
+// startExe launches exe with args, reparented under explorer.exe when underExplorer is set (05 §18.3), registers its
+// pid under role, and reads the JSON lines of it and its descendants from a pipe they all inherit.
+func (f *fixtureRun) startExe(role, exe string, args []string, underExplorer bool) *trackedProc {
+	f.mu.Lock()
+	closed := f.closed
+	f.mu.Unlock()
+	if closed {
+		return nil
+	}
+	cmd, reparented, stdout := startProcess(exe, args, underExplorer)
+	f.mu.Lock()
+	if underExplorer {
+		f.allReparented = f.allReparented && reparented
+	}
+	f.mu.Unlock()
+	if cmd == nil {
+		return nil
+	}
+	tp := f.track(role, uint32(cmd.Process.Pid)) //nolint:gosec // G115: a PID fits in uint32
+	f.mu.Lock()
+	f.cmds = append(f.cmds, cmd)
+	f.mu.Unlock()
+	f.wg.Add(2)
+	go func() { defer f.wg.Done(); _ = cmd.Wait() }() // reaps it and releases os/exec's handle when it exits
+	go func() { defer f.wg.Done(); f.scan(stdout) }()
+	return tp
+}
+
+// track registers pid under role and opens a handle on it, watched by a goroutine that records its exit.
+func (f *fixtureRun) track(role string, pid uint32) *trackedProc {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, p := range f.procs {
-		_ = exec.CommandContext(context.Background(), "taskkill", "/F", "/T", "/PID", fmt.Sprint(p.Pid)).Run() //nolint:gosec // G204: the harness kills its own fixtures
-	}
-	f.procs = nil
-}
-
-// fixtureArgs builds the `fixture` subcommand arguments for a step.
-func fixtureArgs(step *fixtureStep) []string {
-	args := []string{"fixture", step.verb}
-	switch step.verb {
-	case verbTone:
-		args = append(args, "-f", joinFreqs(step.freqs))
-		if step.dur > 0 {
-			args = append(args, "-d", fmt.Sprint(step.dur))
-		}
-		if step.amp > 0 {
-			args = append(args, "-amp", fmt.Sprint(step.amp))
-		}
-		if step.mic {
-			args = append(args, "-mic")
-		}
-	case verbIdle:
-		if step.dur > 0 {
-			args = append(args, "-d", fmt.Sprint(step.dur))
-		}
-		if step.mic {
-			args = append(args, "-mic")
-		}
-	case verbSpawn:
-		if step.child != nil {
-			args = append(args, "-d", fmt.Sprint(step.child.dur))
-		}
-		if step.orphanAfter > 0 {
-			args = append(args, "-orphan-after", fmt.Sprint(step.orphanAfter))
+	f.pids[pid] = role
+	for _, tp := range f.procs {
+		if tp.pid == pid {
+			return tp
 		}
 	}
-	return args
-}
-
-func joinFreqs(freqs []float64) string {
-	parts := make([]string, len(freqs))
-	for i, f := range freqs {
-		parts[i] = fmt.Sprint(f)
+	tp := &trackedProc{role: role, pid: pid, done: make(chan struct{})}
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_TERMINATE|
+		windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		close(tp.done)
+		f.procs = append(f.procs, tp)
+		return tp
 	}
-	return strings.Join(parts, ",")
+	tp.h = h
+	f.procs = append(f.procs, tp)
+	f.byRole[role] = tp
+	if f.closed {
+		_ = windows.TerminateProcess(h, 1) // announced after the case ended
+	}
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		_, _ = windows.WaitForSingleObject(h, windows.INFINITE)
+		at := f.clock()
+		tp.mu.Lock()
+		_ = windows.CloseHandle(h)
+		tp.h = 0
+		tp.mu.Unlock()
+		f.mu.Lock()
+		if _, ok := f.exit[role]; !ok {
+			f.exit[role] = at
+		}
+		f.mu.Unlock()
+		close(tp.done)
+	}()
+	return tp
 }
 
-// copyFixtures copies the exe of a step (and its children) into the work folder under their role paths, before any
-// recording (05 §18.3).
-func copyFixtures(self, work string, step fixtureStep, roleExe map[string]string) error {
-	if step.exe != "" {
-		dst := filepath.Join(work, step.exe)
-		if _, ok := roleExe[step.role]; !ok {
-			if err := copyExe(self, dst); err != nil {
-				return err
+// scan reads the fixtures' JSON lines until every process holding the pipe exited: a hello registers the pid of a
+// child the harness didn't start itself; a first render, a start or the bursts' onsets are recorded.
+func (f *fixtureRun) scan(r io.ReadCloser) {
+	defer func() { _ = r.Close() }()
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		var l fixtureLine
+		if json.Unmarshal(sc.Bytes(), &l) != nil {
+			continue
+		}
+		if l.Role != "" && l.PID != 0 {
+			f.track(l.Role, l.PID)
+		}
+		f.mu.Lock()
+		if l.Role != "" && l.StartNS != 0 {
+			f.started[l.Role] = l.StartNS
+		}
+		if l.Role != "" && l.FirstRenderNS != 0 {
+			if _, ok := f.firstRender[l.Role]; !ok {
+				f.firstRender[l.Role] = l.FirstRenderNS
 			}
 		}
-		roleExe[step.role] = dst
+		if len(l.OnsetNS) > 0 {
+			f.onsets = append([]int64(nil), l.OnsetNS...)
+		}
+		f.mu.Unlock()
 	}
-	if step.child != nil {
-		return copyFixtures(self, work, *step.child, roleExe)
-	}
-	return nil
 }
 
+// waitExit waits up to timeout for role's process to exit and its handle to close.
+func (f *fixtureRun) waitExit(role string, timeout time.Duration) bool {
+	f.mu.Lock()
+	tp := f.byRole[role]
+	f.mu.Unlock()
+	if tp == nil {
+		return false
+	}
+	select {
+	case <-tp.done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// pidOf is the pid of role's process, if known.
+func (f *fixtureRun) pidOf(role string) (uint32, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tp := f.byRole[role]
+	if tp == nil {
+		return 0, false
+	}
+	return tp.pid, true
+}
+
+// schedule starts the late fixtures and makes the mid-run calls (05 §18.5), each at its time after origin, the wall
+// time of the recording's t = 0: case 15's SetAppDecision at 4 s (its T_set is the first recorder stamp after the
+// call) and case 21's bitrate change at 4 s. It returns when ctx ends.
+func (f *fixtureRun) schedule(ctx context.Context, cs caseSpec, origin time.Time, caseDur float64,
+	svc *audio.Service, rec *recorder, sess media.Session, tSetIndex *int64) {
+	at := func(s float64, fn func()) {
+		f.wg.Add(1)
+		go func() {
+			defer f.wg.Done()
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Until(origin.Add(secs(s)))):
+				fn()
+			}
+		}()
+	}
+	for i := range cs.fixtures {
+		step := &cs.fixtures[i]
+		if step.at > 0 {
+			at(step.at, func() { f.start(step, fixtureArgs(step, f.work, caseDur)) })
+		}
+	}
+	switch {
+	case cs.name == "runtime-rule":
+		at(4, func() {
+			atomic.StoreInt64(tSetIndex, int64(rec.stampCount()))
+			_ = svc.SetAppDecision("exe:fakevoice.exe", audio.DecisionKeepOut)
+		})
+	case cs.special == "opus":
+		at(4, func() { _ = sess.SetBitrate(media.LayerAudio, 256000) })
+	}
+}
+
+// end is what the fixture run knows for the capture's finish (05 §18.3, §18.6).
+func (f *fixtureRun) end(cs caseSpec, caseDur float64) captureEnd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return captureEnd{
+		dur: caseDur, plan: planSpans(cs, caseDur), reparented: f.allReparented,
+		firstRender: cloneNS(f.firstRender), start: cloneNS(f.started), exit: cloneNS(f.exit),
+	}
+}
+
+func cloneNS(m map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// killAll ends every fixture of the case: each tracked process (orphans included) through the handle the harness
+// holds, then each top-level tree with taskkill /T for anything untracked. It waits briefly for the watchers.
+func (f *fixtureRun) killAll() {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
+	f.closed = true
+	procs := append([]*trackedProc(nil), f.procs...)
+	cmds := append([]*exec.Cmd(nil), f.cmds...)
+	f.mu.Unlock()
+	for _, c := range cmds {
+		_ = exec.CommandContext(context.Background(), "taskkill", "/F", "/T", "/PID", //nolint:gosec // G204: the harness kills its own fixtures
+			strconv.Itoa(c.Process.Pid)).Run()
+	}
+	for _, tp := range procs {
+		tp.mu.Lock()
+		if tp.h != 0 {
+			_ = windows.TerminateProcess(tp.h, 1)
+		}
+		tp.mu.Unlock()
+	}
+	done := make(chan struct{})
+	go func() { f.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
+}
+
+// copyExe copies the harness binary to dst (a fixture copy), creating its folder.
 func copyExe(src, dst string) error {
 	if _, err := os.Stat(dst); err == nil {
 		return nil
@@ -583,7 +819,7 @@ func copyExe(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
@@ -604,212 +840,6 @@ func removeAllRetry(dir string) {
 	}
 }
 
-// ---------------------------------------------------------------- capture → recording
-
-// capture accumulates the tap and the report samples for one case and builds a recording.
-type capture struct {
-	cs      caseSpec
-	roleExe map[string]string
-	exeRole map[string]string // exe base name → role
-	rec     *recorder
-	offset  int64 // engine clock − session clock
-
-	left, right []float64
-	tap0        int64 // the first tap chunk's CaptureNS (session clock); the recording's t = 0
-	haveTap0    bool
-	lastTapNS   int64
-	lostGapMs   int
-
-	roles       map[string]*roleTrack
-	engineAt    []engineSample
-	bannerAt    []bannerSample
-	events      []recEvent
-	firstRender map[string]float64
-	counters    map[string]int
-	foreign     map[string]bool
-}
-
-func newCapture(cs caseSpec, roleExe map[string]string, rec *recorder, offset int64) *capture {
-	exeRole := map[string]string{}
-	for role, path := range roleExe {
-		exeRole[strings.ToLower(filepath.Base(path))] = role
-	}
-	return &capture{
-		cs: cs, roleExe: roleExe, exeRole: exeRole, rec: rec, offset: offset,
-		roles: map[string]*roleTrack{}, firstRender: map[string]float64{}, counters: map[string]int{},
-		foreign: map[string]bool{},
-	}
-}
-
-// packet adds one PCM-tap chunk to the capture (05 §10.2: KindPCM is the tap; Opus packets are ignored here).
-func (c *capture) packet(pkt media.Packet) {
-	switch pkt.Kind {
-	case media.KindPCM:
-		if len(pkt.Data) != pcmChunkBytes {
-			return
-		}
-		if !c.haveTap0 {
-			c.tap0, c.haveTap0 = pkt.CaptureNS, true
-		} else if gap := pkt.CaptureNS - c.lastTapNS; gap > 15_000_000 {
-			if ms := int((gap - 10_000_000) / 1_000_000); ms > c.lostGapMs {
-				c.lostGapMs = ms
-			}
-		}
-		c.lastTapNS = pkt.CaptureNS
-		l, r := decodePCM(pkt.Data)
-		c.left = append(c.left, l...)
-		c.right = append(c.right, r...)
-	}
-}
-
-// sampleReport samples the engine report through the service's FriendsHear and the report itself, mapping rows to
-// fixture roles by exe base name.
-func (c *capture) sampleReport(svc *audio.Service, cs caseSpec) {
-	t := c.now()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	r, err := c.rec.AudioReport(ctx)
-	cancel()
-	if err != nil {
-		return
-	}
-	c.engineAt = append(c.engineAt, engineSample{t: t, value: r.Engine})
-	c.bannerAt = append(c.bannerAt, bannerSample{t: t, codes: bannerCodesOf(svc.FriendsHear())})
-	for _, app := range r.Apps {
-		role := c.exeRole[strings.ToLower(app.Exe)]
-		if role == "" {
-			if app.Playing && app.Verdict == "heard" {
-				c.foreign[otherRedacted] = true
-			}
-			continue
-		}
-		tr := c.roles[role]
-		if tr == nil {
-			tr = &roleTrack{}
-			c.roles[role] = tr
-		}
-		tr.samples = append(tr.samples, roleSampleState{
-			t: t, active: app.Playing, verdict: app.Verdict, reason: app.Reason, detail: app.Detail})
-	}
-	for _, ev := range r.Events {
-		role := c.exeRole[strings.ToLower(exeOfApp(ev.App))]
-		c.events = append(c.events, recEvent{t: c.engineToTap(ev.TNanos), code: ev.Code, role: role})
-	}
-	for k, v := range reportCounters(r) {
-		c.counters[k] = v
-	}
-}
-
-// now is the time since the recording started (the first tap chunk), in seconds.
-func (c *capture) now() float64 {
-	if !c.haveTap0 {
-		return 0
-	}
-	return float64(c.lastTapNS-c.tap0) / 1e9
-}
-
-// engineToTap maps an engine-clock time to seconds since the recording start.
-func (c *capture) engineToTap(engineNS int64) float64 {
-	if !c.haveTap0 {
-		return 0
-	}
-	return float64((engineNS-c.offset)-c.tap0) / 1e9
-}
-
-// finish builds the recording for the portable verdict. firstRenderNS are the fixtures' logged first-render times
-// in the engine clock, mapped here to recording-relative seconds.
-func (c *capture) finish(dur float64, reparented bool, firstRenderNS map[string]int64) recording {
-	var foreign []string
-	for f := range c.foreign {
-		foreign = append(foreign, f)
-	}
-	sort.Strings(foreign)
-	// Mark the roles the case plays that never appeared.
-	for _, role := range playingRoles(c.cs) {
-		if c.roles[role] == nil {
-			c.roles[role] = &roleTrack{neverActive: true}
-		} else if !anyActive(c.roles[role]) {
-			c.roles[role].neverActive = true
-		}
-	}
-	for role, ns := range firstRenderNS {
-		c.firstRender[role] = c.engineToTap(ns)
-	}
-	setStamp, ok := c.rec.lastStamp()
-	rc := recording{
-		left: c.left, right: c.right, recordDur: dur, reparented: reparented,
-		lostGapMs: c.lostGapMs, foreign: foreign, roles: c.roles, engineAt: c.engineAt, bannerAt: c.bannerAt,
-		events: c.events, firstRender: c.firstRender, counters: c.counters,
-		driverMeas: c.driverMeasures(),
-	}
-	if ok {
-		rc.setStamp, rc.setStampOK = c.engineToTap(setStamp), true
-	}
-	return rc
-}
-
-// driverMeasures are the session-lag and fast-path-exit values the driver computes from the engine events and the
-// fixtures' first-render times (cases 5). They are read from the events; when absent they are omitted.
-func (c *capture) driverMeasures() map[string]int {
-	out := map[string]int{}
-	// fastpathExit: the time from a voice app's session_created to the fastpath_exit event.
-	var created, exit float64
-	var haveCreated, haveExit bool
-	for _, ev := range c.events {
-		switch ev.code {
-		case "session_created":
-			if !haveCreated {
-				created, haveCreated = ev.t, true
-			}
-		case "fastpath_exit":
-			exit, haveExit = ev.t, true
-		}
-	}
-	if haveCreated && haveExit {
-		out[measureFastpathExit] = int(math.Round((exit - created) * 1000))
-	}
-	// sessionLag: session_created minus the fixture's logged first render.
-	for role, fr := range c.firstRender {
-		_ = role
-		if haveCreated {
-			out[measureSessionLag] = int(math.Round((created - fr) * 1000))
-			break
-		}
-	}
-	return out
-}
-
-func anyActive(tr *roleTrack) bool {
-	for _, s := range tr.samples {
-		if s.active {
-			return true
-		}
-	}
-	return false
-}
-
-// decodePCM splits a 3840-byte tap chunk into left and right float64 (interleaved little-endian float32).
-func decodePCM(data []byte) (left, right []float64) {
-	left = make([]float64, pcmChunkFrames)
-	right = make([]float64, pcmChunkFrames)
-	for i := range pcmChunkFrames {
-		left[i] = float64(math.Float32frombits(le32(data[i*8:])))
-		right[i] = float64(math.Float32frombits(le32(data[i*8+4:])))
-	}
-	return left, right
-}
-
-func le32(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
-
-// exeOfApp returns the exe part of an app id ("exe:foo.exe" → "foo.exe"), else the id.
-func exeOfApp(id string) string {
-	if s, ok := strings.CutPrefix(id, "exe:"); ok {
-		return s
-	}
-	return id
-}
-
 func bannerCodesOf(fh audio.FriendsHear) []string {
 	out := make([]string, 0, len(fh.Banners))
 	for _, b := range fh.Banners {
@@ -818,429 +848,253 @@ func bannerCodesOf(fh audio.FriendsHear) []string {
 	return out
 }
 
-// reportCounters is the mixer counters the verdict reads (fastpathLateCuts, …).
-func reportCounters(r media.AudioReport) map[string]int {
-	return map[string]int{
-		"underruns":        r.Counters.Underruns,
-		"trims":            r.Counters.Trims,
-		"fastpathExits":    r.Counters.FastpathExits,
-		"fastpathLateCuts": r.Counters.FastpathLateCuts,
-		"mixerResyncs":     r.Counters.MixerResyncs,
-	}
-}
-
 // ---------------------------------------------------------------- the special cases
 
-// tapChunk is one captured PCM-tap chunk with its session-clock capture time and mono samples.
-type tapChunk struct {
-	captureNS int64
-	mono      []float64
-}
+// runTimestamps (case 20) compares the PCM-tap onset of each 2 kHz burst against im_test_render_bursts' predicted
+// device-position time (05 §18.5, §13.2). The bursts are rendered by a reparented fixture with its own DLL, so they
+// are not isshoni's tree. bursts.exe is copied before the session starts (05 §18.3) and killed with the case.
+func (d *winDriver) runTimestamps(cs caseSpec, cfg gateConfig) (caseReport, error) {
+	setup, err := d.prepare(cs, cfg, exeBursts)
+	if err != nil {
+		return caseReport{}, err
+	}
+	defer setup.close()
+	const dur = 13.0
+	fx := newFixtureRun(setup.work, d.engineNow)
+	defer fx.killAll()
 
-// opusPkt is one captured Opus packet: its capture time, bytes and reinit flag.
-type opusPkt struct {
-	captureNS int64
-	data      []byte
-	reinit    bool
-}
-
-// capRaw is what sessionCapture collected: the tap, the Opus packets, and the engine-vs-session clock offset.
-type capRaw struct {
-	tap    []tapChunk
-	opus   []opusPkt
-	offset int64
-}
-
-// sessionCapture starts an audio-only session with the tap, calls onStart right after Start, and collects the tap
-// and Opus packets for dur seconds (05 §10.2).
-func (d *winDriver) sessionCapture(ac media.AudioConfig, dur float64, onStart func(sess media.Session)) (capRaw, error) {
+	ac := setup.svc.AudioConfig()
+	ac.TapPCM = true
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ac.TapPCM = true
 	sess, err := d.eng.Start(ctx, media.Config{Audio: &ac})
 	if err != nil {
-		return capRaw{}, err
+		return caseReport{}, fmt.Errorf("start the audio session: %w", err)
 	}
 	defer func() { _ = sess.Stop() }()
-	out := capRaw{offset: d.clockOffset(sess)}
-	if onStart != nil {
-		onStart(sess)
-	}
-	deadline := time.Now().Add(time.Duration(dur * float64(time.Second)))
-	for time.Now().Before(deadline) {
+	offset := d.clockOffset(sess)
+	capt := newCapture(offset, setup.watchNS)
+	fx.startExe("bursts", filepath.Join(setup.work, exeBursts),
+		[]string{"fixture", "bursts", "-role", "bursts", "-dll", filepath.Dir(setup.self), "-n", "10"}, true)
+	deadline := time.Now().Add(secs(dur + 5))
+	nextReport := time.Now()
+	for capt.now() < dur && time.Now().Before(deadline) {
+		if capt.haveTap && !time.Now().Before(nextReport) {
+			d.sample(capt, setup.svc, setup.rec, fx)
+			nextReport = nextReport.Add(secs(reportEverySec))
+		}
 		pctx, pcancel := context.WithTimeout(ctx, 60*time.Millisecond)
-		pkt, perr := sess.Next(pctx)
+		pkt, err := sess.Next(pctx)
 		pcancel()
-		if perr != nil {
-			continue
-		}
-		switch pkt.Kind {
-		case media.KindPCM:
-			if len(pkt.Data) == pcmChunkBytes {
-				l, r := decodePCM(pkt.Data)
-				out.tap = append(out.tap, tapChunk{captureNS: pkt.CaptureNS, mono: mono(l, r)})
-			}
-		case media.KindAudio:
-			data := append([]byte(nil), pkt.Data...)
-			out.opus = append(out.opus, opusPkt{captureNS: pkt.CaptureNS, data: data, reinit: pkt.Reinit})
+		if err == nil {
+			capt.packet(pkt)
 		}
 	}
-	return out, nil
+	// The fixture prints its onsets once the last burst has played.
+	for wait := time.Now().Add(2 * time.Second); time.Now().Before(wait); time.Sleep(50 * time.Millisecond) {
+		fx.mu.Lock()
+		n := len(fx.onsets)
+		fx.mu.Unlock()
+		if n > 0 {
+			break
+		}
+	}
+	cancel()
+	fx.killAll()
+	end := fx.end(cs, dur)
+	end.silenceFail, end.keptOutPre = setup.silenceFail, setup.keptOutPre
+	rec := capt.finish(cs, end)
+	fx.mu.Lock()
+	predicted := make([]int64, 0, len(fx.onsets))
+	for _, o := range fx.onsets {
+		predicted = append(predicted, o-offset) // engine clock → session clock
+	}
+	fx.mu.Unlock()
+	return scoreTimestamps(cs, cfg, rec, predicted), nil
 }
 
-// runTimestamps (case 20) compares the PCM-tap onset of each 2 kHz burst against im_test_render_bursts' predicted
-// device-position time (05 §18.5, §13.2): median abs error ≤ 15 ms, p95 − p5 ≤ 5 ms, Opus spacing exactly 20 ms,
-// 50 ± 1 packets/s. The bursts are rendered by a reparented fixture (its own DLL), so they are not isshoni's tree.
-func (d *winDriver) runTimestamps(cs caseSpec, cfg gateConfig) (caseReport, error) {
-	cr := baseReport(cs, cfg)
-	svc, _, stop, err := d.newService(audio.DefaultSettings(), nil)
-	if err != nil {
-		return inconclusive(cs, cfg, "service: %s", err), nil
-	}
-	defer stop()
-	_ = svc.Watch(true)
-
-	work, err := os.MkdirTemp("", "isshoni-audiotest-")
-	if err != nil {
-		return inconclusive(cs, cfg, "work folder: %s", err), nil
-	}
-	defer removeAllRetry(work)
-	self, _ := os.Executable()
-	exeDir := filepath.Dir(self)
-
-	onsetsCh := make(chan []int64, 1)
-	raw, err := d.sessionCapture(svc.AudioConfig(), 13, func(media.Session) {
-		go func() { onsetsCh <- d.runBurstsFixture(self, work, exeDir) }()
-	})
-	if err != nil {
-		return inconclusive(cs, cfg, "capture: %s", err), nil
-	}
-	var predicted []int64
-	select {
-	case predicted = <-onsetsCh:
-	case <-time.After(2 * time.Second):
-	}
-	if len(predicted) < 2 {
-		return inconclusive(cs, cfg, "the bursts fixture logged no onsets"), nil
-	}
-
-	errsMs := burstErrorsMs(raw, predicted)
-	if len(errsMs) < 2 {
-		return inconclusive(cs, cfg, "too few bursts were captured (%d)", len(errsMs)), nil
-	}
-	medAbs, spread := medianAbs(errsMs), p95MinusP5(errsMs)
-	spacingOK, rate := opusSpacing(raw.opus, 13)
-	cr.Measured["timestampMedianAbsMs"] = measure{ValueMs: int(math.Round(medAbs)), BudgetMs: 15}
-	cr.Measured["timestampSpreadMs"] = measure{ValueMs: int(math.Round(spread)), BudgetMs: 5}
-	fail := false
-	if medAbs > 15 {
-		cr.Problems = append(cr.Problems, fmt.Sprintf("median abs timestamp error %.1f ms > 15", medAbs))
-		fail = true
-	}
-	if spread > 5 {
-		cr.Problems = append(cr.Problems, fmt.Sprintf("timestamp spread %.1f ms > 5", spread))
-		fail = true
-	}
-	if !spacingOK {
-		cr.Problems = append(cr.Problems, "Opus packet spacing is not exactly 20 ms")
-		fail = true
-	}
-	if rate < 49 || rate > 51 {
-		cr.Problems = append(cr.Problems, fmt.Sprintf("Opus rate %.1f packets/s, want 50 ± 1", rate))
-		fail = true
-	}
-	cr.Result = resultPass
-	if fail {
-		cr.Result = resultFail
-	}
-	return cr, nil
-}
-
-// runOpus (case 21) checks the Opus stage: 1000 Hz within ±1.5 dB of the PCM-tap level, 440 Hz absent in the decoded
-// audio, the bitrate change at t = 4 s visible in packet sizes, and no IM_PKT_REINIT after the first packet
-// (05 §18.5).
+// runOpus (case 21) records the case like a tone case (fixtures, controls, the bitrate change at t = 4 s), decodes
+// every Opus packet with the DLL's libopus (im_test_opus_decode) and scores it (special.go).
 func (d *winDriver) runOpus(cs caseSpec, cfg gateConfig) (caseReport, error) {
-	cr := baseReport(cs, cfg)
-	svc, _, stop, err := d.newService(audio.DefaultSettings(), nil)
+	rec, err := d.runCase(cs, cfg)
 	if err != nil {
-		return inconclusive(cs, cfg, "service: %s", err), nil
+		return caseReport{}, err
 	}
-	defer stop()
-	_ = svc.Watch(true)
-
-	work, err := os.MkdirTemp("", "isshoni-audiotest-")
+	decoded, decoded0, err := d.decodeOpus(rec.opus)
 	if err != nil {
-		return inconclusive(cs, cfg, "work folder: %s", err), nil
+		return inconclusive(cs, cfg, "the Opus packets could not be decoded: %s", err), nil
 	}
-	defer removeAllRetry(work)
-	self, _ := os.Executable()
-	roleExe := map[string]string{}
-	for _, step := range cs.fixtures {
-		if err := copyFixtures(self, work, step, roleExe); err != nil {
-			return inconclusive(cs, cfg, "copy fixtures: %s", err), nil
-		}
-	}
-	fx := newFixtureRun(work, roleExe)
-	defer fx.killAll()
-	for i := range cs.fixtures {
-		fx.start(&cs.fixtures[i])
-	}
-	time.Sleep(time.Second) // the settle
-
-	raw, err := d.sessionCapture(svc.AudioConfig(), 8, func(sess media.Session) {
-		go func() {
-			time.Sleep(4 * time.Second)
-			_ = sess.SetBitrate(media.LayerAudio, 256000)
-		}()
-	})
-	if err != nil {
-		return inconclusive(cs, cfg, "capture: %s", err), nil
-	}
-	if len(raw.opus) < 50 {
-		return inconclusive(cs, cfg, "too few Opus packets (%d)", len(raw.opus)), nil
-	}
-
-	tapMono, tap0 := joinTap(raw.tap)
-	decoded, reinitAfterFirst, err := d.decodeOpus(raw)
-	if err != nil {
-		return inconclusive(cs, cfg, "decode: %s", err), nil
-	}
-	fail := false
-	tap1000 := toneLevelDB(segment(tapMono, sampleRate, 2, 0), sampleRate, freqGame)
-	dec1000 := toneLevelDB(segment(decoded, sampleRate, 2, 0), sampleRate, freqGame)
-	dec440 := toneLevelDB(segment(decoded, sampleRate, 2, 0), sampleRate, freqVoice)
-	if math.Abs(dec1000-tap1000) > 1.5 {
-		cr.Problems = append(cr.Problems, fmt.Sprintf("decoded 1000 Hz %.1f dB vs tap %.1f dB (> 1.5 dB)", dec1000,
-			tap1000))
-		fail = true
-	}
-	if dec440 > absentMaxDB {
-		cr.Problems = append(cr.Problems, fmt.Sprintf("decoded 440 Hz %.1f dB is not absent", dec440))
-		fail = true
-	}
-	if reinitAfterFirst {
-		cr.Problems = append(cr.Problems, "an IM_PKT_REINIT came after the first packet")
-		fail = true
-	}
-	if !bitrateVisible(raw.opus, raw.offset, tap0) {
-		cr.Problems = append(cr.Problems, "the 128→256 kbps change is not visible in packet sizes")
-		fail = true
-	}
-	cr.Result = resultPass
-	if fail {
-		cr.Result = resultFail
-	}
-	return cr, nil
+	return scoreOpus(cs, cfg, rec, decoded, decoded0), nil
 }
 
-// runPIDReuse (case 27, INFO) records whether Windows follows a reused PID into a heard app's tree (05 §5.2, §18.5).
-// The suspended-copy loop needs raw CreateProcess (not expressible with os/exec), so this build records the question
-// as INFO; the integrator's run reads the fixture's {matched, attempts} and the game's reason from the report.
-func (d *winDriver) runPIDReuse(cs caseSpec, cfg gateConfig) (caseReport, error) {
-	cr := baseReport(cs, cfg)
-	cr.Result = resultInfo
-	cr.Problems = append(cr.Problems, "pid-reuse records whether Windows follows a reused PID (§5.2); INFO")
-	return cr, nil
-}
-
-// runBurstsFixture copies the binary to work\Bursts\bursts.exe, runs `fixture bursts -dll <exeDir> -n 10` reparented
-// under explorer.exe, and returns the predicted onset times it logged (engine clock ns).
-func (d *winDriver) runBurstsFixture(self, work, exeDir string) []int64 {
-	dst := filepath.Join(work, `Bursts\bursts.exe`)
-	if err := copyExe(self, dst); err != nil {
-		return nil
-	}
-	proc, _, stdout := startProcess(dst, []string{"fixture", "bursts", "-dll", exeDir, "-n", "10"}, true, true)
-	if proc == nil || stdout == nil {
-		return nil
-	}
-	defer stdout.Close()
-	sc := bufio.NewScanner(stdout)
-	for sc.Scan() {
-		var line struct {
-			OnsetNS []int64 `json:"onsetNs"`
-		}
-		if json.Unmarshal(sc.Bytes(), &line) == nil && len(line.OnsetNS) > 0 {
-			return line.OnsetNS
-		}
-	}
-	return nil
-}
-
-// decodeOpus decodes every captured Opus packet with the DLL's libopus (im_test_opus_decode) and returns the
-// concatenated mono audio and whether any packet after the first carried IM_PKT_REINIT (05 §18.5 case 21).
-func (d *winDriver) decodeOpus(raw capRaw) ([]float64, bool, error) {
+// decodeOpus decodes every captured Opus packet with the DLL's libopus and returns the concatenated mono audio and
+// the capture time of its first sample (the first packet's, session clock).
+func (d *winDriver) decodeOpus(pkts []opusPkt) ([]float64, int64, error) {
 	pcm := make([]float32, 2*opusMaxFramesDecode)
 	var out []float64
-	reinitAfterFirst := false
-	for i, p := range raw.opus {
-		if i > 0 && p.reinit {
-			reinitAfterFirst = true
+	var first int64
+	for i, p := range pkts {
+		if i == 0 {
+			first = p.captureNS
 		}
 		if len(p.data) == 0 {
 			continue
 		}
 		frames, err := d.hooks.OpusDecode(p.data, pcm)
 		if err != nil {
-			return nil, reinitAfterFirst, err
+			return nil, 0, err
 		}
 		for f := range frames {
 			out = append(out, (float64(pcm[2*f])+float64(pcm[2*f+1]))/2)
 		}
 	}
-	return out, reinitAfterFirst, nil
+	return out, first, nil
 }
 
 // opusMaxFramesDecode is the longest Opus frame count per channel (120 ms at 48 kHz).
 const opusMaxFramesDecode = 5760
 
-// joinTap concatenates the tap chunks into one mono stream and returns it with the first chunk's capture time.
-func joinTap(chunks []tapChunk) ([]float64, int64) {
-	var out []float64
-	var first int64
-	for i, c := range chunks {
-		if i == 0 {
-			first = c.captureNS
-		}
-		out = append(out, c.mono...)
+// runPIDReuse (case 27, INFO) records whether Windows follows a reused PID into a heard app's tree (05 §5.2,
+// §18.5): the game plays 1000; LauncherX (A) starts Discord (B, playing the chime partials) and exits at 2 s; the
+// harness waits for A's exit and closes its handles on A, recreates A's pid as a suspended child of the game
+// (`fixture reuse-pid`), and on a match runs AudioController.SoundCheck(<game's pid>, 3 s), an INCLUDE stream on the
+// game's tree outside the policy whose "captured" means both chime partials were in it (§11.3). It records
+// {matched, attempts, captured, gameReason}.
+func (d *winDriver) runPIDReuse(cs caseSpec, cfg gateConfig) (caseReport, error) {
+	setup, err := d.prepare(cs, cfg)
+	if err != nil {
+		return caseReport{}, err
 	}
-	return out, first
+	defer setup.close()
+	fx := newFixtureRun(setup.work, d.engineNow)
+	defer fx.killAll()
+	for i := range cs.fixtures {
+		fx.start(&cs.fixtures[i], fixtureArgs(&cs.fixtures[i], setup.work, pidReuseLife))
+	}
+	cr := newCaseReport(cs, cfg)
+	info := map[string]any{"matched": false, "attempts": 0, "captured": false, "gameReason": ""}
+	cr.Info = info
+	result := func(problem string) (caseReport, error) {
+		if problem != "" {
+			cr.Problems = append(cr.Problems, problem)
+		}
+		return withResult(cs, cfg, cr, resultInfo), nil
+	}
+	if !fx.reparented() {
+		return result("fixtures weren't reparented under explorer.exe")
+	}
+
+	// Wait for A's exit (at 2 s) and for every handle the harness holds on A to close (os/exec's and the tracker's).
+	if !fx.waitExit("launcherx", 15*time.Second) {
+		return result("LauncherX (A) did not exit")
+	}
+	aPID, _ := fx.pidOf("launcherx")
+	gamePID, ok := fx.pidOf("game")
+	if !ok {
+		return result("the game fixture did not start")
+	}
+	time.Sleep(500 * time.Millisecond) // os/exec's Wait releases its handle once A exits
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, setup.self, "fixture", "reuse-pid", //nolint:gosec // G204: this binary
+		"-target", strconv.FormatUint(uint64(aPID), 10), "-parent", strconv.FormatUint(uint64(gamePID), 10)).Output()
+	var l fixtureLine
+	for _, line := range strings.Split(string(out), "\n") {
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &l) == nil && l.Matched != nil {
+			break
+		}
+	}
+	if l.Matched == nil {
+		return result(fmt.Sprintf("reuse-pid printed no result (%v)", err))
+	}
+	info["matched"], info["attempts"] = *l.Matched, l.Attempts
+	if !*l.Matched {
+		return result("")
+	}
+	fx.track("reused", aPID) // killed with the case (it stays suspended until then)
+	sc, err := setup.rec.SoundCheck(ctx, gamePID, 3*time.Second)
+	if err != nil {
+		return result("the sound check failed: " + err.Error())
+	}
+	info["captured"] = sc.Captured
+	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer rcancel()
+	if r, err := setup.rec.AudioReport(rctx); err == nil {
+		info["gameReason"] = gameRowReason(r, gamePID)
+	}
+	return result("")
 }
 
-// burstErrorsMs pairs each predicted burst onset (engine clock) with the nearest tap onset and returns the signed
-// errors in ms (measured − predicted). A burst onset in the tap is the first sample above 0.05 near the predicted
-// session time.
-func burstErrorsMs(raw capRaw, predicted []int64) []float64 {
-	var errs []float64
-	for _, pe := range predicted {
-		ps := pe - raw.offset // predicted session-clock time
-		if m, ok := tapOnsetNear(raw.tap, ps); ok {
-			errs = append(errs, float64(m-ps)/1e6)
-		}
-	}
-	return errs
-}
-
-// tapOnsetNear finds the first tap sample above 0.05 within ±30 ms of the session time ps and returns its session
-// time.
-func tapOnsetNear(chunks []tapChunk, ps int64) (int64, bool) {
-	const windowNS = 30_000_000
-	for _, c := range chunks {
-		chunkEnd := c.captureNS + int64(len(c.mono))*1e9/sampleRate
-		if chunkEnd < ps-windowNS || c.captureNS > ps+windowNS {
+// gameRowReason is the reason of the app row that the session of pid belongs to ("" if none).
+func gameRowReason(r media.AudioReport, pid uint32) string {
+	for _, s := range r.Sessions {
+		if s.PID != pid {
 			continue
 		}
-		for i, v := range c.mono {
-			t := c.captureNS + int64(i)*1e9/sampleRate
-			if t < ps-windowNS || t > ps+windowNS {
-				continue
-			}
-			if math.Abs(v) > 0.05 {
-				return t, true
+		for _, a := range r.Apps {
+			if a.ID == s.AppID {
+				return a.Reason
 			}
 		}
 	}
-	return 0, false
+	return ""
 }
 
-// medianAbs is the median of the absolute values.
-func medianAbs(xs []float64) float64 {
-	abs := make([]float64, len(xs))
-	for i, x := range xs {
-		abs[i] = math.Abs(x)
-	}
-	sort.Float64s(abs)
-	return abs[len(abs)/2]
-}
-
-// p95MinusP5 is the p95 − p5 spread.
-func p95MinusP5(xs []float64) float64 {
-	s := append([]float64(nil), xs...)
-	sort.Float64s(s)
-	p := func(q float64) float64 { return s[min(int(q*float64(len(s))), len(s)-1)] }
-	return p(0.95) - p(0.05)
-}
-
-// opusSpacing reports whether consecutive Opus packet capture times differ by exactly 20 ms and returns the packet
-// rate per second over dur.
-func opusSpacing(pkts []opusPkt, dur float64) (bool, float64) {
-	ok := len(pkts) > 1
-	for i := 1; i < len(pkts); i++ {
-		if pkts[i].captureNS-pkts[i-1].captureNS != 20_000_000 {
-			ok = false
-		}
-	}
-	return ok, float64(len(pkts)) / dur
-}
-
-// bitrateVisible reports whether the mean Opus packet size after t = 4 s exceeds the mean before it (the 128→256
-// kbps change).
-func bitrateVisible(pkts []opusPkt, offset, tap0 int64) bool {
-	cut := tap0 + 4_000_000_000
-	var beforeSum, afterSum float64
-	var beforeN, afterN int
-	for _, p := range pkts {
-		if p.captureNS < cut {
-			beforeSum += float64(len(p.data))
-			beforeN++
-		} else {
-			afterSum += float64(len(p.data))
-			afterN++
-		}
-	}
-	if beforeN == 0 || afterN == 0 {
-		return false
-	}
-	return afterSum/float64(afterN) > beforeSum/float64(beforeN)
-}
-
-func baseReport(cs caseSpec, cfg gateConfig) caseReport {
-	return caseReport{
-		Name: cs.name, Required: cs.requiredUnder(cfg), Measured: map[string]measure{},
-		Counters: map[string]int{}, ClicksAt: []float64{}, Problems: []string{},
-	}
+// reparented reports whether every reparented fixture so far was really started under explorer.exe.
+func (f *fixtureRun) reparented() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.allReparented
 }
 
 // ---------------------------------------------------------------- Windows process helpers (S1's winapi)
 
-// startProcess launches exe with args, reparented under explorer.exe when underExplorer is set (05 §18.3). It
-// returns the process, whether it was reparented, and (when wantStdout) a reader of the process's stdout.
-func startProcess(exe string, args []string, underExplorer, wantStdout bool) (*os.Process, bool, io.ReadCloser) {
-	build := func(reparent bool) (*exec.Cmd, bool, io.ReadCloser) {
+// startProcess launches exe with args, reparented under explorer.exe when underExplorer is set (05 §18.3), with its
+// stdout on a pipe that its descendants inherit. It returns the started command, whether it was reparented, and the
+// pipe's read end (EOF once every process holding it exited). A failed reparented start is retried without
+// reparenting (the case is then INCONCLUSIVE).
+func startProcess(exe string, args []string, underExplorer bool) (*exec.Cmd, bool, io.ReadCloser) {
+	try := func(reparent bool) (*exec.Cmd, bool, io.ReadCloser, error) {
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			return nil, false, nil, err
+		}
 		cmd := exec.CommandContext(context.Background(), exe, args...) //nolint:gosec // G204: the harness starts its own fixture copies
+		cmd.Stdout = pw                                                // an *os.File: the child gets the handle itself, and Wait never closes the read end
 		attr := &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 		reparented := false
+		var explorer windows.Handle
 		if reparent {
 			if h, err := openExplorer(); err == nil {
-				defer func() { _ = windows.CloseHandle(h) }()
+				explorer = h
 				attr.ParentProcess = syscall.Handle(h)
 				reparented = true
 			}
 		}
 		cmd.SysProcAttr = attr
-		var out io.ReadCloser
-		if wantStdout {
-			if p, err := cmd.StdoutPipe(); err == nil {
-				out = p
-			}
+		err = cmd.Start()
+		if explorer != 0 {
+			_ = windows.CloseHandle(explorer) // only after CreateProcess has used it
 		}
-		return cmd, reparented, out
+		_ = pw.Close()
+		if err != nil {
+			_ = pr.Close()
+			return nil, false, nil, err
+		}
+		return cmd, reparented, pr, nil
 	}
-	cmd, reparented, out := build(underExplorer)
-	if err := cmd.Start(); err != nil {
-		if !reparented {
-			return nil, false, nil
-		}
-		cmd, reparented, out = build(false) // retry without reparenting
-		if err := cmd.Start(); err != nil {
-			return nil, false, nil
-		}
+	cmd, reparented, out, err := try(underExplorer)
+	if err != nil && underExplorer {
+		cmd, reparented, out, err = try(false)
 	}
-	return cmd.Process, reparented, out
+	if err != nil {
+		return nil, false, nil
+	}
+	return cmd, reparented, out
 }
 
 // openExplorer opens the user's explorer.exe in this session, for PROC_THREAD_ATTRIBUTE_PARENT_PROCESS (05 §18.3,
-// S1's openExplorer).
+// S1's openExplorer). os/exec duplicates the standard handles into it, hence PROCESS_DUP_HANDLE.
 func openExplorer() (windows.Handle, error) {
 	var mySession uint32
 	_ = windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &mySession)
@@ -1265,7 +1119,10 @@ func openExplorer() (windows.Handle, error) {
 	return 0, fmt.Errorf("explorer.exe not found in session %d", mySession)
 }
 
-// readOSInfo reads the Windows product, build and UBR (redacted: no machine identifiers).
+// ntCurrentVersion is the registry key with the OS build's UBR and edition.
+const ntCurrentVersion = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`
+
+// readOSInfo reads the Windows product, build, UBR and edition (05 §18.4; no machine identifiers).
 func readOSInfo() osInfo {
 	_, _, build := windows.RtlGetNtVersionNumbers()
 	build &= 0xffff
@@ -1273,13 +1130,55 @@ func readOSInfo() osInfo {
 	if build < 22000 {
 		product = "win10"
 	}
-	return osInfo{Product: product, Build: int(build)}
+	o := osInfo{Product: product, Build: int(build)}
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, ntCurrentVersion, registry.QUERY_VALUE)
+	if err != nil {
+		return o
+	}
+	defer func() { _ = k.Close() }()
+	if ubr, _, err := k.GetIntegerValue("UBR"); err == nil && ubr <= 1<<31 {
+		o.UBR = int(ubr)
+	}
+	if ed, _, err := k.GetStringValue("EditionID"); err == nil {
+		o.Edition = ed
+	}
+	return o
+}
+
+// readCPUVendor is the first processor's vendor string ("GenuineIntel", "AuthenticAMD"; 05 §18.4).
+func readCPUVendor() string {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `HARDWARE\DESCRIPTION\System\CentralProcessor\0`,
+		registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = k.Close() }()
+	v, _, err := k.GetStringValue("VendorIdentifier")
+	if err != nil {
+		return ""
+	}
+	return v
+}
+
+// readDuckingPref is HKCU\Software\Microsoft\Multimedia\Audio\UserDuckingPreference (0 mute, 1 −80 %, 2 −50 %,
+// 3 do nothing; 05 §18.4 records it), or −1 when it is not set (Windows' default, which ducks) or unreadable.
+func readDuckingPref() int {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Multimedia\Audio`, registry.QUERY_VALUE)
+	if err != nil {
+		return -1
+	}
+	defer func() { _ = k.Close() }()
+	v, _, err := k.GetIntegerValue("UserDuckingPreference")
+	if err != nil || v > 3 {
+		return -1
+	}
+	return int(v)
 }
 
 // ---------------------------------------------------------------- the fixture subcommand (a fixture copy runs this)
 
 // runFixture is what a renamed copy of the binary runs (05 §18.3): it plays a tone, idles, spawns a child, reuses a
-// PID, renders bursts or an endpoint tone. It prints {"firstRenderNs": N} before its first PlaySoundW when asked.
+// PID, renders bursts or an endpoint tone.
 func runFixture(args []string) int {
 	// Resolve DLLs from System32 only (never the download folder), like S1 and the engine's loader.
 	_ = windows.SetDefaultDllDirectories(windows.LOAD_LIBRARY_SEARCH_SYSTEM32)

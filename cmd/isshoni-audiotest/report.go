@@ -51,8 +51,8 @@ type machineInfo struct {
 	CPU               string         `json:"cpu"`
 	RenderEndpoints   []endpointInfo `json:"renderEndpoints"`
 	Mic               bool           `json:"mic"`
-	MasterVolume      float64        `json:"masterVolume"`
-	Muted             bool           `json:"muted"`
+	MasterVolume      *float64       `json:"masterVolume"` // null: not read (needs the endpoint volume COM API)
+	Muted             *bool          `json:"muted"`        // null: not read
 	DuckingPreference int            `json:"duckingPreference"`
 }
 
@@ -91,6 +91,8 @@ type caseReport struct {
 	Engine   []string           `json:"engine"`
 	Counters map[string]int     `json:"counters"`
 	Events   []reportEvent      `json:"events"`
+	// Info is what an INFO case records beyond checks (case 27: matched, attempts, captured, gameReason).
+	Info map[string]any `json:"info,omitempty"`
 }
 
 // checkReport is one frequency check of a case (05 §18.7). MaxShortDB/MaxShortAtS are the short-window rule's
@@ -107,7 +109,9 @@ type checkReport struct {
 }
 
 // measure is one event-relative value with its budget (05 §18.7): cutMs (case 15), onsetMs (cases 8, 13, 25),
-// sessionLagMs (case 5), fastpathExitMs (case 5).
+// sessionLagMs (case 5), fastpathExitMs (case 5). The report nests them ("cutMs": {"valueMs": 58, "budgetMs": 100})
+// where §18.7's example is flat ({"cutMs": 58, "budgetMs": 100}): case 5 records two values with two budgets, which
+// one flat budgetMs can't hold. A deviation for the integrator's write-back.
 type measure struct {
 	ValueMs  int `json:"valueMs"`
 	BudgetMs int `json:"budgetMs"`
@@ -187,7 +191,9 @@ func reportName(product string, build int, stamp string) string {
 //
 // The sha256 is shortened to 12 hex; gate= is PASS, FAIL or absent for a non-gate run.
 func summaryLine(r report) string {
-	total := r.Summary.Pass + r.Summary.Fail + r.Summary.Inconclusive + r.Summary.Skip + r.Summary.Info
+	// INFO cases are not in the total (05 §18.7's example: pass 24, info 2 → "24/24 PASS"); the " · N INFO" suffix
+	// counts them.
+	total := r.Summary.Pass + r.Summary.Fail + r.Summary.Inconclusive + r.Summary.Skip
 	sha := r.DLL.SHA256
 	if len(sha) > 12 {
 		sha = sha[:12]
@@ -214,7 +220,8 @@ func summaryLine(r report) string {
 }
 
 // osProductLabel is a short OS label for the summary line (no machine name): "Windows 11 Pro 26200.6899", or the
-// GOOS for a non-Windows diagnostic run.
+// GOOS for a non-Windows diagnostic run. The registry's EditionID ("Professional", "Core") is shortened to the
+// marketing name.
 func osProductLabel(o osInfo) string {
 	switch o.Product {
 	case "win11", "win10":
@@ -222,8 +229,8 @@ func osProductLabel(o osInfo) string {
 		if o.Product == "win10" {
 			name = "Windows 10"
 		}
-		if o.Edition != "" {
-			name += " " + o.Edition
+		if e := editionLabel(o.Edition); e != "" {
+			name += " " + e
 		}
 		if o.Build != 0 {
 			name += fmt.Sprintf(" %d.%d", o.Build, o.UBR)
@@ -233,6 +240,22 @@ func osProductLabel(o osInfo) string {
 		return "unknown OS"
 	default:
 		return o.Product
+	}
+}
+
+// editionLabel is the summary line's name of a Windows EditionID.
+func editionLabel(edition string) string {
+	switch edition {
+	case "Professional":
+		return "Pro"
+	case "Core":
+		return "Home"
+	case "ProfessionalWorkstation":
+		return "Pro for Workstations"
+	case "ProfessionalEducation":
+		return "Pro Education"
+	default:
+		return edition
 	}
 }
 

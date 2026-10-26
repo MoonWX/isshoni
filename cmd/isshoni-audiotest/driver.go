@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
+	"runtime"
 	"sync"
 
 	"github.com/MoonWX/isshoni/internal/media"
@@ -12,8 +14,13 @@ import (
 // and the engine driver (docs/m2/05-windows-audio.md §18.1). The Windows driver (driver_windows.go) loads
 // isshoni-media.dll through native.Open, drives it through internal/desktop/audio.Service, starts the fixtures as
 // children of explorer.exe and records the PCM tap; every other OS gets a driver that reports the engine is not
-// available yet (driver_other.go, which defines errUnsupportedOS), so the binary builds on the Mac and CI
-// ubuntu/macOS (GOOS=windows is the one that runs the cases).
+// available yet (driver_other.go returns errUnsupportedOS), so the binary builds on the Mac and CI ubuntu/macOS
+// (GOOS=windows is the one that runs the cases).
+
+// errUnsupportedOS is what newDriver returns on an OS without the engine. It is the only newDriver error selfcheck
+// skips: on Windows a DLL that is missing, of the wrong ABI or without an export fails selfcheck (05 §18.2).
+var errUnsupportedOS = errors.New("isshoni-audiotest: the Windows audio engine is required for this; this build is " +
+	runtime.GOOS)
 
 // driver runs the engine side of the audiotest. Only the Windows driver captures audio; the others return
 // errUnsupportedOS. A driver is used for one process invocation and closed at the end.
@@ -38,7 +45,8 @@ type driver interface {
 
 // driverOptions configures newDriver.
 type driverOptions struct {
-	keepWAV string // a folder to write the captured tap WAVs into; "" = don't keep
+	keepWAV string    // a folder to write the captured tap WAVs into; "" = don't keep
+	console io.Writer // where the driver names local things the report never carries (a kept-out process); nil = none
 }
 
 // recorder wraps a media.AudioController and stamps every SetExclusions call with the engine clock just before
@@ -73,6 +81,17 @@ func (r *recorder) lastStamp() (int64, bool) {
 		return 0, false
 	}
 	return r.stamps[len(r.stamps)-1], true
+}
+
+// stampAt is the engine clock of the i-th SetExclusions call (0-based), and whether there was one. Case 15 reads
+// stampCount right before its SetAppDecision and takes the next stamp as T_set (05 §18.5).
+func (r *recorder) stampAt(i int) (int64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i < 0 || i >= len(r.stamps) {
+		return 0, false
+	}
+	return r.stamps[i], true
 }
 
 // stampCount is how many SetExclusions calls have been recorded.

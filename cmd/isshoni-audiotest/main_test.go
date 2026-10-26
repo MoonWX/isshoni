@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
@@ -27,6 +28,26 @@ func TestSelfcheckWithoutEngine(t *testing.T) {
 	}
 	if !strings.Contains(b.String(), "engine self-check skipped") {
 		t.Fatalf("selfcheck should note the engine was skipped:\n%s", b.String())
+	}
+}
+
+// TestSelfcheckFailsWhenTheDLLDoesntLoad is 05 §18.2: selfcheck loads the DLL and exits 0 or 1; only an OS without
+// the engine skips the engine part. A missing DLL, a wrong ABI or a missing export fails it (CI windows runs it).
+func TestSelfcheckFailsWhenTheDLLDoesntLoad(t *testing.T) {
+	var b strings.Builder
+	open := func(driverOptions) (driver, error) { return nil, errors.New("open the engine: the DLL is missing") }
+	if got := selfcheckWith(&b, open); got != exitFail {
+		t.Fatalf("a DLL that doesn't load: exit %d, want %d\n%s", got, exitFail, b.String())
+	}
+	b.Reset()
+	open = func(driverOptions) (driver, error) { return nil, errUnsupportedOS }
+	if got := selfcheckWith(&b, open); got != exitAllPass || !strings.Contains(b.String(), "skipped") {
+		t.Fatalf("no engine on this OS: exit %d, want %d with a skip note\n%s", got, exitAllPass, b.String())
+	}
+	b.Reset()
+	open = func(driverOptions) (driver, error) { return &stubDriver{endpoints: 1}, nil }
+	if got := selfcheckWith(&b, open); got != exitAllPass || !strings.Contains(b.String(), "selfcheck: ok") {
+		t.Fatalf("a working engine: exit %d\n%s", got, b.String())
 	}
 }
 
