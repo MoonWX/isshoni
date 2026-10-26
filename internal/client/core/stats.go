@@ -14,9 +14,9 @@ import (
 // Stats (docs/m2/01-client-core.md §11.9, M1 01 §8.11), three flows:
 //
 //   - The engine's view: while a share is live, its actor calls Session.Stats every timing.engineStats (1 s) and
-//     copies each layer's encoder, HW flag and limit into its LayerSnapshot (EventShare when one changes), next to
-//     the live counters FPSIn and EngineLatency (capture → engine ring, P50 and P95; Max stays 0), which fire no
-//     event (§11.10).
+//     copies each layer's encoder, HW flag and limit into its LayerSnapshot (EventShare when one changes; a cpu or
+//     gpu limit from EventLimit holds until its none edge), next to the live counters FPSIn and EngineLatency
+//     (capture → engine ring, P50 and P95; Max stays 0), which fire no event (§11.10).
 //   - The stats report to the server: every timing.statsReport (10 s) while the share's pub PC exists and signaling
 //     is ready, a protocol.ClientStats with the pub PC (gen, its RTCPeerConnectionState, the RTT from the SFU's
 //     receiver reports, the selected pair's local candidate type and transport) and an outbound entry per video
@@ -25,7 +25,8 @@ import (
 //     before it goes. It carries encoder names and numbers only: no source or app name, no address (§11.12).
 //   - The server's view (WatchServerStats, the app's debug overlay): stats.watch{on} on the Go connection, sent
 //     again on a new connection (a resumed one keeps it, M1 01 §8.11), and the server's stats of the share's
-//     layers (every 2 s while the connection is in the share's room) kept in ShareSnapshot.Server, a live counter.
+//     layers (every 2 s while the connection is in the share's room) kept in ShareSnapshot.Server, a live counter,
+//     which is cleared while signaling is down and when a republish changes the share's id.
 
 // statsState is a share's side of the stats. The actor's alone.
 type statsState struct {
@@ -35,13 +36,14 @@ type statsState struct {
 }
 
 // statsTick is the actor's look at the stats (tick, every timing.pcPoll): the engine's stats while the share is
-// live, a stats report when one is due, and the connection's stats.watch.
+// live, the server's stats that went stale, a stats report when one is due, and the connection's stats.watch.
 func (s *Share) statsTick(now time.Time) {
 	t := s.c.timing
 	if s.live && !now.Before(s.st.engineAt) {
 		s.st.engineAt = now.Add(t.engineStats)
 		s.pollEngine()
 	}
+	s.dropStaleServerStats()
 	if s.rec.online {
 		s.c.syncWatch()
 	}
@@ -66,7 +68,10 @@ func (s *Share) statsTick(now time.Time) {
 
 // pollEngine copies the engine's stats into the snapshot (§11.9): the encoder, its HW flag and the limit of each
 // layer (and f's encoder as the share's), and the live counters FPSIn and EngineLatency, which fire no EventShare.
-// An engine that leaves a field empty keeps what EventLayer and EventLimit said.
+// An engine that leaves a field empty keeps what EventLayer and EventLimit said. A layer whose last EventLimit was
+// cpu or gpu keeps that limit: ratectl, Overloaded and the reports' qualityLimitation follow EventLimit's edges,
+// and stats that lag the event (the fake engine's say none always) would put none next to them. Once the layer's
+// EventLimit says none, the stats' limit shows again (none, or source, which only the stats carry).
 func (s *Share) pollEngine() {
 	st, err := s.sess.Stats()
 	if err != nil {
@@ -93,7 +98,7 @@ func (s *Share) pollEngine() {
 					snap.Encoder, snap.HW = l.Encoder, l.HW
 				}
 			}
-			if l.Limit != "" {
+			if l.Limit != "" && !encoderLimited(s.limits[l.RID]) {
 				ls.Limit = l.Limit
 			}
 		}
@@ -177,6 +182,10 @@ func qualityLimitation(uploadLimited bool, limit string) string {
 	return qualityNone
 }
 
+// encoderLimited reports whether an EventLimit's limit says the layer's encoder can't keep up (cpu or gpu), as
+// ratectl's CPU hint counts it.
+func encoderLimited(limit string) bool { return limit == "cpu" || limit == "gpu" }
+
 // rttMs is the pub PC's RTT in whole milliseconds, rounded up so that a known one is never 0: the first track's
 // that has one (the video layers come first), 0 while no receiver report has given one.
 func rttMs(tracks []publish.TrackStats) int {
@@ -227,7 +236,8 @@ const watchRetry = 2 * time.Second
 // WatchServerStats turns stats.watch on or off (the app's debug overlay); the server's view of this connection's
 // layers then arrives in ShareSnapshot.Server, a live counter (every 2 s while a share is in its room, M1 01 §8.11).
 // It returns at once: the request goes out in the background while signaling is ready, and again on a new
-// connection, which starts without the watch. Off clears ShareSnapshot.Server at once.
+// connection, which starts without the watch. Off clears ShareSnapshot.Server at once; it is also empty while
+// signaling is down, until the server's next stats.
 func (c *Client) WatchServerStats(on bool) {
 	c.mu.Lock()
 	c.watch.want, c.watch.retryAt = on, time.Time{}
@@ -316,6 +326,21 @@ func (c *Client) onServerStats(st protocol.ServerStats) {
 	sh.setServerStats(st.Layers)
 	if on, _ := want(); !on {
 		sh.setServerStats(nil)
+	}
+}
+
+// dropStaleServerStats clears ShareSnapshot.Server while the server sends none for the share: signaling is down
+// (the hold), or a republish gave the share a new id (the old id's stats would show as the new one's until the
+// first stats of the new id). Fresh ones come with the first stats message after the watch is sent again (a new
+// connection) or the republished share is in the room. A live counter, so no EventShare. The actor's (statsTick).
+func (s *Share) dropStaleServerStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.snap.Server) == 0 || s.snap.State == StateEnded {
+		return
+	}
+	if !s.rec.online || s.snap.Server[0].ShareID != s.snap.ID {
+		s.snap.Server = nil
 	}
 }
 

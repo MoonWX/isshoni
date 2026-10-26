@@ -134,8 +134,8 @@ func TestStatsNotWhileOffline(t *testing.T) {
 	waitReports(t, fs, n+1)
 }
 
-// TestQualityLimitation: §11.9's mapping, and a layer's EventLimit in the next report (the share isn't live, so the
-// engine's stats poll doesn't run).
+// TestQualityLimitation: §11.9's mapping, and a layer's EventLimit on a live share: the snapshot keeps it through
+// the engine's stats polls (the fake engine's stats say none always), Overloaded agrees, and the next report has it.
 func TestQualityLimitation(t *testing.T) {
 	for _, tc := range []struct {
 		upload bool
@@ -153,13 +153,22 @@ func TestQualityLimitation(t *testing.T) {
 
 	fs := newFakeServer(t)
 	e := newEnv(t, fs, envOptions{tweak: statsTiming()})
-	startedShare(t, e)
+	sh := startedShare(t, e)
+	roomState(fs, 3, shareAs(protocol.ShareStatusLive, protocol.PresetAuto))
+	e.waitState(sh, StateLive)
+	eventually(t, func() bool { return fullOf(sh).Encoder == "fake" && fullOf(sh).Limit == "none" },
+		func() string { return fmt.Sprintf("the full layer %+v, want the engine's stats in it", *fullOf(sh)) })
 	sess := sessionOf(t, e)
 	for _, limit := range []struct{ engine, report string }{{"cpu", qualityCPU}, {"gpu", qualityOther},
 		{"none", qualityNone}} {
 		sess.Emit(media.Event{Code: media.EventLimit, Layer: "f", Limit: limit.engine})
-		eventually(t, func() bool { return fullOf(e.c.ActiveShare()).Limit == limit.engine },
+		eventually(t, func() bool { return fullOf(sh).Limit == limit.engine },
 			func() string { return fmt.Sprintf("the snapshot's f limit, want %s", limit.engine) })
+		time.Sleep(150 * time.Millisecond) // three engine stats polls
+		if snap := sh.Snapshot(); snap.layer("f").Limit != limit.engine || snap.Overloaded != (limit.engine != "none") {
+			t.Errorf("limit %s: after the engine's stats polls f's limit is %q and Overloaded %t, want %s and %t",
+				limit.engine, snap.layer("f").Limit, snap.Overloaded, limit.engine, limit.engine != "none")
+		}
 		n := len(statsReports(t, fs))
 		rs := waitReports(t, fs, n+1)
 		last := rs[len(rs)-1]
@@ -251,7 +260,7 @@ func waitWatches(t *testing.T, fs *fakeServer, want string) {
 
 // TestWatchServerStats: a wish made before Run goes once online; the server's stats of the share's current id reach
 // ShareSnapshot.Server, without EventShare, and those of another id don't; off clears it at once and later stats are
-// dropped; a resumed connection keeps the watch, a new one is asked again.
+// dropped; signaling's drop clears it; a resumed connection keeps the watch, a new one is asked again.
 func TestWatchServerStats(t *testing.T) {
 	fs := newFakeServer(t)
 	e := newEnv(t, fs, envOptions{tweak: statsTiming()})
@@ -298,8 +307,18 @@ func TestWatchServerStats(t *testing.T) {
 
 	e.c.WatchServerStats(true)
 	waitWatches(t, fs, "on off on")
-	fs.kill() // resumed: the server keeps the connection's watch
-	eventually(t, func() bool { return fs.helloCount() == 2 && e.c.Status().Conn == ConnOnline },
+	fs.send(protocol.MessageTypeStats, protocol.ServerStats{Layers: []protocol.ServerLayerStats{mine}})
+	eventually(t, func() bool { return len(sh.Snapshot().Server) > 0 },
+		func() string { return "the server's stats are not in the snapshot" })
+	refuseHellos(fs)
+	fs.kill() // signaling is down: the server sends no stats, so the snapshot has none
+	eventually(t, func() bool { return e.c.Status().Conn != ConnOnline && sh.Snapshot().Server == nil },
+		func() string {
+			return fmt.Sprintf("status %+v, ShareSnapshot.Server %+v, want it offline and none", e.c.Status().Conn,
+				sh.Snapshot().Server)
+		})
+	fs.setHello(nil) // resumed: the server keeps the connection's watch
+	eventually(t, func() bool { return e.c.Status().Conn == ConnOnline },
 		func() string { return "no resume" })
 	settle()
 	if got := watches(fs); got != "[on off on]" {
