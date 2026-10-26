@@ -327,8 +327,8 @@ INSTANTIATE_TEST_SUITE_P(AllSeven, Goldens,
                                            Case{"report-many-apps.json", &ManyApps},
                                            Case{"report-browser-mic.json", &BrowserMic},
                                            Case{"report-shared-mic.json", &SharedMic}),
-                         [](const auto &info) {
-                           std::string n = info.param.file;
+                         [](const auto &param_info) { // not "info": gtest's macro has a parameter of that name
+                           std::string n = param_info.param.file;
                            n = n.substr(7, n.size() - 12); // "report-" ... ".json"
                            for (char &c : n) {
                              c = c == '-' ? '_' : c;

@@ -375,13 +375,13 @@ TEST_F(GpuWarp, ConverterReconfigures) {
 
   // A content of another size (a resized window before its re-init, 04 §7.7) is fitted into the output, black bars
   // around it, and never reads past its region of the texture.
-  const SourceFrame small = tex.Source(Size{1000, 1000}, Rotation::kIdentity);
-  const ConvertGeometry gs = conv->Geometry(small);
+  const SourceFrame fitted = tex.Source(Size{1000, 1000}, Rotation::kIdentity);
+  const ConvertGeometry gs = conv->Geometry(fitted);
   EXPECT_TRUE(gs.dest == (Rect{280, 0, 720, 720}));
-  const Nv12Image got_small = ConvertAndRead(*dev_, *conv, small);
+  const Nv12Image got_fitted = ConvertAndRead(*dev_, *conv, fitted);
   ASSERT_FALSE(HasFailure());
   const wt::Nv12Diff ds =
-      wt::CompareNv12(got_small, model::Convert(img, gs), [&](Point p) { return model::Flat(img, gs, p, 1) ? 1 : 2; });
+      wt::CompareNv12(got_fitted, model::Convert(img, gs), [&](Point p) { return model::Flat(img, gs, p, 1) ? 1 : 2; });
   EXPECT_LE(ds.max_flat, 1) << ds.Summary();
   EXPECT_LE(ds.max_edge, 2) << ds.Summary();
 }
