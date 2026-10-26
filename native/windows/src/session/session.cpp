@@ -210,6 +210,11 @@ uint64_t DeviceOf(im_session s) {
   const std::shared_ptr<Session> p = Sessions().Get(s);
   return p ? p->device() : 0;
 }
+
+bool GpuPathOf(im_session s) {
+  const std::shared_ptr<Session> p = Sessions().Get(s);
+  return p && p->gpu_path();
+}
 #endif
 
 } // namespace im::session

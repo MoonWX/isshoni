@@ -37,9 +37,10 @@ import (
 //     FileVersion = -winver, ProductName "isshoni", CompanyName "isshoni project", LegalCopyright "Copyright the
 //     isshoni authors. Apache-2.0.", OriginalFilename "isshoni-media.dll", FileDescription "isshoni media engine" and
 //     InternalName "isshoni-media" (04 §13.4);
-//   - with -load-config: has DependentLoadFlags 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) in its load config. That check
-//     exists only if README WA11's dll_search_test shows the delay-load helper honors /DEPENDENTLOADFLAG (06 §5.1);
-//     without the flag the value is printed only.
+//   - with -load-config: has DependentLoadFlags 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) in its load config. No job
+//     passes it: WA11's dll_search_test found that the delay-load helper doesn't honor /DEPENDENTLOADFLAG ("not
+//     honored", README §3 item 34, 04 §13.1, 06 §5.1), so the DLL is linked without the flag and the engine's
+//     delay-load hook is the guard. Without -load-config the value is printed, unchecked (loadConfigNote).
 //
 // With -ffmpeg DIR, the FFmpeg DLLs in DIR (avcodec-*.dll, avutil-*.dll) are exactly the two that
 // native/ffmpeg/lock.json names after its majors, have its SHA-256s, and import neither Media Foundation (mfplat.dll,
@@ -53,7 +54,8 @@ func runDLLCheck(_ context.Context, e *env, args []string) error {
 	version := fs.String("version", "", "the release SemVer the DLL was built with (IM_VERSION): its ProductVersion")
 	winver := fs.String("winver", "", "its Windows version a.b.c.d (IM_WINVER): FILEVERSION, PRODUCTVERSION, FileVersion")
 	ffmpegDir := fs.String("ffmpeg", "", "also check the FFmpeg DLLs in this folder against native/ffmpeg/lock.json")
-	loadConfig := fs.Bool("load-config", false, "require DependentLoadFlags 0x800 in the load config (06 §5.1)")
+	loadConfig := fs.Bool("load-config", false,
+		"require DependentLoadFlags 0x800 in the load config (unused: the delay-load helper doesn't honor it, 06 §5.1)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -345,10 +347,14 @@ func checkEngineDLL(data []byte, rules *dllRules, want dllExpect) report {
 	case want.loadConfig:
 		r.note("load config: DependentLoadFlags 0x%04x", flags)
 	default:
-		r.note("load config: DependentLoadFlags 0x%04x (not checked: README WA11's verdict decides 06 §5.1's check)", flags)
+		r.note(loadConfigNote, flags)
 	}
 	return r
 }
+
+// loadConfigNote is the load-config line without -load-config: printed for people, never a problem (06 §5.1).
+const loadConfigNote = "load config: DependentLoadFlags 0x%04x (not checked: the delay-load helper doesn't honor " +
+	"/DEPENDENTLOADFLAG, so the engine's delay-load hook is the guard, 04 §13.1)"
 
 func checkExports(r *report, img *peImage, rules *dllRules) {
 	if !slices.Equal(sortedCopy(rules.defExports), sortedCopy(rules.exports)) {

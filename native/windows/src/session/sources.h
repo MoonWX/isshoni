@@ -7,8 +7,9 @@
 // capture area) adds its picks here with AddPick and forwards im_release_source to Release; until then only the test
 // hooks' fake picker adds picks (src/testhooks/).
 //
-// Listed sources need IM_START_ALLOW_LISTED_SOURCE: "test:pattern" (the test pattern, 04 §8; this slice's CPU
-// pattern, a GPU one in README WA33) and the monitors of im_list_sources ("mon:…", README WA60).
+// Listed sources need IM_START_ALLOW_LISTED_SOURCE: "test:pattern" (the test pattern: README WA33's GPU pattern on the
+// session's frame slots, frame times only for the test hooks' IM_ENC_FAKE sessions, session/frames.h) and the monitors
+// of im_list_sources ("mon:…", README WA60).
 //
 // Thread-safe. im_start resolves and consumes on the engine worker, so two starts never race for one token.
 #pragma once
@@ -29,7 +30,7 @@ inline constexpr std::string_view kTestPatternId = "test:pattern";
 inline constexpr int64_t kPickLifetimeNs = 5LL * 60 * 1'000'000'000; // 04 §6.4
 inline constexpr std::size_t kMaxPicks = 4;
 
-// How the CPU test pattern behaves (the test hooks choose; a session uses kMoving otherwise).
+// When the test pattern's frames come (the test hooks choose; a session uses kMoving otherwise).
 enum class Pattern : uint8_t {
   kMoving, // a new frame every 1/hz on a grid anchored at epoch_ns (a moving pattern)
   kStatic, // only the first frame, at epoch_ns (a static screen: WGC and DD deliver an initial frame)

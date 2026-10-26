@@ -1,6 +1,8 @@
 // session_fake_test (docs/m2/04-windows-engine.md §18.2, README WA23): the session core through the C ABI with the
 // test hooks (IM_TEST_HOOKS builds: win-x64-ci, win-x64-asan): test:pattern (and the fake picker's picks), IM_ENC_FAKE
 // and the test tone; no GPU and no audio device (the engine runs with IM_INIT_NO_AUDIO, which the tone doesn't need).
+// IM_ENC_FAKE takes no pixels, so these sessions run no GPU path (README WF2: frame times only, no WARP device) and
+// the timing bounds below hold on a runner without a GPU; session_gpu_test runs the session's GPU path.
 //
 // It asserts: each layer's first packet is KEYFRAME|REINIT within 500 ms after im_start returns, also on a static
 // pattern and with no captured frame at all; IM_ENC_FAKE's output (real SPS/PPS for the profile and size, CB byte e0,
@@ -36,6 +38,7 @@
 #include "im/h264/nal.h"
 #include "im/h264/sps.h"
 #include "isshoni_media.h"
+#include "session/session.h"
 #include "session/sources.h"
 #include "testhooks/fake_encoder.h"
 #include "testhooks/testhooks.h"
@@ -272,6 +275,7 @@ TEST_F(Session, FirstPacketOfEachLayerIsAReinitKeyframeWithin500ms) {
   EXPECT_EQ(info.layers[1].width, 640u);
   EXPECT_EQ(info.layers[1].height, 360u);
   EXPECT_EQ(info.layers[1].fps, 15u);
+  EXPECT_FALSE(im::session::GpuPathOf(s)) << "IM_ENC_FAKE sessions run no GPU path: they stay off WARP";
   ExpectFirstKeyframes(s, started_, epoch_, 2, "moving pattern");
   EXPECT_EQ(im_stop(s), IM_OK);
 }
