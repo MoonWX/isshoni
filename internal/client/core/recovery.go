@@ -33,7 +33,8 @@ import (
 // carries the count of readies, so the actor, which may begin after some of them (StartShare's steps run first),
 // takes each change once.
 
-// timing holds the timers of the core's recovery (§13). The package's tests shorten them (Options.timing).
+// timing holds the timers of the core's recovery (§13), and those of its stats (stats.go). The package's tests
+// shorten them (Options.timing).
 type timing struct {
 	hold               time.Duration // signaling not ready this long ends the share (server-unreachable)
 	pcPoll             time.Duration // how often a share's actor looks at its pub PC
@@ -46,6 +47,8 @@ type timing struct {
 	// republishRetry: a republish that failed for want of signaling or a reply, or that the server refused with a
 	// retryable code and no retryAfterMs, goes again after this.
 	republishRetry time.Duration
+	// stats.go (§11.9): a live share's Session.Stats poll, and the stats reports while it has a pub PC.
+	engineStats, statsReport time.Duration
 }
 
 // defaultTiming are §13's values.
@@ -59,6 +62,8 @@ var defaultTiming = timing{
 	unreachableSpacing: 30 * time.Second,
 	refusedWindow:      60 * time.Second,
 	republishRetry:     time.Second,
+	engineStats:        time.Second,
+	statsReport:        10 * time.Second,
 }
 
 // resumeStateWait bounds the wait for the room.state that follows a resumed welcome (leaveAfterResume).
@@ -134,12 +139,14 @@ func (s *Share) begin() *endRequest {
 	return nil
 }
 
-// tick is the actor's regular look: a republish that is due, else the pub PC (pubdriver.go) and an owed
-// share.update{paused} (hints.go). Nothing once end has asked the actor to end the share: its request is next.
+// tick is the actor's regular look: the stats (stats.go), then a republish that is due, else the pub PC
+// (pubdriver.go) and an owed share.update{paused} (hints.go). Nothing once end has asked the actor to end the share:
+// its request is next.
 func (s *Share) tick(now time.Time) *endRequest {
 	if s.ctx.Err() != nil {
 		return nil
 	}
+	s.statsTick(now)
 	if s.rec.republish {
 		return s.republish()
 	}
