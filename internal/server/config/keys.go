@@ -105,9 +105,10 @@ func (k Key) clone() Key {
 // install.sh's, the release tooling's and the dev tasks' variables, plus ISSHONI_CONFIG (read as the config path).
 // The list matches 06's, with M2 06 §7.3's names after M1's, then the names that M2's desktop dev and e2e builds,
 // tasks and tests read (WF7), so that one of them left in the shell that runs the server doesn't make it warn. A new
-// non-key ISSHONI_* name must be added to both (04 §4.2). Names are matched exactly, never by prefix, so any other
-// ISSHONI_* name that is not a key still warns. The env-only switches ISSHONI_IN_CONTAINER and
-// ISSHONI_ALLOW_EPHEMERAL_DATA are read by the server and are not warned about either.
+// non-key ISSHONI_* name must be added to both (04 §4.2); TestRepoEnvNamesReserved fails on one that the repository
+// reads but this list lacks. Names are matched exactly, never by prefix, so any other ISSHONI_* name that is not a
+// key still warns. The env-only switches ISSHONI_IN_CONTAINER and ISSHONI_ALLOW_EPHEMERAL_DATA are read by the
+// server and are not warned about either.
 func ReservedEnvNames() []string { return slices.Clone(reservedEnv) }
 
 var reservedEnv = []string{
