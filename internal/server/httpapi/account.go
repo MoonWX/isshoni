@@ -7,14 +7,16 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/auth"
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// Self-service (README S58; 03 §12.3 #4 and #12–#18, §12.4.3): what a signed-in user does to the own account, all
-// User routes. auth.Service owns every change: the rules, the re-authentication with its throttles, the revocation
-// rows of 03 §7.7 (which sessions and devices go, and which connections are closed, with which reason) and the
-// audit rows. The handlers decode the request, call it, set or clear the session cookie and tell the SPAs
-// (03 §12.5). The two lists are reads of the store.
+// Self-service (README S58; 03 §12.3 #4 and #12–#18, §12.4.3): what a signed-in user does to the own account. The
+// account changes (#12 password, #13 delete, #16 sign out other browsers) are UserSession routes, the rest User
+// routes that a device's bearer may call too (M2 02 §6.4). auth.Service owns every change: the rules, the
+// re-authentication with its throttles, the revocation rows of 03 §7.7 (which sessions and devices go, and which
+// connections are closed, with which reason) and the audit rows. The handlers decode the request, call it, set or
+// clear the session cookie (never for a device) and tell the SPAs (03 §12.5). The two lists are reads of the store.
 
 // useSessionCookie sets the session cookie to a new token, as the only Set-Cookie of the response.
 //
@@ -40,7 +42,8 @@ func sessionLive(s store.Session, now time.Time) bool {
 
 // postLogoutEverywhere is POST /api/v1/auth/logout-everywhere (03 §12.3 #4; 03 §7.7 "Log out everywhere"): 204
 // with the cookie cleared. Every web session and device of the caller's account is gone, this one included, with
-// their push subscriptions, and every connection of the user is closed. The body ({}) is not read.
+// their push subscriptions, and every connection of the user is closed. The body ({}) is not read. A device may call
+// it too (M2 02 §6.4 #4): it signs out everything, the app included, and no cookie is cleared for it.
 func (a *API) postLogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {
@@ -52,7 +55,9 @@ func (a *API) postLogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.sessionChanged(p.UserID)
-	a.endSessionCookie(w)
+	if p.Method == auth.MethodSession {
+		a.endSessionCookie(w)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -115,14 +120,23 @@ func (a *API) postDeleteSelf(w http.ResponseWriter, r *http.Request) {
 // browser label, creation and last-seen times and last IP. This request's session is marked current and comes
 // first; the others follow, the most recently seen first. Expired rows the janitor has not removed yet are left
 // out. It reads only.
+//
+// A device may list them too (M2 02 §6.4 #14): no entry is current, the list keeps the store's order, and instead of
+// "the own session must be live" the read checks that the caller's device still exists (callerLive).
 func (a *API) getSessions(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {
 		WriteError(w, r, api.NewError(api.CodeUnauthenticated))
 		return
 	}
+	device := p.Method == auth.MethodBearer
 	var rows []store.Session
 	err := a.d.DB.Read(r.Context(), func(q *store.Q) error {
+		if device {
+			if err := callerLive(q, p); err != nil {
+				return err
+			}
+		}
 		var err error
 		rows, err = q.ListSessions(p.UserID)
 		return err
@@ -143,13 +157,16 @@ func (a *API) getSessions(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:  s.CreatedAt,
 			LastSeenAt: s.LastSeenAt,
 			LastIP:     s.LastIP,
-			Current:    s.ID == p.SessionID,
+			Current:    !device && s.ID == p.SessionID,
 		})
+	}
+	if device {
+		WriteJSON(w, http.StatusOK, api.SessionsResponse{Sessions: sessions})
+		return
 	}
 	current := slices.IndexFunc(sessions, func(s api.SessionInfo) bool { return s.Current })
 	if current < 0 {
-		// The session went away between the chain's authentication and this read. (M2: a device's principal has
-		// no session of its own in the list.)
+		// The session went away between the chain's authentication and this read.
 		WriteError(w, r, api.NewError(api.CodeUnauthenticated))
 		return
 	}
@@ -206,7 +223,8 @@ func (a *API) postRevokeOthers(w http.ResponseWriter, r *http.Request) {
 }
 
 // getDevices is GET /api/v1/me/devices (03 §12.3 #17, §12.4.3): {devices}, the caller's linked apps, the most
-// recently seen first. Linking an app is M2, so the list is empty until then. It reads only.
+// recently seen first. A device's own row is marked current for its bearer (M2 02 §7.2), never for a cookie. The read
+// checks the caller again: its web session, or for a bearer its device, must still exist (callerLive). It reads only.
 func (a *API) getDevices(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {
@@ -228,23 +246,15 @@ func (a *API) getDevices(w http.ResponseWriter, r *http.Request) {
 	}
 	devices := make([]api.DeviceInfo, 0, len(rows))
 	for _, d := range rows {
-		devices = append(devices, api.DeviceInfo{
-			ID:         string(d.ID),
-			Name:       d.Name,
-			ClientKind: d.ClientKind,
-			OS:         d.OS,
-			AppVersion: d.AppVersion,
-			CreatedAt:  d.CreatedAt,
-			LastSeenAt: d.LastSeenAt,
-			LastIP:     d.LastIP,
-		})
+		devices = append(devices, apiDevice(d, p))
 	}
 	WriteJSON(w, http.StatusOK, api.DevicesResponse{Devices: devices})
 }
 
 // deleteDevice is DELETE /api/v1/me/devices/{id} (03 §12.3 #18; 03 §7.7 "Revoke device"): 204; that app is signed
-// out and its connections are closed. A device that is not one of the caller's own is 404 not_found, which is the
-// answer for every ID until M2 links the first app.
+// out, its connections are closed and device.revoked {via: "devices_page"} is written. A device that is not one of
+// the caller's own is 404 not_found. A device may call it too (M2 02 §6.4 #18): its own ID is the app signing itself
+// out ({via: "app"}), and another ID of its user's is removed as on the Devices page.
 func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {

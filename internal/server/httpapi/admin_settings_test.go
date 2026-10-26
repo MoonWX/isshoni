@@ -313,9 +313,16 @@ func TestAccountRoutes(t *testing.T) {
 		wantError(t, rec, http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
 		rec = f.call(u.method, u.path, u.body, with(cookie), header("Content-Type", ""))
 		wantError(t, rec, http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
-		// No bearer tokens in M1.
+		// A bearer token nobody issued, beside the admin's cookie: 401 invalid_token on the routes that take a
+		// credential; the Public auth routes ignore the header and answer as without it (M2 02 §6.4).
 		rec = f.call(u.method, u.path, u.body, with(cookie), header("Authorization", "Bearer isa_"+strings.Repeat("A", 43)))
-		wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+		if strings.HasPrefix(u.path, "/api/v1/auth/") {
+			if rec.Code == http.StatusUnauthorized || rec.Code/100 == 2 {
+				t.Errorf("%s %s with a bearer: status %d, want the route's own refusal", u.method, u.path, rec.Code)
+			}
+			continue
+		}
+		wantError(t, rec, http.StatusUnauthorized, api.CodeInvalidToken)
 	}
 	if got := f.invites(cookie, ""); len(got) != 1 || f.db.Settings().Get().RegistrationMode != store.ModeInvite || f.tableRows("users") != 1 {
 		t.Errorf("refused requests changed something: %d invites, mode %q, %d users", len(got),

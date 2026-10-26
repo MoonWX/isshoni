@@ -671,13 +671,13 @@ func TestPushRoutes(t *testing.T) {
 		// Not signed in: 401.
 		wantError(t, f.call(u.method, u.path, u.body), http.StatusUnauthorized, api.CodeUnauthenticated)
 		// A cross-site request with the member's cookie changes nothing: 403 csrf_failed. Without a JSON
-		// Content-Type: 415. No bearer tokens in M1.
+		// Content-Type: 415. A bearer token nobody issued: 401 invalid_token, the cookie beside it unread (M2 02 §6.4).
 		rec := f.call(u.method, u.path, u.body, with(member), header("Sec-Fetch-Site", "cross-site"), header("Origin", "https://evil.example"))
 		wantError(t, rec, http.StatusForbidden, api.CodeCSRFFailed)
 		wantError(t, f.call(u.method, u.path, u.body, with(member), header("Content-Type", "text/plain")), http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
 		wantError(t, f.call(u.method, u.path, u.body, with(member), header("Content-Type", "")), http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
 		rec = f.call(u.method, u.path, u.body, with(member), header("Authorization", "Bearer isa_"+strings.Repeat("A", 43)))
-		wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+		wantError(t, rec, http.StatusUnauthorized, api.CodeInvalidToken)
 	}
 	wantError(t, f.call(http.MethodGet, "/api/v1/push/preferences", ""), http.StatusUnauthorized, api.CodeUnauthenticated)
 	prefs := decodeBody[api.PushPreferences](t, f.call(http.MethodGet, "/api/v1/push/preferences", "", with(member)), http.StatusOK)

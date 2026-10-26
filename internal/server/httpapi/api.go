@@ -15,16 +15,25 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// Access is the access level of an /api/v1 route (03 §12.1).
+// Access is the access level of an /api/v1 route (03 §12.1; M2 02 §6.4): which credential the route takes.
 type Access uint8
 
 const (
-	// Public routes need no authentication; the CSRF check still applies to their unsafe methods.
+	// Public routes need no authentication and read no credential in the chain: the Authorization header is ignored,
+	// cookies matter only to the handler's own logic, and the CSRF check applies to their unsafe methods.
 	Public Access = iota
-	// User routes need an active user: the session cookie in M1 (cookie or bearer in M2).
+	// User routes need an active user, with either credential: the session cookie or a device's bearer access token.
 	User
-	// Admin routes need an active admin.
+	// Admin routes need an active admin's session cookie. A bearer, even an admin's, is 403 forbidden
+	// {credential: session} (M2 02 §6.4): no desktop screen calls an admin route, and a device's credential must not
+	// reach server administration.
 	Admin
+	// UserSession routes need an active user's session cookie; a bearer is 403 forbidden {credential: session}
+	// (M2 02 §6.4: account changes, the device approval, web push).
+	UserSession
+	// UserDevice routes need a device's bearer access token; a session cookie is 403 forbidden {credential: device}
+	// (M2 02 §6.4: the app's own sign-out).
+	UserDevice
 )
 
 func (a Access) String() string {
@@ -35,6 +44,10 @@ func (a Access) String() string {
 		return "user"
 	case Admin:
 		return "admin"
+	case UserSession:
+		return "user-session"
+	case UserDevice:
+		return "user-device"
 	}
 	return fmt.Sprintf("Access(%d)", uint8(a))
 }
@@ -65,6 +78,11 @@ type Deps struct {
 	Site Site
 	// ClientIP is 04's httpapi.ClientIP (trusted-proxy aware); nil means ClientIP.
 	ClientIP func(*http.Request) netip.Addr
+	// DesktopOrigins are the origins of the desktop app's bundled SPA, the only cross-origin pages the API answers
+	// CORS for, and only with bearer tokens (M2 02 §6.4). The wiring passes Site.ExtraOrigins, which it sets to
+	// protocol.DesktopOrigins() (M2 02 §6.3 item 1). nil or empty means no CORS at all: every Origin passes the CORS
+	// step untouched, as in M1.
+	DesktopOrigins []string
 	// Clock is the API's clock; nil means time.Now.
 	Clock func() time.Time
 	// Logger is the server logger; the API adds component=api. nil means slog.Default().
@@ -82,31 +100,53 @@ type authService interface {
 var _ authService = (*auth.Service)(nil)
 
 // API is 03's REST API under /api/v1 (03 §12). 04's router mounts it at /api/v1/ (RouterOptions.API), behind the
-// global chain of 04 §9.3. Its own chain runs, outermost first (03 §12.1):
+// global chain of 04 §9.3. Its own chain runs, outermost first (03 §12.1, M2 02 §6.4):
 //
+//  0. CORS (cors.go), first so that every answer of the chain carries it: a request whose Origin is one of
+//     Deps.DesktopOrigins has its preflight answered here (204, with the allow headers only for the methods and
+//     request headers the desktop SPA uses, cached 600 s), and any other request from such an origin loses its
+//     Cookie header and gets Access-Control-Allow-Origin and Access-Control-Expose-Headers. Every response to such an
+//     origin carries Vary: Origin, and none ever Access-Control-Allow-Credentials. Other origins pass untouched;
 //  1. body limit: 16 KiB for /api/v1/auth/ and /api/v1/device/, 64 KiB elsewhere; a larger Content-Length gets 413
 //     payload_too_large at once, and the body reader stops at the limit (DecodeJSON then answers the same);
 //  2. no-store: Cache-Control: no-store on every response, errors included, whatever a handler sets;
 //  3. route lookup: a path no route matches gets 404 not_found, a known path with another method 405
 //     method_not_allowed with an Allow header, both as 03's JSON envelope; a matched route reports its own pattern
 //     to 04's RouteObserver and 5xx log lines;
-//  4. no bearer tokens in M1: a request with any Authorization header gets 401 unauthenticated, whatever the
-//     route's Access (03 §7.5). It runs before CSRF because M2's bearer requests skip the cross-origin check there;
+//  4. credentials: a Public route goes on to step 5 without reading the Authorization header. On any other route a
+//     request with an Authorization header takes the bearer path: its cookies are dropped unread, there is no CSRF
+//     step (only the Content-Type rule of unsafe methods, 415 unsupported_media_type), Auth.Authenticate checks the
+//     token (401 invalid_token with WWW-Authenticate, or 500), no rotation, and an Admin or UserSession route then
+//     answers 403 forbidden {credential: session}; the handler follows (step 9). A request without the header takes
+//     the cookie path, steps 5–8;
 //  5. CSRF: the route's unsafe methods (all but GET, HEAD and OPTIONS) pass Auth.CSRF, the cross-origin and
 //     Content-Type check of 03 §7.5 (403 csrf_failed, 415 unsupported_media_type);
-//  6. authenticate (User and Admin routes): Auth.Authenticate; its error is the answer (401 unauthenticated);
+//  6. authenticate (every route but Public): Auth.Authenticate; its error is the answer (401 unauthenticated);
 //  7. rotate: Auth.MaybeRotate;
-//  8. access: an Admin route answers a non-admin 403 forbidden;
+//  8. access: an Admin route answers a non-admin 403 forbidden, a UserDevice route every cookie 403 forbidden
+//     {credential: device};
 //  9. the handler, with the principal in its context (PrincipalFrom).
 //
-// Steps 4–9 are per route, so a route registered with Handle gets them all.
+// Steps 4–9 are per route, so a route registered with Handle gets them all. Skipping the CSRF check on the header's
+// presence is safe (M2 02 §6.4): a cross-site page can send Authorization only after a preflight, only the desktop
+// origins get one, and the bearer path reads no cookie, so no ambient credential is ever used.
 type API struct {
 	d       Deps
 	auth    authService
 	mux     *http.ServeMux
 	handler http.Handler
+	// desktop is the set of Deps.DesktopOrigins.
+	desktop map[string]struct{}
+	// registered is every route of Handle with its access level, in registration order (tests, and nothing else).
+	registered []registeredRoute
 	// pushTests is the push-test bucket of POST /api/v1/push/test (03 §7.3).
 	pushTests *pushTestLimiter
+}
+
+// registeredRoute is one route of Handle.
+type registeredRoute struct {
+	pattern string
+	access  Access
 }
 
 // New builds the API and registers 03's routes. It panics when Deps.DB or Deps.Auth is nil or Deps.Site.Origin is
@@ -142,15 +182,16 @@ func newAPI(d Deps, au authService) *API {
 		d.Logger = slog.Default()
 	}
 	d.Logger = d.Logger.With(slog.String("component", "api"))
-	a := &API{d: d, auth: au, mux: http.NewServeMux(), pushTests: newPushTestLimiter(d.Clock)}
-	a.handler = a.bodyLimit(a.noStore(http.HandlerFunc(a.route)))
+	a := &API{d: d, auth: au, mux: http.NewServeMux(), desktop: originSet(d.DesktopOrigins),
+		pushTests: newPushTestLimiter(d.Clock)}
+	a.handler = a.cors(a.bodyLimit(a.noStore(http.HandlerFunc(a.route))))
 	a.routes()
 	return a
 }
 
-// routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table): every M1 row but #43, the
-// dashboard, which 04's wiring registers through Handle with DashboardAccounts inside (03 §12.6). The device flow
-// (#44–#49) comes with M2.
+// routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table) with the access of M2 02 §6.4:
+// every M1 row but #43, the dashboard, which 04's wiring registers through Handle with DashboardAccounts inside
+// (03 §12.6), and the device rows of M2 02 §7.1 (#44–#49, #52; device.go).
 func (a *API) routes() {
 	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                                      // #1
 	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                             // #2
@@ -163,20 +204,20 @@ func (a *API) routes() {
 	a.Handle("POST /api/v1/auth/reset/check", Public, http.HandlerFunc(a.postResetCheck))                  // #9
 	a.Handle("POST /api/v1/auth/reset/complete", Public, http.HandlerFunc(a.postResetComplete))            // #10
 	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                            // #11
-	a.Handle("POST /api/v1/me/password", User, http.HandlerFunc(a.postPassword))                           // #12
-	a.Handle("POST /api/v1/me/delete", User, http.HandlerFunc(a.postDeleteSelf))                           // #13
+	a.Handle("POST /api/v1/me/password", UserSession, http.HandlerFunc(a.postPassword))                    // #12
+	a.Handle("POST /api/v1/me/delete", UserSession, http.HandlerFunc(a.postDeleteSelf))                    // #13
 	a.Handle("GET /api/v1/me/sessions", User, http.HandlerFunc(a.getSessions))                             // #14
 	a.Handle("DELETE /api/v1/me/sessions/{id}", User, http.HandlerFunc(a.deleteSession))                   // #15
-	a.Handle("POST /api/v1/me/sessions/revoke-others", User, http.HandlerFunc(a.postRevokeOthers))         // #16
+	a.Handle("POST /api/v1/me/sessions/revoke-others", UserSession, http.HandlerFunc(a.postRevokeOthers))  // #16
 	a.Handle("GET /api/v1/me/devices", User, http.HandlerFunc(a.getDevices))                               // #17
 	a.Handle("DELETE /api/v1/me/devices/{id}", User, http.HandlerFunc(a.deleteDevice))                     // #18
 	a.Handle("GET /api/v1/rooms", User, http.HandlerFunc(a.getRooms))                                      // #19
 	a.Handle("GET /api/v1/invites", User, http.HandlerFunc(a.getInvites))                                  // #21
 	a.Handle("POST /api/v1/invites", User, http.HandlerFunc(a.postInvite))                                 // #22
 	a.Handle("DELETE /api/v1/invites/{id}", User, http.HandlerFunc(a.deleteInvite))                        // #23
-	a.Handle("POST /api/v1/push/subscriptions", User, http.HandlerFunc(a.postPushSubscription))            // #24
+	a.Handle("POST /api/v1/push/subscriptions", UserSession, http.HandlerFunc(a.postPushSubscription))     // #24
 	a.Handle("POST /api/v1/push/unsubscribe", User, http.HandlerFunc(a.postPushUnsubscribe))               // #27
-	a.Handle("POST /api/v1/push/test", User, http.HandlerFunc(a.postPushTest))                             // #28
+	a.Handle("POST /api/v1/push/test", UserSession, http.HandlerFunc(a.postPushTest))                      // #28
 	a.Handle("GET /api/v1/admin/users", Admin, http.HandlerFunc(a.getUsers))                               // #29
 	a.Handle("PATCH /api/v1/admin/users/{id}", Admin, http.HandlerFunc(a.patchUser))                       // #30
 	a.Handle("DELETE /api/v1/admin/users/{id}", Admin, http.HandlerFunc(a.deleteUser))                     // #31
@@ -191,8 +232,15 @@ func (a *API) routes() {
 	a.Handle("GET /api/v1/admin/settings", Admin, http.HandlerFunc(a.getSettings))                         // #40
 	a.Handle("PATCH /api/v1/admin/settings", Admin, http.HandlerFunc(a.patchSettings))                     // #41
 	a.Handle("GET /api/v1/admin/audit", Admin, http.HandlerFunc(a.getAudit))                               // #42
+	a.Handle("POST /api/v1/device/code", Public, http.HandlerFunc(a.postDeviceCode))                       // #44
+	a.Handle("POST /api/v1/device/token", Public, http.HandlerFunc(a.postDeviceToken))                     // #45
+	a.Handle("POST /api/v1/device/lookup", UserSession, http.HandlerFunc(a.postDeviceLookup))              // #46
+	a.Handle("POST /api/v1/device/decide", UserSession, http.HandlerFunc(a.postDeviceDecide))              // #47
+	a.Handle("POST /api/v1/device/password", Public, http.HandlerFunc(a.postDevicePassword))               // #48
+	a.Handle("POST /api/v1/device/revoke", UserDevice, http.HandlerFunc(a.postDeviceRevoke))               // #49
 	a.Handle("GET /api/v1/push/preferences", User, http.HandlerFunc(a.getPushPreferences))                 // #50
 	a.Handle("PUT /api/v1/push/preferences", User, http.HandlerFunc(a.putPushPreferences))                 // #51
+	a.Handle("PATCH /api/v1/me/devices/{id}", User, http.HandlerFunc(a.patchDevice))                       // #52
 }
 
 // ServeHTTP serves every request under /api/v1/ through the API's chain. After the no-store step it answers every
@@ -201,13 +249,14 @@ func (a *API) routes() {
 // /api/v1/.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.handler.ServeHTTP(w, r) }
 
-// Handle registers a route owned by another doc behind the same /api/v1 chain (body limit, no-store, the M1
-// Authorization rejection, CSRF, auth, rotation, access), e.g. a.Handle("POST /api/v1/admin/doctor", httpapi.Admin,
-// h). Patterns use Go 1.22+ ServeMux syntax without a host, and their path starts with /api/v1/. A GET pattern also
-// serves HEAD. Like http.ServeMux.Handle, it panics on an invalid or conflicting pattern; it also panics on a path
-// outside /api/v1/, an unknown Access or a nil handler.
+// Handle registers a route owned by another doc behind the same /api/v1 chain (CORS, body limit, no-store, the
+// credential step, CSRF, auth, rotation, access), e.g. a.Handle("POST /api/v1/admin/doctor", httpapi.Admin, h). An
+// Admin route refuses every bearer, an admin's included (403 forbidden {credential: session}, M2 02 §6.4). Patterns
+// use Go 1.22+ ServeMux syntax without a host, and their path starts with /api/v1/. A GET pattern also serves HEAD.
+// Like http.ServeMux.Handle, it panics on an invalid or conflicting pattern; it also panics on a path outside
+// /api/v1/, an unknown Access or a nil handler.
 func (a *API) Handle(pattern string, access Access, h http.Handler) {
-	if access > Admin {
+	if access > UserDevice {
 		panic(fmt.Sprintf("httpapi: API.Handle(%q): unknown %v", pattern, access))
 	}
 	if h == nil {
@@ -220,16 +269,14 @@ func (a *API) Handle(pattern string, access Access, h http.Handler) {
 	if !strings.HasPrefix(path, apiPrefix) {
 		panic(fmt.Sprintf("httpapi: API.Handle(%q): the path must start with %s and have no host", pattern, apiPrefix))
 	}
-	if access != Public {
-		h = a.authenticate(access, h)
-	}
-	a.mux.Handle(pattern, rejectAuthorization(a.auth.CSRF(h)))
+	a.mux.Handle(pattern, a.credentials(access, h))
+	a.registered = append(a.registered, registeredRoute{pattern: pattern, access: access})
 }
 
 type principalKey struct{}
 
-// PrincipalFrom returns the authenticated caller of a User or Admin route. It reports false on Public routes and
-// outside the API.
+// PrincipalFrom returns the authenticated caller of a route that is not Public: a web session (auth.MethodSession)
+// or a device (auth.MethodBearer). It reports false on Public routes and outside the API.
 func PrincipalFrom(ctx context.Context) (auth.Principal, bool) {
 	p, ok := ctx.Value(principalKey{}).(auth.Principal)
 	return p, ok
@@ -363,32 +410,113 @@ func (p *methodProbe) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// rejectAuthorization is step 4: M1 has no bearer tokens, so any Authorization header gets 401 unauthenticated
-// (03 §7.5), on every route and before the CSRF check, the cookie and the rotation. In M2 this step becomes the
-// bearer branch, which also skips the cross-origin check.
-func rejectAuthorization(next http.Handler) http.Handler {
+// credentials is step 4 (M2 02 §6.4), which replaces M1's rejection of every Authorization header. A Public route
+// reads no credential here: it goes to the CSRF step whatever its headers. On any other route the presence of an
+// Authorization header, whatever its value, chooses the bearer path (bearerAuth); its absence the cookie path
+// (CSRF, then cookieAuth).
+func (a *API) credentials(access Access, next http.Handler) http.Handler {
+	if access == Public {
+		return a.auth.CSRF(next)
+	}
+	bearer := a.bearerAuth(access, next)
+	cookie := a.auth.CSRF(a.cookieAuth(access, next))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := r.Header["Authorization"]; ok {
-			WriteError(w, r, api.NewError(api.CodeUnauthenticated))
+			bearer.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		cookie.ServeHTTP(w, r)
 	})
 }
 
-// authenticate is steps 6–8 for a User or Admin route.
-func (a *API) authenticate(access Access, next http.Handler) http.Handler {
+// bearerAuth is the bearer path of step 4 (M2 02 §6.1, §6.4) for a route that is not Public. In order:
+//
+//  1. the request's Cookie header is dropped: a bearer request never reads a cookie, neither here nor in the
+//     handler, so the cross-origin half of the CSRF check has nothing to protect and is skipped;
+//  2. the Content-Type rule of 03 §7.5 still holds for unsafe methods: exactly one application/json (a charset only
+//     if utf-8), else 415 unsupported_media_type. It comes before the token, as the CSRF step comes before the
+//     cookie on the cookie path;
+//  3. Auth.Authenticate checks the header's grammar and the token: 401 invalid_token (WriteError adds
+//     WWW-Authenticate), or another error as it is (500 internal). A principal that is not a device's is
+//     invalid_token too (Authenticate never returns one for a request with the header);
+//  4. an Admin or UserSession route answers the valid token 403 forbidden {credential: session}, after the token
+//     checked out, so that a bad token is still 401;
+//  5. the handler, with the device's principal. There is no rotation: MaybeRotate does nothing for a device.
+func (a *API) bearerAuth(access Access, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = withoutCookies(r)
+		if !isSafeMethod(r.Method) && !jsonContentTypeOK(r.Header.Values("Content-Type")) {
+			WriteError(w, r, api.NewError(api.CodeUnsupportedMediaType))
+			return
+		}
+		p, err := a.auth.Authenticate(r)
+		if err != nil {
+			WriteError(w, r, err)
+			return
+		}
+		if p.Method != auth.MethodBearer {
+			WriteError(w, r, api.NewError(api.CodeInvalidToken))
+			return
+		}
+		if access == Admin || access == UserSession {
+			WriteError(w, r, credentialRequired(api.CredentialKindSession))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
+	})
+}
+
+// cookieAuth is steps 6–8, the cookie path of a route that is not Public: authenticate (401 unauthenticated), rotate,
+// then the access check. An Admin route answers a non-admin 403 forbidden, a UserDevice route every cookie 403
+// forbidden {credential: device} (M2 02 §6.4); both come after the rotation, which a refused request keeps.
+func (a *API) cookieAuth(access Access, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, err := a.auth.Authenticate(r)
 		if err != nil {
 			WriteError(w, r, err)
 			return
 		}
+		if p.Method != auth.MethodSession {
+			// Authenticate never returns a device for a request without the header.
+			WriteError(w, r, api.NewError(api.CodeUnauthenticated))
+			return
+		}
 		a.auth.MaybeRotate(w, p)
-		if access == Admin && !p.IsAdmin() {
+		switch {
+		case access == Admin && !p.IsAdmin():
 			WriteError(w, r, api.NewError(api.CodeForbidden))
+			return
+		case access == UserDevice:
+			WriteError(w, r, credentialRequired(api.CredentialKindDevice))
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
 	})
+}
+
+// credentialRequired is 403 forbidden with params {credential}: the only credential the route takes (M2 02 §6.4).
+func credentialRequired(kind api.CredentialKind) *api.Error {
+	return &api.Error{Code: api.CodeForbidden, Params: map[string]any{api.ParamCredential: string(kind)}}
+}
+
+// withoutCookies returns r without its Cookie header, as a copy when it has one: the request the outer steps hold
+// keeps its headers.
+func withoutCookies(r *http.Request) *http.Request {
+	if _, ok := r.Header["Cookie"]; !ok {
+		return r
+	}
+	r = r.Clone(r.Context())
+	r.Header.Del("Cookie")
+	return r
+}
+
+// isSafeMethod reports whether a method never changes state (03 §7.5; http.CrossOriginProtection's safe methods).
+func isSafeMethod(m string) bool {
+	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
+}
+
+// jsonContentTypeOK is the Content-Type rule of 03 §7.5 for unsafe requests: exactly one Content-Type header,
+// application/json, with a charset only if utf-8 (auth's CSRFGuard applies the same rule on the cookie path).
+func jsonContentTypeOK(values []string) bool {
+	return len(values) == 1 && isJSONRequest(values[0])
 }

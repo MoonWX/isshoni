@@ -14,14 +14,14 @@ import (
 )
 
 // wantInfoJSON is the 03 §12.4.1 shape with the fixture's fake sources, a fresh DB (default settings, no admin yet)
-// and the domain site.
+// and the domain site. Every M2 server lists deviceFlow (M2 02 §7.1).
 const wantInfoJSON = `{
   "server": {"name": "watch.example.com", "version": "1.2.3", "publicUrl": "https://watch.example.com"},
   "protocol": {"current": 3, "min": 2},
   "minClientVersion": "",
   "registration": "invite",
   "setupRequired": true,
-  "features": ["push", "passwordReset"],
+  "features": ["push", "passwordReset", "deviceFlow"],
   "accountRules": {"usernameMinLength": 2, "usernameMaxLength": 32, "passwordMinLength": 8, "passwordMaxLength": 128},
   "push": {"vapidPublicKey": "` + testVAPIDKey + `"}
 }`
@@ -99,7 +99,7 @@ func TestInfoWithoutPush(t *testing.T) {
 		got := getInfoJSON(t, f)
 		want := decodeJSONMap(t, wantInfoJSON)
 		delete(want, "push")
-		want["features"] = []any{"passwordReset"}
+		want["features"] = []any{"passwordReset", "deviceFlow"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: GET /info = %v, want %v", name, got, want)
 		}

@@ -207,8 +207,9 @@ func TestAPICSRFBeforeAuthenticate(t *testing.T) {
 	}
 }
 
-// TestAPIChainOrder pins the /api/v1 chain of 03 §12.1 as far as it is observable: body limit → no-store → route
-// lookup → the M1 Authorization rejection → CSRF → authenticate → rotate → access → handler.
+// TestAPIChainOrder pins the /api/v1 chain of 03 §12.1 and M2 02 §6.4 as far as it is observable: body limit →
+// no-store → route lookup → credentials, then either CSRF → authenticate → rotate → access → handler (no
+// Authorization header), or Content-Type → bearer authenticate → access → handler (the header).
 func TestAPIChainOrder(t *testing.T) {
 	f := newAPIFixture(t, nil)
 	f.api.Handle("POST /api/v1/test/user", User, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -240,15 +241,41 @@ func TestAPIChainOrder(t *testing.T) {
 			t.Fatalf("the 403 lost the rotated cookie: Set-Cookie %q", sc)
 		}
 	})
-	t.Run("Authorization before CSRF", func(t *testing.T) {
+	t.Run("bearer: no CSRF, no cookie, no rotation", func(t *testing.T) {
+		rec := f.do(http.MethodPost, "/api/v1/test/user", nil, withCookie("user", "Sec-Fetch-Site", "cross-site",
+			"Origin", "https://evil.example", "Content-Type", "application/json", "Authorization", "Bearer device-user")...)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status %d (body %q)", rec.Code, rec.Body)
+		}
+		if calls := f.auth.take(); !slices.Equal(calls, []string{"authenticate bearer", "handler"}) {
+			t.Fatalf("calls %v", calls)
+		}
+		if sc := rec.Header().Values("Set-Cookie"); len(sc) != 0 {
+			t.Fatalf("a bearer request rotated the cookie: %q", sc)
+		}
+	})
+	t.Run("bearer: Content-Type before the token", func(t *testing.T) {
 		rec := f.do(http.MethodPost, "/api/v1/test/user", nil,
 			withCookie("user", "Sec-Fetch-Site", "cross-site", "Authorization", "Bearer isa_x")...)
-		wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+		wantError(t, rec, http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
 		if calls := f.auth.take(); len(calls) != 0 {
 			t.Fatalf("calls %v; want none", calls)
 		}
 	})
-	t.Run("body limit before Authorization and CSRF", func(t *testing.T) {
+	t.Run("bearer: the token before the access check", func(t *testing.T) {
+		rec := f.do(http.MethodPost, "/api/v1/test/admin", nil, "Content-Type", "application/json",
+			"Authorization", "Bearer isa_x")
+		wantError(t, rec, http.StatusUnauthorized, api.CodeInvalidToken)
+		rec = f.do(http.MethodPost, "/api/v1/test/admin", nil, "Content-Type", "application/json",
+			"Authorization", "Bearer device-admin")
+		if e := wantError(t, rec, http.StatusForbidden, api.CodeForbidden); e.Params["credential"] != "session" {
+			t.Fatalf("an admin's bearer on an Admin route: params %v, want {credential: session}", e.Params)
+		}
+		if calls := f.auth.take(); !slices.Equal(calls, []string{"authenticate bearer", "authenticate bearer"}) {
+			t.Fatalf("calls %v", calls)
+		}
+	})
+	t.Run("body limit before the credentials and CSRF", func(t *testing.T) {
 		body := strings.NewReader(strings.Repeat("x", authBodyLimit+1))
 		rec := f.do(http.MethodPost, "/api/v1/auth/test", body, "Sec-Fetch-Site", "cross-site",
 			"Authorization", "Bearer isa_x")
@@ -257,7 +284,7 @@ func TestAPIChainOrder(t *testing.T) {
 			t.Fatalf("calls %v; want none", calls)
 		}
 	})
-	t.Run("route lookup before Authorization and CSRF", func(t *testing.T) {
+	t.Run("route lookup before the credentials and CSRF", func(t *testing.T) {
 		rec := f.do(http.MethodPost, "/api/v1/test/nothing-here", nil, "Sec-Fetch-Site", "cross-site",
 			"Authorization", "Bearer isa_x")
 		wantError(t, rec, http.StatusNotFound, api.CodeNotFound)
@@ -270,9 +297,10 @@ func TestAPIChainOrder(t *testing.T) {
 	})
 }
 
-// TestAPIAuthorizationHeader: M1 has no bearer tokens, so any Authorization header gets 401 unauthenticated on every
-// route, whatever its Access, before the CSRF check, the cookie and the rotation (03 §7.5; 03 §15 "an Authorization
-// header in M1 → 401").
+// TestAPIAuthorizationHeader is the credential step of M2 02 §6.4 with the fake auth service: a Public route ignores
+// the Authorization header, whatever its value, and keeps its CSRF check; on any other route the header's presence
+// takes the bearer path, so a header that is no valid bearer token is 401 invalid_token with WWW-Authenticate, even
+// beside a valid cookie, without the CSRF check, the cookie or the rotation.
 func TestAPIAuthorizationHeader(t *testing.T) {
 	f := newAPIFixture(t, nil)
 	reached := 0
@@ -297,7 +325,7 @@ func TestAPIAuthorizationHeader(t *testing.T) {
 		{"Admin POST with a valid cookie", http.MethodPost, "/api/v1/test/admin", withCookie("admin", sameOriginJSON...),
 			http.StatusNoContent},
 	}
-	// Without the header the requests get their usual answers: the header alone makes the 401.
+	// Without the header the requests get their usual answers.
 	for _, rq := range requests {
 		if rec := f.do(rq.method, rq.path, nil, rq.header...); rec.Code != rq.status {
 			t.Fatalf("%s without Authorization: status %d, want %d (body %q)", rq.name, rec.Code, rq.status, rec.Body)
@@ -306,24 +334,37 @@ func TestAPIAuthorizationHeader(t *testing.T) {
 	reached = 0
 	f.auth.take()
 
-	for _, authz := range []string{"Bearer isa_x", "Basic dTpw", "Bearer", ""} {
+	for _, authz := range []string{"Bearer isa_x", "Basic dTpw", "Bearer", "", "Bearer device-user extra"} {
 		for _, rq := range requests {
 			name := fmt.Sprintf("%s, Authorization %q", rq.name, authz)
+			public := !strings.Contains(rq.path, "/test/user") && !strings.Contains(rq.path, "/test/admin")
+			before := reached
 			rec := f.do(rq.method, rq.path, nil, append(slices.Clone(rq.header), "Authorization", authz)...)
-			if rec.Code != http.StatusUnauthorized {
-				t.Fatalf("%s: status %d, want 401 (body %q)", name, rec.Code, rec.Body)
+			if public {
+				// The header counts for nothing: the answer is the usual one, with the CSRF check alone.
+				if rec.Code != rq.status {
+					t.Fatalf("%s: status %d, want %d as without the header (body %q)", name, rec.Code, rq.status, rec.Body)
+				}
+				if calls := f.auth.take(); !slices.Equal(calls, []string{"csrf"}) {
+					t.Errorf("%s: auth calls %v; want the CSRF check alone", name, calls)
+				}
+				continue
 			}
-			wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+			wantError(t, rec, http.StatusUnauthorized, api.CodeInvalidToken)
+			if got := rec.Header().Values("WWW-Authenticate"); !slices.Equal(got, []string{`Bearer error="invalid_token"`}) {
+				t.Errorf("%s: WWW-Authenticate %q", name, got)
+			}
 			if cc := rec.Header().Values("Cache-Control"); !slices.Equal(cc, []string{cacheNoStore}) {
 				t.Errorf("%s: Cache-Control %q, want exactly no-store", name, cc)
 			}
 			if sc := rec.Header().Values("Set-Cookie"); len(sc) != 0 {
 				t.Errorf("%s: Set-Cookie %q", name, sc)
 			}
-			if calls := f.auth.take(); len(calls) != 0 {
-				t.Errorf("%s: auth calls %v; want none (no CSRF, authenticate or rotate)", name, calls)
+			if calls := f.auth.take(); !slices.Equal(calls, []string{"authenticate bearer"}) {
+				t.Errorf("%s: auth calls %v; want the bearer authentication alone (no CSRF, cookie or rotate)", name,
+					calls)
 			}
-			if reached != 0 {
+			if reached != before {
 				t.Fatalf("%s: the handler ran", name)
 			}
 		}
@@ -664,9 +705,10 @@ func TestAPIHandlePanics(t *testing.T) {
 		{"not under the prefix", "GET /healthz", Public, noContent},
 		{"the prefix without its slash", "GET /api/v1", Public, noContent},
 		{"a host", "GET watch.example.com/api/v1/x", Public, noContent},
-		{"unknown access", "GET /api/v1/x", Admin + 1, noContent},
+		{"unknown access", "GET /api/v1/x", UserDevice + 1, noContent},
 		{"nil handler", "GET /api/v1/x", Public, nil},
 		{"conflict with /info", "GET /api/v1/info", Public, noContent},
+		{"conflict with /device/revoke", "POST /api/v1/device/revoke", UserDevice, noContent},
 		{"invalid pattern", "GET /api/v1/{", Public, noContent},
 	} {
 		func() {
@@ -678,10 +720,10 @@ func TestAPIHandlePanics(t *testing.T) {
 			f.api.Handle(tc.pattern, tc.access, tc.h)
 		}()
 	}
-	if s := (Admin + 1).String(); s != "Access(3)" {
+	if s := (UserDevice + 1).String(); s != "Access(5)" {
 		t.Errorf("String of an unknown Access = %q", s)
 	}
-	if s := Public.String() + " " + User.String() + " " + Admin.String(); s != "public user admin" {
+	if s := fmt.Sprint(Public, User, Admin, UserSession, UserDevice); s != "public user admin user-session user-device" {
 		t.Errorf("Access names = %q", s)
 	}
 }

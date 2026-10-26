@@ -354,13 +354,14 @@ func TestRoomRoutes(t *testing.T) {
 		// A member: 403 forbidden on the admin routes.
 		wantError(t, f.call(c.method, c.path, c.body, with(member)), http.StatusForbidden, api.CodeForbidden)
 		// A cross-site request with the admin's cookie changes nothing: 403 csrf_failed. Without a JSON
-		// Content-Type: 415, also for the DELETE without a body. No bearer tokens in M1.
+		// Content-Type: 415, also for the DELETE without a body. A bearer token nobody issued: 401 invalid_token, the
+		// cookie beside it unread (M2 02 §6.4).
 		rec := f.call(c.method, c.path, c.body, with(cookie), header("Sec-Fetch-Site", "cross-site"), header("Origin", "https://evil.example"))
 		wantError(t, rec, http.StatusForbidden, api.CodeCSRFFailed)
 		wantError(t, f.call(c.method, c.path, c.body, with(cookie), header("Content-Type", "text/plain")), http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
 		wantError(t, f.call(c.method, c.path, c.body, with(cookie), header("Content-Type", "")), http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
 		rec = f.call(c.method, c.path, c.body, with(cookie), header("Authorization", "Bearer isa_"+strings.Repeat("A", 43)))
-		wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+		wantError(t, rec, http.StatusUnauthorized, api.CodeInvalidToken)
 	}
 	// The Admin rule of the route comes before anything of the body: a member's bad request is 403 too.
 	wantError(t, f.createRoom(member, ""), http.StatusForbidden, api.CodeForbidden)

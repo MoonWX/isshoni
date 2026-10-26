@@ -532,7 +532,7 @@ func TestSelfServiceRoutes(t *testing.T) {
 		{http.MethodDelete, "/api/v1/me/devices/d1d1d1d1d1d1", ``},
 	}
 	for _, rt := range routes {
-		// User routes: nobody without a session, and no bearer tokens in M1.
+		// Nobody without a session, and a bearer token nobody issued is 401 invalid_token (M2 02 §6.4).
 		for name, opts := range map[string][]reqOpt{
 			"no cookie":     nil,
 			"a dead cookie": {cookieValue(sessionCookieName, strings.Repeat("A", 43))},
@@ -568,7 +568,7 @@ func TestSelfServiceRoutes(t *testing.T) {
 		"/api/v1/me/delete":                    "POST",
 		"/api/v1/me/sessions/" + otherID:       "DELETE",
 		"/api/v1/me/sessions/revoke-others":    "DELETE, POST",
-		"/api/v1/me/devices/d1d1d1d1d1d1":      "DELETE",
+		"/api/v1/me/devices/d1d1d1d1d1d1":      "DELETE, PATCH",
 		"/api/v1/me/sessions/" + otherID + "/": "",
 		"/api/v1/me/devices/x/y":               "",
 		"/api/v1/me/passwords":                 "",
