@@ -73,13 +73,16 @@ const (
 	maxFinalLossPct = 2.0
 	// recoverWithin: once the limit lifts, the full layer is back at its ceiling, the upload hint off and the estimate
 	// gone within this (D9). After a backoff the estimate is held for 10 s, then grows by 15.1 % a step, and the full
-	// layer follows each step with one of its ramp's, RampEvery apart (a hint every 3–4 s). Under -race on the Mac the
-	// way back took 30–57 s: least when the estimate was growing at the lift, most after a backoff right at it (the
-	// estimate's probes can hit the policer about every 25 s), with the hold, some 13 steps from about 1.4 Mbit/s and
-	// the upload hint's UploadOff. A second backoff on the next tick that lowers the estimate by less than a hint's
-	// 15 % restarts the hold without one, and the first growth step after it is no hint either: about 4 s more. So
-	// the bound has little margin in that case.
-	recoverWithin = 60 * time.Second
+	// layer follows each step with one of its ramp's, RampEvery apart (a step every 3–3.5 s). The way back takes
+	// longest after a backoff right at the lift (the estimate's probes reach the policer about every 20–25 s): the
+	// hold, some 12–14 ramp steps from about 1.4–1.9 Mbit/s, and the upload hint's UploadOff after the last of them.
+	// Each time the policer loses, the estimate backs off to 80 % of what arrived in the last second (about 2.2 Mbit/s)
+	// and, in every run here, 2–3 s later once more, as the policer still lost some of the lower rate: to about
+	// 1.7 Mbit/s, which restarts the hold. The bound was 60 s; README WF5 made it 75 s, because RampEvery must stay 3 s
+	// for D19 (01 §9.6 has 2 s; README WA54), which costs D9 about 10 s: with WA54's loss row the way back took up to
+	// 57 s at 3 s and 45 s at 2 s. With WF5's (the loss counted once, on the last second's arrivals) it took 29–54 s in
+	// five runs under -race on the Mac.
+	recoverWithin = 75 * time.Second
 	// ceilingF is the Auto preset's full layer (M1 02 §8.6), where the ramp ends.
 	ceilingF = 8_000_000
 	// rampWithin bounds the wait for the ramp to reach ceilingF from live: RampDelay and four RampEvery (01 §9.3),
@@ -142,8 +145,8 @@ func congestionEngine(seed uint64, reinit bool) fake.EngineConfig {
 // 15 s ("settles"); from then on, while the limit lasts, the viewer loses less than 2 % of the video for good (what
 // neither the core's nor the SFU's retransmissions brought back), although the estimate probes upward again after
 // its hold; and the app's share shows the upload hint at about 540p or 720p. Once the policer allows 20 Mbit/s, the
-// full layer is back at 8 Mbit/s within 60 s, with the upload hint cleared and a last congestion hint that lifts the
-// cap.
+// full layer is back at 8 Mbit/s within 75 s (recoverWithin), with the upload hint cleared and a last congestion hint
+// that lifts the cap.
 func TestDesktopUplinkCongestion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D9 runs for about two minutes")
