@@ -543,20 +543,23 @@ without `exchangeId` never takes the retry row.
 ### 6.3 The WebSocket bearer path
 
 01 built the shapes (01 §3.1, §3.2, §8.2; `upgrade.go` as merged). M2 changes:
-1. **Origins**: `wire.go` sets `site.ExtraOrigins = protocol.DesktopOrigins()` right after `config.NewSite` (the slot
-   M1 built for this: `config.Site.ExtraOrigins`, "later (M2) the Wails asset origins, added in code"). The hub gets
-   it through the line M1 already has, `hubCfg.AllowedOrigins = s.site.ExtraOrigins` (`wire.go`, as built), and the
-   REST API through `httpapi.Deps.DesktopOrigins = s.site.ExtraOrigins` (§6.4). `DesktopOrigins` returns a new slice on
-   every call, so nothing else holds the site's copy; `config` keeps importing no protocol package. As built, an
-   allowed origin is accepted only for a socket without a valid cookie, which then authenticates with `hello.auth`; a
-   valid cookie from such an origin gets 403. The Go connection sends no `Origin` and takes the non-browser path.
+1. **Origins**: `wire.go` sets `site.ExtraOrigins = protocol.DesktopOrigins()` (the slot M1 built for this:
+   `config.Site.ExtraOrigins`, "later (M2) the Wails asset origins, added in code"). As built (WA56), it does so at the
+   top of `wireAccounts`, not right after `config.NewSite`: `NewSite` is called in `tls.go`'s `newSite`, outside
+   `wire.go`, and `wireAccounts` runs before the hub and the REST API are built (only a server with a site builds them),
+   so both see the origins. The hub gets it through the line M1 already has, `hubCfg.AllowedOrigins =
+   s.site.ExtraOrigins` (`wire.go`, as built), and the REST API through `httpapi.Deps.DesktopOrigins =
+   s.site.ExtraOrigins` (§6.4). `DesktopOrigins` returns a new slice on every call, so nothing else holds the site's
+   copy; `config` keeps importing no protocol package. As built, an allowed origin is accepted only for a socket without
+   a valid cookie, which then authenticates with `hello.auth`; a valid cookie from such an origin gets 403. The Go
+   connection sends no `Origin` and takes the non-browser path.
 2. **The bearer adapter** (`internal/server/wire.go`, WA56's change): `AuthenticateBearer(ctx, token)` calls
-   `auth.AuthenticateBearerToken(ctx, token.Reveal())` (until WA56, `wire.go`'s adapter answers every bearer
-   `signal.ErrInvalid`, as M1 built it); `*api.Error` `invalid_token` or `unauthenticated` → `signal.ErrInvalid` (the
-   hub answers `unauthenticated`, 4401); other errors pass through (the hub answers `internal`). The `Identity` is
-   `{UserID, Name: Username, Admin: Role == admin, DeviceID, DeviceName}` (`identityOf` copies the principal's
-   `DeviceName`). `Admin` is set for a bearer identity exactly as for a cookie one (presence's admin flag and the
-   admin-only `invalidate` topics, as built); only the REST admin routes refuse a bearer (§6.4).
+   `auth.AuthenticateBearerToken(ctx, token.Reveal())` (M1's adapter answered every bearer `signal.ErrInvalid`);
+   `*api.Error` `invalid_token` or `unauthenticated` → `signal.ErrInvalid` (the hub answers `unauthenticated`, 4401);
+   other errors pass through (the hub answers `internal`). The `Identity` is `{UserID, Name: Username, Admin: Role ==
+   admin, DeviceID, DeviceName}` (`identityOf` copies the principal's `DeviceName`). `Admin` is set for a bearer
+   identity exactly as for a cookie one (presence's admin flag and the admin-only `invalidate` topics, as built); only
+   the REST admin routes refuse a bearer (§6.4).
    - **`signal.Identity.DeviceName string`** (new in M2, bearer identities only; "" for cookie sessions): the device's
      current name, which the hub puts into 01-client-core's `OwnConnection.DeviceName` (its §10.4). `LogValue` stays
      as built (user id and admin flag only), so the name is never logged.
@@ -565,10 +568,14 @@ without `exchangeId` never takes the retry row.
    or one read), records the use (§6.1), and returns the principal as the rows have it now: the device row's current
    `DeviceName` and the user's current name and role (§6.8). `Touch` keeps M1's signature (`error` only) and calls
    `TouchPrincipal` (WA39-R2): `wire.go`'s `sessionService` interface calls `Touch`, and only WA56 and WA66 may change
-   `wire.go`, so **WA56** switches `sessionService` and `Revalidate` to `TouchPrincipal`. `Revalidate` copies the
-   principal into the identity; a `DeviceName` that changed is applied like a changed `Name` (M1 01 §3.2), so a rename
-   through `PATCH /me/devices/{id}` reaches open connections within the 5-min revalidation. The access token's expiry
-   doesn't matter after `hello` (01 §3.2): a connection lives until its device is revoked.
+   `wire.go`, so **WA56** switches `sessionService` and `Revalidate` to `TouchPrincipal`. As built (WA56): `Revalidate`
+   still reads the user again, as in M1, for the name, role and status, and takes only `DeviceName` from the principal
+   `TouchPrincipal` returns: `TouchPrincipal` can answer from auth's 30 s bearer cache, which a change made straight in
+   the store (the CLI) doesn't invalidate, and the fresh read keeps M1's guarantee that such changes reach open
+   connections (03 §7.7). A `DeviceName` that changed is applied like a changed `Name` (M1 01 §3.2), so a rename
+   through `PATCH /me/devices/{id}` reaches open connections within the 5-min revalidation; a cookie identity's
+   `DeviceName` stays "". The access token's expiry doesn't matter after `hello` (01 §3.2): a connection lives until
+   its device is revoked.
 4. **Pre-auth refund**: a socket without a cookie takes a token of the hub's per-IP pre-auth bucket at the upgrade
    (20 per IP key per minute, 01 §3.1 step 4). M2 gives it back when its `hello` authenticates with a bearer
    (`keyedLimiter.refund`, beside the existing `h.authenticated(s)`), so the bucket counts only sockets that never
@@ -787,7 +794,9 @@ func (s *Service) TouchPrincipal(ctx context.Context, p Principal, ip netip.Addr
 // is removed as on the Devices page ({via: "devices_page"}, also the cookie path's detail now).
 // RevokeSession: allowed for a bearer (DELETE /me/sessions/{id} stays a User route, §6.4 #15).
 // Logout: refuses a bearer principal with 403 forbidden {credential: "session"}: POST /auth/logout is a Public route
-// that reads the cookie, and the app signs out with RevokeOwnDevice.
+// that reads the cookie, and the app signs out with RevokeOwnDevice. As built, the route never passes Logout a bearer:
+// it authenticates the cookie alone, so a request with only a bearer token gets M1's 204 and signs nothing out (WA57's
+// note in M1 03 §12.4).
 // LogoutEverywhere: allowed for a bearer; deletes every session and device, its own included.
 // ChangePassword, DeleteSelf, RevokeOtherSessions keep refusing a bearer (the routes are UserSession, §6.4).
 // The admin methods (03 §7.11, M1 04's ops routes) are reached only by cookie principals: their routes are Admin,
@@ -1077,8 +1086,10 @@ become:
 | Per linked app: the name (the computer's name unless the friend changed it), app kind, OS, app version, created and last-seen times, **last IP**, token hashes | `devices`, `device_tokens` | Native apps; the Devices page | Revoked; 90 days without a refresh (+ ≤ 1 h); tokens at their expiry |
 | Pending app links: the same, plus the requesting IP | `device_codes` | The approval page | ≤ 70 min |
 
-- Only the friend sees a device's name, last-seen time and last IP (Devices page); admins see a count per user and
-  the audit log (30 days), as in M1.
+- Only the friend sees the list of their apps with last-seen times and last IPs (Devices page). Admins see a count per
+  user and the audit log (30 days), as in M1, whose device rows carry the device's name as the target and the
+  request's IP (§8's table: `device.approved`, `denied`, `linked`, `renamed` and `revoked`; no IP for a `cap` revoke
+  or `device.expired`). `docs/privacy.md` says the same (WA57).
 - **On the PC**: the refresh token, device ID and username in Windows Credential Manager; the server list (origins,
   server names, usernames, device IDs) in `servers.json` (§11.6). No access token or password is written to disk.
 - `docs/privacy.md`: slice DA12 adds only the server-side device rows of the table above. The "On the PC" facts go to
@@ -2062,10 +2073,12 @@ func linkedManager(t *testing.T, srv *servertest.Server, cookie string) *devicea
    by `GET /me/devices`.
 2. 01's Go signal client dials with `Options.Token = func(ctx context.Context) (protocol.Secret, error) { return
    mgr.AccessToken(ctx, false) }`, `role: publisher`, `kind: desktop`; a second client dials as the "SPA" (`viewer`,
-   the same token, `Origin: http://wails.localhost`); both join the Lounge and `room.state` shows **one** participant.
-   Once 01-client-core's C08 has merged, `user.connections` lists both with `deviceName` "Test PC" (01 §10.4); until
-   then this assertion is skipped with a note.
-3. `DELETE /me/devices/{id}` with the cookie: both sockets get `error{session_revoked}` and close 4401 within 100 ms;
+   the same token, `Origin: http://wails.localhost`); both join the Lounge and `room.state` shows **one** participant,
+   and `user.connections` lists both with `deviceName` "Test PC" (01 §10.4; 01's C08 merged with WA27 in group 3).
+3. `DELETE /me/devices/{id}` with the cookie: both sockets get `error{session_revoked}` and close 4401 within 100 ms
+   (as built, WA56: timed from the moment the DELETE's 204 arrives, when the revocation has committed; the 4401 close
+   is read from the server's `isshoni_ws_close_total{code="4401"}`, which must rise by 2, since the Go signal client
+   reports the error but not the close code);
    `SessionEnded(ctx, session_revoked)` → refresh → `invalid_grant` → returns `unlinked` with `signed_out`; the memory
    store is empty; `AccessToken(ctx, false)` then returns an error with `RelinkRequired() == true`.
 4. Relink, then present a spent refresh token from outside the manager after the manager refreshed: the device is
@@ -2077,7 +2090,7 @@ func linkedManager(t *testing.T, srv *servertest.Server, cookie string) *devicea
    read) and `device.linked {via: "password"}` is in the audit log; a wrong password → 401 `invalid_credentials`, state
    `unlinked`.
 7. `PATCH /me/devices/{id}` renames the device; after the hub's 5-min revalidation (advanced through the test clock)
-   `user.connections` shows the new `deviceName` (skipped with a note, like case 2, until 01's C08 has merged).
+   `user.connections` shows the new `deviceName`.
 8. `goleak` clean (checked over the whole file, cases 9–12 included).
 9. **Grace replay, then the superseded child** (raw HTTP, `linkDevice`): refresh `P → C` with an `exchangeId`; at
    +100 s (test clock) replay `P` without one → 200 with a new pair; then present `C` → 400 `invalid_grant {reason:
@@ -2094,6 +2107,13 @@ func linkedManager(t *testing.T, srv *servertest.Server, cookie string) *devicea
 12. **Network comparison**: a code started from `2001:db8:cc::7` and looked up by the cookie from `203.0.113.7` →
     `network: unknown`; started and looked up from `203.0.113.7` → `same`; from `203.0.113.7` and `198.51.100.9` →
     `different` (the checkbox each value needs is §16.3's Vitest).
+
+As built (WA56): two more tests in `device_test.go` cover README WA56's remaining items on the real wiring.
+`TestDeviceOrigins`: the site's `ExtraOrigins` equal `protocol.DesktopOrigins()`, and the REST API answers each origin's
+preflight (204, `Max-Age` 600) and a bearer request's answer with `Access-Control-Allow-Origin` and never
+`Allow-Credentials` (§6.4). `TestDeviceSockets`: a socket from `http://wails.localhost` with `hello.auth` is accepted
+and with a cookie gets 403; 21 bearer sockets of two users from one address, one after another, all pass (the pre-auth
+refund, §6.3 item 4), while 21 sockets whose hello fails get 429 at the 21st upgrade.
 
 ### 16.3 Web
 

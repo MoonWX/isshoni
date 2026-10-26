@@ -543,7 +543,7 @@ package app // internal/desktop/app
 type Deps struct {
 	Settings *settings.Store     // settings.json; 05's audio.SettingsStore through settings.NewAudioStore (§14.2)
 	Servers  *deviceauth.Servers // 02: servers.json, one Manager per server, the credential store
-	Session  Session             // C2: 01's core for the active linked server (§9); *session.Session (WA58)
+	Session  Session             // C2: 01's core for the active linked server (§9); nil: New builds one (WA58)
 	Engine   media.Engine        // native.Open on Windows; fake.NewEngine in dev and e2e builds (§4.5)
 	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio; wired by WA77)
 	Updater  Updater             // 06's *update.Updater, built in the first instance only (§13.4; wired by WA84)
@@ -608,7 +608,15 @@ Wiring in `main.go` (first instance, §13.4 step 7):
   settings.Updates().Channel }, WizardDone: settings.WizardDone, DataDir: <data dir>, Logger: log})`; `App.Run`
   runs `Updater.Run(ctx)` (first instance only).
 - `session.New(session.Options{Servers, Engine, Client: protocol.ClientInfo{Kind: desktop, Version, OS}, Log})`
-  (§9).
+  (§9). As built (WA58): `app.New` builds it itself when `Deps.Session` is nil and an engine is open
+  (`session.ServersOf(Deps.Servers)`, `Client {Kind: desktop, Version: version.Version()}` with the core's OS, and 05's
+  `AudioConfig` when `Deps.Audio` has it), so `main.go` and the e2e host pass no session and get C2 and the share
+  controller without a change; a `Deps.Session` without `*session.Session`'s C2 methods (`Ready`, `ConnectionID`, …)
+  gets no C2 for the controller (`Share.Start` answers `publisher_offline`). `app.New` also builds the share controller
+  (§10.1) over the session, the engine's picker, 05's audio policy when `Deps.Audio` implements `share.AudioPolicy`, the
+  shell's main window and `settings.json`. Both of 05's interfaces are found by a type assertion on `Deps.Audio`, so
+  `deps_test.go` asserts at compile time that `*audio.Service` has them: a signature that drifted would otherwise drop
+  05's calls silently.
 - The engine's probe (`Engine.Probe(ctx, false)`) runs once at start in the background; `Share.Capabilities()` waits
   for it at most 2 s.
 
@@ -642,11 +650,14 @@ service missing there gets no binding. Argument and result types use plain strin
 its arguments against the generated signatures and casts results to `bridge.ts`'s unions (§7.4). `main.go` passes
 `update.PolicyDisabled` as `Deps.PolicyOff` (§14.2's `updates.policyOff`). Methods whose slice hasn't landed answer
 `not_implemented` (README §4): `Auth.Unlink`, `AddServer`, `SwitchServer` and `RemoveServer` until WA71 (they need the
-app's reload and share stop), `Share.Pick`, `Start`, `StopOther`, `SetPaused`, `SetPreset` and `SetAudioEnabled` until
-WA58 (`Current` and `Stats` answer null and `Stop` and `Release` do nothing until then), `Settings.Update`, `Hotkeys`,
-`TestHotkey` and `Updates.*` until WA84; `Audio.*` work over 05's service once `main.go` passes it as `Deps.Audio`
-(WA77). `Share.Capabilities` already answers from the probe: each usable encoder kind once, in 04's order (the probe
-lists a kind once per adapter), with `reason` the media code when `canShare` is false.
+app's reload and share stop), `Settings.Update`, `Hotkeys`, `TestHotkey` and `Updates.*` until WA84; `Audio.*` work
+over 05's service once `main.go` passes it as `Deps.Audio` (WA77). As built (WA58): every `Share` method works through
+the app's share controller (§10.1), which `bridge.New` finds on `Deps.App` (`*app.App`'s `Shares`; `bridge.Deps.Shares`
+overrides it) and whose events it forwards as `share.state`, `share.stats` and `share.notice`; a `Core` without a
+controller (`cmd/isshoni-desktop`'s test core) gets a stand-in whose calls that would make or change a share answer
+`not_implemented` (`Current` and `Stats` answer null; `Stop`, `Release` and `WatchServerStats` do nothing), so
+`bridge.Core` gained no method. `Share.Capabilities` already answers from the probe: each usable encoder kind once, in
+04's order (the probe lists a kind once per adapter), with `reason` the media code when `canShare` is false.
 
 | Service.Method | In → out | Errors | Notes |
 |---|---|---|---|
@@ -683,7 +694,7 @@ lists a kind once per adapter), with `reason` the media code when `canShare` is 
 | `Share.SetPreset(preset)` | → — | wire codes, `not_sharing` | 01's `Share.SetPreset`: C2 sends `share.update` |
 | `Share.SetAudioEnabled(on)` | → — | `not_sharing` | local only: 05's `audio.Service.SetShareSound(on)`; no wire message; a no-op for a share started without sound, whose switch isn't shown (§10.3) |
 | `Share.Stats()` | → `*ShareStatsSample` | — | M1's shape (05 §8), mapped from 01's snapshot (§6.3) |
-| `Share.WatchServerStats(on)` | → — | — | reference-counted; 01's `Client.WatchServerStats(count > 0)` while the Details disclosure is open (§10.3) |
+| `Share.WatchServerStats(on)` | → — | — | reference-counted; 01's `Client.WatchServerStats(count > 0)` while the Details disclosure is open (§10.3). As built (WA58): the controller keeps the wish and passes it to C2's core client at each `Start` and on every change while a share runs, and turns it off on that client once the share ended, since 01's switch is sticky on its client: no later share keeps `stats.watch` on without an open disclosure |
 | `Audio.FriendsHear()` | → `FriendsHear` (05 §14.5) | — | pull for `audio.report` |
 | `Audio.Watch(on)` | → — | — | reference-counted in the bridge; 05's `Service.Watch(count > 0)`. The ShareSheet, first-share sheet, the wizard's voice step and Settings → Audio call it on mount and unmount |
 | `Audio.WatchLevels(on)` | → — | — | reference-counted; 10 Hz `audio.levels` while > 0 |
@@ -758,8 +769,9 @@ fields; named apart from `core.ShareSnapshot` on purpose):
 - `hint`: `ShareHint | null` (M1's shape): `{kind: 'upload-limited', approxHeight}` from `Upload.Limited` and
   `Upload.ApproxHeight`, `{kind: 'cpu-limited'}` from `Overloaded`, else `null` (§10.3).
 - `encoder`, `hw`, `layers`, `server`: the Details disclosure (§10.3): `layers` from `LayerSnapshot {RID, Width,
-  Height, FPS, TargetBps/1000, SentBps/1000, CaptureToSend}`; `server` = `ShareSnapshot.Server` while
-  `Share.WatchServerStats` is on, else `null`.
+  Height, FPS, TargetBps/1000, SentBps/1000, CaptureToSend}`; `server` = `{layers: ShareSnapshot.Server}` (an object
+  around 01's `ServerLayerStats[]`, as built by WA58: WA48's DTO types it `map[string]any`, TS `Record<string,
+  unknown>`) while `Share.WatchServerStats` is on, else `null`.
 - `endReason`: `user | hotkey | tray | source-gone | elsewhere | server | server-unreachable | unlinked | system | error`.
 - `error`: `{code, params}` per §6.4.
 
@@ -797,6 +809,11 @@ fault; only `Auth`, whose deadlines bound calls to a server, makes it `server_un
 are `server_unreachable`; an error no rule knows is `internal`, logged once at WARN with its cause (the packages below
 never put a token, password, name or path into an error's text). Params hold codes and numbers only, never English.
 The update codes' texts are `desktop.update.error.<code>` (README §3 item 42), written with the update screens (WA82).
+As built (WA58): the share controller's errors are checked first, since they may wrap a wire or media error:
+`pick_expired` (with `params.reason: pick_expired`, like the engine's `source_gone` of an expired token, so §10.5's
+reason row matches both), `already_sharing`, `not_sharing`, `publisher_offline`, `feature_disabled` (with
+`params.feature: share.pause`), `busy` (`StopOther` while C2 shares in another room) and `invalid_argument`; then the
+rest of the table as above.
 
 ---
 
@@ -1125,7 +1142,7 @@ does (README WA65's row).
 
   | Result | Code |
   |---|---|
-  | DNS, TCP, connect or overall timeout | `server_unreachable`, with the extra line "Opens in your browser but not here? See why" that opens `<the typed origin>/troubleshooting#desktop-linking` through `openExternal` (02 DA12: proxies, filtering software and `HTTPS_PROXY`, which WebView2 and Go see differently) |
+  | DNS, TCP, connect or overall timeout | `server_unreachable`, with the extra line "Opens in your browser but not here? See why" that opens the project site's `DOCS_URL + 'troubleshooting#desktop-linking'` (`web/src/conntest/links.ts`, as M1's other docs links) through `openExternal` (02 DA12: proxies, filtering software and `HTTPS_PROXY`, which WebView2 and Go see differently). Not `<the typed origin>/troubleshooting…`: an isshoni server has no `/troubleshooting` route, and the SPA's catch-all would show its 404 (WA57-R6) |
   | TLS failure (untrusted, expired, wrong name) | `tls_untrusted`: "isshoni servers need a trusted certificate (04 §8)" |
   | status ≠ 200, or a body that is not 03's `Info` (02's `ErrBadResponse`) | `not_isshoni` |
   | `setupRequired: true` | `server_not_set_up` |
@@ -1314,8 +1331,9 @@ in settings (per install) records that the sound and voice steps were seen once.
 - Watcher counts for the tray and the pill come from `core.ShareSnapshot.Watchers`; the names in the panel from C1's
   `room.state`, as in M1.
 - C2 that isn't ready for 10 s when `Share.Start` runs → `publisher_offline` ("Can't reach the server", plus the
-  line "Opens in your browser but not here? See why", which opens `serverOrigin + '/troubleshooting#desktop-linking'`
-  through `openExternal`; no proxy detection, and Go's `http.Transport` is unchanged). C2's stops
+  line "Opens in your browser but not here? See why", which opens the project site's `DOCS_URL +
+  'troubleshooting#desktop-linking'` through `openExternal`, as §8.1 does; no proxy detection, and Go's
+  `http.Transport` is unchanged). C2's stops
   (01 §11.3): `update_required` → `compat.FromError` → the version screen (§16.3); `unlinked` with code
   `session_revoked` and `account_disabled` → the adapter calls `Manager.SessionEnded(ctx, code)` and rebuilds the core
   if 02 stays `linked`; otherwise the relink page follows `auth.state`.
@@ -1354,21 +1372,38 @@ hotkeys, pill, keep-awake and tray.
   `Source.Kind`, `label` = `Source.Name` (the controller fills it; local only), `border` from `Source.OSBorder` at pick
   time and from `core.ShareSnapshot.NoOSIndicator` once the share is live (the fields 04 and 01 add). A window share's
   pill goes on the primary monitor unless 04 adds a monitor to `Source`. `confirm` lists the one-time sheets due
-  (§10.2).
+  (§10.2). `Pick` has no bound of its own: the picker's 120 s timeout (04 §7.2) applies. The 300 s hold is
+  `share.PickHold` (`Options.PickHold` overrides it in tests); README WA58's row and 01 §16 said 120 s, the picker's
+  timeout mixed in (README §3 item 45).
 - **Start**, in order: C2 ready (≤ 10 s, else `publisher_offline`) → `audio.OnShareStarted(uint32(src.PID),
   withAudio)` (the shared app is never auto-excluded, PLAN; `src.PID` is 0 for a monitor) →
   `core.Client.StartShare(ctx, core.ShareRequest{RoomID: roomId, Source: src, Preset: preset, Audio: withAudio,
-  Exclusions: audio.Exclusions(), Borderless: probe.Capture.Borderless, Label: ""})` → `starting`. The core joins the
-  room itself (01 §11.4 step 1; its errors `room_not_found`, `room_full`, `forbidden` come back as wire codes). If
-  `StartShare` fails, `audio.OnShareStopped()` is called. `serverPrefs[origin].preset` remembers the preset.
+  Label: ""})` with its own 10 s → `starting`. 01's `ShareRequest` has no `Exclusions` or `Borderless` (WA58): 05's
+  exclusions reach the engine through C2's `core.Options.AudioConfig` (05's `AudioConfig()`, §6.1), and the core takes
+  `Borderless` from the probe itself (01 §11.4 step 3). The core joins the room itself (01 §11.4 step 1; its errors
+  `room_not_found`, `room_full`, `forbidden` come back as wire codes). If `StartShare` fails, `audio.OnShareStopped()`
+  is called, and the view shows `failed` with the error while the pick stays held for another `Start`, unless the
+  engine said `source_gone` or `pick_expired` or a `Stop` aborted the start (that start ends with the Stop's cause).
+  `serverPrefs[origin].preset` remembers the preset.
 - **Pause** (§11.3): `core.Share.SetPaused(ctx, p)`, then, once it succeeded, `audio.SetPaused(p)` (05's extra mute;
-  not the mechanism).
+  not the mechanism). On a server without `share.pause` it returns `feature_disabled` and changes nothing (§6.2,
+  §11.3), rather than 01's local-only pause.
 - **Preset**: `core.Share.SetPreset(ctx, p)` (C2's `share.update`). **Share sound**: `audio.SetShareSound(on)`, local
   only (§10.3).
 - **Stop** is idempotent and ordered: `core.Share.Stop(ctx)` (the core runs `share.stop` → `pc.close` → Publisher
   closed → engine `Stop` → `room.leave`, 01 §11.4) → `audio.OnShareStopped()` → hotkeys unregistered, pill hidden,
   keep-awake off, tray idle. On **every** share end (also one the server or the core made), the controller runs the
-  same local steps once when `Share.Done()` closes, `audio.OnShareStopped()` included.
+  same local steps once when `Share.Done()` closes, `audio.OnShareStopped()` included. As built (WA58): the bound
+  `Share.Stop` waits for the server at most 10 s (the local part always runs), and `Share.StopOther`'s 10 s include
+  the wait for C2.
+- **05's calls** (WA58): through `share.AudioPolicy`, which `app.New` passes when `Deps.Audio` implements it (§6.1):
+  `OnShareStarted` before `StartShare`, `OnShareStopped` at every end, `SetPaused` after the core's pause and
+  `SetShareSound`. The `SetSharedPID` hand-off at pick, release and expiry is WA77's.
+- **Views** (WA58): `Current()` and `share.state` show the picker's view (`picking`) while it is open, then the share's;
+  after an end they keep the last share's final view (`ended` or `failed`) until the next `Pick`, and carry `null`
+  when there has been no share. 01's `reconnecting` shows only once it has lasted 2 s (`share.ReconnectingAfter`), so
+  a short drop that 01 cures doesn't flash "Reconnecting…" in the panel, the tray and the pill; `unreachable` shows at
+  once.
 - **Notices**: 01's `EventNotice` `encoder_fallback {encoder}` becomes `share.notice` (§10.5). `audio_rebuilt` is
   logged only; the audio state shows through 05's banners.
 - `liveSince` is stamped when the controller first sees `live` and kept across `replaces` (the share's id changes,
@@ -1396,14 +1431,16 @@ hotkeys, pill, keep-awake and tray.
 | any other `server` | `server` (e.g. `media_timeout`) |
 | `server-unreachable` | `server-unreachable` (01's 30 s hold ran out) |
 | `unlinked` | state `ended`, `endReason: unlinked`; the session adapter calls `Manager.SessionEnded` when `StopError.Code` is `session_revoked` or `account_disabled` (§9); the relink page follows `auth.state` (§8.3) |
-| `error` | state `failed`, `error.code` = `engine.<media code>` when `EndInfo` names a media code, else the protocol code |
+| `error` | state `failed`, `error.code` = `engine.<media code>` with `params.reason` = `EndInfo.MediaReason` when `EndInfo` names a media code (README §3 item 43: until WF4 adds the field, `params.reason` is empty, so §10.5's `device_removed` row can't show for a live share), else the protocol code |
 
 ### 10.2 The SPA flow
 
 `DesktopSharing` (`platform/desktop/DesktopSharing.ts`) is a `SharingProvider` with `mode: 'native'`:
 - `pick()` → `bridge.share.pick()` → a `PickedSource {kind, audioScope: withAudio ? 'system' : 'none', warning: null,
   preview: null, label, confirm, release}`; no transient-activation rule applies, but M1's ShareButton still calls it
-  first in the click handler, which is fine.
+  first in the click handler, which is fine. The SPA counts on the same 300 s hold as Go (§10.1, README §3 item 45;
+  `bridge.ts`'s `Picked` said 120 s until WA65): a `start` after it gets `pick_expired`, which reopens the picker
+  (§10.5).
 - `start(src, opts, ctx)` → `bridge.share.start({pickId, roomId: ctx.roomId, preset, withAudio})` → a
   `DesktopShare`. `ctx.signal` is unused (C2 publishes).
 - `current()`, `localConnectionIds()` (`[publisherConnectionId]`), `stopOther(roomId, shareId)` per §7.1.
@@ -1474,8 +1511,9 @@ M1's `SharePanel` (05 §13.7) with native extras from `share/native/` (lazy, loa
   - **Details** (a disclosure, also toggled with Ctrl+Shift+D while the window has focus): encoder and HW; per layer
     width × height @ fps, target and sent kbit/s, CaptureToSend p50/p95; and the server's view of the layers. Data from
     `share.state` / `Share.Current()` (`ShareView.encoder`, `hw`, `layers`, `server`); while open it calls
-    `Share.WatchServerStats(true)` (`false` on close). It shows no source or app names. 01 §12.2's latency run reads
-    the encoder and the full layer's bitrate here.
+    `Share.WatchServerStats(true)` (`false` on close; the bridge counts the open disclosures and the controller keeps
+    the wish across shares, §6.2). The server's view arrives as `ShareView.server = {layers: [...]}` (§6.3). It shows
+    no source or app names. 01 §12.2's latency run reads the encoder and the full layer's bitrate here.
 - **Banners** (always visible, PLAN "Transparency"): `FriendsHear.banners[]` as they arrive, codes from 05 §14.7 and
   texts from 05 §14.8's keys (in the `desktop` namespace as `desktop.audio.*`, §18.1). This doc has no banner strings
   of its own.
@@ -1522,7 +1560,7 @@ Keyed on 01's `media.ErrorCode` (bridge code `engine.<code>`) and then on `media
 | `no_media_foundation` (`dependency`; MF encoder status) | probe | "This edition of Windows (N or KN) needs Microsoft's Media Feature Pack for video" with a link to `/troubleshooting#desktop-media-feature-pack`; when no encoder works, Share is disabled with this text instead of `no_encoder`'s |
 | `blocked_by_policy` (`dependency`) | probe, start | "Windows (Smart App Control or your organization's policy) blocked part of isshoni's video engine." with a link to `/troubleshooting#desktop-smart-app-control`; when 04 offers it, [Enable Cisco OpenH264…] (Cisco signs its binary, 04 §17) |
 | `missing`, `version`, `abi` (`dependency`) | open, probe, start | "Part of isshoni is missing or damaged. Reinstall isshoni from your server's Download page." [Open download page] (`serverOrigin + '/download'`); sharing off, viewing works |
-| `device_removed` (`encoder_lost` from `Next`: the GPU was removed or reset, 04 §5.7, §9.8) | live | the share ends with code `encoder_lost`: state `failed`, toast and panel "Your graphics driver restarted, so the share stopped." [Share again], which starts a new pick (`Share.Pick()`; the engine's next session uses a new device) |
+| `device_removed` (`encoder_lost` from `Next`: the GPU was removed or reset, 04 §5.7, §9.8) | live | the share ends with code `encoder_lost`: state `failed`, toast and panel "Your graphics driver restarted, so the share stopped." [Share again], which starts a new pick (`Share.Pick()`; the engine's next session uses a new device). The reason reaches the view through 01's `EndInfo.MediaReason` (README §3 item 43, WF4); WA58's `endError` had only `EndInfo.Media`, so until WF4 this row showed as `encoder_lost`'s |
 
 **By code** (when no reason row applies):
 
@@ -2240,7 +2278,9 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | What | Value |
 |---|---|
 | Pick held without Start | 300 s from the pick (04's pick-token life, 04 §7.2) |
-| `Share.Start` waiting for C2 | 10 s, then `publisher_offline` |
+| `Share.Start` waiting for C2 | 10 s, then `publisher_offline`; then 01's `StartShare` ≤ 10 s (`Start` ≤ 20 s in all) |
+| `Share.Stop` waiting for the server | ≤ 10 s (the local part always runs) |
+| `reconnecting` shown | after 2 s of 01's `reconnecting` (`share.ReconnectingAfter`); `unreachable` at once |
 | Hotkey or button → no media leaves the core | ≤ 100 ms (01's pump); viewers see "Paused" within 1 s |
 | Lock pause: unlock that resumes on its own | within 5 min of the lock; later → "Resume sharing?" (§11.6) |
 | Lock pause: stop | 30 min after the lock without a resume (`endReason: system`) |
@@ -2305,7 +2345,7 @@ there.
 | `assets` | `index.html` gets the bridge tag exactly once before `boot-check.js`; `New` fails without the tag; CSP header and `<meta>` equal, with the active host in `connect-src` and `'self'` only without a server; `http:`/`ws:` only in dev/e2e for a loopback origin; release build has no dev origin and no `http:`/`ws:`; `bridge.js` JSON escapes `<`, `>`, `&`, U+2028/9 and never holds a token (fuzzed server names); `/sw.js` and `/manifest.webmanifest` 404; dotted miss 404; 405 for POST; `Guard`: foreign Origin 403, same-origin passes, no Origin plus `Sec-Fetch-Site: same-origin` passes, no Origin without it 403; runtime allowlist with requests built as the pinned runtime builds them (W21's ids), in both forms (JSON body and `?object=` query): `Call` and `CancelCall` pass with the body intact for the next handler, `Browser.OpenURL`, `Clipboard.Text`/`SetText`, `Window.Hide`, `Application.Quit`, `Dialog`, `System`, `Screens`, `ContextMenu` and `Events.Emit` get 403 with one rate-limited WARN; an unparsable object, a chunked request and a body over 64 KiB are refused |
 | `servers` | `Normalize` table (hosts, IPs, ports, paths dropped, fragments never kept, invite and setup paths flagged, http refused in release, http loopback in dev/e2e through 02's `NormalizeOrigin`); `LocalID` vectors (shared with the TypeScript test); probe against `httptest` TLS servers in §8.1's order: untrusted cert → `tls_untrusted`, redirect not followed, 404 → `not_isshoni`, `setupRequired` → `server_not_set_up`, a 0.1.x `/info` without `deviceFlow` → `incompatible_server` with `reason: no_device_flow`, protocol ranges → `incompatible_server` with 02's verdicts, `publicUrl` adopted |
 | `settings` | round trip; unknown fields kept; corrupt file → `.bad-*` and `.bak` used, credentials untouched (a fake `credstore` sees no call); migration from schema 0 fixture; atomic write (temp + rename) with a fault-injected writer; no secrets serialized (reflection test on the struct); no file and `UpdateChecks=0` → `updates.check=false`, read once and never again; `serverPrefs` for an unknown origin dropped; `audio.SettingsStore` round trip of 05's `Settings` |
-| `share` | the state machine of §10.1 with a fake core (01's `Client`/`Share` shapes), fake engine, fake `audio.Service` and clock (`testing/synctest`): pick expiry at 300 s (a Start at 299 s works, one at 301 s returns `pick_expired`), one pick at a time, `ErrCancelled` → null, a fake `Pick` returning `invalid`/`self_window` → no pick held and `engine.invalid` with `params.reason: self_window`; Start calls in order (`OnShareStarted(pid, withAudio)`, then `StartShare` with `Exclusions` and `Label: ""`; `OnShareStopped` when `StartShare` fails); the controller sends no `room.join`, `room.leave` or `share.stop` of its own (the join-before-`share.start` order is 01's itests D1, D2); Stop calls `Share.Stop` then `OnShareStopped`, and a server-made end runs the same local steps once; pause calls `Share.SetPaused` then `audio.SetPaused`; `SetAudioEnabled` calls only `SetShareSound`; every row of the state and end-reason tables (`elsewhere` from `Server` ∈ {stopped, left} and `!ByThisApp`, `unlinked`, `failed` with `engine.<code>`); `liveSince` kept across `replaces`; `publisher_offline` at 10 s; lock pauses and releases keep-awake, an unlock at 4 min resumes and takes keep-awake again, an unlock at 6 min stays paused with the "Resume sharing?" state (pill, tray, toast) and resumes only on Resume, a lock pause stops at 30 min with `endReason: system` (also when the unlock came at 6 min and no Resume followed), an unlock at 31 min finds it stopped, a pause the user chose before the lock stays and never auto-resumes; suspend stops |
+| `share` | the state machine of §10.1 with a fake core (01's `Client`/`Share` shapes), fake engine, fake `audio.Service` and clock (`testing/synctest`): pick expiry at 300 s (a Start at 299 s works, one at 301 s returns `pick_expired`), one pick at a time, `ErrCancelled` → null, a fake `Pick` returning `invalid`/`self_window` → no pick held and `engine.invalid` with `params.reason: self_window`; Start calls in order (`OnShareStarted(pid, withAudio)`, then `StartShare` with `Label: ""`, 05's exclusions going through C2's `AudioConfig`, §10.1; `OnShareStopped` when `StartShare` fails); the controller sends no `room.join`, `room.leave` or `share.stop` of its own (the join-before-`share.start` order is 01's itests D1, D2); Stop calls `Share.Stop` then `OnShareStopped`, and a server-made end runs the same local steps once; pause calls `Share.SetPaused` then `audio.SetPaused`; `SetAudioEnabled` calls only `SetShareSound`; every row of the state and end-reason tables (`elsewhere` from `Server` ∈ {stopped, left} and `!ByThisApp`, `unlinked`, `failed` with `engine.<code>`); `liveSince` kept across `replaces`; `publisher_offline` at 10 s; lock pauses and releases keep-awake, an unlock at 4 min resumes and takes keep-awake again, an unlock at 6 min stays paused with the "Resume sharing?" state (pill, tray, toast) and resumes only on Resume, a lock pause stops at 30 min with `endReason: system` (also when the unlock came at 6 min and no Resume followed), an unlock at 31 min finds it stopped, a pause the user chose before the lock stays and never auto-resumes; suspend stops |
 | `session` | `core.Auth` adapter: bound to the `Manager` of the origin its core was built for (after the active server changes, the old core's `AccessToken` never returns the new server's token); `force` is passed to `Manager.AccessToken(ctx, force)`; `ErrNotLinked` → an error with `RelinkRequired() == true`; `ErrIncompatible` closes the core; `StopUnlinked` with `session_revoked` calls `SessionEnded` and rebuilds the core when 02 stays `linked` |
 | `app` | close policy table of §11.6; deep link handling table of §13.2 with fakes (unknown server → `?add=` with no network call; a known server that isn't linked → active and one `Shell.Reload()`; a link during a confirmation ignored; 21st server refused); every change of the active server (`SwitchServer`, `AddServer`) reloads the window once, `AddServer` at `/desktop/setup?link=1`; PendingServer/PendingRoom read and deleted before `HandleArgs`; `--open-url 'isshoni://watch.example.com/r/lounge' --purge-data` handles the link and never purges; a bare positional URL ignored; one-shot modes ignored in forwarded args; start-time update with a fake updater: pending at start → `Apply` and exit; a link start writes both Pending values first; `--autostart` never applies; a second instance never builds the updater; `Updates.Install` → `busy` while live; server switch refused while live; `playback.state` → `SetViewerBrowser`, and a sender missing from `OwnConnections` → `playing=false`; quit order (share stop before shell quit, 3 s bound); goleak |
 | `tray` | `Render` for every mode, tooltip truncation at 127 characters with a 40-character source, menu items and hotkey labels, "Restart and update" only in Idle |
@@ -2546,7 +2586,7 @@ shows the encoder and the full layer's bitrate, and its windows stay out of the 
 | TS: `Platform.desktop` (optional, §7.1), `DesktopFeatures` (with `sessionEnded`, `helloRefused`, `signalStopped`), `HelloAuthProvider`, `PickedSource.preview \| null` (with WA65), `label`, `confirm`, `SharingProvider.current/localConnectionIds/stopOther(roomId, shareId)`, `LocalEndReason` additions, `NativeBridge`, `ShareView`, `RoomSession.adoptShare`, `SignalClientOptions.auth`; `RoomPage`'s `?conntest=1` | §7 | 05-web (browser parts unchanged), M3, M4 |
 | `web.DesktopCatalog()`, namespace `desktop`, Go keys `desktop.native.*` (incl. the mic-prompt toasts); 05's texts as `desktop.audio.*` | §18.1 | 05 (texts) |
 | Viewer tile state `paused` for `ShareStatus paused`; no freeze detection while paused | §11.3 | 01-client-core (server status) |
-| Project-site anchors the app links: `/download#windows-updates` (install_failed, manifest_expired), `/troubleshooting#desktop-webview2` (WebView2 message box), `#desktop-gpu-driver`, `#desktop-media-feature-pack` and `#desktop-smart-app-control` (§10.5's reason rows), `/privacy#desktop` and `/code-signing` (About) | §5.4, §10.5, §14.4, §16.2 | 06 (`TestDocsAnchors`) |
+| Project-site anchors the app links: `/download#windows-updates` (install_failed, manifest_expired), `/troubleshooting#desktop-webview2` (WebView2 message box), `#desktop-gpu-driver`, `#desktop-media-feature-pack` and `#desktop-smart-app-control` (§10.5's reason rows), `#desktop-linking` (§8.1's and §9's "See why", 02 DA12's section), `/privacy#desktop` and `/code-signing` (About) | §5.4, §8.1, §9, §10.5, §14.4, §16.2 | 06 (`TestDocsAnchors`) |
 | The `Auth` binding's token contract: `AccessToken(origin, force)`, `SessionEnded(origin, code)` (`unauthenticated`, `session_revoked`, `account_disabled`), `HelloRefused(origin, error)`, answered only for the active server's origin; no `TokenRejected`; the window reloads on every change of the active server (`AddServer` at `/desktop/setup?link=1`); C2's `core.Auth` adapter is bound to its core's origin | §5.8, §6.2, §7.3, §8.2, §9 | 02 (§11.7, §11.8 write the same signatures) |
 | The browser's "Get the desktop app" links to `/download?room=<roomId>` (room id by 02's rule, else plain `/download`), shown only when `client.os` is `windows` | §12.3 | 06 (`/download` turns `room` into "Open isshoni"'s `appLinkFor(publicUrl, roomId)`) |
 | `bridge.Audio` wraps 05's `DismissPrompt(promptID)`; `Decide` takes only `keep-out` or `include`; no sound-mode binding | §6.2, §10.3, §15 | 05 (§14.2, §14.6) |
@@ -2568,7 +2608,7 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   c.Run(ctx)                                    // until ctx ends or a terminal *StopError
   c.Status()                                    // Conn, Stop, ConnectionID (01 adds), Features, Share
   c.Subscribe()                                 // EventStatus, EventShare, EventNotice, EventPlaybackState (01 adds), EventResync, …
-  c.StartShare(ctx, core.ShareRequest{RoomID, Source, Preset, Audio, Exclusions, Borderless, Label: ""})
+  c.StartShare(ctx, core.ShareRequest{RoomID, Source, Preset, Audio, Label: ""}) // exclusions: Options.AudioConfig
   c.ActiveShare()
   c.StopOther(ctx, roomID, shareID)             // 01 adds: share.stop for another connection's share of this user
   c.WatchServerStats(on)
@@ -2576,9 +2616,12 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   s.Snapshot(); s.SetPreset(ctx, p); s.SetPaused(ctx, p); s.Stop(ctx); s.Done()
   ```
   `core.Auth` is implemented by `internal/desktop/session` over 02's `Manager` (§9). `ShareSnapshot` as 01 §11.9 plus
-  `AudioSentBps int` (§11.9 adds it), `NoOSIndicator bool`, and `EndInfo.Server`, `EndInfo.ByThisApp` (for
-  `elsewhere`). `EventNotice` codes `encoder_fallback {encoder}` and `audio_rebuilt`. `EventPlaybackState{From,
-  Playing, Browser, OS}` for a decoded `playback.state` (01 §11.11); the core serves no relay request kind (01 D16).
+  `AudioSentBps int` (§11.9 adds it), `NoOSIndicator bool`, and `EndInfo.Server`, `EndInfo.ByThisApp` (for `elsewhere`)
+  and `EndInfo.MediaReason` (§10.5's reason rows for a share's end, README §3 item 43). As built (WA58): `ShareRequest`
+  has no `Exclusions` or `Borderless`; 05's exclusions come through `Options.AudioConfig` and the core takes
+  `Borderless` from the probe (§10.1). `EventNotice` codes `encoder_fallback {encoder}` and `audio_rebuilt`.
+  `EventPlaybackState{From, Playing, Browser, OS}` for a decoded `playback.state` (01 §11.11); the core serves no relay
+  request kind (01 D16).
 - `Share.SetPaused` per 01 §11.8 / D14 (pump drops at once, keyframe requests ignored while paused, `share.update
   {paused}`); `share.pause` on the server (`ShareUpdate.Paused`, `ShareStatus paused`, `sharerPaused` in the SFU).
 - `StartShare` joins the room and `Share.Stop` leaves it (01 §11.4, D12); the app sends no room or share messages of
