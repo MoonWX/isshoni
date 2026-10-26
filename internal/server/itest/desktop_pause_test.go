@@ -43,7 +43,8 @@ func shareLogged(w *world, words ...string) bool {
 // checkPausedStarting checks a share that the core paused before it went live, once it has stayed paused past the
 // start timeout: the viewer's room.state still has it, paused; no room.state ever showed it live and no room.event
 // named it (neither share.started nor share.stopped); the server logged no end of it (media_timeout or any other);
-// and the core still has it, paused, live as the server shows it.
+// and the core still has it, paused. The core's state isn't checked: since WF3, room.state's paused no longer means
+// that the share had its first keyframe, and the core still takes paused for live.
 func checkPausedStarting(t *testing.T, w *world, sh *core.Share, viewer *client, id string) {
 	t.Helper()
 	info, ok := viewer.shareIn(id)
@@ -73,9 +74,9 @@ func checkPausedStarting(t *testing.T, w *world, sh *core.Share, viewer *client,
 	}
 	eventually(t, func() bool {
 		s := sh.Snapshot()
-		return s.ID == id && s.Paused && s.State == core.StateLive
+		return s.ID == id && s.Paused
 	}, func() string {
-		return fmt.Sprintf("the core's share is %+v, want %s paused, and live as the server shows it", sh.Snapshot(), id)
+		return fmt.Sprintf("the core's share is %+v, want %s paused", sh.Snapshot(), id)
 	})
 }
 
