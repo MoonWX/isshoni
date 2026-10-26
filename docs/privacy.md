@@ -20,6 +20,21 @@ stores, every connection it makes to others, and what the installer and this sit
 - **No telemetry.** The server never contacts the project; its only call home is the optional daily release check
   below. The desktop apps will check GitHub Releases for updates, and that can be turned off.
 
+## Linked apps {#linked-apps}
+
+A desktop app signs in to a server once, when you link it to your account: you approve it in your browser, or sign
+in with your username and password in the app ([how that sign-in is protected](/security#linked-apps)). For that,
+the server keeps:
+
+| Data | Table | Why | Kept until |
+|---|---|---|---|
+| Per linked app: the name (the computer's name unless you changed it), app kind, operating system, app version, when it was linked and last seen, its **last IP address**, and hashes of its tokens | `devices`, `device_tokens` | Signing in the apps; the Devices page | Removed or signed out; 90 days without a refresh (plus up to 1 hour); each token until it expires |
+| Pending app links (a code waiting for approval): the same, plus the IP address the request came from | `device_codes` | The approval page | At most 70 minutes |
+
+Only you see the list of your apps with their last-seen times and last IP addresses, on your account's Devices page.
+Admins see how many apps each user has linked, and the audit log (kept 30 days), whose entries for linking, renaming
+and removing an app carry its name and the IP address of the request.
+
 ## The server's connections to others {#outbound}
 
 Everything an isshoni server sends to a third party, and how to turn it off:

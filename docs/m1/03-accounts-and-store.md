@@ -16,6 +16,15 @@ through wiring adapters (04 §6.6); one REST error envelope and code table (§12
 REST and preferences are here, the sender is 04's; the admin dashboard endpoint is 04's, with an `accounts` part
 from here.
 
+**The device flow in M2.** [`docs/m2/02-device-auth.md`](../m2/02-device-auth.md), "M2 02" in this document (a bare
+"02" is still M1's `02-sfu.md`), is the M2 design of everything this document sketched for native apps as *later
+(M2)*: the device flow, device tokens and their rotation, bearer authentication on REST and on the WebSocket, CORS for
+the desktop origins, which routes take which credential, the device rows of revocation, audit and privacy, the device
+endpoints and their JSON, the throttles and the limits. Where M2 02 changes the sketch here, M2 02 holds and says
+why; M1's behavior stays as built. Each section it supersedes carries an **M2** note that points to the M2 02 section:
+§2.1, §3.2, §4.7, §5 (its last note), §6, §7.3, §7.5, §7.6, §7.7, §7.12, §7.13, §10, §11, §12.1 to §12.5, §14 and
+slice 15 of §18.
+
 ---
 
 ## 1. Key decisions
@@ -57,6 +66,10 @@ It does not own the following, and uses them through interfaces (§16, §17):
 - packaging (docs/m1/06-deploy-and-ci.md).
 
 ### 2.1 Package layout
+
+**M2:** the device flow's files follow [M2 02 §2.1](../m2/02-device-auth.md#21-package-layout):
+`internal/protocol/api/device.go`, the store's `migrations/0002_device_flow.sql`, auth's `deviceflow.go`,
+`devicepassword.go`, `refresh.go`, `bearer.go` and `devicename.go`, and httpapi's `device.go`.
 
 ```
 internal/protocol/api/            REST DTOs + error codes; imports only the stdlib (tygo → TS)
@@ -115,6 +128,10 @@ internal/server/httpapi/
 - Integer rowids never leave the DB. The one exception is `audit_log.id`, which is a pagination cursor.
 
 ### 3.2 Secrets and tokens
+
+**M2:** the four device rows of this table are designed in
+[M2 02 §3](../m2/02-device-auth.md#3-tokens-and-codes), which adds the refresh request's exchange id, the user-code
+rules and the shape checks; a spent refresh token stays until its own expiry, for reuse detection (M2 02 §6.2).
 
 All tokens come from crypto/rand and are encoded as base64url without padding.
 
@@ -320,6 +337,10 @@ migration (06).
   `vapid_key_fp`, in `push.New`, which the wiring runs before `auth.New` and before serving.
 
 ### 4.7 Janitor and pruning
+
+**M2:** [M2 02 §6.7](../m2/02-device-auth.md#67-device-cap-expiry-and-the-janitor) adds a devices rule before the
+token rule: a device more than an hour old without an unspent, unexpired refresh token is deleted, with one
+`device.expired` audit row each and `PruneStats.Devices`. The two device rows below are built as written.
 
 `auth.(*Service).RunJanitor(ctx)` runs at startup and then every hour. 04 starts it with `serve`. Each run calls
 `db.Prune(ctx, now)`, which deletes the rows below in one `Write` and then does the upkeep itself:
@@ -556,11 +577,18 @@ Notes:
 - **Login throttles are not persisted** (decision 8). The approval queue is the set of `users.status='pending'` rows.
   Admin alerts are derived from the audit log (§7.11).
 - Later migrations that only add a nullable column or a table are additive. A later (M2) feature that needs one ships
-  as `0002_…`.
+  as `0002_…`. **M2:** the device flow's `0002_device_flow.sql` (schema version 2) adds the nullable columns
+  `device_tokens.issued_by` and `device_tokens.exchange_hash` and an index on `issued_by`
+  ([M2 02 §4.1](../m2/02-device-auth.md#41-migration-0002_device_flowsql-schema-version-2)).
 
 ---
 
 ## 6. Store Go API
+
+**M2:** the device methods marked *later (M2)* below have their bodies since M2, two with a changed signature
+(`DecideDeviceCode` takes the device name, `SpendRefreshToken` an exchange hash), beside new ones (`TrimDevices`,
+`RenameDevice`, `SupersedeRefreshToken` and others) and `DeviceToken`'s `IssuedBy` and `ExchangeHash`:
+[M2 02 §4.2](../m2/02-device-auth.md#42-store-go-api-m2) is that API.
 
 ```go
 package store
@@ -1010,6 +1038,11 @@ This is the first open question in §19. `/api/v1/info` serves the limits, so ch
 
 ### 7.3 Throttles
 
+**M2:** [M2 02 §5.5](../m2/02-device-auth.md#55-abuse-guards) designs the device flow's buckets: `lookup` below
+became `device-lookup`, keyed by the user ID (a user can hold 50 sessions) and taken before the read; M2 adds
+`device-code-ip`, `device-code-ip48` (an IPv6 client's /48), `device-token-ip` and a server-wide cap of 5,000 pending
+codes. `device/password` takes exactly login's buckets in login's order (M2 02 §14).
+
 The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (all but `push-test`, which is in
 `httpapi`: below). Every per-IP key is `auth.IPKey`
 (§7.13): an IPv4 address as its /32, an IPv6 address as its /64. It is exported so that 04's wiring test pins
@@ -1200,6 +1233,13 @@ Set-Cookie: __Host-isshoni_session=<43-char token>; Path=/; Max-Age=2592000; Htt
 
 ### 7.5 CSRF and Origin checks (REST)
 
+**M2:** the two *later (M2)* items at the end are designed in M2 02
+[§6.1](../m2/02-device-auth.md#61-bearer-authentication-on-rest) (the bearer header's grammar, 401 `invalid_token`)
+and [§6.4](../m2/02-device-auth.md#64-credentials-per-route-and-cors): a CORS step first in the `/api/v1` chain for
+the origins of `protocol.DesktopOrigins()`, whose preflights allow `GET, POST, PUT, PATCH, DELETE` (PUT for
+`/push/preferences`), with `Access-Control-Expose-Headers`, `Vary: Origin` and the `Cookie` header removed; and which
+routes take which credential (a bearer skips the cross-origin check, the `Content-Type` rule stays).
+
 - **Cross-origin check**: every unsafe method under `/api/v1` (every method but GET, HEAD and OPTIONS, as
   `http.CrossOriginProtection` counts them: POST, PUT, PATCH, DELETE) passes through `http.CrossOriginProtection`,
   which Go has had since 1.25.
@@ -1227,6 +1267,11 @@ Set-Cookie: __Host-isshoni_session=<43-char token>; Path=/; Max-Age=2592000; Htt
 
 ### 7.6 WebSocket authentication
 
+**M2:** item 3 is designed in [M2 02 §6.3](../m2/02-device-auth.md#63-the-websocket-bearer-path): the origins are
+`protocol.DesktopOrigins()` (the four below plus `wails://localhost`, macOS) through `Site.ExtraOrigins`, a socket
+whose `hello` authenticates with a bearer gets its pre-auth token back, `signal.Identity` gains `DeviceName`, and
+`Revalidate` calls `auth.TouchPrincipal`.
+
 01's hub owns the upgrade: the exact Origin allowlist, the pre-auth rate limit, the per-user connection cap and
 `websocket.Accept` (01 §3.1). This doc supplies only credential checks, through a small wiring adapter that
 implements 01's `signal.Authenticator` (04 §6.6):
@@ -1245,6 +1290,10 @@ implements 01's `signal.Authenticator` (04 §6.6):
    the pinned Wails v3 beta in M2) are accepted by the hub only for bearer connections, never with cookies.
 
 ### 7.7 Revocation
+
+**M2:** the two *later (M2)* rows are built as written; [M2 02 §6.5](../m2/02-device-auth.md#65-revocation) adds the
+app's own sign-out, the device cap's eviction and device expiry, and forgets the bearer cache's entries in the same
+step as the session cache's.
 
 Every row below commits first. Then the session cache is invalidated, and only then does
 `ConnCloser.CloseConnections(sel, reason)` run (the wiring implements it with 01's `Hub.CloseConnections`, mapping
@@ -1578,6 +1627,13 @@ invite's use back, and the session of a cookie the request arrived with is delet
 
 ### 7.12 Native apps: device flow and tokens (later: M2)
 
+**M2:** [M2 02](../m2/02-device-auth.md) is the M2 design of this section, in its §5 (the flow, the approval page's
+checks and the abuse guards), §6 (tokens, refresh with rotation and reuse detection, the WebSocket, credentials per
+route, revocation, expiry) and §14 (the password fallback), and supersedes this sketch where they differ: for example
+the refresh grace (the same `exchangeId`, or 120 s once, instead of 30 s), the `device-lookup` bucket keyed by the
+user, the approval page's network check, and the routes that stay cookie-only (account changes, push subscriptions,
+the approval routes and every admin route).
+
 The endpoints are listed in §12.4.7. RFC 8628 applies, with our JSON conventions (camelCase versions of the RFC field
 names) and our error envelope. Rationale: only first-party clients use it.
 
@@ -1606,7 +1662,8 @@ names) and our error envelope. Rationale: only first-party clients use it.
 - **Password fallback** (the plan's in-app form): `POST /device/password {username, password, clientKind, …}`. It has
   the same throttles and rules as login, and creates a device with `linked_via=password`.
 - **Use and revocation**:
-  - `Authorization: Bearer isa_…` works on every user and admin endpoint and on the WebSocket (§7.6);
+  - `Authorization: Bearer isa_…` works on every user endpoint and on the WebSocket; admin routes are cookie-only
+    ([M2 02 §6.4](../m2/02-device-auth.md#64-credentials-per-route-and-cors));
   - expired or unknown tokens get 401 `invalid_token` with `WWW-Authenticate: Bearer error="invalid_token"`, so the
     app knows to refresh rather than relink;
   - on the WebSocket the token travels only in `hello.auth` and failure is always `unauthenticated` (01 §3.2). The
@@ -1615,6 +1672,11 @@ names) and our error envelope. Rationale: only first-party clients use it.
 - **Caps**: 20 devices per user; the 21st evicts the least recently seen one.
 
 ### 7.13 Auth Go API
+
+**M2:** the calls under "later (M2)" at the end of the block are designed, with the rest of auth's M2 API
+(`TouchPrincipal`, `RefreshReusedError`, `RenameDevice`, `RevokeOwnDevice`, `Principal.DeviceName`,
+`NormalizeDeviceName`, `IPKey48`, and the bearer cases of the existing calls), in
+[M2 02 §6.8](../m2/02-device-auth.md#68-auth-go-api-m2); `LookupUserCode` and `DecideUserCode` changed signature.
 
 ```go
 package auth
@@ -2066,6 +2128,12 @@ soft limit.
 
 ## 10. Audit log
 
+**M2:** the device rows are designed in [M2 02 §8](../m2/02-device-auth.md#8-audit-alerts-notifications-and-logs),
+with the IP column of each: it adds `device.approved`, `device.denied`, `device.renamed` and `device.expired`, gives
+`device.revoked` a `via` detail (`devices_page`, `app` or `cap`, where M1 wrote `{}`), makes `device.linked` a
+security event, and adds the scope `device_lookup` to `auth.throttled`. An admin's revoke of one device of another
+user is *later (M6)* (M2 02 §6.5).
+
 - Rows are written in the **same transaction** as the change they describe (store §6). The exceptions are failed
   logins and throttle events, which have no other write.
 - Rows are pruned after **30 days**. An admin-configurable retention comes *later*.
@@ -2127,6 +2195,10 @@ accounts (a typo there is often the password), and SDP.
 
 ## 11. Privacy: exactly what the server stores
 
+**M2:** the two *later (M2)* rows below are [M2 02 §9](../m2/02-device-auth.md#9-privacy)'s: a linked app is also
+deleted after 90 days without a refresh (+ ≤ 1 h), and the project site's privacy page (`docs/privacy.md`, "Linked
+apps") lists both rows.
+
 This section backs the plan's privacy statement. The project site's privacy page (06) and the login page text (05)
 are written from this table.
 
@@ -2176,6 +2248,11 @@ session cache.
 
 ### 12.1 Conventions
 
+**M2:** [M2 02 §6.4](../m2/02-device-auth.md#64-credentials-per-route-and-cors) adds the access levels
+`UserSession` (cookie only) and `UserDevice` (bearer only), makes `Admin` cookie-only (a bearer, even an admin's, gets
+403 `forbidden {credential: "session"}`), and changes the chain: a CORS step first, and a credential step in place of
+M1's refusal of every `Authorization` header (a bearer takes the bearer path and skips CSRF).
+
 - **Base**: `/api/v1`. 04 mounts `httpapi.API` at `/api/v1/`. Changes within v1 are additive only: clients ignore
   unknown fields, and the server ignores unknown request fields (no `DisallowUnknownFields`).
 - **Encoding**: requests and responses are JSON, and response field names are camelCase. Timestamps have the fixed
@@ -2199,6 +2276,12 @@ session cache.
   handler.
 
 ### 12.2 Errors
+
+**M2:** the device codes below are built as M2 02 uses them
+([§7.1](../m2/02-device-auth.md#71-endpoint-table-03-123-m2-rows), §5, §6): `invalid_token` also answers a malformed
+`Authorization` header and carries `WWW-Authenticate: Bearer error="invalid_token"`, `slow_down` has
+`params.interval`, `invalid_grant` may have `params.reason` (`reused`), and `forbidden` has `params.credential`
+(`session` or `device`) on a route that takes the other credential.
 
 The envelope carries codes only and never English text (plan). It is the **only** REST error shape: 04's routes
 (`/api/v1/conntest`, push sender errors, admin dashboard, doctor, bandwidth) and 04's global middleware use it too. The
@@ -2304,6 +2387,12 @@ interpolates a wait time normalized to seconds and one normalized reference id. 
 
 ### 12.3 Endpoint table
 
+**M2:** [M2 02 §7.1](../m2/02-device-auth.md#71-endpoint-table-03-123-m2-rows) is the M2 design of rows 44–49 and
+adds #52, `PATCH /api/v1/me/devices/{id}` (rename); the route table of
+[M2 02 §6.4](../m2/02-device-auth.md#64-credentials-per-route-and-cors) changes the access of M1 rows: #12, #13, #16,
+#24 and #28 are `UserSession` (cookie only), like #46 and #47; #49 is `UserDevice` (bearer only); every `Admin` row
+refuses a bearer; every other `User` row takes either credential.
+
 Common errors are not repeated per row: `bad_request`, `payload_too_large`, `unsupported_media_type`, `csrf_failed`,
 `rate_limited`, `internal`, and (for User and Admin rows) `unauthenticated`, plus `forbidden` for Admin rows.
 
@@ -2360,9 +2449,20 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 
 ### 12.4 Requests and responses
 
+**M2:** with a bearer, some answers below change
+([M2 02 §6.4](../m2/02-device-auth.md#64-credentials-per-route-and-cors), §6.8): `POST /auth/logout` stays Public
+and reads only the cookie, so a bearer signs nothing out there (the app signs out with `POST /device/revoke`),
+`logout-everywhere` signs the app out too, `/me/sessions` has no `current` entry, and the cookie-only routes
+(`/me/password`, `/me/delete`, `revoke-others`, push subscribe and test) answer 403 `forbidden {credential:
+"session"}`. §12.4.1, §12.4.3 and §12.4.7 have their own notes.
+
 Examples use `watch.example.com` and documentation IPs. IDs are illustrative.
 
 #### 12.4.1 Info
+
+**M2:** every M2 server lists `deviceFlow` in `features`
+([M2 02 §7.1](../m2/02-device-auth.md#71-endpoint-table-03-123-m2-rows)); the desktop app's version check reads it
+with `minClientVersion` (M2 02 §13). The `Authorization` header is ignored here, as on every Public route.
 
 `GET /api/v1/info`
 
@@ -2444,6 +2544,11 @@ Secure; SameSite=Lax`. It deletes this session and its push subscriptions. The S
 `PushSubscription.unsubscribe()` locally.
 
 #### 12.4.3 Me
+
+**M2:** [M2 02 §7.2](../m2/02-device-auth.md#72-requests-and-responses-beyond-5-and-62) is the M2 design of `/me`
+for a bearer (`device` instead of `session`) and of `/me/devices` (items gain `current`, true only for a bearer's own
+device, whose existence it checks instead of a session's), and adds `PATCH /me/devices/{id}` to rename a device.
+`DELETE /me/devices/{id}` with a bearer's own ID is the app's sign-out (M2 02 §6.4).
 
 `GET /api/v1/me` →
 
@@ -2642,6 +2747,11 @@ endpoint. The SPA re-subscribes when the key differs from its subscription's `ap
 
 #### 12.4.7 Device flow (later: M2)
 
+**M2:** [M2 02](../m2/02-device-auth.md) is the M2 design of these calls: §5.2 to §5.4 (start, approval, polling),
+§6.2 (refresh, with an optional `exchangeId` and `appVersion`), §7.2 (revoke, rename) and §14 (the password
+fallback). The lookup answer gains `userCode` and `network` (`same`, `different` or `unknown`), and `decide` an
+optional `deviceName`.
+
 ```json
 POST /api/v1/device/code
 {"clientKind": "desktop", "deviceName": "Alex-PC", "os": "windows", "appVersion": "0.2.0"}
@@ -2796,6 +2906,11 @@ The counts as README S70 built them (`httpapi/accounts.go`, read in one snapshot
   `httpapi/testdata/dashboard_accounts.json` (regenerated with `-update` when the audit flows change).
 
 ### 12.5 httpapi Go API (for the integrator and the other docs)
+
+**M2:** `Access` gains `UserSession` and `UserDevice`, and `Deps` gains `DesktopOrigins`
+([M2 02 §6.4](../m2/02-device-auth.md#64-credentials-per-route-and-cors)); the *later (M2)* DTOs at the end of this
+section are [M2 02 §7.3](../m2/02-device-auth.md#73-dtos-internalprotocolapidevicego)'s; `{UserID}: devices` is also
+sent after a device is renamed and after a refresh-token reuse (M2 02 §8).
 
 ```go
 package httpapi
@@ -2996,6 +3111,10 @@ SPA removes the fragment right after reading it (05).
 ---
 
 ## 14. Limits and timeouts
+
+**M2:** the device-flow row is designed in [M2 02 §15](../m2/02-device-auth.md#15-limits-and-timeouts), which also
+lists the device buckets, the pending-code cap, the bearer cache and the client's timers; the refresh grace there is
+the same `exchangeId`, or 120 s once, not 30 s, and a device expires after 90 days without a refresh.
 
 | Item | Value |
 |---|---|
@@ -3356,6 +3475,7 @@ slice.
     *Acceptance*: RFC 8628 state tests (pending, slow_down, denied, expired, consumed), reuse revoking the device, the
     grace path, and the bearer paths through CSRF and CORS.
     *Depends on*: all of the above.
+    **M2:** [M2 02 §19](../m2/02-device-auth.md#19-implementation-slices) splits it into the slices DA1 to DA13.
 
 ---
 
