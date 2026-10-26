@@ -15,7 +15,10 @@ import (
 // already does this job.
 
 // The estimator's constants (M2 01 §10.1). They are tuned only with M2 01 §14's integration cases D9, D10 and D19
-// passing.
+// passing (internal/server/itest's desktop_congestion_test.go). README WA54 tuned one of them: nativeGrowth is 1.15,
+// not §10.1's 1.10. A step of 15 % is a hint of its own (nativeHintMinChange) that the sharer's ramp follows in one of
+// its steps (ratectl.RampFactor, 115); steps of 10 % went out in pairs, +21 % about every 5 s, and after a backoff
+// right at the end of D9's 3 Mbit/s limit the way back to 8 Mbit/s took more than D9's 60 s.
 const (
 	nativeLossHigh        = 10.0                   // percent of raw loss that backs off on one tick
 	nativeLossMid         = 3.0                    // percent of raw loss that backs off on two consecutive ticks
@@ -27,7 +30,7 @@ const (
 	nativeDelayWindow     = 500 * time.Millisecond // QueueDelay is the minimum of the samples of this window
 	nativeBaselineRise    = 500 * time.Microsecond // per second (500 ppm): how fast the delay baseline may rise
 	nativeDelayMinSamples = 3                      // fewer samples in the window: QueueDelay unknown
-	nativeGrowth          = 1.10                   // the estimate's growth step
+	nativeGrowth          = 1.15                   // the estimate's growth step (WA54: §10.1 has 1.10)
 	nativeHold            = 10 * time.Second       // growth is held this long after a backoff
 	nativeMinCap          = 500_000                // bit/s: no backoff goes below this
 	nativeMinRate         = 250_000                // bit/s: below this a tick has too few packets for a verdict

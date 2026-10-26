@@ -120,13 +120,19 @@ func newController(live map[string]bool, p protocol.ShareParams) *Controller {
 	return New(Config{Live: live, Params: p, TargetHeight: 1080})
 }
 
-// ramped returns an Auto share that went live at 0 and is at its ceiling (8 Mbit/s) after the Tick at 10 s.
+// ramped returns an Auto share whose full layer reached its ceiling (8 Mbit/s) at the Tick at 10 s: its last change.
+// A live full layer went live RampDelay and four RampEvery earlier (its five steps), a re-init one OneStepDelay
+// earlier (its one step).
 func ramped(t *testing.T, live map[string]bool) *Controller {
 	t.Helper()
 	c := newController(live, autoParams)
 	c.Initial()
-	c.Live(at(0))
-	tickRange(c, 0.5, 10)
+	from := 10 - (RampDelay + 4*RampEvery).Seconds()
+	if !live["f"] {
+		from = 10 - OneStepDelay.Seconds()
+	}
+	c.Live(at(from))
+	tickRange(c, from+0.5, 10)
 	if got := c.State().Applied["f"]; got != 8_000_000 {
 		t.Fatalf("ramped: f applied %d after 10 s, want 8000000", got)
 	}
@@ -201,10 +207,10 @@ func TestInitialInactiveLayer(t *testing.T) {
 func TestRamp(t *testing.T) {
 	steps := []event{
 		{2, bitrate("f", 4_600_000)},
-		{4, bitrate("f", 5_290_000)},
-		{6, bitrate("f", 6_083_500)},
-		{8, bitrate("f", 6_996_025)},
-		{10, bitrate("f", 8_000_000)}, // 14.4 %: the last step to the ceiling passes
+		{5, bitrate("f", 5_290_000)},
+		{8, bitrate("f", 6_083_500)},
+		{11, bitrate("f", 6_996_025)},
+		{14, bitrate("f", 8_000_000)}, // 14.4 %: the last step to the ceiling passes
 	}
 	c := newController(bothLive, autoParams)
 	c.Initial()
@@ -212,17 +218,17 @@ func TestRamp(t *testing.T) {
 	var got []event
 	for s := 0.5; s <= 30; s += 0.5 {
 		got = append(got, events(s, c.Tick(at(s)))...)
-		if want := s < 10; c.State().Ramping != want {
+		if want := s < 14; c.State().Ramping != want {
 			t.Errorf("Ramping at %gs = %v, want %v", s, !want, want)
 		}
 	}
-	checkEvents(t, "ramp 4 → 8 Mbit/s in 5 steps and 10 s", got, steps)
+	checkEvents(t, "ramp 4 → 8 Mbit/s in 5 steps and 14 s", got, steps)
 
-	// Live at an instant between Ticks: five steps, 2 s apart, the first one 2 s after Live (within a Tick).
+	// Live at an instant between Ticks: five steps, 3 s apart, the first one 2 s after Live (within a Tick).
 	c = newController(bothLive, autoParams)
 	c.Live(at(0.3))
 	got = tickRange(c, 0.5, 30)
-	if len(got) != 5 || got[0].At != 2.5 || got[4].At != 10.5 || got[4].Bps != 8_000_000 {
+	if len(got) != 5 || got[0].At != 2.5 || got[4].At != 14.5 || got[4].Bps != 8_000_000 {
 		t.Errorf("ramp from Live at 0.3 s:\n %s", joinEvents(got))
 	}
 
@@ -249,8 +255,8 @@ func TestRampCongestionHold(t *testing.T) {
 	}
 	prev := 2_300_000
 	for i, e := range got {
-		if e.At != 30.5+2*float64(i) || e.Op != OpBitrate || e.Layer != "f" {
-			t.Errorf("step %d: %v, want f at %gs", i, e, 30.5+2*float64(i))
+		if want := 30.5 + RampEvery.Seconds()*float64(i); e.At != want || e.Op != OpBitrate || e.Layer != "f" {
+			t.Errorf("step %d: %v, want f at %gs", i, e, want)
 		}
 		if i < len(got)-1 && e.Bps != grow(prev) {
 			t.Errorf("step %d: %d after %d, want ×1.15", i, e.Bps, prev)
@@ -268,9 +274,9 @@ func TestRampCongestionHold(t *testing.T) {
 	checkActions(t, "a cap above the ramp", c.Hint(congestion(7_000_000), at(2.2)))
 	// The ramp's last step stops at the cap's split (7.0 − 0.3), 10.1 %: a ramp step, so it applies.
 	checkEvents(t, "the ramp toward a cap", tickRange(c, 2.5, 30), []event{
-		{4, bitrate("f", 5_290_000)},
-		{6, bitrate("f", 6_083_500)},
-		{8, bitrate("f", 6_700_000)},
+		{5, bitrate("f", 5_290_000)},
+		{8, bitrate("f", 6_083_500)},
+		{11, bitrate("f", 6_700_000)},
 	})
 	if st := c.State(); !st.Ramping || c.ramp != 6_700_000 {
 		t.Errorf("Ramping %v, ramp %d; want the ramp held at the cap's split 6700000", st.Ramping, c.ramp)
@@ -278,7 +284,7 @@ func TestRampCongestionHold(t *testing.T) {
 	// The server lifts the cap: the ramp goes on to the ceiling, 6.7 × 1.15 = 7.705, then 8.
 	checkEvents(t, "cap lifted", events(30.2, c.Hint(congestion(0), at(30.2))), nil)
 	checkEvents(t, "the rest of the ramp", tickRange(c, 30.5, 40),
-		[]event{{30.5, bitrate("f", 7_705_000)}, {32.5, bitrate("f", 8_000_000)}})
+		[]event{{30.5, bitrate("f", 7_705_000)}, {33.5, bitrate("f", 8_000_000)}})
 }
 
 func TestLiveGuards(t *testing.T) {
@@ -522,8 +528,8 @@ func TestSetLimit(t *testing.T) {
 				t.Error("CPU after none")
 			}
 			// Held for 10 s after the limit cleared.
-			checkEvents(t, "after none", tickRange(c, 7.5, 19.5),
-				[]event{{17.5, bitrate("f", 5_290_000)}, {19.5, bitrate("f", 6_083_500)}})
+			checkEvents(t, "after none", tickRange(c, 7.5, 20.5),
+				[]event{{17.5, bitrate("f", 5_290_000)}, {20.5, bitrate("f", 6_083_500)}})
 		})
 	}
 	t.Run("other values", func(t *testing.T) {

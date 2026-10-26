@@ -139,20 +139,20 @@ func TestUploadHint(t *testing.T) {
 				t.Errorf("limited at %gs without a cap", s)
 			}
 		}
-		// A cap above the ramp: the ramp binds until it reaches the cap's split (4.7 at 4 s), so the hint comes
+		// A cap above the ramp: the ramp binds until it reaches the cap's split (4.7 at 5 s), so the hint comes
 		// 6 s after that, not 6 s after the cap.
 		c = newController(bothLive, autoParams)
 		c.Hint(protocol.QualityHint{Reason: protocol.HintReasonAdmin, MaxBitrate: 5_000_000,
 			Encodings: encs(8_000_000, 60, true, true)}, at(-1))
 		c.Live(at(0))
 		tl := uploadTimeline(c, 0.5, 12)
-		for s := 0.5; s < 10; s += 0.5 {
+		for s := 0.5; s < 11; s += 0.5 {
 			if tl[s].Limited {
 				t.Errorf("limited at %gs, while the ramp bounds f", s)
 			}
 		}
-		if want := (UploadHint{Limited: true, ApproxHeight: 900}); tl[10] != want {
-			t.Errorf("Upload at 10 s = %+v, want %+v", tl[10], want)
+		if want := (UploadHint{Limited: true, ApproxHeight: 900}); tl[11] != want {
+			t.Errorf("Upload at 11 s = %+v, want %+v", tl[11], want)
 		}
 	})
 	t.Run("the condition", func(t *testing.T) {
