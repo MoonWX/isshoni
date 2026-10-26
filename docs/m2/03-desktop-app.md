@@ -1038,8 +1038,8 @@ New routes in `app/router.tsx` (the page-folder contract of 05 §5; folder `desk
 - The account menu in the desktop: "Settings" (`/desktop/settings`), "Switch server" (when more than one), "Account ↗"
   and, for admins, "Admin ↗" (both open the browser), and "Sign out of <server>" (§8.3) through `Auth.Unlink()`,
   never `POST /auth/logout` (02 §11.8). "Invite friends" stays (its dialog is a REST call). Not built yet: the menu is
-  `web/src/rooms/AccountMenu.tsx`, which WA42's paths didn't include and no slice row lists; until a slice takes it
-  (README WA71's row), the desktop still shows M1's menu with its Sign out and Notifications.
+  `web/src/rooms/AccountMenu.tsx`, which WA42's paths didn't include; WA71 builds it (README WA71's row), and until
+  then the desktop still shows M1's menu with its Sign out and Notifications.
 - `/about` works in both.
 
 ### 7.6 What the browser keeps unchanged

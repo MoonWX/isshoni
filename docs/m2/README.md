@@ -350,9 +350,9 @@ review found and left open)
     input, and removes WA23's CPU frame-time pattern (`frame_ts_`, `kFrameSlots`). `IM_ENC_FAKE` sessions stay off
     WARP, so `session_fake_test`'s timing cases keep their bounds. `test_pattern` and `pattern_layout` live in `gpu/`,
     not `capture/` (04 §4's tree, §6.1, §8.2, §18.2, E6).
-38. **dll-check has no load-config check**: WA11's verdict was "not honored" (item 34), so dll-check prints the load
-    config and checks nothing, and no job passes `-load-config`; WF2 replaces the printed note that called the
-    verdict pending (06 §5.1, §16).
+38. **dll-check has no load-config check in any job**: WA11's verdict was "not honored" (item 34), so dll-check prints
+    the load config and checks nothing unless `-load-config` is passed, and no job passes it; the flag and its check
+    stay in dll-check, unused. WF2 replaces the printed note that called the verdict pending (06 §5.1, §16).
 
 **Re-cut in this plan**
 - 04 E1 splits into the header and native skeleton (WA03) and the binding's pure Go half, which joins E2's Go loader
@@ -544,7 +544,7 @@ fake), WA29 (`internal/client/core` §11.2), WA41 (`internal/desktop/app` and `O
 | `native/CMakeLists.txt`, `CMakePresets.json`, `vcpkg.json`, `vcpkg-configuration.json`, `.clang-format`, `triplets/` | WA03 (`triplets/x64-windows-static.cmake`: group 2's CI fixes) | integrator only; the vcpkg baseline is bumped by hand, and the triplet's `VCPKG_PLATFORM_TOOLSET_VERSION` moves with `deploy/windows/tools.json`'s toolset (`task lint:pins` checks it) |
 | `native/common/CMakeLists.txt` | WA03 | adds `audio/`, `audiopolicy/`, `audiomix/` when present and globs each library's `tests/`; slices add files only |
 | `native/windows/CMakeLists.txt`, `native/windows/src/api/` | WA11 | the CMake file globs each `src/` folder and `tests/`; every export forwards to an area function whose stub lives in that area's folder, and a slice replaces its own area's stub |
-| `native/windows/tests/` | file-level | each test file belongs to one slice, and so do the support header and `testdata/` folder that only it uses (`gpu_warp_support.h` and `testdata/gpu/` are WA33's `gpu_warp_test`'s) |
+| `native/windows/tests/` | file-level | each test file belongs to one slice, and so do the support header and `testdata/` folder that only it uses (`gpu_warp_support.h` and `testdata/gpu/` are WA33's `gpu_warp_test`'s); WA44 adds `audio_bridge_test.cpp`'s `ProbeFlags` case to WA34's file (group 4's hand-over, 04 §9.10) |
 | `cmd/isshoni-enginetest` | WA44 | WA44 writes the tool (flags, dispatch, `probe`, `capture`, `bench`); each later subcommand is one file registered in `init()` and owned by its slice (`pick.go` WA50, `openh264.go` WA51, `sources.go` WA60, `sessions.go` WA61, `protect.go` WA70, `soak.go` and `avsync.go` WA76) |
 | `deploy/notices/native-windows.json` | WA03 | created in 06 §9.2's format; append-only, one entry per native dependency with the slice that adds it; WA78 adds the gate |
 | `deploy/windows/dll-imports.txt` | WA11 | append-only: any new system DLL import in the same PR |
