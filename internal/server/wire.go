@@ -474,6 +474,11 @@ func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok 
 // of ops, once doctor's environment is there.
 func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) error {
 	origin := s.site.Origin
+	// The desktop app's SPA origins (M2 02 §6.3 item 1) go into the slot that config.Site keeps for them: code, not
+	// config, fills it, and config imports no protocol package. DesktopOrigins returns a new slice, so nothing else
+	// holds the site's copy. The hub takes it as its AllowedOrigins (accepted only for bearer sockets) and the REST
+	// API as the origins it answers CORS for (only with a bearer token, M2 02 §6.4).
+	s.site.ExtraOrigins = protocol.DesktopOrigins()
 
 	// push comes first (04 §6.1 step 8): its VAPID fingerprint check purges the subscriptions of a rotated key
 	// before anything else reads them, and auth, whose own purges and changes raise admin alerts, sends them
@@ -514,7 +519,7 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 
 	hubCfg := signal.DefaultConfig()
 	hubCfg.PublicOrigin = origin
-	hubCfg.AllowedOrigins = s.site.ExtraOrigins // none in M1
+	hubCfg.AllowedOrigins = s.site.ExtraOrigins // the desktop origins, set above
 	hubCfg.ServerVersion = version.Version()
 	hubCfg.ResumeKey = s.secrets.Key(config.KeyResume) // resume tokens die with a rotated key (04 §5.2)
 	hubCfg.Limits.PreAuthPerIPPerMinute = s.cfg.Limits.WSHandshakesPerIPPerMinute
@@ -536,15 +541,16 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 
 	s.accounts, s.hub, s.push = accounts, hub, svc
 	s.api = httpapi.New(httpapi.Deps{
-		DB:       s.store,
-		Auth:     accounts,
-		Signal:   signalAdapter{hub: hub},
-		Push:     pushREST,
-		Info:     buildInfo{},
-		Site:     s.site,
-		ClientIP: httpapi.ClientIP,
-		Clock:    s.deps.Now,
-		Logger:   s.log,
+		DB:             s.store,
+		Auth:           accounts,
+		Signal:         signalAdapter{hub: hub},
+		Push:           pushREST,
+		Info:           buildInfo{},
+		Site:           s.site,
+		DesktopOrigins: s.site.ExtraOrigins,
+		ClientIP:       httpapi.ClientIP,
+		Clock:          s.deps.Now,
+		Logger:         s.log,
 	})
 	s.health.AddCheck("signal", func() (bool, string) {
 		if hub.Ready() {
@@ -694,16 +700,20 @@ func (c *dbCheck) ready() (ok bool, detail string) {
 
 // ---- signal.Authenticator over 03's auth.Service ----
 
-// sessionService is the part of *auth.Service behind the hub's Authenticator (03 §7.6).
+// sessionService is the part of *auth.Service behind the hub's Authenticator (03 §7.6; M2 02 §6.3): the session
+// cookie at the upgrade, a device's access token in hello.auth, and the principal-returning Touch of M2 02 §6.8
+// (auth.TouchPrincipal; auth.Touch, which keeps M1's signature, is no longer called here).
 type sessionService interface {
 	AuthenticateCookie(r *http.Request) (auth.Principal, error)
-	Touch(ctx context.Context, p auth.Principal, ip netip.Addr) error
+	AuthenticateBearerToken(ctx context.Context, token string) (auth.Principal, error)
+	TouchPrincipal(ctx context.Context, p auth.Principal, ip netip.Addr) (auth.Principal, error)
 }
 
-// authenticator implements signal.Authenticator (04 §6.6): the session cookie at the upgrade, auth.Touch and a
-// re-read of the user at connect and every five minutes. Only "the credential is gone" becomes signal.ErrInvalid
-// (the hub then closes with session_revoked); every other error is passed on as it is, which the hub takes as
-// transient: 503 at the upgrade, and at a revalidation it keeps the connection and asks again later.
+// authenticator implements signal.Authenticator (04 §6.6, M2 02 §6.3): the session cookie at the upgrade, a device
+// access token at hello, auth.TouchPrincipal and a re-read of the user at connect and every five minutes. Only "the
+// credential is gone" becomes signal.ErrInvalid (the hub then answers unauthenticated at hello and closes with
+// session_revoked at a revalidation); every other error is passed on as it is, which the hub takes as transient: 503
+// at the upgrade, internal at hello, and at a revalidation it keeps the connection and asks again later.
 type authenticator struct {
 	sessions sessionService
 	user     func(ctx context.Context, id store.UserID) (store.User, error)
@@ -725,24 +735,39 @@ func (a *authenticator) AuthenticateRequest(r *http.Request) (signal.Identity, e
 	}
 }
 
-// AuthenticateBearer always answers signal.ErrInvalid in M1: device tokens come with the native apps (M2,
-// auth.AuthenticateBearerToken).
-func (a *authenticator) AuthenticateBearer(context.Context, protocol.Secret) (signal.Identity, error) {
-	return signal.Identity{}, signal.ErrInvalid
+// AuthenticateBearer checks the device access token of a hello (M2 02 §6.3 item 2): auth.AuthenticateBearerToken,
+// whose principal carries the device's ID and current name. An unknown or expired token, or a user who is not
+// active, is signal.ErrInvalid (*api.Error invalid_token, or unauthenticated for a credential that went away
+// meanwhile): the hub answers unauthenticated and 4401. Any other error passes through, and the hub answers internal.
+// The token is revealed only to auth, which hashes it.
+func (a *authenticator) AuthenticateBearer(ctx context.Context, token protocol.Secret) (signal.Identity, error) {
+	p, err := a.sessions.AuthenticateBearerToken(ctx, token.Reveal())
+	switch {
+	case err == nil:
+		return identityOf(p), nil
+	case api.IsCode(err, api.CodeInvalidToken), api.IsCode(err, api.CodeUnauthenticated):
+		return signal.Identity{}, signal.ErrInvalid
+	default:
+		return signal.Identity{}, err
+	}
 }
 
-// Revalidate checks that the session behind id is still there and marks it as seen (auth.Touch), then reads the user
-// again: a rename or a role change made on the CLI reaches the open connections this way (03 §7.7).
+// Revalidate checks that the session or device behind id is still there and marks it as seen
+// (auth.TouchPrincipal), then reads the user again: a rename or a role change made on the CLI reaches the open
+// connections this way (03 §7.7). A device's identity also takes the device's current name from the principal that
+// TouchPrincipal returns (M2 02 §6.3 item 3): the hub applies a changed DeviceName like a changed Name, so a rename
+// on the Devices page reaches open connections within one revalidation. A cookie identity's DeviceName stays "".
 func (a *authenticator) Revalidate(ctx context.Context, id signal.Identity, ip netip.Addr) (signal.Identity, error) {
 	p := auth.Principal{
 		UserID:    store.UserID(id.UserID),
 		Method:    auth.MethodSession,
 		SessionID: store.SessionID(id.SessionID),
 	}
-	if id.SessionID == "" { // a device (M2): auth.Touch has no devices yet and says unauthenticated
+	if id.SessionID == "" { // a device (M2 02 §6.3): the hub's identity of a bearer hello
 		p.Method, p.DeviceID = auth.MethodBearer, store.DeviceID(id.DeviceID)
 	}
-	if err := a.sessions.Touch(ctx, p, ip); err != nil {
+	cur, err := a.sessions.TouchPrincipal(ctx, p, ip)
+	if err != nil {
 		if api.IsCode(err, api.CodeUnauthenticated) {
 			return signal.Identity{}, signal.ErrInvalid
 		}
@@ -758,17 +783,23 @@ func (a *authenticator) Revalidate(ctx context.Context, id signal.Identity, ip n
 		return signal.Identity{}, signal.ErrInvalid
 	}
 	id.Name, id.Admin = u.Username, u.Role == store.RoleAdmin
+	if p.Method == auth.MethodBearer {
+		id.DeviceName = cur.DeviceName
+	}
 	return id, nil
 }
 
-// identityOf is the hub's Identity of an auth.Principal (04 §6.6).
+// identityOf is the hub's Identity of an auth.Principal (04 §6.6; M2 02 §6.3 item 2): a bearer principal's device
+// ID and current device name included. Admin is set for a bearer identity exactly as for a cookie one: only the REST
+// admin routes refuse a bearer (M2 02 §6.4), presence's admin flag and the admin-only topics don't.
 func identityOf(p auth.Principal) signal.Identity {
 	return signal.Identity{
-		UserID:    string(p.UserID),
-		Name:      p.Username,
-		Admin:     p.Role == store.RoleAdmin,
-		SessionID: string(p.SessionID),
-		DeviceID:  string(p.DeviceID),
+		UserID:     string(p.UserID),
+		Name:       p.Username,
+		Admin:      p.Role == store.RoleAdmin,
+		SessionID:  string(p.SessionID),
+		DeviceID:   string(p.DeviceID),
+		DeviceName: p.DeviceName,
 	}
 }
 

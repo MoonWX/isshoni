@@ -122,6 +122,21 @@ func (l *keyedLimiter) allow(key netip.Prefix, now time.Time) (bool, time.Durati
 	return b.take(now, 1)
 }
 
+// refund gives one token back to key's bucket, after a refill up to now and never beyond the burst: the hub's
+// pre-auth bucket counts only the sockets that never authenticate (M2 02 §6.3 item 4). A key without an entry has a
+// full bucket already (it never had one, or the entry was dropped as full or to make room), so there is nothing to
+// give back.
+func (l *keyedLimiter) refund(key netip.Prefix, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.m[key]
+	if !ok {
+		return
+	}
+	b.refill(now)
+	b.tokens = min(b.r.burst, b.tokens+1)
+}
+
 func (l *keyedLimiter) evict(now time.Time) {
 	if now.Sub(l.lastSweep) >= time.Second {
 		l.lastSweep = now

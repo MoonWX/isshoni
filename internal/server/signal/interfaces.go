@@ -23,7 +23,7 @@ type Identity struct {
 	SessionID string // cookie sessions
 	DeviceID  string // bearer (native apps, M2)
 	// DeviceName is the device's current name, for bearer identities only ("" for cookie sessions; M2 02 §6.3). The
-	// wiring's AuthenticateBearer and Revalidate copy it from auth.Principal.DeviceName (M2 slice DA6), and the hub
+	// wiring's AuthenticateBearer and Revalidate fill it from auth.Principal.DeviceName (M2 README WA56), and the hub
 	// puts it into user.connections' OwnConnection.DeviceName (M2 01 §10.4). It is user content: never logged.
 	DeviceName string
 }
@@ -34,17 +34,20 @@ func (id Identity) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("user_id", id.UserID), slog.Bool("admin", id.Admin))
 }
 
-// Authenticator is implemented by a wiring adapter over 03's auth.Service (04 §6.6):
+// Authenticator is implemented by a wiring adapter over 03's auth.Service (04 §6.6, M2 02 §6.3):
 // AuthenticateRequest → auth.AuthenticateCookie(r) (session cookie only; Authorization headers are ignored on /ws),
-// Revalidate → auth.Touch + a user re-read, AuthenticateBearer → M2 device tokens (M1: always ErrInvalid).
+// Revalidate → auth.TouchPrincipal + a user re-read, AuthenticateBearer → auth.AuthenticateBearerToken (M2 device
+// access tokens).
 type Authenticator interface {
 	// AuthenticateRequest reads the session cookie. ErrNoCredentials if absent; ErrInvalid if bad or expired;
 	// other errors are transient (the hub answers 503).
 	AuthenticateRequest(r *http.Request) (Identity, error)
-	// AuthenticateBearer validates a device access token (device flow, 03, M2).
+	// AuthenticateBearer validates a device access token (hello.auth; M2 02 §6.3). ErrInvalid if the token is
+	// unknown or expired or its user is not active (the hub answers unauthenticated); other errors are transient (the
+	// hub answers internal). The identity has DeviceID and DeviceName and no SessionID.
 	AuthenticateBearer(ctx context.Context, token protocol.Secret) (Identity, error)
 	// Revalidate reports whether the session/device behind id is still valid and marks it as seen (03 Touch);
-	// the result can update Name/Admin. Called at connect and every RevalidateEvery.
+	// the result can update Name/Admin and, for a device, DeviceName. Called at connect and every RevalidateEvery.
 	// Returns ErrInvalid only when the session/device is gone or expired or the user is not active (the hub then
 	// closes with session_revoked). Any other error is transient: the hub keeps the connection and retries at the
 	// next RevalidateEvery.

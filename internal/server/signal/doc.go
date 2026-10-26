@@ -7,12 +7,14 @@
 // wiring (04 §6.6) adapts each one; package signaltest has fakes for tests. The hub never imports config, store,
 // auth or sfu.
 //
-// # What exists so far (README slices S11, S19, S28, S40, S51 and F03; 01 slices P3 to P5, P7 and P12; M2 slice WA27)
+// # What exists so far (README slices S11, S19, S28, S40, S51 and F03; 01 slices P3 to P5, P7 and P12; M2 slices WA27
+// and WA56)
 //
 //   - upgrade.go: the six upgrade checks of 01 §3.1 (shutdown, the exact Origin allowlist, cookie authentication,
 //     pre-auth limits per IP key and server-wide, 16 connections per user, Accept) and the hello handshake of
 //     01 §8.2 (validation, cookie or bearer authentication, revalidation, version negotiation, the client floor,
-//     then a resume or a new connection);
+//     then a resume or a new connection); a bearer hello gives the socket's per-IP pre-auth token back (M2 02 §6.3
+//     item 4);
 //   - conn.go: the socket (reader, writer with a bounded send queue, pinger) and the connection actor with its idle
 //     timeout, periodic revalidation, revocation and shutdown; a connection outlives its sockets, and leaves its
 //     room when it closes;
