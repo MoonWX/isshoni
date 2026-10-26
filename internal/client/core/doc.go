@@ -20,8 +20,11 @@
 //   - recovery.go: reconnects (§11.7): the 30 s hold while signaling is down, the resume, the republish on a new
 //     connection, the reconcile with room.state;
 //   - events.go: Status, the events for the app, Subscribe's channels and EventShare's coalescing;
-//   - hints.go, relay.go, stats.go: hints and pause, the relay, and stats, which later slices of docs/m2/README.md
-//     fill in (README WA46 and WA55); bearer auth's integration tests come with WA73.
+//   - hints.go: the server's quality hints (the codec switch, layer pausing, caps) and the rate controller's Ticks,
+//     presets (Share.SetPreset, and one set from another connection), pause (Share.SetPaused, and one set from
+//     another connection), and what a republish owes them;
+//   - relay.go, stats.go: the relay and stats, which a later slice of docs/m2/README.md fills in (README WA55);
+//     bearer auth's integration tests come with WA73.
 //
 // The core never stores a token: 02's manager owns the credential. Nothing it logs holds a token, an SDP, an ICE
 // candidate, a window title, a source or app name, or a relay payload (§11.12). It has no Wails dependency (D18) and

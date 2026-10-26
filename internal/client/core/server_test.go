@@ -19,8 +19,8 @@ import (
 
 // fakeServer is a scripted signaling server for the core's unit tests (docs/m2/01-client-core.md §14: "a
 // signaltest-style fake server where cheap"): it answers each hello as the test says (a welcome, or an error and
-// the close code that follows it), answers requests (room.join, room.leave, share.start, share.stop) like the hub,
-// and records every message it receives. It answers no pub offer, so a share's pub PC never connects.
+// the close code that follows it), answers requests (room.join, room.leave, share.start, share.stop, share.update)
+// like the hub, and records every message it receives. It answers no pub offer, so a share's pub PC never connects.
 //
 // Like the hub, a resumed welcome keeps the connection's id and room, and is followed by a room.state that lists
 // the connection's shares (as live); share.start gives each share an id of its own (s_1, s_2, …), and the same one
@@ -48,13 +48,18 @@ type fakeServer struct {
 	stale int
 	// iceServers go into every welcome (none when nil, as M1's server sends).
 	iceServers []protocol.ICEServer
-	nextID     int
-	nextShare  int
+	// features are the welcome's features; nil is agent.relay alone (the server has no share.pause).
+	features  []protocol.Feature
+	nextID    int
+	nextShare int
 }
 
-// fakeShare is a share the fake server started.
+// fakeShare is a share the fake server started, with the preset and the pause bit that share.start and share.update
+// set.
 type fakeShare struct {
 	id, connID, room, ref string
+	preset                protocol.Preset
+	paused                bool
 }
 
 // setHello replaces the hello answers while the server runs.
@@ -166,17 +171,20 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	fs.conns = append(fs.conns, c)
 	ice := append([]protocol.ICEServer{}, fs.iceServers...)
+	features := []protocol.Feature{protocol.FeatureAgentRelay}
+	if fs.features != nil {
+		features = slices.Clone(fs.features)
+	}
 	var shares []protocol.ShareInfo
 	for _, s := range fs.shares {
 		if s.connID == c.connID && s.room == c.room {
-			shares = append(shares, protocol.ShareInfo{ID: s.id, UserID: "u_alice", ConnectionID: s.connID,
-				Kind: protocol.ShareKindWindow, Preset: protocol.PresetAuto, Status: protocol.ShareStatusLive})
+			shares = append(shares, s.info())
 		}
 	}
 	fs.mu.Unlock()
 	fs.write(ws, protocol.MessageTypeWelcome, "", env.ID, protocol.Welcome{
 		Protocol: protocol.Version, ServerVersion: "0.2.0-test",
-		Features:      []protocol.Feature{protocol.FeatureAgentRelay},
+		Features:      features,
 		Limits:        protocol.Limits{PingIntervalMs: 15000, GraceMs: 30000},
 		ICEServers:    ice,
 		ConnectionID:  c.connID,
@@ -245,19 +253,41 @@ func (fs *fakeServer) answer(c *fakeConn, env protocol.Envelope) {
 		if i < 0 {
 			fs.nextShare++
 			fs.shares = append(fs.shares, fakeShare{id: "s_" + strconv.Itoa(fs.nextShare), connID: c.connID, room: c.room,
-				ref: st.Ref})
+				ref: st.Ref, preset: st.Preset})
 			i = len(fs.shares) - 1
 		}
-		id := fs.shares[i].id
+		id, preset := fs.shares[i].id, fs.shares[i].preset
 		fs.mu.Unlock()
-		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, fakeParams(id))
+		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, presetParams(id, preset))
 	case protocol.MessageTypeShareStop:
 		st, _ := protocol.Decode[protocol.ShareStop](env)
 		fs.mu.Lock()
 		fs.shares = slices.DeleteFunc(fs.shares, func(s fakeShare) bool { return s.id == st.ShareID })
 		fs.mu.Unlock()
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
-	case protocol.MessageTypeShareUpdate, protocol.MessageTypeStatsWatch:
+	case protocol.MessageTypeShareUpdate:
+		// Like the hub: the preset and the pause bit change (paused only with the feature), and the reply is the
+		// share's ShareParams. No room.state follows: a test sends the ones it needs.
+		u, _ := protocol.Decode[protocol.ShareUpdate](env)
+		fs.mu.Lock()
+		i := slices.IndexFunc(fs.shares, func(s fakeShare) bool { return s.id == u.ShareID })
+		if i < 0 {
+			fs.mu.Unlock()
+			fs.write(c.ws, protocol.MessageTypeError, "", env.ID,
+				protocol.NewError(protocol.ErrorCodeShareNotFound, protocol.ErrorScopeRequest))
+			return
+		}
+		sh := &fs.shares[i]
+		if u.Preset != "" {
+			sh.preset = u.Preset
+		}
+		if u.Paused != nil && slices.Contains(fs.features, protocol.FeatureSharePause) {
+			sh.paused = *u.Paused
+		}
+		params := presetParams(sh.id, sh.preset)
+		fs.mu.Unlock()
+		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, params)
+	case protocol.MessageTypeStatsWatch:
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
 	case protocol.MessageTypePCOffer:
 		o, err := protocol.Decode[protocol.PCOffer](env)
@@ -306,6 +336,44 @@ func received[T any](fs *fakeServer, t protocol.MessageType) []T {
 		}
 	}
 	return out
+}
+
+// info is the share as the fake server's room.state lists it (live, or paused).
+func (s fakeShare) info() protocol.ShareInfo {
+	info := protocol.ShareInfo{ID: s.id, UserID: "u_alice", ConnectionID: s.connID, Kind: protocol.ShareKindWindow,
+		Preset: s.preset, Status: protocol.ShareStatusLive}
+	if info.Preset == "" {
+		info.Preset = protocol.PresetAuto
+	}
+	if s.paused {
+		info.Status = protocol.ShareStatusPaused
+	}
+	return info
+}
+
+// shareInfo returns the server's view of share id, as its room.state lists it.
+func (fs *fakeServer) shareInfo(id string) (protocol.ShareInfo, bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for _, s := range fs.shares {
+		if s.id == id {
+			return s.info(), true
+		}
+	}
+	return protocol.ShareInfo{}, false
+}
+
+// presetParams are fakeParams for a preset, as the SFU makes them: Text runs f at a lower frame rate (15 fps here)
+// and Movie has a 256 kbit/s Opus target.
+func presetParams(id string, preset protocol.Preset) protocol.ShareParams {
+	p := fakeParams(id)
+	switch preset {
+	case protocol.PresetText:
+		p.Encodings[0].MaxFramerate = 15
+	case protocol.PresetMovie:
+		p.AudioBitrate = 256_000
+	}
+	return p
 }
 
 // fakeParams are the server's ShareParams: High, f at 1080p30 and q at 360p15 (small for the race detector), Opus.

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -77,9 +78,6 @@ var (
 	ErrNotReady = errors.New("core: not connected")
 	ErrClosed   = errors.New("core: closed")
 )
-
-// errNotImplemented is returned by the parts of the API that later slices of docs/m2/README.md fill in.
-var errNotImplemented = errors.New("core: not implemented yet")
 
 // StopError is why Run ended without its ctx ending: a terminal stop of the connection (§11.3).
 type StopError struct {
@@ -362,6 +360,13 @@ func (c *Client) setStatus(change func(*Status)) {
 // setConn sets Status.Conn.
 func (c *Client) setConn(conn string) {
 	c.setStatus(func(st *Status) { st.Conn = conn })
+}
+
+// hasFeature reports whether the server offered feature f in the connection's last welcome.
+func (c *Client) hasFeature(f protocol.Feature) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Contains(c.status.Features, f)
 }
 
 // isOnline reports whether signaling is ready.

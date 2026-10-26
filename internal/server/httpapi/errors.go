@@ -15,6 +15,7 @@ import (
 // WriteError writes 03's envelope {"error": {…}} (03 §12.2, 04 §9.4):
 //   - an *api.Error (also wrapped) is sent with the status api.StatusOf(code), and a Retry-After header when
 //     RetryAfter is set; a code the table doesn't know is a bug and goes out as 500 internal (its code is logged);
+//     401 invalid_token also gets WWW-Authenticate: Bearer error="invalid_token" (M2 02 §6.1);
 //   - an *http.MaxBytesError (a body over its limit) becomes payload_too_large;
 //   - any other error becomes 500 internal with the request ID in requestId, and is logged with the route pattern
 //     and the request ID (at debug level when the client has gone away). The error text never reaches the client.
@@ -61,8 +62,14 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 	if out.RetryAfter > 0 {
 		h.Set("Retry-After", strconv.Itoa(out.RetryAfter))
 	}
+	if out.Code == api.CodeInvalidToken {
+		h.Set("WWW-Authenticate", bearerChallenge)
+	}
 	writeJSONBytes(w, status, body)
 }
+
+// bearerChallenge is the WWW-Authenticate header of every 401 invalid_token (M2 02 §6.1; RFC 6750 §3).
+const bearerChallenge = `Bearer error="invalid_token"` //nolint:gosec // G101: an RFC 6750 challenge, no credential
 
 // logInternal logs the cause of a 500 once per request.
 func logInternal(r *http.Request, st *reqState, err error, requestID string) {

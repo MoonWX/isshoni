@@ -1,10 +1,10 @@
 // Bridge errors (docs/m2/03 §6.4): a failing bound method returns a Go error whose Error() is the JSON
 // {"code":"…","params":{…}}; each transport turns its rejection into a BridgeError {code, params}. Codes are snake_case
-// and stable (bridge/codes, generated into codes.gen.ts by WA48); the SPA shows desktop.errors.<code>.
+// and stable (internal/desktop/bridge/codes, generated into codes.gen.ts); the SPA shows desktop.errors.<code>.
 
-/** A transport-local code: the reply wasn't the error JSON (a transport failure, a bug). */
+/** The reply wasn't the error JSON (a transport failure, a bug); also Go's own code for a bug. */
 export const BridgeCodeInternal = 'internal';
-/** A transport-local code: this transport can't make the call (WailsBridge before WA48). */
+/** A method whose slice hasn't landed yet (Go's code too, README §4 "Interfaces first"). */
 export const BridgeCodeNotImplemented = 'not_implemented';
 
 export class BridgeError extends Error {

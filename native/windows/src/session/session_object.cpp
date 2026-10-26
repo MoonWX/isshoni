@@ -22,6 +22,7 @@ using engine::os::QpcNs;
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 constexpr uint8_t kFaultNone = 0;
 constexpr uint8_t kFaultEncodeError = 1;
+std::atomic<bool> g_device_removed_for_test{false}; // SetDeviceRemovedForTest
 #endif
 
 std::string_view RidView(const char (&rid)[4]) noexcept {
@@ -48,6 +49,12 @@ template <class F> std::string EventJson(F &&fill) noexcept {
 bool ValidLayerBitrate(uint32_t layer, uint32_t bps) noexcept { return encpolicy::ValidVideoBitrate(layer, bps); }
 
 } // namespace
+
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+void SetDeviceRemovedForTest(bool removed) noexcept {
+  g_device_removed_for_test.store(removed, std::memory_order_release);
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------- small parts
 
@@ -208,6 +215,9 @@ im_status Session::StartVideo(const im_start_config &cfg) {
                       forced ? "of the forced kind is available" : "is available",
                       static_cast<int>(RidView(layers_[0].rid).size()), RidView(layers_[0].rid).data());
   }
+  if (const im_status st = StartFrames(); st != IM_OK) {
+    return st;
+  }
 
   const encpolicy::Selection sel = encpolicy::SelectEncoders(candidates_, profile_, layer_count_, forced, opener_);
   if (sel.status != IM_OK) {
@@ -234,9 +244,42 @@ im_status Session::StartVideo(const im_start_config &cfg) {
   pacer_.emplace(epoch_, std::span<const pace::LayerConfig>(pcfg.data(), layer_count_));
   PublishStats(epoch_); // im_get_stats names the encoders from the start; the video thread refreshes it
 
+  info_.flags |= IM_SESS_NO_OS_INDICATOR; // the test pattern: no OS border; WGC borderless and DD set it too (§7)
+  return IM_OK;
+}
+
+im_status Session::StartFrames() {
+  // The GPU path (§8; README WF2) when an encoder of the session takes pixels: one device per session, on the adapter
+  // of its first candidate that does (§8.1), created before any encoder opens, since FFmpeg wraps it (§9.2). Its
+  // later candidates use the same device (README WA44 decides a cross-adapter one's copy, §9.1 step 3).
+  const EncoderEntry *pixels = nullptr;
+  for (const encpolicy::Candidate &c : candidates_) {
+    if (c.probe_index < catalog_.size() && catalog_[c.probe_index].input == FrameInput::kNv12) {
+      pixels = &catalog_[c.probe_index];
+      break;
+    }
+  }
+  if (pixels != nullptr) {
+    if (const im_status st = gpu::Device::Create(pixels->device, &gpu_); st != IM_OK) {
+      return st;
+    }
+  }
+  std::array<VideoFrames::LayerSetup, IM_MAX_LAYERS> setup{};
+  for (uint32_t l = 0; l < layer_count_; ++l) {
+    setup[l].out = layers_[l].out;
+    setup[l].fps = layers_[l].fps;
+  }
+  VideoFrames::Config fc;
+  fc.source = video::Size{source_.width, source_.height};
+  fc.pattern = source_.capture_path == IM_CAPTURE_TEST;
+  fc.layers = std::span<const VideoFrames::LayerSetup>(setup.data(), layer_count_);
+  if (const im_status st = VideoFrames::Create(gpu_.get(), fc, &frames_); st != IM_OK) {
+    return st;
+  }
   static std::atomic<uint64_t> devices{0};
   device_ = devices.fetch_add(1, std::memory_order_relaxed) + 1; // every session opens its own device (§8.1)
-  info_.flags |= IM_SESS_NO_OS_INDICATOR; // the test pattern: no OS border; WGC borderless and DD set it too (§7)
+  gpu_path_ = gpu_ != nullptr;
+  log::Info("session", "frames", {{"gpu", gpu_path_}, {"w", source_.width}, {"h", source_.height}});
   return IM_OK;
 }
 
@@ -559,18 +602,16 @@ void Session::VideoLoop() noexcept {
         if (device_removed_.load(std::memory_order_acquire)) {
           // 04 §9.8: a removed or reset device ends the session at once (no recovery in M2); the probe's cache is
           // stale and the next start opens a new device.
-          MarkProbeCacheStale();
-          End(IM_ERR_ENCODER_LOST, "encoder_lost", "device_removed: the encoder's device was removed or reset");
+          EndDeviceRemoved("test hooks");
           return;
         }
+        CountCaptured(now);
         ApplyCommands(now);
         ApplyRingRequests();
-        const uint64_t seq = frame_seq_.load(std::memory_order_acquire);
-        if (seq != seen_seq_) {
-          const int64_t ts = frame_ts_[seq % kFrameSlots].load(std::memory_order_acquire);
-          const auto skipped = static_cast<uint32_t>(std::min<uint64_t>(seq - seen_seq_ - 1, 0xFFFFFFFFu));
-          seen_seq_ = seq;
-          pacer_->OnFrame(ts, now, skipped);
+        if (!pacer_->paused()) {
+          // While paused the slots keep the frozen frame (§8.5): new frames wait in them, the newest is taken on
+          // resume.
+          TakeFrame(now, true);
         }
         for (uint32_t l = 0; l < layer_count_ && !ended_.load(std::memory_order_acquire); ++l) {
           if (auto a = layers_[l].planner->Poll(now)) {
@@ -693,9 +734,34 @@ void Session::Apply(const Command &c, int64_t now) {
     }
     break;
   case Command::Type::kPaused:
+    if (c.value == 0 && pacer_->paused()) {
+      // Resume (§8.5): the newest frame first, while the pacer still ignores frames, so the ones captured during the
+      // pause count as neither seen nor dropped; the pacer then encodes it at once.
+      TakeFrame(now, false);
+    }
     pacer_->SetPaused(c.value != 0, now);
     break;
   }
+}
+
+void Session::CountCaptured(int64_t now) noexcept {
+  const uint64_t captured = frames_captured_.load(std::memory_order_relaxed);
+  // The capture side wakes this thread for every frame, so the arrivals are recorded within a wake-up; more than the
+  // meter holds can't be counted within its window anyway.
+  const uint64_t arrived = std::min<uint64_t>(captured - captured_seen_, 1024);
+  for (uint64_t i = 0; i < arrived; ++i) {
+    captured_meter_.Add(now);
+  }
+  captured_seen_ = captured;
+}
+
+void Session::TakeFrame(int64_t now, bool count_skipped) {
+  const VideoFrames::Taken t = frames_->Take();
+  if (!t.fresh) {
+    return;
+  }
+  const auto skipped = count_skipped ? static_cast<uint32_t>(std::min<uint64_t>(t.skipped, 0xFFFFFFFFu)) : 0u;
+  pacer_->OnFrame(t.capture_ts_ns, now, skipped);
 }
 
 void Session::ApplyRingRequests() {
@@ -735,9 +801,24 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
   p.gop_ms = L.gop_ms;
   p.content_hint = content_hint_;
   p.epoch_ns = epoch_;
+  const FrameInput input = catalog_[c.probe_index].input;
+  if (input == FrameInput::kNv12) {
+    if (!frames_ || !frames_->has_device()) {
+      return abi::Fail(IM_ERR_NO_ENCODER, abi::token::kOpenFailed, "session: the encoder takes pixels, no device");
+    }
+    p.device = frames_->device();
+  }
   std::unique_ptr<VideoEncoder> enc;
   L.enc.reset(); // "replaces whatever the layer had": a session limit counts the old one otherwise
-  const im_status st = catalog_[c.probe_index].open(p, &enc);
+  im_status st = catalog_[c.probe_index].open(p, &enc);
+  if (st == IM_OK && input == FrameInput::kNv12) {
+    // The layer's converter drops the old encoder's targets and follows a new output size or frame rate (a re-init,
+    // §7.7, §9.5).
+    st = frames_->Configure(layer, L.out, L.fps);
+    if (st != IM_OK) {
+      enc.reset();
+    }
+  }
   if (st != IM_OK) {
     log::Info("encode", "encoder open failed",
               {{"layer", RidView(L.rid)}, {"encoder", encpolicy::EncoderToken(c.kind)}, {"status", st}});
@@ -746,6 +827,7 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
   L.enc = std::move(enc);
   L.kind = c.kind;
   L.enc_flags = c.flags;
+  L.input = input;
   L.profile = profile;
   for (std::size_t i = 0; i < candidates_.size(); ++i) {
     if (candidates_[i].probe_index == c.probe_index) {
@@ -801,6 +883,12 @@ void Session::Reinit(uint32_t layer, const encpolicy::ReinitAction &a, int64_t n
   }
   const encpolicy::Candidate c = candidates_[L.candidate];
   const im_status st = OpenLayer(layer, c, profile);
+  if (st == IM_ERR_ENCODER_LOST || (st != IM_OK && DeviceLost())) {
+    // The converter's new geometry met a removed device, or the open failed on one (§8.1): no candidate can help
+    // (§9.8).
+    EndDeviceRemoved("re-init");
+    return;
+  }
   if (st != IM_OK) {
     const std::string detail(abi::LastErrorText());
     abi::ClearLastError();
@@ -822,8 +910,18 @@ void Session::Recover(uint32_t layer, encpolicy::Failure why, im_status cause, i
   Layer &L = layers_[layer];
   const uint32_t old_kind = L.kind;
   L.enc.reset();
+  if (DeviceLost()) {
+    EndDeviceRemoved("recover"); // the failure was the device's (§8.1): no candidate can help (§9.8)
+    return;
+  }
   const encpolicy::Recovery r =
       encpolicy::RecoverLayer(candidates_, L.candidate, layer, L.profile, why, cause, opener_);
+  if (DeviceLost()) {
+    // The device went while the candidates were tried: RecoverLayer takes their failures (a converter's
+    // IM_ERR_ENCODER_LOST among them) for open failures, and a candidate that did open would fail next (§9.8).
+    EndDeviceRemoved("recover");
+    return;
+  }
   abi::ClearLastError();
   switch (r.outcome) {
   case encpolicy::Recovery::Outcome::kSame:
@@ -857,6 +955,13 @@ void Session::Recover(uint32_t layer, encpolicy::Failure why, im_status cause, i
   }
   pacer_->Reopen(layer, now);
   OnOpened(layer, now, true);
+}
+
+im_status Session::ConvertFor(Layer &L, uint32_t layer, bool black, gpu::Nv12Target *target) {
+  if (const im_status st = L.enc->NextTarget(target); st != IM_OK) {
+    return st;
+  }
+  return frames_->Convert(layer, black, *target);
 }
 
 void Session::EncodeOne(const pace::Encode &e, int64_t now) {
@@ -893,22 +998,32 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     }
   }
   EncodedAu au;
+  gpu::Nv12Target picture;
   const int64_t t0 = QpcNs();
   im_status st = IM_OK;
+  if (L.input == FrameInput::kNv12) {
+    // The pacer's frame is the reader's slot: the newest one taken (kLatest), or for kLast the layer's last frame
+    // again, which is that slot too except while paused, when the slots keep the newest frame taken before the pause.
+    st = ConvertFor(L, e.layer, in.black, &picture);
+    in.picture = &picture;
+  }
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
-  if (faults_[e.layer].exchange(kFaultNone, std::memory_order_acq_rel) == kFaultEncodeError) {
+  if (st == IM_OK && faults_[e.layer].exchange(kFaultNone, std::memory_order_acq_rel) == kFaultEncodeError) {
     st = abi::Fail(IM_ERR_INTERNAL, {}, "test hooks: an injected encode error");
-  } else {
+  } else if (st == IM_OK) {
     st = L.enc->Encode(in, &au);
   }
 #else
-  st = L.enc->Encode(in, &au);
+  if (st == IM_OK) {
+    st = L.enc->Encode(in, &au);
+  }
 #endif
   const int64_t t1 = QpcNs();
   ++L.index;
-  if (st == IM_ERR_ENCODER_LOST) {
-    MarkProbeCacheStale();
-    End(IM_ERR_ENCODER_LOST, "encoder_lost", "device_removed: the encoder's device was removed or reset");
+  if (st == IM_ERR_ENCODER_LOST || (st != IM_OK && DeviceLost())) {
+    // A TDR may first show up as an ordinary error (an FFmpeg pool's ENOMEM): with the device gone it is device loss
+    // all the same (§8.1).
+    EndDeviceRemoved("encode");
     return;
   }
   if (st != IM_OK) {
@@ -978,6 +1093,10 @@ void Session::PublishLimits() {
 void Session::PublishStats(int64_t now) {
   StatsSnapshot s;
   s.layer_count = layer_count_;
+  // fpsIn: the captured frames over the last 2 s (the pacer's own count stops while paused, §8.5).
+  const int64_t from = std::max(now - kStatsWindowNs, epoch_);
+  const double window_s = static_cast<double>(now - from) / 1e9;
+  const double fps_in = window_s > 0 ? static_cast<double>(captured_meter_.CountSince(from)) / window_s : 0.0;
   for (uint32_t l = 0; l < layer_count_; ++l) {
     const Layer &L = layers_[l];
     const pace::LayerStats ps = pacer_->Stats(l, now);
@@ -989,7 +1108,7 @@ void Session::PublishStats(int64_t now) {
     o.width = L.out.size.width;
     o.height = L.out.size.height;
     o.active = ps.active;
-    o.fps_in = ps.fps_in;
+    o.fps_in = fps_in; // every layer sees the same captured frames
     o.fps_out = ps.fps_out;
     o.bitrate_bps = L.bytes.BitsPerSecond(now);
     o.target_bps = L.planner->bitrate();
@@ -1013,25 +1132,30 @@ void Session::PublishStats(int64_t now) {
 
 // ---------------------------------------------------------------------------------------------- the supervisor
 
-int64_t Session::PatternFrameNs(uint64_t k) const noexcept {
-  const uint64_t hz = std::max<uint32_t>(source_.pattern_hz, 1);
-  return epoch_ + static_cast<int64_t>(k / hz * 1'000'000'000ull + (k % hz) * 1'000'000'000ull / hz);
-}
-
-// When pattern frame k reaches the video thread: its grid instant, or later for the test hooks' late frames (two of
-// every three; the flash frames, k = n × hz, are on time when hz is a multiple of 3).
-int64_t Session::PatternDueNs(uint64_t k) const noexcept {
-  if (k % 3 == 0 || source_.pattern_late_ns <= 0) {
-    return PatternFrameNs(k);
+bool Session::PublishPattern(const PatternGrid &grid, uint64_t k) {
+  // Its capture time is its grid time, so the flashes land on epoch_ns + k × 1 s exactly.
+  const int64_t ts = grid.FrameNs(k);
+  const im_status st = frames_->PublishPattern(gpu::PatternFrame{k, ts - epoch_}, ts);
+  if (st == IM_ERR_ENCODER_LOST || (st != IM_OK && DeviceLost())) {
+    EndDeviceRemoved("test pattern");
+    return false;
   }
-  const int64_t half = 500'000'000 / std::max<int64_t>(source_.pattern_hz, 1);
-  return PatternFrameNs(k) + std::min(source_.pattern_late_ns, half - 1);
+  if (st != IM_OK) {
+    const std::string detail(abi::LastErrorText());
+    abi::ClearLastError();
+    log::Error("session", "test pattern failed", {{"status", st}, {"detail", detail}});
+    End(IM_ERR_INTERNAL, "internal", detail);
+    return false;
+  }
+  frames_captured_.fetch_add(1, std::memory_order_relaxed);
+  video_waiter_.Wake();
+  return true;
 }
 
 void Session::SupervisorLoop() noexcept {
   const uintptr_t token = engine::os::EnterThread("isshoni supervisor", engine::os::ThreadClass::kNormal);
   const bool pattern = has_video_ && source_.capture_path == IM_CAPTURE_TEST && source_.pattern != Pattern::kNone;
-  const uint64_t hz = std::max<uint32_t>(source_.pattern_hz, 1);
+  const PatternGrid grid{epoch_, source_.pattern_hz, source_.pattern_late_ns};
   uint64_t next_k = 0; // the next pattern frame
   bool pattern_done = !pattern;
   while (!stopping_.load(std::memory_order_acquire)) {
@@ -1039,20 +1163,14 @@ void Session::SupervisorLoop() noexcept {
     if (!pattern_done && (capture_stopped_.load(std::memory_order_acquire) || ended_.load(std::memory_order_acquire))) {
       pattern_done = true;
     }
-    if (!pattern_done && now >= PatternDueNs(next_k)) {
-      // The newest frame that is due; the ones the timer missed are skipped, as a capture source keeps only the
-      // newest. Its capture time is its grid time, so the flashes land on epoch_ns + k × 1 s exactly.
-      const auto elapsed = static_cast<uint64_t>(now - epoch_);
-      uint64_t k = elapsed / 1'000'000'000ull * hz + (elapsed % 1'000'000'000ull) * hz / 1'000'000'000ull;
-      while (k > next_k && PatternDueNs(k) > now) {
-        --k;
-      }
-      k = std::max(k, next_k);
-      const uint64_t seq = frame_seq_.load(std::memory_order_relaxed) + 1;
-      frame_ts_[seq % kFrameSlots].store(PatternFrameNs(k), std::memory_order_release);
-      frame_seq_.store(seq, std::memory_order_release);
-      frames_captured_.fetch_add(1, std::memory_order_relaxed);
-      video_waiter_.Wake();
+    if (!pattern_done && now >= grid.DueNs(next_k)) {
+      // The newest frame that is due; the ones the timer missed are skipped, as a capture source keeps only the newest.
+      const uint64_t k = grid.NewestDue(now, next_k);
+      api::Guard("session test pattern", [&] {
+        if (!PublishPattern(grid, k)) {
+          pattern_done = true; // the session ended
+        }
+      });
       next_k = k + 1;
       if (source_.pattern == Pattern::kStatic) {
         pattern_done = true; // a static screen: the initial frame only
@@ -1061,7 +1179,7 @@ void Session::SupervisorLoop() noexcept {
     api::Guard("session supervisor", [&] { SuperviseEvents(now); });
     int64_t deadline = now + kSupervisorPollNs;
     if (!pattern_done) {
-      deadline = std::min(deadline, PatternDueNs(next_k));
+      deadline = std::min(deadline, grid.DueNs(next_k));
     }
     supervisor_waiter_.WaitUntil(deadline);
   }
@@ -1144,6 +1262,26 @@ void Session::End(im_status status, std::string_view reason, std::string_view de
   tone_waiter_.Wake();
 }
 
+void Session::EndDeviceRemoved(std::string_view what) noexcept {
+  // 04 §9.8: no recovery in M2; the probe's cache is stale and the next start opens a new device.
+  log::Warn("session", "device removed", {{"where", what}, {"detail", abi::LastErrorText()}});
+  abi::ClearLastError();
+  MarkProbeCacheStale();
+  End(IM_ERR_ENCODER_LOST, "encoder_lost", "device_removed: the encoder's device was removed or reset");
+}
+
+bool Session::DeviceLost() const noexcept {
+  if (!gpu_) {
+    return false; // the test hooks' IM_ENC_FAKE sessions: no device to lose
+  }
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (g_device_removed_for_test.load(std::memory_order_acquire)) {
+    return true;
+  }
+#endif
+  return gpu_->Removed();
+}
+
 void Session::JoinThreads(int64_t deadline_ns) noexcept {
   {
     std::unique_lock<std::mutex> lock(exit_mu_);
@@ -1194,12 +1332,25 @@ void Session::Stop() noexcept {
     std::lock_guard<std::mutex> consumer(consumer_mu_); // the consumer has returned
     pump_.Release();
   }
-  if (!video_thread_.started || (video_thread_.done.load(std::memory_order_acquire) && !video_thread_.th.joinable())) {
-    for (Layer &L : layers_) {
-      L.enc.reset(); // the encoders and their device go now; an abandoned video thread keeps them
-    }
-  }
+  ReleaseVideo();
   log::Info("session", "stopped", {{"device", device_}});
+}
+
+void Session::ReleaseVideo() noexcept {
+  const auto gone = [](const Thread &t) {
+    return !t.started || (t.done.load(std::memory_order_acquire) && !t.th.joinable());
+  };
+  if (!gone(video_thread_)) {
+    return; // an abandoned video thread keeps the encoders, the frames and the device (the destructor frees them)
+  }
+  for (Layer &L : layers_) {
+    L.enc.reset(); // the encoders go first: they hold the device (FFmpeg's hardware device wraps it, §9.2)
+  }
+  if (!gone(supervisor_thread_)) {
+    return; // an abandoned supervisor may still draw the test pattern into the slots
+  }
+  frames_.reset();
+  gpu_.reset();
 }
 
 } // namespace im::session

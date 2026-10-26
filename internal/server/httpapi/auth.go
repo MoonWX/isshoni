@@ -20,9 +20,9 @@ func apiUser(u store.User) api.User {
 	return api.User{ID: string(u.ID), Username: u.Username, Role: api.Role(u.Role)}
 }
 
-// sessionChanged tells the user's other tabs that their session list changed (03 §12.5: a session created or
-// revoked → {UserID}: devices).
-func (a *API) sessionChanged(id store.UserID) {
+// devicesChanged tells the user's SPAs that the Devices page changed: {UserID}: devices after a session was
+// created or revoked (03 §12.5) and after a device was linked, renamed or revoked (M2 02 §8).
+func (a *API) devicesChanged(id store.UserID) {
 	a.d.Signal.Notify(NotifyTarget{UserID: id}, protocol.TopicDevices)
 }
 
@@ -41,7 +41,7 @@ func (a *API) postLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.d.Auth.SetSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
-	a.sessionChanged(res.User.ID)
+	a.devicesChanged(res.User.ID)
 	WriteJSON(w, http.StatusOK, api.UserResponse{User: apiUser(res.User)})
 }
 
@@ -57,7 +57,7 @@ func (a *API) postLogout(w http.ResponseWriter, r *http.Request) {
 			WriteError(w, r, err)
 			return
 		}
-		a.sessionChanged(p.UserID)
+		a.devicesChanged(p.UserID)
 	case errors.Is(err, auth.ErrNoCookie), api.IsCode(err, api.CodeUnauthenticated):
 		// Not logged in.
 	default:
@@ -103,7 +103,7 @@ func (a *API) postSetupComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.d.Auth.SetSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
-	a.sessionChanged(res.User.ID)
+	a.devicesChanged(res.User.ID)
 	WriteJSON(w, http.StatusCreated, api.UserResponse{User: apiUser(res.User)})
 }
 
@@ -144,7 +144,7 @@ func (a *API) postResetComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.d.Auth.SetSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
-	a.sessionChanged(res.User.ID)
+	a.devicesChanged(res.User.ID)
 	a.usersChanged()
 	WriteJSON(w, http.StatusOK, api.UserResponse{User: apiUser(res.User)})
 }
@@ -201,7 +201,7 @@ func (a *API) postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.d.Auth.SetSessionCookie(w, res.Login.Token, res.Login.Session.IdleExpiresAt)
-	a.sessionChanged(res.Login.User.ID)
+	a.devicesChanged(res.Login.User.ID)
 	// The invite was used, and there is one more user.
 	a.inviteChanged(r, res.Login.User.InviteID, protocol.TopicAdminInvites, protocol.TopicAdminUsers)
 	user := apiUser(res.Login.User)

@@ -7,14 +7,23 @@
 // tap (producer: the test-tone thread or 05's mixer thread, through the Opus stage), and the event queue; the packet
 // pump drains them for im_next_packet (events first, then the oldest capture time).
 //
+// Frames (§8; README WF2): a session whose encoders take pixels (encoder.h, FrameInput::kNv12) creates its own
+// gpu::Device on the engine worker, on the adapter of its first such candidate (§8.1), before it opens any encoder;
+// VideoFrames (frames.h) holds the GPU path on it: the frame slots, the GPU test pattern of "test:pattern" (release
+// builds too) and a converter per layer. A session whose encoders take nothing (the test hooks' IM_ENC_FAKE) has no
+// device: its frames are capture times only, so it stays off WARP.
+//
 // Threads (§6.1):
-// - video (MMCSS "Capture"): drains the command queue, feeds captured frames to the pacer (§8.4), encodes what it asks
-//   for, runs the normalizer (§9.4) and pushes into the rings; re-inits through the re-init planner (§9.5); recovers a
-//   failed encoder with the next candidate (ENCODER_CHANGED first, §9.8); ends the session when a device is removed
-//   or no candidate is left. It never waits on the consumer.
-// - supervisor: the CPU test pattern's frame timer (frames on a grid anchored at epoch_ns, so the pattern's flash
-//   instants are the test tone's beeps), and the real-time flags into events: LIMIT_CHANGED (every edge of the
-//   pacer's overload rule), RING_OVERFLOW (at most one per stream and second).
+// - video (MMCSS "Capture"): drains the command queue, takes the newest frame for the pacer (§8.4; not while paused,
+//   so the slots keep the frozen frame, §8.5), converts the frame (or black) into each encode's NV12 target, encodes
+//   what the pacer asks for, runs the normalizer (§9.4) and pushes into the rings; re-inits through the re-init
+//   planner (§9.5); recovers a failed encoder with the next candidate (ENCODER_CHANGED first, §9.8); ends the session
+//   when a device is removed (IM_ERR_ENCODER_LOST, or any failure while the device reports itself removed, §8.1) or no
+//   candidate is left. It never waits on the consumer.
+// - supervisor: the test pattern's frame timer (frames on a grid anchored at epoch_ns, pattern_grid.h, so the
+//   pattern's flash instants are the test tone's beeps; each frame drawn into a slot by the GPU, or only its time
+//   without a device), and the real-time flags into events: LIMIT_CHANGED (every edge of the pacer's overload rule),
+//   RING_OVERFLOW (at most one per stream and second).
 // - test tone (MMCSS "Pro Audio", IM_AUDIO_MODE_TEST_TONE only): 04 §10.3's tone on an exact 10 ms grid into the
 //   Opus stage. With IM_AUDIO_MODE_EXCLUDE_APPS 05's mixer feeds the stage instead (audio::AudioEngine::NewMixer).
 //
@@ -41,6 +50,7 @@
 #include "api/owned.h"
 #include "audio/mixer.h"
 #include "engine/os.h"
+#include "gpu/device.h"
 #include "im/audio/opus_stage.h"
 #include "im/audio/test_tone.h"
 #include "im/encpolicy/candidates.h"
@@ -48,6 +58,7 @@
 #include "im/h264/annexb.h"
 #include "im/os/clock.h"
 #include "im/pace/pacer.h"
+#include "im/pace/rate_meter.h"
 #include "im/ring/event_queue.h"
 #include "im/ring/packet_ring.h"
 #include "im/ring/pump.h"
@@ -55,6 +66,8 @@
 #include "im/video/scale.h"
 #include "isshoni_media.h"
 #include "session/encoder.h"
+#include "session/frames.h"
+#include "session/pattern_grid.h"
 #include "session/session.h"
 #include "session/sources.h"
 #include "session/stats.h"
@@ -97,7 +110,10 @@ public:
   void FillInfo(im_session_info &info) const;
   // Whether the session runs audio (it counts against the one audio session of 04 §6.4).
   bool wants_audio() const noexcept { return audio_mode_ != IM_AUDIO_MODE_OFF; }
+  // The id of the session's device (every session opens its own, §8.1; a session without a GPU path counts one too).
   uint64_t device() const noexcept { return device_; }
+  // Whether the session runs the GPU path (has a gpu::Device); set by Start.
+  bool gpu_path() const noexcept { return gpu_path_; }
 
   // im_next_packet (one caller at a time).
   im_status Next(uint32_t timeout_ms, im_packet &out);
@@ -142,8 +158,9 @@ private:
     std::unique_ptr<VideoEncoder> enc;
     std::size_t candidate = 0; // into candidates_
     uint32_t kind = IM_ENC_AUTO;
-    uint32_t enc_flags = 0; // IM_ENCF_* of the encoder
-    uint32_t profile = 0;   // the profile the encoder was opened with
+    uint32_t enc_flags = 0;               // IM_ENCF_* of the encoder
+    FrameInput input = FrameInput::kNone; // what the encoder takes per frame
+    uint32_t profile = 0;                 // the profile the encoder was opened with
     h264::Normalizer norm;
     std::optional<encpolicy::ReinitPlanner> planner;
     bool reinit_next = true;     // the next packet that gets in carries REINIT
@@ -189,6 +206,8 @@ private:
   };
 
   im_status StartVideo(const im_start_config &cfg);
+  // The device (when an encoder takes pixels) and the frames, before the encoders open.
+  im_status StartFrames();
   im_status StartAudio(const im_start_config &cfg, uint32_t init_flags);
   void StartThreads();
   template <class F> void Launch(Thread &t, F &&body);
@@ -199,6 +218,14 @@ private:
   void ApplyCommands(int64_t now);
   void Apply(const Command &c, int64_t now);
   void ApplyRingRequests();
+  // Records the frames captured since the last call for fpsIn (04 §5.6), whether or not the video thread takes them.
+  void CountCaptured(int64_t now) noexcept;
+  // Takes the newest published frame for the pacer; count_skipped false: the frames published meanwhile were neither
+  // seen nor dropped (a pause, §8.5).
+  void TakeFrame(int64_t now, bool count_skipped);
+  // The picture for an encode of a FrameInput::kNv12 layer: the encoder's target, converted from the newest frame
+  // (or black).
+  im_status ConvertFor(Layer &L, uint32_t layer, bool black, gpu::Nv12Target *target);
   void EncodeOne(const pace::Encode &e, int64_t now);
   void Reinit(uint32_t layer, const encpolicy::ReinitAction &a, int64_t now);
   void Recover(uint32_t layer, encpolicy::Failure why, im_status cause, int64_t now);
@@ -211,8 +238,8 @@ private:
 
   // The supervisor.
   void SupervisorLoop() noexcept;
-  int64_t PatternFrameNs(uint64_t k) const noexcept;
-  int64_t PatternDueNs(uint64_t k) const noexcept;
+  // Publishes test-pattern frame k; false when the GPU failed and the session ended.
+  bool PublishPattern(const PatternGrid &grid, uint64_t k);
   void SuperviseEvents(int64_t now);
 
   // The test-tone thread.
@@ -220,6 +247,15 @@ private:
 
   // Queues ENDED once (any thread) and stops the session's work; resources stay until Stop.
   void End(im_status status, std::string_view reason, std::string_view detail) noexcept;
+  // End on a removed or reset device (04 §9.8): ENDED{IM_ERR_ENCODER_LOST} with token device_removed; the probe's cache
+  // is stale. what says where it was seen (logged).
+  void EndDeviceRemoved(std::string_view what) noexcept;
+  // Whether the session's device was removed or reset (gpu::Device::Removed; false without a device). Every generic
+  // failure on the GPU path asks it (04 §8.1): a TDR may first show up as an encoder's or a pool's ordinary error, or
+  // as re-opens that fail, and still ends the session as device_removed (§9.8). Any session thread.
+  bool DeviceLost() const noexcept;
+  // Releases the GPU path once no session thread can use it any more (the encoders first: they hold the device).
+  void ReleaseVideo() noexcept;
   im_status Push(const Command &c);
   im_status CheckLayer(const char *fn, uint32_t layer) const noexcept;
   std::string_view StreamName(uint32_t stream) const noexcept;
@@ -229,6 +265,7 @@ private:
   uint64_t device_ = 0;
   SourceSpec source_;
   bool has_video_ = false;
+  bool gpu_path_ = false;
   uint32_t layer_count_ = 0;
   uint32_t audio_mode_ = IM_AUDIO_MODE_OFF;
   std::vector<EncoderEntry> catalog_;
@@ -252,10 +289,9 @@ private:
   std::unique_ptr<audio::Mixer> mixer_;
   uint32_t audio_state_ = IM_AUDIO_STATE_OFF; // without a mixer (the tone: ok)
 
-  // ---- capture: the CPU test pattern (published by the supervisor, read by the video thread)
-  static constexpr uint32_t kFrameSlots = 8;
-  std::atomic<uint64_t> frame_seq_{0};
-  std::array<std::atomic<int64_t>, kFrameSlots> frame_ts_{};
+  // ---- the GPU path (declared before the layers: their encoders go first, then the frames, then the device)
+  std::unique_ptr<gpu::Device> gpu_;    // null for a session whose encoders take nothing
+  std::unique_ptr<VideoFrames> frames_; // the capture side writes (the supervisor's pattern), the video thread reads
 
   // ---- the video thread's
   std::array<Layer, IM_MAX_LAYERS> layers_;
@@ -263,10 +299,13 @@ private:
   Opener opener_{this};
   uint32_t profile_ = 0;      // the session profile asked for (start, im_set_profile)
   uint32_t content_hint_ = 0; // IM_CONTENT_*
-  uint64_t seen_seq_ = 0;
   int64_t retry_at_ = kNever;
   int64_t next_stats_ = 0;
   bool video_ended_ = false;
+  // fpsIn counts captured frames (04 §5.6), also while paused, when the video thread takes none and the pacer sees
+  // none (§8.5): frames_captured_'s growth, recorded when the video thread wakes for it.
+  pace::RateMeter<1024> captured_meter_;
+  uint64_t captured_seen_ = 0;
 
   // ---- commands and flags from other threads
   std::mutex cmd_mu_;

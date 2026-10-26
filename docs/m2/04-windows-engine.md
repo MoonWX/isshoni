@@ -113,19 +113,27 @@ native/
    ├─ src/engine/                  process state, worker thread, probe cache, handle table use,
    │                               delayload.cpp (the System32-only delay-load hook, §13.1)          04
    ├─ src/session/                 session state machine, video thread, supervisor, the source registry
-   │                               (picks), the encoder catalog (encoder.h), stats; WA23's CPU
-   │                               test pattern until WA33's GPU one replaces it                     04
+   │                               (picks), the encoder catalog (encoder.h), stats; the session's
+   │                               audio wiring (05's AudioEngine/Mixer, §10.2); test:pattern drawn
+   │                               by gpu/'s TestPattern (WF2, §6.1)                                 04
    ├─ src/testhooks/               IM_TEST_HOOKS builds: IM_ENC_FAKE, fault injection, the fake picker 04
-   ├─ src/capture/                 picker, wgc, dd, monitor_map, window_match, sources, test_pattern  04
-   ├─ src/gpu/                     device, slots, video_processor, shader_convert, cursor            04
+   ├─ src/capture/                 picker, wgc, dd, monitor_map, window_match, sources              04
+   ├─ src/gpu/                     device, triple_buffer and slots, frame, geometry, converter (the
+   │                               layer's choice), video_processor, shader_convert, nv12 (our NV12
+   │                               surfaces and their readback), cursor and cursor_shape,
+   │                               test_pattern and pattern_layout (the GPU test pattern), cpu_model
+   │                               (the converters' CPU reference, tests only); gpu.h lists them      04
    ├─ src/encode/                  ffmpeg_api, ffmpeg_encoder, openh264_encoder, selector, probe     04
    ├─ src/audio/                   the watcher, the mixer and everything WASAPI                        05
-   ├─ src/audio_bridge/            session wiring between 05's AudioEngine/Mixer and common/audio     04
+   ├─ src/audio_bridge/            which AudioEngine 04 calls (Engine(), a test override), the
+   │                               im_test_opus_decode decoder, libopus's version                     04
    ├─ src/window/                  protect.cpp (WDA_EXCLUDEFROMCAPTURE)                              04
    ├─ isshoni-media.def            the exports (`LIBRARY isshoni-media`): exactly the header's IM_API functions  04
-   ├─ shaders/*.hlsl               compiled with fxc at build time into headers                      04
+   ├─ shaders/*.hlsl, *.hlsli      compiled with fxc at build time into headers (§13.1)              04
    ├─ resources/version.rc.in      VERSIONINFO                                                        04
-   ├─ tests/                       GoogleTest: fakes, WARP, OpenH264, ABI                             04 (05 adds audio tests)
+   ├─ tests/                       GoogleTest: fakes, WARP, OpenH264, ABI; a test's own support
+   │                               header and goldens belong to it (gpu_warp_support.h and
+   │                               testdata/gpu/ are gpu_warp_test's)                                04 (05 adds audio tests)
    ├─ tools/hwcheck.ps1            the owner's-PC hardware run (§14)                                  04
    └─ third_party/openh264/        codec_api.h, codec_app_def.h, codec_def.h, codec_ver.h and LICENSE
                                    (Cisco's BSD-2-Clause text at the pinned tag)                      04
@@ -978,11 +986,28 @@ wake-up; the result shows in packets, events and stats. A full queue (64 command
 stops the session next).
 
 The session's threads (WA23): the video thread is MMCSS "Capture" at `THREAD_PRIORITY_ABOVE_NORMAL`, the test tone
-MMCSS "Pro Audio", the supervisor a normal thread (`avrt.dll` loaded at run time, §13.1). Until WA33's GPU test
-pattern, `test:pattern` is a CPU pattern inside `src/session/` that only produces frame times, published by the
-supervisor; WA33's renders the pixels and replaces it. With `IM_AUDIO_MODE_EXCLUDE_APPS` the session drives 05's
-`AudioEngine` itself (`SetRules` with the start's exclusions, `NewMixer`, the mixer's `Start`, `Stop`, `SetPaused`
-and `State`), the contract WA34's `audio_bridge/` builds to.
+MMCSS "Pro Audio", the supervisor a normal thread (`avrt.dll` loaded at run time, §13.1).
+
+**`test:pattern`** (README §3 item 37): WA33's GPU test pattern (`gpu/test_pattern`) is the pattern, in release builds
+too, wired into the session by WF2. Its look is `pattern_layout.h`'s, as integers so a readback compares exactly: color
+bars and a grey ramp in the static top half (encoders converge on it), a white bar crossing its band every 2 s and a
+16-bit frame counter (every frame is new), and a flash box that is white for the first 100 ms of every second since
+`epoch_ns`, so every layer, the 15 fps preview included, shows each flash. The session makes its `gpu::Device`, the
+three `FrameSlots` and one `Converter` per layer in `Session::StartVideo`; on the pattern's frame grid (frame k at
+`epoch_ns + k / fps`, the instants the supervisor schedules, so the flash box lights with the test tone's beeps) the
+pattern is drawn into the writer's slot (`FrameSlots::BeginWrite`, `TestPattern::Render`, `FrameSlots::Publish` with the
+frame's time); the video loop takes the latest slot, and each encode of layer l converts it with that layer's
+`Converter` into the encoder's input (an FFmpeg pool slice, or our own `Nv12Surface` read back for a CPU encoder, §8.3).
+WF2 removes WA23's CPU frame-time pattern (the session's `frame_ts_` ring and `kFrameSlots`). **`IM_ENC_FAKE` sessions
+stay off WARP**: the fake encoder ignores pixels, so a session whose encoders are `IM_ENC_FAKE` (test hooks) gets the
+pattern's frames on the same grid without a D3D device or any rendering (it still gets a new session device id, which
+`session_fake_test` compares across a device removal), and `session_fake_test`'s timing cases keep their bounds;
+`gpu_warp_test` covers the pattern's pixels on WARP. (Until WF2 merges, `test:pattern` is still WA23's CPU frame-time
+pattern in `src/session/`.)
+
+**Audio**: with `IM_AUDIO_MODE_EXCLUDE_APPS` the session drives 05's `AudioEngine` itself in
+`src/session/session_object.cpp` (`SetRules` with the start's exclusions, `NewMixer`, the mixer's `Start`, `Stop`,
+`SetPaused` and `State`), reaching it through `audio_bridge::Engine()` (§10.2).
 
 ### 6.2 Rings and packet memory
 
@@ -1248,7 +1273,8 @@ Unidentified windows simply lack these extras; capture is unaffected.
 - DD: the desktop image has no pointer. The DD thread keeps the pointer position (`PointerPosition`, visible flag)
   and, when `PointerShapeBufferSize > 0`, the shape (`GetFramePointerShape`). Shapes are converted on the CPU to a
   BGRA texture with alpha: color shapes as they are; masked-color shapes with the mask bit → inverted pixels drawn as
-  opaque black or white by luminance; monochrome shapes (AND/XOR) → black, white, transparent, and "invert" drawn as
+  opaque black or white by luminance, as they would look over white (BT.709 luma of the inverted value below 128 →
+  black); monochrome shapes (AND/XOR) → black, white, transparent, and "invert" drawn as
   black with a white outline. The video thread blends the pointer into the slot copy with a textured quad (alpha
   blending, precompiled shaders) before the VideoProcessor, at the pointer's position adjusted for rotation. With
   `IM_START_HIDE_CURSOR` the DD thread skips the blend.
@@ -1274,13 +1300,23 @@ Unidentified windows simply lack these extras; capture is unaffected.
 
 - `D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, …, D3D11_CREATE_DEVICE_BGRA_SUPPORT |
   D3D11_CREATE_DEVICE_VIDEO_SUPPORT, {11_1, 11_0})`. `ID3D10Multithread::SetMultithreadProtected(TRUE)` as a safety net.
+  A device that refuses `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` is created without it: it has no VideoProcessor, and its
+  converters use the shader (§8.3). Whether the device can render to NV12 is checked, not assumed (an optional D3D11
+  capability that hardware drivers report; WARP is checked like any other, `gpu/device.h`).
 - **One device per session**, on the adapter of the chosen encoder (§9.1): for DD that is the output's adapter by
   construction; for WGC any adapter works (WGC copies across adapters itself). On an Optimus or hybrid laptop the
-  internal panel is on the iGPU, whose QSV/AMF encoder then wins; that keeps the path zero-copy.
+  internal panel is on the iGPU, whose QSV/AMF encoder then wins; that keeps the path zero-copy. A `test:pattern`
+  session takes the same path, its frames drawn by gpu/'s `TestPattern` (README §3 item 37, §6.1; until WF2 merges,
+  the session still draws WA23's CPU frame-time pattern); only a session whose encoders are `IM_ENC_FAKE` (test
+  hooks) creates no D3D device, so the fake-encoder tests never render on WARP.
 - **The context lock**: a `CRITICAL_SECTION` (recursive, like FFmpeg's own default D3D11 lock, because FFmpeg may
   take it again while holding it) around every use of the immediate context, by the capture copy, the video thread
   and FFmpeg. The FFmpeg D3D11 device context gets the same lock through `AVD3D11VADeviceContext.lock`/`unlock`
-  (§9.2), so encoder submissions and our copies never interleave on the context.
+  (§9.2), so encoder submissions and our copies never interleave on the context. The lock is held only around D3D
+  calls, never across a wait for the GPU (§6.1): the CPU encoders' readback (§8.3) submits its copies, an event query
+  and a `Flush` under the lock, then polls the query with the lock taken only for each `GetData` and released between
+  polls (at most 3 s), maps with `D3D11_MAP_FLAG_DO_NOT_WAIT` the same way and copies the rows out with the lock
+  released, so the capture copy and FFmpeg's submissions go on while the GPU works through its queue (WA33).
 - **Device loss**: any `DXGI_ERROR_DEVICE_REMOVED`/`_RESET`, or an encoder error with
   `GetDeviceRemovedReason() != S_OK`, ends the session (§9.8).
 
@@ -1291,6 +1327,14 @@ triple buffer: the capture side writes a slot that is neither the latest nor the
 as the latest with a sequence number; the video thread takes the latest. Both share one immediate context, so the
 copy is ordered before the reads without fences. A capture that arrives while the video thread still reads the only
 free slot overwrites the previous unread frame (the newest frame wins).
+
+As built (WA33, `gpu/slots.h`, `gpu/triple_buffer.h`): the writers are the WGC callback, the DD thread and the test
+pattern (§6.1); the video thread keeps the slot it took as the last frame for refreshes and static keyframes (§8.5).
+The slots start at the source's size. A capture whose content is larger (a window grown before its resize settles,
+§7.7) grows the writer's texture in `BeginWrite`, each grown side rounded up to a multiple of 256 pixels, so a window
+dragged larger reallocates every 256 pixels rather than on every frame (the one exception to "the callback never
+allocates"); textures never shrink, and each frame says how much of its texture it fills (`FrameMeta::content`). The
+test pattern draws straight into a slot (`TestPattern::Render`).
 
 ### 8.3 Color conversion and scaling
 
@@ -1306,9 +1350,35 @@ free slot overwrites the previous unread frame (the newest frame wins).
   rectangle = the content; destination rectangle = the letterboxed fit; background = black (Y 16, Cb/Cr 128).
 - **Shader converter** (fallback and CI reference): two pixel-shader passes write the Y plane (`R8_UNORM` render
   target view) and the half-size CbCr plane (`R8G8_UNORM` view) of the NV12 texture, with a bilinear (preview: 2×2
-  box then bilinear) filter and the same BT.709 limited matrix. Used when `CreateVideoProcessorEnumerator` or the
-  first `VideoProcessorBlt` fails; WARP runs it in CI as the reference that the VideoProcessor output is compared to
-  (max difference 2 code values on flat areas).
+  box then bilinear) filter and the same BT.709 limited matrix. Used when `CreateVideoProcessorEnumerator` fails or a
+  `VideoProcessorBlt` fails on a healthy device (the first failure, whenever it comes); WARP runs it in CI as the
+  reference that the VideoProcessor output is compared to (max difference 2 code values on flat areas).
+- **As built (WA33, `gpu/converter.h`, `geometry.h`, `cpu_model.h`)**, where the text above is silent or differs:
+  - **The fallback** is for good and per layer: any failed `VideoProcessorBlt` on a healthy device (not only the
+    first), a failed enumerator, format check or color-space check, or a device without video support switches the
+    layer to the shader (logged). Per frame the shader also takes what the VideoProcessor can't do: a rotated frame
+    on a driver without rotation, and an empty destination (all black). Device loss is never a fallback: it is
+    `IM_ERR_ENCODER_LOST` `device_removed` (§9.8).
+  - **VideoProcessors per input size**: a VideoProcessor is made for one input texture size, and the slots' textures
+    can differ (only the writer's grows, §8.2), so the converter keeps one per size, up to one per slot (the least
+    recently used goes), and alternating slot sizes reuse them. `Create` and `Reconfigure` (after a stable resize or
+    an fps re-init, §7.7, §9.5) make the one for `ConverterConfig::input`, the slots' starting size in the capture's
+    orientation, so a session's first frames, rotated ones included, create none on the video thread.
+  - **The preview filter** is one pass that averages four bilinear taps half a source texel to each side: exactly
+    the 2×2 box at 2:1 and a (1 2 1)² tent at 3:1. It is used when the content is downscaled 2:1 or more on both axes.
+  - **Chroma siting**: one Cb/Cr pair per 2×2 block, sited at the left luma column and between the rows (chroma
+    pixel (i, j) samples the luma position (2i + 0.5, 2j + 1)), matching `YCBCR_STUDIO_G22_LEFT_P709`.
+  - **Sampling**: a content smaller than its texture is sampled clamped to the content's texel centers, so nothing
+    past its edge is read.
+  - **Planar surfaces**: a device that can't render to NV12 (§8.1) gets two plane textures (`R8_UNORM` and
+    `R8G8_UNORM`) for our own pictures and the readback, which the shader writes; such a device has no VideoProcessor.
+    So the WARP test runs even if WARP lacks NV12 render targets. A planar source must be `R8_UNORM` at the
+    readback's size and `R8G8_UNORM` at half of it, else `IM_ERR_INVALID_ARG`.
+  - **CI's comparison** of the VideoProcessor with the shader uses flat areas only: a pixel at least 3 pixels from the
+    content edge with uniform texels 3 to each side, or at least 3 pixels deep inside the bars. A case for which WARP
+    creates no VideoProcessor is skipped with a message; the 1080p case must compare.
+  - `cpu_model.h` is the converters' CPU reference (header-only, used by `gpu_warp_test`, never by the engine): the
+    shader on WARP is within 1 code value of it on flat areas and 2 on edges.
 - **Encoder VUI**: every encoder signals BT.709 primaries, transfer and matrix with limited range (§9.3), so browsers
   don't fall back to BT.601 and shift colors.
 - The output NV12 textures come from the encoder's hardware frame pool (§9.2); for CPU encoders from our own pool,
@@ -1629,7 +1699,8 @@ with the session.
    `IM_ERR_DEPENDENCY` with token `driver_too_old` (03 tells the user which driver version is needed, from §13.2).
    Every unavailable encoder's `status` and `reason` (§5.7 token) are written into its `im_encoder_info`, so Go and
    03 never parse log text.
-4. Audio flags from 05's `AudioEngine::ProbeFlags()`, posted to 05's watcher (the worker does no WASAPI work).
+4. Audio flags from 05's `AudioEngine::ProbeFlags()` through `audio_bridge::Engine()` (§10.2), posted to 05's watcher
+   (the worker does no WASAPI work).
 
 The whole probe stays under 2 s on the owner's PC (acceptance in E7). 03 runs it once at startup in the background
 and before the first share if it hasn't finished.
@@ -1716,10 +1787,21 @@ There is no event sink: 05 reports through `im_list_audio_apps` (`seq`, `state`,
 argument checks, with their arguments as the header declares them (05 §10.5 has the same signatures: `ListAppsJson`
 takes `im_list_audio_apps`' `flags`, `SoundCheck` its `int32_t timeout_ms`). In M2 those checks refuse
 `IM_AUDIO_MODE_EVERYTHING` in `im_start` and `im_audio_set_mode` with `IM_ERR_INVALID_ARG` (README §3 item 15; the
-value stays reserved). `audio_bridge/` creates the session's `Mixer` in
-`im_start` (for `audio.mode` EXCLUDE_APPS), calls `SetRules` first when `im_start_config.exclusions` is non-NULL, wires
-the session's Opus stage as the sink, and maps `im_set_paused` to `Mixer::SetPaused`. 04's tests run against a fake
-`AudioEngine` (§18.2).
+value stays reserved). The session wiring stays in `src/session/session_object.cpp`, as WA23 built it (WA34): in
+`im_start` (for `audio.mode` EXCLUDE_APPS) the session calls `SetRules` first when `im_start_config.exclusions` is
+non-NULL, creates its `Mixer` with `NewMixer`, starts it with the session's Opus stage (and PCM tap) as the sink, maps
+`im_set_paused` and `IM_START_PAUSED` to `Mixer::SetPaused`, reports `Mixer::State` as the session's audio state and
+stops the mixer in `im_stop`; a refused rule set, no mixer or a mixer that doesn't start is logged and the share runs
+without audio packets. `src/audio_bridge/` holds what the rest of 04 needs of 05's side: `Engine()`, the
+`AudioEngine` every 04 call goes to (`AudioEngine::Get()`, or a test's fake set with `SetEngineForTest`), the
+process-wide decoder behind `im_test_opus_decode` and libopus's version for `im_build_info`; its header documents the
+whole wiring path. 04's tests run against a fake `AudioEngine` (§18.2).
+
+**`im_test_opus_decode`** (05 §4.1 leaves these open; WA34): one decoder per process, created by the first call
+(inside its `try`, so an allocation failure is `IM_ERR_INTERNAL` and the next call tries again), its state kept between
+calls as one receiver's is (a caller decodes one stream's packets in order), calls from several threads serialized.
+A `max_frames` too small for the packet or a malformed packet is `IM_ERR_INVALID_ARG`, another libopus failure
+`IM_ERR_INTERNAL`; every detail starts with `im_test_opus_decode: `. It works before `im_init`.
 
 Audio timestamps come from WASAPI's QPC positions (05), the same clock as video capture, which is what A/V sync rests
 on (plan "A/V sync").
@@ -1823,7 +1905,7 @@ Windows-only extras of §12.2, the OpenH264 helpers and 05's `AudioTest` (05 §1
 | `bridge.go` | all | everything behind the `caller` interface (§12.4): the export table (every `IM_API` function, 05's audio and test exports included), `addrOf` (`runtime.Pinner`), `Open`'s portable half (`openEngine`: the ABI check, `im_init`, the clock cross-check, the build info), `Close`, the log drain (§12.3), the `Engine` and `session` logic, the snprintf retry, JSON decoding (build info, sources, stats, events), `media.Config` → `imStartConfig`, `imCaps` → `media.Probe`, the packet copy and validation rules, ENDED handling, the event mapping and `EventLayer` synthesis, the session state machine, `IM_PACKET_PCM` → `media.KindPCM` packets (README §3 item 32), the `IM_SRCF_SELF` rule of `Pick` (WA23, §12.2). WA10 wrote the skeleton; WA23 owns it next |
 | `types.go` | all | the exported Windows-only types: `BuildInfo`, `ClockSample`, `SourceDetail` (the test tone is `media.AudioTestTone`, 05 §13.1; this package declares no mode constant, and no PCM type: PCM reaches Go as `media.KindPCM` packets, README §3 item 32) |
 | `openh264.go` | all | `OpenH264` pin, `InstallOpenH264`, `VerifyOpenH264`, `RemoveOpenH264`, `SetOpenH264Path` (pure Go; the DLL only exists on Windows, but the code and tests run everywhere; WA51 fills WA10's stubs) |
-| `audio.go` | all | `media.AudioController` on `*Engine`, `AudioTestHooks` and the `AudioTest` wrappers (05 §13.2; **owned by 05**: WA35 fills WA10's stubs, `AudioTest.EngineClockNS` is real), over the same `caller`; also `AudioApps`, a stub WA10 declared for the report's apps |
+| `audio.go` | all | `media.AudioController` on `*Engine`, `AudioTestHooks` and the `AudioTest` wrappers (05 §13.2; **owned by 05**: WA35 filled WA10's stubs), over the same `caller`; also the start's `buildAudioConfig` and `buildExclusions` that `bridge.go` calls, and `AudioApps` (`AudioReport().Apps`, Op `list_audio_apps`) |
 | `engine_windows.go` | windows | `Open`'s Windows half: `LoadLibraryEx` by full path (a load failure is `dependency` with `missing` or `blocked_by_policy`), `im_version` first (so another major fails as one, not as missing exports), every export resolved, then `openEngine` |
 | `call_windows.go` | windows | the `caller` over `syscall.SyscallN`, with `runtime.LockOSThread` around each call and its `im_last_error` read |
 | `clock_windows.go` | windows | `qpcNS()` from kernel32's `QueryPerformanceCounter` and the cached `QueryPerformanceFrequency`, through `windows.NewLazySystemDLL("kernel32.dll")` (System32 only): x/sys/windows v0.49.0 has no wrapper for them |
@@ -1940,15 +2022,12 @@ func (s *session) SetAudioBitrate(bps int) error                  // im_set_audi
   `media.Packet{Kind: media.KindPCM, CaptureNS, Data}` (3840 bytes: 480 interleaved stereo float32 frames, little
   endian), in `im_next_packet` order like any other packet (§12.3), as 01 §5.1, §6.2 and 05 §13.2 describe and the fake
   does. There is no `PCMTap` channel and no `PCMChunk` type: `cmd/isshoni-audiotest` (05) pulls its Opus and tap
-  packets with `Session.Next`, and the core never sets `TapPCM`, so the pump and the publisher never see PCM. (Until
-  WA35 in group 4, the binding still routes PCM to WA23's `PCMTap()` channel; WA35 makes this change and removes
-  `PCMTap` and `PCMChunk`.)
-- **Start-time audio mapping**: `bridge.go`'s `startAudioConfig` and `startExclusions` (WA23) build the start's
-  `im_audio_config` and `im_exclusions`; WA35 folds them into `audio.go`'s single mode mapping and `buildExclusions`
-  (05 §13.2), so one place maps modes and rules for `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode`. The
-  folded `buildExclusions` applies 05 §13.1's rule checks on every path (`Start`, `WatchAudio`, `SetExclusions`): a NUL
-  in a value, app id or name, or a value of 520 bytes or more, is `CodeInvalid` with the rule's index in `Detail`. Until
-  WA35, `bridge.go`'s `startExclusions` refuses only a NUL, without the index.
+  packets with `Session.Next`, and the core never sets `TapPCM`, so the pump and the publisher never see PCM.
+- **Start-time audio mapping**: `bridge.go`'s `media.Config` → `im_start_config` conversion calls `audio.go`'s
+  `buildAudioConfig` (05 §13.2: the single mode mapping and `buildExclusions`), so one place maps modes and rules for
+  `Start`, `WatchAudio`, `SetExclusions` and `SetAudioMode`. `buildExclusions` applies 05 §13.1's rule checks on every
+  path (`Start`, `WatchAudio`, `SetExclusions`): more than `IM_MAX_RULES` rules is `CodeInvalid`, and so is a NUL in a
+  value, app id or name or a value of 520 bytes or more, with the rule's index in `Detail`.
 
 **`media.Config` → `im_start_config`**
 
@@ -2259,7 +2338,9 @@ agree; a unit test reads both.
   toolset change that alters it shows.
 - **Host flags**: `-std=c++20 -Wall -Wextra -Wpedantic -Wshadow -Werror`.
 - **Shaders**: `shaders/*.hlsl` compiled by `fxc /T vs_5_0|ps_5_0 /O3 /Fh` at build time into headers (no runtime
-  compiler, no `d3dcompiler_47.dll` dependency).
+  compiler, no `d3dcompiler_47.dll` dependency). Every fxc command depends on every shared include
+  (`shaders/*.hlsli`, globbed with `CONFIGURE_DEPENDS`; group 4's integration), so an edit to `convert.hlsli`
+  recompiles the shaders that include it in an incremental build too.
 - **Formatting**: `native/.clang-format` (LLVM base, 120 columns, like the Go and TS line length); 06's `native-host`
   job runs `clang-format --dry-run --Werror`.
 - **Exports**: `isshoni-media.def` (`LIBRARY isshoni-media`) must list exactly the header's `IM_API` functions,
@@ -2489,10 +2570,10 @@ and `dll_search_test` runs with the engine's delay-load hook; the DLL's real exp
 | Test | Asserts |
 |---|---|
 | `exports_test` | every export with null and invalid arguments returns its documented code, and `im_last_error` starts with the §5.7 token where one applies; `struct_size` below v1.0 → `IM_ERR_ABI`, above → accepted; JSON functions follow snprintf; `im_clock` is monotonic and within 50 ms of the system time; `im_abi_layout` equals the golden file; `isshoni-media.def` lists exactly the header's `IM_API` functions (both parsed); a hook that stalls the worker makes a posted call return `IM_ERR_TIMEOUT` (`engine_timeout`) after its bound + 1 s |
-| `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone: first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s; `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired` |
-| `audio_bridge_test` | with a fake `AudioEngine`: `im_init`/`im_shutdown` call `Init`/`Shutdown`; every audio export forwards its arguments (rules, flags, `shared_pid` copied); `im_start_config.exclusions` → `SetRules` before `Mixer::Start`; mode OFF creates no mixer; `im_start` with `audio.mode` `IM_AUDIO_MODE_EVERYTHING` and `im_audio_set_mode(IM_AUDIO_MODE_EVERYTHING)` → `IM_ERR_INVALID_ARG`, no mixer created and the fake's mode unchanged; `im_set_paused` → `Mixer::SetPaused`; the fake mixer's chunks come out as Opus packets every 20 ms and, with `IM_AUDIOF_TAP_PCM`, PCM packets every 10 ms |
+| `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone (no D3D device: `IM_ENC_FAKE` sessions stay off WARP, §6.1, so the timing bounds hold; "a new device" below is the session's device id): first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s; `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired` |
+| `audio_bridge_test` | with a fake `AudioEngine`: `im_init`/`im_shutdown` call `Init`/`Shutdown`; every audio export forwards its arguments (rules, flags, `shared_pid` copied); `im_start_config.exclusions` → `SetRules` before `Mixer::Start`; modes OFF and TEST_TONE create no mixer; after `im_init(IM_INIT_NO_AUDIO)`, `im_start` with `IM_AUDIO_MODE_EXCLUDE_APPS` and exclusions calls neither `SetRules` nor `NewMixer` (05 §4.3, README §3 item 35); `im_start` with `audio.mode` `IM_AUDIO_MODE_EVERYTHING` and `im_audio_set_mode(IM_AUDIO_MODE_EVERYTHING)` → `IM_ERR_INVALID_ARG`, no mixer created and the fake's mode unchanged; `im_set_paused` → `Mixer::SetPaused`; the fake mixer's chunks come out as Opus packets every 20 ms and, with `IM_AUDIOF_TAP_PCM`, PCM packets every 10 ms |
 | `window_match_test` | §7.6's matcher over a fake window list: one match gives `window` and `pid`; two matches or none give 0; cloaked windows skipped; an `applicationframehost.exe` match takes its `Windows.UI.Core.CoreWindow` child's pid, and 0 without one |
-| `gpu_warp_test` | on WARP: the shader converter against a CPU BT.709 limited-range reference (≤ 1 code value on flat areas, ≤ 2 on edges); the VideoProcessor against the shader output (≤ 2) when WARP offers one, else skipped with the reason; letterbox geometry; rotation 90/180/270; cursor blending of color, masked and monochrome shapes against golden images, and no blend with `IM_START_HIDE_CURSOR`; the GPU test pattern renders |
+| `gpu_warp_test` | on WARP: the shader converter against a CPU BT.709 limited-range reference (≤ 1 code value on flat areas, ≤ 2 on edges); the VideoProcessor against the shader output (≤ 2) when WARP offers one, else skipped with the reason; letterbox geometry; rotation 90/180/270; cursor blending of color, masked and monochrome shapes against golden images, and no blend with `IM_START_HIDE_CURSOR`; the GPU test pattern renders (pixel for pixel against `pattern_layout.h`'s model, and through slots and converters on two threads, the frame counter decoded from the NV12); slot growth steps, one VideoProcessor per slot size, the planar readback and its refused sources, the context lock free while the readback waits (test hook). The goldens are text pictures in `tests/testdata/gpu/`, and the portable `tests/gpu_warp_support.h` checks them on any OS; both belong to this test (§4). With `IM_GPU_TEST_HARDWARE=1`, `GpuHardware.*` compares the VideoProcessor with the shader on every hardware adapter (the owner's-PC check) |
 | `ffmpeg_load_test` | with the pinned artifact: loads, versions check, encoders listed (none available without a GPU, MF software if the runner has Media Foundation); `ffmpeg_dir` pointed at an empty folder → `IM_ERR_DEPENDENCY` (`missing`) and an audio-only test-tone session still works; a stub DLL with another major → `IM_ERR_DEPENDENCY` (`version`) |
 | `dll_search_test` (§13.3) | Run as a child process whose current directory and one `PATH` entry each hold marker DLLs (a tiny test DLL whose `DllMain` writes a file named after itself; built by the tests, never shipped). **Delay-load hook** (E2): the `win-x64-ci` build's test binary links the engine code with an extra `/DELAYLOAD:im-test-missing.dll` (a name that is in no system folder; the windows-2025 image has `mfplat.dll` in System32, which is searched before the current directory, so a planted `mfplat.dll` could never show the bug); with `im-test-missing.dll` planted in both places, `__HrLoadAllImportsForDll("im-test-missing.dll")` fails, no marker file appears and `GetModuleHandleW(L"im-test-missing.dll")` is NULL; the same check with `mfplat.dll` passes and loads it from System32 (`GetModuleFileNameW`), asked as `mfplat.dll` while `mfplat.lib` stores `MFPlat.DLL` (§13.1). **The `/DEPENDENTLOADFLAG` verdict** (06 §5.1): two probe DLLs (`tests/support/dlprobe.cpp`) delay-load the marker with the default helper and no hook, one linked plain and one with `/DEPENDENTLOADFLAG:0x800`; whether the flagged one still loads the planted marker goes to the test log and to `<build>/windows/dependentloadflag-verdict.txt`, which `windows-native` writes into its summary. **Vendor runtimes and libvpl** (E7, in `ffmpeg_load_test`'s harness with the pinned FFmpeg): markers named `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll` and `libmfxhw64.dll` (none exist on the GPU-less runner) planted in both places, `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` set to the marker folder, and **no** process default set (the host-independent case); after `im_init` and a full `im_probe`, no marker file exists and `EnumProcessModules` lists none of them. A failure of the libvpl names is §17's libvpl risk, not a flake |
 | `openh264_test` | CI downloads Cisco's DLL and checks the pinned hash (a mismatch fails the job); `test:pattern` 1280×720@30 for 3 s through the full session (WARP, readback, OpenH264) and back through OpenH264's decoder: PSNR ≥ 35 dB on the pattern's static regions; profile key `42e0`; SPS and PPS before every IDR; a live bitrate step lands within ±25 % |
@@ -2767,7 +2848,7 @@ Windows PC (Win11 and Win10 22H2).
 | E3 | Rings, normalizer, pacer, policy | `common/`: rings, event queue, Annex B normalizer, SPS parser, pacer, encoder policy, scaling rule, resize debounce, monitor-map logic; fuzz targets | §18.1 tests pass, TSan clean, 60 s per fuzz target clean | Mac, CI | E1 |
 | E4 | Opus stage | `common/audio`: `PcmSink`, the Opus stage with 05 §10.1's settings and lookahead-corrected timestamps, the start-at-`epoch_ns` drop, the `REINIT`/`DISCONTINUITY` rules, the PCM tap, the tone generator and its Marker framing; libopus through vcpkg | `opus_stage_test` | Mac, CI | E1 |
 | E5 | Session core on fakes | session state machine, video thread, supervisor, command queue, rings wired to `im_next_packet`, controls (including `im_set_content_hint`), stats, events, the first-keyframe bound; test hooks (`IM_ENC_FAKE` as §18.2, fault injection, the fake picker), test tone; Go `bridge.go` (`Next`, `Stop`, the event table and `EventLayer` synthesis, the PCM packets (README §3 item 32), the §12.2 mappings) | `session_fake_test`; `bridge_test` on the Mac and ubuntu; Go tests with the DLL under `goleak`, including `mediatest.Conformance` on `test:pattern`; `TestNativeIntoPublisher` | CI windows, Mac, CI ubuntu | E2, E3, E4 |
-| E6 | GPU path | device and lock, slots, shader converter, VideoProcessor, cursor blending (and `IM_START_HIDE_CURSOR`), the GPU test pattern (`test:pattern` in release builds) | `gpu_warp_test`; on the PC the VideoProcessor matches the shader output within 2 on each available GPU vendor | CI windows (WARP), PC | E5 |
+| E6 | GPU path | device and lock, slots, shader converter, VideoProcessor, cursor blending (and `IM_START_HIDE_CURSOR`), the GPU test pattern (`test:pattern` in release builds; WF2 wires it into the session, §6.1) | `gpu_warp_test`; on the PC the VideoProcessor matches the shader output within 2 on each available GPU vendor | CI windows (WARP), PC | E5 |
 | E7 | libavcodec encoders and probe | `ffmpeg_api`, `FfmpegEncoder` for NVENC, QSV, AMF, MF (hw and sw), zero-copy decisions, normalizer wiring, `im_probe` with `status` and `reason` per encoder and the live-bitrate check (§9.10); `enginetest probe`, `capture` (with `-bitrate-steps`' keyframe assertions), `bench`, and the tool's process setup (§14); CMake reading `native/ffmpeg/lock.json` | `ffmpeg_load_test`, `mf_sw_test` (if MF present), `dll_search_test`'s vendor-runtime and libvpl part, and the Go process-default check in CI; on the PC: full probe < 2 s, both `capture` runs per available encoder pass §14's assertions at 1080p60 (first keyframe ≤ 500 ms included; `-bitrate-steps`: rate within ±25 %, no `KEYFRAME`/`REINIT` between steps for NVENC and QSV, one `REINIT\|KEYFRAME` per applied step for AMF and MF; if QSV emits IDRs, the probe's check clears its live flag and the run passes as re-init), `bench` encode p99 ≤ 16 ms; the `isshoni-native-tools` zip's `isshoni-enginetest probe -quick` runs (moved here from 06 R3b, since the tool comes with this slice); AU fixtures committed for E3's tests; §9.3's settings, layer 0's VBV comparison (0.5 s against 0.1–0.2 s) included, recorded in the PR for the write-back to §9.3 | CI windows, PC | E5, E6, 06's FFmpeg workflow |
 | E8 | OpenH264 | Go `InstallOpenH264`/`VerifyOpenH264`/`RemoveOpenH264`; engine backend; `im_set_openh264_path`; pinned version, hash and decompressed size, the bounded streaming install of §9.9; `third_party/openh264/LICENSE` and its notices entry | `openh264_test` in CI with Cisco's real DLL; §18.3's OpenH264 helper tests on the Mac and ubuntu (tampered, short and long downloads rejected with nothing left behind; the bzip2 bomb stops after `Size + 1` bytes with bounded memory); wrong version → `IM_ERR_DEPENDENCY` `version`; Go pin equals `codec_ver.h` | CI windows, PC | E6 |
 | E9 | Selection, fallback, device loss, profiles | candidate order, preview-layer fallback, profile consistency, `im_set_profile`, `im_update_layer`, `im_set_content_hint` re-inits, re-init spacing, `ENCODER_CHANGED` queued before the new encoder's first packet, device loss ending the session (`device_removed`, the probe cache marked stale; no recovery, M5) | fault-injection cases of `session_fake_test` extended (fallback event order; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` `device_removed` within 1 s, then a new session starts on a new device); on the PC M-NVENC-LIMIT passes | CI windows, PC | E7 |

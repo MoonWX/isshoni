@@ -969,7 +969,14 @@ func TestDesktopHoldExpiry(t *testing.T) {
 		t.Errorf("after the end: engine session %v, active share %v; want neither", app.engine.Session(),
 			app.core.ActiveShare())
 	}
-	if runs := app.shareStates(shareMark); runs != "reconnecting ended" {
+	// The share's last EventShare (ended) is flushed after Done closes (Share.over), and the app records it after
+	// that: it may still be on its way here.
+	runs := app.shareStates(shareMark)
+	for deadline := time.Now().Add(waitTimeout); runs != "reconnecting ended" && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		runs = app.shareStates(shareMark)
+	}
+	if runs != "reconnecting ended" {
 		t.Errorf("the share's states since the stop are %q, want reconnecting, then ended", runs)
 	}
 

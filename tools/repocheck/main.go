@@ -1,7 +1,7 @@
 // Command repocheck runs the repository consistency checks behind `task lint:pins` and `task lint:keys`
 // (docs/m1/06-deploy-and-ci.md §7.1, §4.3, §9.4, §10.3).
 //
-//	go -C tools run ./repocheck [-root DIR] pins|keys|update-keys
+//	go -C tools run ./repocheck [-root DIR] pins|keys|update-keys|ps1-keys
 //
 // pins: the Go version pinned in .tool-versions equals the toolchain directive of go.mod, tools/go.mod,
 // tools/goreleaser/go.mod and tools/wails3/go.mod; the Task, golangci-lint and shfmt pins equal the versions that
@@ -12,21 +12,26 @@
 // note), and web/package.json must not list the runtime. Once deploy/windows/tools.json exists, its MSVC toolset equals
 // the VCPKG_PLATFORM_TOOLSET_VERSION of the overlay triplet native/triplets/x64-windows-static.cmake.
 //
-// keys: the allowed-signers block embedded in deploy/install.sh equals deploy/keys/allowed_signers byte for byte, and
-// that file uses no option that Windows 10's OpenSSH 8.1 can't parse (only namespaces= and cert-authority;
-// docs/m2/06-windows-release.md §7.2). The desktop app's update keys (06 §8.3): deploy/keys/update_signers has one
-// `isshoni-update namespaces="isshoni-update" ssh-ed25519 AAAA… <name>` line per key, exactly one named
-// isshoni-update-backup-<n> and at least one named isshoni-update-<n>; the block of internal/update/signers.go
+// keys: the allowed-signers block embedded in deploy/install.sh equals deploy/keys/allowed_signers byte for byte, so
+// do the lines between the markers of the key block of deploy/install-desktop.ps1 (a single-quoted here-string,
+// docs/m2/06-windows-release.md §7.1; the file must be ASCII and no line may start with '@), and that file uses no
+// option that Windows 10's OpenSSH 8.1 can't parse (only namespaces= and cert-authority; 06 §7.2). The desktop app's
+// update keys (06 §8.3): deploy/keys/update_signers has one `isshoni-update namespaces="isshoni-update" ssh-ed25519
+// AAAA… <name>` line per key, exactly one named isshoni-update-backup-<n> and at least one named
+// isshoni-update-<n>; the block of internal/update/signers.go
 // between "// BEGIN UPDATE SIGNERS" and "// END UPDATE SIGNERS" equals what update-keys writes from it (Backup set
 // exactly for the backup line), and no key is also a release key. Once a key file is non-empty, it holds at least
 // one key, the "## Release signing keys" section of README.md lists the SHA256 fingerprint of each key of both files,
 // as `ssh-keygen -l` prints it, and no other fingerprint, and none of its lines still says a key is "not created
 // yet" (a row naming only update keys may, while deploy/keys/update_signers does not exist). While a key file does
-// not exist yet, its checks print a note and succeed (the embedded update block must then be empty); while
-// deploy/install.sh does not, the release keys' block is not checked, with a note.
+// not exist yet, its checks print a note and succeed (the embedded update block and the ps1 key block must then be
+// empty); while deploy/install.sh or deploy/install-desktop.ps1 does not, its block is not checked, with a note.
 //
 // update-keys (`task release:update-keys`): checks deploy/keys/update_signers as keys does, writes its keys into the
 // block of internal/update/signers.go and prints each key's fingerprint and name.
+//
+// ps1-keys (the step of `task release:keys` for the desktop script): checks deploy/keys/allowed_signers as keys does
+// and writes it into the key block of deploy/install-desktop.ps1.
 //
 // Exit status: 0 when the check passes (or is skipped with a note), 1 when it fails, 2 on a usage error.
 package main
@@ -48,7 +53,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	root := fs.String("root", ".", "repository root")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: repocheck [-root DIR] pins|keys|update-keys")
+		fmt.Fprintln(stderr, "usage: repocheck [-root DIR] pins|keys|update-keys|ps1-keys")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -73,6 +78,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		note, err = checkKeys(*root)
 	case "update-keys":
 		note, err = writeUpdateKeys(*root, stdout)
+	case "ps1-keys":
+		note, err = writePS1Keys(*root)
 	default:
 		fmt.Fprintf(stderr, "repocheck: unknown check %q\n", fs.Arg(0))
 		fs.Usage()

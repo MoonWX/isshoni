@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,7 +13,9 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// Web Push subscriptions and preferences (03 §12.3 #24, #27, #28, #50, #51; §12.4.6), User routes. This file owns
+// Web Push subscriptions and preferences (03 §12.3 #24, #27, #28, #50, #51; §12.4.6). Subscribe (#24) and the test
+// (#28) are UserSession routes, since a subscription belongs to a web session (M2 02 §6.4; native push is later);
+// unsubscribe and the preferences are User routes, which a device's bearer may call too. This file owns
 // the storage side: a browser's subscription is a row bound to the web session that posted it, so it goes with
 // that session (logout, revocation, expiry), and the preferences are a row per user. Sending is 04's: its push
 // service reaches the handlers as Deps.Push (endpoint validation, the test notification) and reads the same rows
@@ -73,13 +76,31 @@ func pushKey(s string, n int) (canonical string, raw []byte, ok bool) {
 	return base64.RawURLEncoding.EncodeToString(raw), raw, true
 }
 
-// callerLive is the chain's authentication again, inside the transaction of a change: the caller's web session must
-// still exist, else *api.Error{unauthenticated}. The chain let the request in on a principal that may be up to 30 s
-// old (auth's session cache), and a logout, a revocation or the account's deletion may have removed the session
-// since. Every way an account stops being active deletes its sessions (03 §7.7), so the session stands for the
-// account too. Reading it in the Write also keeps the foreign keys of the push tables (session_id, user_id) from
-// failing as a 500. M2 adds the device of a bearer principal here.
+// callerLive is the chain's authentication again, inside the transaction of a change (or the read of a list): the
+// caller's web session must still exist, else *api.Error{unauthenticated}. The chain let the request in on a
+// principal that may be up to 30 s old (auth's session cache), and a logout, a revocation or the account's deletion
+// may have removed the session since. Every way an account stops being active deletes its sessions (03 §7.7), so the
+// session stands for the account too. Reading it in the Write also keeps the foreign keys of the push tables
+// (session_id, user_id) from failing as a 500.
+//
+// For a device's principal (M2 02 §6.4) the device stands in for the session: it must still exist, be the
+// principal's user's, and that user must be active (the bearer cache may be 30 s old too).
 func callerLive(q *store.Q, p auth.Principal) error {
+	if p.Method == auth.MethodBearer {
+		if p.DeviceID == "" {
+			return api.NewError(api.CodeUnauthenticated)
+		}
+		dev, user, err := q.DeviceByID(p.DeviceID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return api.NewError(api.CodeUnauthenticated)
+		case err != nil:
+			return err
+		case dev.UserID != p.UserID || user.Status != store.StatusActive:
+			return api.NewError(api.CodeUnauthenticated)
+		}
+		return nil
+	}
 	sessions, err := q.ListSessions(p.UserID)
 	if err != nil {
 		return err

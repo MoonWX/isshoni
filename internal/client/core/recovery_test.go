@@ -411,9 +411,12 @@ func TestServerRebuild(t *testing.T) {
 		fs.send(protocol.MessageTypePCRestart, protocol.PCRestart{PC: protocol.PCKindPub, Gen: gen,
 			Mode: protocol.RestartModeRebuild, Reason: protocol.RestartReasonFailed})
 	}
+	// Timed from the first request, which the core can't act on earlier: its spacing runs from the first rebuild's
+	// start, and the first rebuilt PC's offer arrives an ICE gathering later (on windows-go up to ~100 ms more than
+	// the second's), so timing from that offer under-reads the spacing.
+	asked := time.Now()
 	rebuild(1)
 	waitOffers(t, fs, "1/1 2/1")
-	rebuilt := time.Now()
 	offers := received[protocol.PCOffer](fs, protocol.MessageTypePCOffer)
 	if !slices.Equal(offers[1].Tracks, offers[0].Tracks) || offers[1].SDP.Reveal() == offers[0].SDP.Reveal() {
 		t.Error("the rebuilt PC's offer has other tracks than the first, or the same SDP: want a new PC for the same share")
@@ -421,8 +424,11 @@ func TestServerRebuild(t *testing.T) {
 	rebuild(1) // the old PC's: ignored
 	rebuild(2)
 	waitOffers(t, fs, "1/1 2/1 3/1")
-	if took := time.Since(rebuilt); took < spacing-50*time.Millisecond {
-		t.Errorf("the second rebuild came %v after the first, want the %v spacing", took, spacing)
+	// 20 ms: Windows' clock ticks up to 15.6 ms. Without the spacing the third offer comes about two gatherings
+	// after the first request (~200 ms).
+	if took := time.Since(asked); took < spacing-20*time.Millisecond {
+		t.Errorf("the second rebuild's offer came %v after the first rebuild was asked for, want at least the %v "+
+			"spacing", took, spacing)
 	}
 	if got := fs.types(); slices.Contains(got, protocol.MessageTypePCClose) {
 		t.Errorf("the server got %v: a rebuild sends no pc.close", got)

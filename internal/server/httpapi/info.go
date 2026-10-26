@@ -36,7 +36,8 @@ func (a *API) getInfo(w http.ResponseWriter, r *http.Request) {
 //   - minClientVersion and registration are the settings of the same names;
 //   - setupRequired is true while no admin row exists, whatever its status: the rule of auth's SetupAvailable
 //     (03 §7.8), read from the store;
-//   - features has passwordReset (M1), preceded by push exactly when the push object is present;
+//   - features has passwordReset (M1) and deviceFlow (every M2 server: the routes of M2 02 §7.1), preceded by push
+//     exactly when the push object is present;
 //   - push is present when push is on (Deps.Push) and has a VAPID key.
 func (a *API) info(ctx context.Context) (api.Info, error) {
 	var hasAdmin bool
@@ -68,7 +69,7 @@ func (a *API) info(ctx context.Context) (api.Info, error) {
 			info.Features = append(info.Features, api.InfoFeaturePush)
 		}
 	}
-	info.Features = append(info.Features, api.InfoFeaturePasswordReset)
+	info.Features = append(info.Features, api.InfoFeaturePasswordReset, api.InfoFeatureDeviceFlow)
 	return info, nil
 }
 

@@ -563,13 +563,15 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
     (`VCRUNTIME*`, `MSVCP*`, `MSVCR*` such as `msvcrt.dll`, `api-ms-win-crt-*`, `ucrtbase*`, `concrt*`, `vccorlib*`,
     their debug builds) and `opus*.dll`: the engine must load, probe and capture audio when FFmpeg is missing or
     blocked (04 §9.2, §13.3).
-  - **Load config**: printed, not checked (README §3 item 34). WA11's `dll_search_test` verdict on windows-2025 (the
-    group 2 PR's `windows-native` run, PR #38, run 39690115167) is "not honored": with `/DEPENDENTLOADFLAG:0x800` the
-    default delay-load helper still loaded the planted DLL from the current directory. So the DLL is linked without
-    the flag, no job passes `-load-config`, dll-check prints `load config: DependentLoadFlags 0x0000 (not checked …)`,
-    and 04's delay-load hook is the guard (04 §13.1). The test keeps writing the verdict to
-    `dependentloadflag-verdict.txt` and the job summary. (`-load-config` and its check stay in dll-check, unused; its
-    printed note still names WA11's verdict as pending, a wording a later dll-check change can drop.) The same run's
+  - **Load config**: printed, never checked in any job: no job passes `-load-config` (README §3 items 34 and 38); the
+    flag and its check stay in dll-check, unused (with it, anything but `DependentLoadFlags` 0x0800 fails). WA11's
+    `dll_search_test` verdict on windows-2025 (the group 2 PR's `windows-native` run, PR #38, run 39690115167) is "not
+    honored": with `/DEPENDENTLOADFLAG:0x800` the default delay-load helper still loaded the planted DLL from the
+    current directory. So the DLL is linked without the flag, dll-check prints
+    `load config: DependentLoadFlags 0x0000` with a note that it is not checked, and 04's delay-load hook is the guard
+    (04 §13.1). WF2 replaces the note's wording, which still calls WA11's verdict pending, with one that says the
+    verdict leaves the line unchecked. The test keeps writing the verdict to `dependentloadflag-verdict.txt` and the
+    job summary. The same run's
     dll-check of the first real DLL (39 exports; static imports `KERNEL32.dll` and `ole32.dll` only; no delay imports;
     the version resource as below with `0.0.0-ci.77`) and its ctest results are recorded in 04 §18.2.
   - **Version resource**: `FILEVERSION` and `PRODUCTVERSION` = `<winver>`; the strings `ProductVersion` = `<v>`,
@@ -1226,7 +1228,8 @@ missing or empty (§11.1).
 | `beta` (opt-in in 03's settings) | `GET https://api.github.com/repos/MoonWX/isshoni/releases?per_page=10` (`Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, ≤ 1 MiB), then the newest non-draft release with a SemVer tag that has both assets; its `browser_download_url`s must be the exact `…/releases/download/v<version>/…` URLs. A `beta` app accepts manifests of both channels; a `stable` app only `stable` |
 
 Non-SemVer tags (`deps-ffmpeg-…`) are skipped. HTTP 403/429 from the API is `rate_limited` and waits for the next
-scheduled check.
+scheduled check. As built (WA40): "newest" in the beta listing means the highest SemVer, not the first listed, and a
+429 on the stable download URLs is `rate_limited` too.
 
 ### 8.5 Check algorithm and states
 
@@ -1262,20 +1265,23 @@ scheduled check.
   not newer is just `up_to_date`.
 - The local clock decides expiry. A far-off clock can make every manifest look expired; the error text says to check
   the clock.
+- As built (WA40): a check that fails while an update is `ready` leaves it `ready` and only logs the error;
+  `not_installed` is logged at INFO, not WARN, because a copy run from a folder hits it at every check.
 
 ### 8.6 Schedule, limits, timeouts
 
 | Item | Value |
 |---|---|
-| First check | 60–300 s after start (uniform random), not before 03 says the first-run wizard is done. Only this **scheduled** first check waits for `WizardDone`: `CheckNow`, a user action (02 §13.3's "Update now" can appear during wizard step 1 when a server's `minClientVersion` is above the app), never waits for it, but still honors `Enabled()` |
+| First check | 60–300 s after start (uniform random), not before 03 says the first-run wizard is done (re-asked every 5 s). Only this **scheduled** first check waits for `WizardDone`: `CheckNow`, a user action (02 §13.3's "Update now" can appear during wizard step 1 when a server's `minClientVersion` is above the app), never waits for it, but still honors `Enabled()` |
 | Then | every 24 h ± 1 h while running |
 | After an error | next check in 6 h ± 30 min |
-| `CheckNow` | at most once per 30 s (a second call returns the running check's result) |
+| `CheckNow` | at most once per 30 s: a call while any check runs returns that check's result, and a call within 30 s of the last `CheckNow` that checked returns the current status (with that check's error while the status is the one it left). A `CheckNow` that ended with its context, or found the updater off or disabled, made no complete check and doesn't count, so the next one checks at once. A check runs on the context of the caller that started it; when that context ends the check, a joined caller whose own context is live runs (or joins) a check of its own instead of taking the error (WA40) |
 | Manifest / signature | 20 s each; ≤ 64 KiB / ≤ 8 KiB; `Content-Encoding` other than identity/gzip refused |
 | Installer download | stall timeout 60 s without a byte, 60 min total; must equal `size` exactly; ≤ 256 MiB |
 | Disk | free space ≥ `size` + 64 MiB in the updates folder before downloading |
 | TLS | Go's defaults (TLS 1.2+), system roots |
-| One download at a time | yes; a newer manifest during a download cancels it |
+| One download at a time | yes. As built (WA40) the download is part of the check, and checks never overlap (`CheckNow` joins a running one, above), so there is never more than one download and a newer manifest can only be seen by a later check: that check discards the pending installer before downloading the newer one, and a check that finds nothing newer also drops a stale pending. (`CheckNow` must come back with `ready` for 03's `--update-now`, and §8.9 has no `Close` that could own a background download.) |
+| HTTP client | when the updater uses its own client (`Options.HTTP` nil), it closes idle connections after each check, so nothing stays open between daily checks |
 
 ### 8.7 Download and apply on Windows
 
@@ -1286,10 +1292,15 @@ scheduled check.
   ```json
   {"v": 1,
    "pending": {"version": "0.2.1", "file": "isshoni-desktop_0.2.1_windows_amd64_setup.exe", "size": 15204352,
-               "sha256": "…", "expiresAt": "2027-06-01T10:00:00.000Z", "attempts": 0},
+               "sha256": "…", "expiresAt": "2027-06-01T10:00:00.000Z", "attempts": 0,
+               "required": false, "notesUrl": "https://github.com/MoonWX/isshoni/releases/tag/v0.2.1"},
    "revokedKeys": [],
    "lastCheckAt": "2026-12-05T09:12:00.000Z"}
   ```
+
+  `pending.required` and `notesUrl` (WA40) carry the manifest's verdict and release page to a later start, which can
+  show a ready or failed update with its required flag and release page before any check runs. A file with another
+  `v` keeps only its `revokedKeys`, so a revocation is never lost.
 
 - **When it applies**: (a) when the user clicks "Restart and update" (03): 03 takes the verified installer from
   `Ready()` (non-nil only in `StateReady`) and calls `Apply`; and (b) **at the next start** of the app, before its
@@ -1309,13 +1320,19 @@ scheduled check.
 - **Loop guard**: `attempts` is incremented before each launch; after 2 failed attempts for the same version (the app
   starts again still older), automatic applying stops for that version: the state is `error` with `install_failed`
   and `Available=<v>` until a newer version appears (§8.5), and 03 shows "The update didn't install" with a link to
-  `/download#windows-updates`.
+  `/download#windows-updates`. `Apply` publishes that state at once (`Ready()` nil, a WARN naming the version and the
+  attempts) when the last allowed attempt fails to start and when it is asked to apply a version that has had 2
+  attempts, not only at the next check or start; a context that ended while `Apply` waited for the installer's mutex is
+  not a failed launch (WA40).
 - **Only real installs update**: the running exe's folder must equal `HKCU\Software\isshoni\InstallDir`; otherwise (a
   build run from a folder) a newer verified manifest gives `error` / `not_installed` with `Available` and `NotesURL`
   and nothing is downloaded (§8.5), and `Apply` returns `ErrNotInstalled`.
 - **Launch** (`Apply`): verify the file again (size and SHA-256 against `state.json`; a mismatch deletes it and
   returns `hash_mismatch`), return `ErrNotInstalled` outside `InstallDir`, then start it with `/S /UPDATE /RELAUNCH`
-  (`exec.Cmd` with `SysProcAttr{HideWindow: true, CreationFlags: CREATE_NEW_PROCESS_GROUP}`), wait until
+  (`exec.Cmd` with `SysProcAttr{HideWindow: true, CreationFlags: CREATE_NEW_PROCESS_GROUP}`; an open point from
+  WA40's review, not yet verified on Windows: `HideWindow` applies `SW_HIDE` to the started process's first top-level
+  window, which in `/S /UPDATE` mode is §6.4's "Updating isshoni to {v}…" banner, while an NSIS GUI exe opens no
+  console for the flag to hide; R4's owner's-PC check starts `setup.exe` from a shell, not through `Apply`), wait until
   `Local\io.isshoni.desktop.installing` exists (`OpenMutexW` every 50 ms, up to 10 s; on timeout log WARN and return
   nil anyway), and return; 03 then quits within 5 s (closing its connections normally). The wait hands the lock over
   without a gap: the app's running mutex is still held while the installer's installing mutex appears, so no start
@@ -1331,7 +1348,7 @@ scheduled check.
 ### 8.8 Turning it off
 
 - 03's setting `updates.check` (default on, initial value from the installer's `UpdateChecks`, §2.3). Off means no
-  request at all.
+  request at all, and a pending update is not applied at start either (`PendingAtStartup` returns nil).
 - Machine policy `HKLM\SOFTWARE\Policies\isshoni\DisableUpdateChecks` = 1 → `off` with `PolicyOff: true`; 03 shows
   "Turned off by your administrator" and greys out the setting.
 - `Enabled()` is asked before every request, so turning the setting off mid-check stops the next request.
@@ -1430,8 +1447,9 @@ The channel `ci` (§8.2) is the unexported `channelCI`: no app setting names it.
 
 - Files: `update.go` (states, schedule), `manifest.go`, `sshsig.go`, `fetch.go` (HTTP client, limits, redirects),
   `state.go` (`state.json`), `signers.go` (the embedded keys), `apply_windows.go`, `policy_windows.go`,
-  `apply_other.go`; **later (M3)** `apply_darwin.go` (`.app` swap after `codesign -R` against the designated
-  requirement, plan).
+  `apply_other.go`, `hooks_updatetest.go` (§8.11); besides §16's tests, WA40 added `harness_test.go`, `fetch_test.go`,
+  `state_test.go`, `hooks_updatetest_test.go` and `testdata/hookcheck`; **later (M3)** `apply_darwin.go` (`.app` swap
+  after `codesign -R` against the designated requirement, plan).
 - Imports: stdlib, `golang.org/x/crypto/ssh`, `golang.org/x/sys/windows{,/registry}`, `internal/version` (also for
   every SemVer parse and comparison: `version.Parse`, `version.Compare`, 02 §13.2, so the updater and 02's
   `update_app` screen never disagree on which version is newer; no `golang.org/x/mod/semver`), `internal/logx`. Never
@@ -1452,12 +1470,15 @@ them to `desktop.update.errors.<code>` in `web/src/i18n/lazy/desktop.en.json`. 0
 Only in builds with `-tags updatetest` (CI test builds, never a release). WA40's tagged hooks file sets the
 unexported package variable `updateTestBuild` in `init()`; `manifest.go` reads it through an unexported
 `rules{releases, testBuild}`, so a release build has no code that turns either on:
-- `ISSHONI_UPDATE_TEST_BASE` replaces both the stable URL base and the beta API (an `http://127.0.0.1:<port>` origin
-  is then allowed), and with it the releases URL that `notesUrl` and every artifact `url` must start with (§8.2;
-  `desktoppkg manifest -releases` writes manifests for such a base);
+- `ISSHONI_UPDATE_TEST_BASE` replaces both the stable URL base (`<base>/latest/download/…`) and the beta API (the
+  listing at `<base>/api/releases?per_page=10`), and with it the releases URL that `notesUrl` and every artifact `url`
+  must start with (§8.2; `desktoppkg manifest -releases` writes manifests for such a base). The base must be an
+  `https` URL or `http://127.0.0.1:<port>` (with an optional path and no trailing slash, query, fragment or user: the
+  rule `desktoppkg`'s `-releases` uses), and redirects are followed only within it (same scheme, host and port, a path
+  under it);
 - `ISSHONI_UPDATE_TEST_SIGNERS` names an allowed-signers file used instead of the embedded keys;
-- `Eligible` also accepts a `-ci.N` prerelease, and a manifest with channel `beta` (or `ci`) is accepted whatever
-  the app's channel setting, so the CI builds `0.0.1-ci.N` of §16 check and update;
+- `Eligible` also accepts a `-ci.N` prerelease, and a manifest of any channel (`stable`, `beta`, `ci`) is accepted
+  whatever the app's channel setting, so the CI builds `0.0.1-ci.N` of §16 check and update;
 - 03's `--update-now` flag exists and skips the `WizardDone` wait.
 
 03's DK12 tests (an update offered in a test channel) build with `-tags updatetest` (`internal/desktop/e2ehost`, and
@@ -1590,7 +1611,9 @@ New `changes` filters:
   `deploy/notices/native-windows.json`, `tools/desktoppkg/**`, `tools/wails3/**`, `tools/notices/**`, `go.mod`,
   `go.sum`, `web/**` (the SPA is bundled), `.github/workflows/ci.yml`.
 - `native`: `native/**`, `.github/workflows/ci.yml`, `Taskfile.yml` (`native-host` runs `task native:test` and
-  `task lint:native`, so the Taskfile is one of its inputs, as M1 counts each job's own inputs).
+  `task lint:native`, so the Taskfile is one of its inputs, as M1 counts each job's own inputs), and
+  `internal/media/testdata/audio/**` (group 4's integration: `mix_report_test` checks the C++ report writer against
+  those goldens byte for byte, so a goldens-only PR runs it too).
 - `update`: `internal/update/**`, `deploy/windows/nsis/**`, `tools/desktoppkg/**` (runs the updater e2e).
 - `ps`: `deploy/install-desktop.ps1`, `deploy/test/install-desktop.Tests.ps1`, `deploy/test/windows/*.ps1`,
   `native/windows/tools/*.ps1`, `deploy/windows/msvc-env.ps1`, `deploy/windows/tools.json`.
@@ -1610,7 +1633,7 @@ New `changes` filters:
 | Job | Runs when | Runner | Steps and assertions | Timeout | Gates |
 |---|---|---|---|---|---|
 | `lint-go` (changed) | go | ubuntu-24.04 | M1's steps plus `GOOS=windows golangci-lint run ./...` (Windows-only files: the x/sys/windows loader in `internal/media/native` (04 §12), `apply_windows.go`, 03's `winos`), `go vet` with `GOOS=darwin` and `GOOS=windows`, and `task lint:go:cross`: `GOOS=windows CGO_ENABLED=0 go build ./internal/... ./cmd/...` (the Windows app needs no cgo, so the cross-compile stays possible) and the gomobile check, package builds of `./internal/client/...` and `./internal/media` for `android` and `ios` on arm64 (01 §4); for the `tools/` module also `GOOS=windows go vet ./...` (g2g's GDI capture is Windows-only) | 10 | yes |
-| `test-go` (unchanged) | go | ubuntu-24.04 | `go test -race ./...`: the client core, `internal/update` and the app's non-Wails packages with the fake engine; the app main is the stub | 20 | yes |
+| `test-go` (changed) | go | ubuntu-24.04 | `go test -race ./...`: the client core, `internal/update` and the app's non-Wails packages with the fake engine; the app main is the stub. Then `go test -race -count=1 -tags updatetest ./internal/update/` (group 4's integration): the whole package with §8.11's hooks, so `TestTestHooks` and the hooks' `init()` path run in CI | 20 | yes |
 | `protocol` (changed) | protocol | ubuntu-24.04 | M1's `task gen:check`, now also covering `web/src/platform/desktop/codes.gen.ts` (03's `tygo.yaml` entry for `internal/desktop/bridge/codes`); then builds `.bin/wails3` (`task release:wails3`) and runs `GOOS=windows .bin/wails3 generate bindings` into `web/src/platform/desktop/bindings/`, failing on any diff (with GOOS unset the generator sees only the D18 stub on linux, so no services) | 10 | yes |
 | `build` (changed) | as M1 | ubuntu-24.04 | M1's steps plus `go build -o bin/isshoni-desktop-e2ehost ./internal/desktop/e2ehost`, uploaded with M1's binaries for `e2e` (like `isshoni-loadtest`) | 10 | yes |
 | `e2e` (changed) | run-e2e | ubuntu-24.04 | M1's steps with `DESKTOP_E2E_BIN` = the downloaded `bin/isshoni-desktop-e2ehost` (`chmod +x`), so 03's desktop specs (03 §22.4 A) run in the same `npm run e2e` | as M1 | yes |
@@ -2088,7 +2111,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Unit | `manifest_test.go` | schema, product, channel acceptance per app channel (`ci` only with the `updatetest` tag), SemVer compare through `internal/version` (rc < final; a `version` or `minVersion` that doesn't parse → `bad_manifest`), `Eligible` (empty and `rc.N` yes, `ci.N` only with `updatetest`, dev no), expiry at the boundary, `minVersion` → required, artifact selection per OS/arch, the exact URL rule; `revokedKeys`: an active-key manifest revoking the backup → ignored, nothing persisted, the backup still verifies the next manifest; an active-key manifest revoking another active key → ignored; a backup-key manifest revoking the active key → persisted in `state.json` (also when the manifest is not newer) and a later manifest signed by that key → `bad_signature`; a backup-key manifest listing the backup itself → that entry dropped, the rest honoured; the internal `applyRevocations` helper called directly with a list that covers every trusted key (unreachable through a manifest, since the backup entry is always dropped; the check is defence in depth) → refused as a whole, nothing persisted; unknown fields ignored, 64 KiB limit; WA25's extra rules: `ci` for any prerelease but `rc.N` (`0.0.0-dryrun.N` included), at most 64 `revokedKeys`, `notesUrl` exactly the release page, the `nsis` artifact name, one entry per OS/arch, an unknown `kind` checked but never selected | same |
 | Unit | `update_test.go` (httptest TLS server, `testing/synctest`) | first check in 60–300 s and not before the wizard; `CheckNow` before `WizardDone` makes the request (and makes none when `Enabled` is false); daily ± 1 h; 6 h after an error; `CheckNow` debounce; `Ready()` non-nil only in `StateReady`; a newer verified manifest in a copy outside `InstallDir` → `error`/`not_installed` with `Available` and `NotesURL` and zero download requests; after 2 failed attempts → `error`/`install_failed` with `Available` until a newer manifest appears, which downloads; `Apply` re-verifies (a changed file → `hash_mismatch`, deleted) and returns `ErrNotInstalled` outside `InstallDir`; `PendingAtStartup(true)` (an `--autostart` start) returns nil while `PendingAtStartup(false)` returns the same pending update; `Enabled` false → the server counts zero requests; redirects to another host or to http refused; stall and total timeouts; size and hash mismatch delete the partial file; disk check; `state.json` atomic and versioned; `PendingAtStartup` rules (newer, not expired, verifies, attempts < 2); `ErrNotInstalled`; beta listing parse, 403/429 → `rate_limited`, non-SemVer tags skipped; goleak | same |
 | Unit | `apply_windows_test.go`, `policy_windows_test.go` | the installer is started with exactly `/S /UPDATE /RELAUNCH` (a fake installer, a Go test binary, records its arguments); `Apply` returns only once the fake installer has created `Local\io.isshoni.desktop.installing`, and returns nil with one WARN after 10 s when it never does (an injected clock and mutex probe); the HKLM policy value is read (a test key under HKCU through an injected root) | CI windows |
-| Unit | `tools/desktoppkg` | the winver table; stage list and mtimes; NSIS defines; manifest golden; `check` rules (unknown binary, literal strings in NSIS, size budget: warn above 40 MB, fail above 100 MB); `ffmpeg-inputs` hash; `dll-check` against synthetic PE images that a test builder writes (`pebuild_test.go`; dll-check reads PE files, not dumpbin text, §5.1): an extra or missing export, an ordinal-only or forwarded export, another export name, a `VCRUNTIME140.dll`, UCRT, `opus.dll`, unlisted or `avcodec-*`/`avutil-*` import fail; `mfplat.dll` and `avrt.dll` pass only as delay imports; a 32-bit image, an executable, no Control Flow Guard, a wrong `ProductVersion`, `FileVersion`, `OriginalFilename` or binary `FILEVERSION` and a missing VERSIONINFO fail; the load-config cases; an FFmpeg DLL importing `mfplat.dll` fails; DLL names unequal to `lock.json`'s majors fail; `stage -release` refuses a `windows_amd64-test` exe and a DLL whose `--self-check` reports `testHooks: true` (fixture) | CI ubuntu; Mac |
+| Unit | `tools/desktoppkg` | the winver table; stage list and mtimes; NSIS defines; manifest golden; `check` rules (unknown binary, literal strings in NSIS, size budget: warn above 40 MB, fail above 100 MB); `ffmpeg-inputs` hash; `dll-check` against synthetic PE images that a test builder writes (`pebuild_test.go`; dll-check reads PE files, not dumpbin text, §5.1): an extra or missing export, an ordinal-only or forwarded export, another export name, a `VCRUNTIME140.dll`, UCRT, `opus.dll`, unlisted or `avcodec-*`/`avutil-*` import fail; `mfplat.dll` and `avrt.dll` pass only as delay imports; a 32-bit image, an executable, no Control Flow Guard, a wrong `ProductVersion`, `FileVersion`, `OriginalFilename` or binary `FILEVERSION` and a missing VERSIONINFO fail; the load-config cases (with `-load-config`, 0x800 passes and a zero flag or no load config fails; without it the line is printed, never a failure, §5.1); an FFmpeg DLL importing `mfplat.dll` fails; DLL names unequal to `lock.json`'s majors fail; `stage -release` refuses a `windows_amd64-test` exe and a DLL whose `--self-check` reports `testHooks: true` (fixture) | CI ubuntu; Mac |
 | Unit | `tools/notices` desktop golden | the native section; LGPL accepted only dynamic and with the bundle; a GPL native entry fails; an unlisted vcpkg port fails; a `LicenseRef` without an exception fails | CI ubuntu |
 | Unit | `internal/server/httpapi` `desktopscripts_test.go` | `RenderInstallPS1`: `'` doubled, a non-ASCII origin or an `http://` non-loopback origin gives an empty server, a dev/CI/e2e version gives an empty version, rc kept, missing or doubled markers error; the route: 200, content type with charset, `Cache-Control`, `ETag`, `HEAD` without body; `/install-desktop.sh` is 404 text, never the SPA; the template itself (`deploy.InstallDesktopPS1`) renders | CI ubuntu; Mac |
 | Unit | `web/src/download/links.test.ts`, `DownloadPage.test.tsx` | release vs non-release links, the exact installer URL, the ps1 command, `openAppUrl` exactly `isshoni://watch.example.com/` for `https://watch.example.com` (via `appLinkFor`) and `""` for an `http://localhost` origin, the "Open isshoni" button hidden then, the requirement lines, the three warning lines (browser download, SmartScreen, Smart App Control) with their project-site anchors, OS ordering | CI ubuntu; Mac |

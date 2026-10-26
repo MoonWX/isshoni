@@ -1,5 +1,5 @@
 // The engine's test hooks (docs/m2/04-windows-engine.md §2 "Test builds", §18.2): IM_ENC_FAKE (fake_encoder.h), fault
-// injection, the fake picker and the CPU test pattern's modes. They exist only in IM_TEST_HOOKS builds (the CMake
+// injection, the fake picker and the test pattern's modes. They exist only in IM_TEST_HOOKS builds (the CMake
 // presets win-x64-ci and win-x64-asan), never in a shipped DLL: in any other build this header declares nothing and
 // the folder's sources compile to nothing.
 //
@@ -21,7 +21,8 @@
 namespace im::testhooks {
 
 struct Options {
-  // The CPU test pattern of "test:pattern" and of fake picks (session/sources.h).
+  // The test pattern of "test:pattern" and of fake picks (session/sources.h): drawn on the GPU, or only its frame
+  // times for IM_ENC_FAKE sessions (session/frames.h, session/frame_times.h).
   session::Pattern pattern = session::Pattern::kMoving;
   uint32_t pattern_width = 1920;
   uint32_t pattern_height = 1080;

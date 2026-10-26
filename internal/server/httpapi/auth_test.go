@@ -604,13 +604,20 @@ func TestRealServiceChain(t *testing.T) {
 	rec := f.call(http.MethodPost, "/api/v1/auth/login", login, header("Sec-Fetch-Site", ""), header("Origin", ""))
 	decodeBody[api.UserResponse](t, rec, http.StatusOK)
 
-	// An Authorization header in M1 → 401, on every route and before anything else.
+	// An Authorization header (M2 02 §6.4): a User route takes the bearer path, where a token nobody issued is 401
+	// invalid_token even beside a valid cookie; a Public route ignores the header, and its handler reads the cookie.
 	bearer := header("Authorization", "Bearer isa_"+strings.Repeat("A", 43))
-	wantError(t, f.call(http.MethodGet, "/api/v1/me", "", with(cookie), bearer), http.StatusUnauthorized, api.CodeUnauthenticated)
-	wantError(t, f.call(http.MethodGet, "/api/v1/info", "", bearer), http.StatusUnauthorized, api.CodeUnauthenticated)
-	wantError(t, f.call(http.MethodPost, "/api/v1/auth/login", login, bearer), http.StatusUnauthorized, api.CodeUnauthenticated)
-	wantError(t, f.call(http.MethodPost, "/api/v1/auth/logout", "{}", with(cookie), bearer), http.StatusUnauthorized,
-		api.CodeUnauthenticated)
+	rec = f.call(http.MethodGet, "/api/v1/me", "", with(cookie), bearer)
+	wantError(t, rec, http.StatusUnauthorized, api.CodeInvalidToken)
+	if got := rec.Header().Get("WWW-Authenticate"); got != `Bearer error="invalid_token"` {
+		t.Errorf("401 invalid_token: WWW-Authenticate %q", got)
+	}
+	decodeBody[api.Info](t, f.call(http.MethodGet, "/api/v1/info", "", bearer), http.StatusOK)
+	rec = f.call(http.MethodPost, "/api/v1/auth/login", login, bearer)
+	decodeBody[api.UserResponse](t, rec, http.StatusOK)
+	second := f.sessionCookie(rec, thirtyDays)
+	wantNoContent(t, f.call(http.MethodPost, "/api/v1/auth/logout", "{}", with(second), bearer))
+	f.wantUnauthenticated(second)
 	decodeBody[api.Me](t, f.call(http.MethodGet, "/api/v1/me", "", with(cookie)), http.StatusOK) // not logged out
 
 	// Unknown paths and wrong methods of the new routes answer in JSON.

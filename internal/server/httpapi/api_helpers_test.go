@@ -25,11 +25,19 @@ var (
 		Method: auth.MethodSession, SessionID: "s1s1s1s1s1s1", ClientKind: "web"}
 	adminPrincipal = auth.Principal{UserID: "a1a1a1a1a1a1", Username: "Alex", Role: store.RoleAdmin,
 		Method: auth.MethodSession, SessionID: "s2s2s2s2s2s2", ClientKind: "web"}
+	// The devices of the same two users, for the bearer values "device-user" and "device-admin".
+	userDevicePrincipal = auth.Principal{UserID: "u1u1u1u1u1u1", Username: "Sam", Role: store.RoleUser,
+		Method: auth.MethodBearer, DeviceID: "d1d1d1d1d1d1", ClientKind: "desktop", DeviceName: "Sam-PC"}
+	adminDevicePrincipal = auth.Principal{UserID: "a1a1a1a1a1a1", Username: "Alex", Role: store.RoleAdmin,
+		Method: auth.MethodBearer, DeviceID: "d2d2d2d2d2d2", ClientKind: "desktop", DeviceName: "Alex-PC"}
 )
 
 // fakeAuth stands in for *auth.Service in the /api/v1 chain. CSRF is auth's real CSRFGuard trusting testOrigin (what
-// Service.CSRF wraps); Authenticate reads a cookie named "session": "user" and "admin" are principals, "broken" is a
-// non-API error, anything else (or no cookie) is 401 unauthenticated. Every call is recorded.
+// Service.CSRF wraps). Authenticate takes the bearer path for a request with an Authorization header, as the real
+// one does: exactly "Bearer device-user" or "Bearer device-admin" is a device's principal, anything else 401
+// invalid_token (recorded as "authenticate bearer"). Without the header it reads a cookie named "session": "user" and
+// "admin" are principals, "broken" is a non-API error, anything else (or no cookie) is 401 unauthenticated (recorded
+// as "authenticate"). Every call is recorded.
 type fakeAuth struct {
 	guard *auth.CSRFGuard
 
@@ -70,6 +78,18 @@ func (f *fakeAuth) CSRF(next http.Handler) http.Handler {
 }
 
 func (f *fakeAuth) Authenticate(r *http.Request) (auth.Principal, error) {
+	if _, ok := r.Header["Authorization"]; ok {
+		f.record("authenticate bearer")
+		if vals := r.Header.Values("Authorization"); len(vals) == 1 {
+			switch vals[0] {
+			case "Bearer device-user":
+				return userDevicePrincipal, nil
+			case "Bearer device-admin":
+				return adminDevicePrincipal, nil
+			}
+		}
+		return auth.Principal{}, api.NewError(api.CodeInvalidToken)
+	}
 	f.record("authenticate")
 	c, err := r.Cookie("session")
 	if err != nil {

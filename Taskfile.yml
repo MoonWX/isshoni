@@ -317,10 +317,71 @@ tasks:
   test:ps:
     desc: >-
       Run the Pester tests of install-desktop.ps1 under pwsh (deploy/test/install-desktop.Tests.ps1; Windows
-      PowerShell 5.1 runs them in CI's windows-desktop job)
+      PowerShell 5.1 runs them in CI's windows-desktop job), with Pester at deploy/windows/tools.json's version, fetched
+      into .deps/psmodules/ and checked against its SHA-256; PWSH=<binary> picks another PowerShell (powershell for
+      5.1), and outside CI a missing one is skipped with a note
+    vars:
+      PWSH: '{{.PWSH | default "pwsh"}}'
     cmds:
-      - cmd: "echo 'test:ps: note: not implemented yet; README WA49 adds it with deploy/install-desktop.ps1 (docs/m2/06 §16). Nothing was run.'"
+      - cmd: "echo 'test:ps: skipped, deploy/test/install-desktop.Tests.ps1 does not exist yet'"
         silent: true
+        if: '[ ! -f deploy/test/install-desktop.Tests.ps1 ]'
+      # The module comes straight from the PowerShell Gallery's package URL, not through PowerShellGet: the same
+      # code then runs under pwsh and Windows PowerShell 5.1, needs no repository setup and checks the bytes. A new
+      # Pester version in tools.json needs its SHA-256 here (the hash of the .nupkg at the URL in the error).
+      - cmd: |
+          pwsh='{{.PWSH}}'
+          if ! command -v "$pwsh" >/dev/null 2>&1; then
+            if [ -n "${CI:-}" ]; then
+              echo "test:ps: $pwsh is not installed" >&2
+              exit 1
+            fi
+            echo "test:ps: skipped, $pwsh is not installed here (CI runs the tests; PWSH=<binary> picks another PowerShell)"
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cat >"$tmp/test-ps.ps1" <<'EOF'
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $name = 'Pester'
+          $known = @{ '5.9.1' = '8dd4060fc3bc895f05bd655e4ab82abe346de54a4e6415dfb727cc8378672b69' }
+          $version = [string](Get-Content -Raw -LiteralPath 'deploy/windows/tools.json' | ConvertFrom-Json).pester
+          $dir = [IO.Path]::Combine((Get-Location).Path, '.deps', 'psmodules', $name, $version)
+          $manifest = Join-Path -Path $dir -ChildPath "$name.psd1"
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+              $url = "https://www.powershellgallery.com/api/v2/package/$name/$version"
+              if (-not $known.ContainsKey($version)) {
+                  throw "deploy/windows/tools.json pins $name $version, whose SHA-256 test:ps does not know: add the SHA-256 of $url to test:ps in Taskfile.yml"
+              }
+              $null = New-Item -ItemType Directory -Force -Path (Split-Path -Path $dir -Parent)
+              [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+              $zip = "$dir.download.zip"
+              Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+              $sum = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+              if ($sum -ne $known[$version]) {
+                  Remove-Item -LiteralPath $zip -Force
+                  throw "$url has the SHA-256 $sum, not $($known[$version])"
+              }
+              if (Test-Path -LiteralPath "$dir.part") { Remove-Item -LiteralPath "$dir.part" -Recurse -Force }
+              # Not Expand-Archive: a .nupkg holds [Content_Types].xml, a name its older versions take for a wildcard.
+              # PowerShell 7 resolves the type without it, and its Add-Type may refuse the framework assembly.
+              try { Add-Type -AssemblyName System.IO.Compression.FileSystem } catch { Write-Verbose 'ZipFile: loaded' }
+              [IO.Compression.ZipFile]::ExtractToDirectory($zip, "$dir.part")
+              Remove-Item -LiteralPath $zip -Force
+              Move-Item -LiteralPath "$dir.part" -Destination $dir
+          }
+          Import-Module -Name $manifest -Force
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'deploy/test/install-desktop.Tests.ps1'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Write-Host "test:ps: Pester $version under PowerShell $($PSVersionTable.PSVersion)"
+          Invoke-Pester -Configuration $config
+          EOF
+          "$pwsh" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$tmp/test-ps.ps1"
+        silent: true
+        if: '[ -f deploy/test/install-desktop.Tests.ps1 ]'
 
   # ---------------------------------------------------------------------------------------------------------------
   # Linters
@@ -446,10 +507,10 @@ tasks:
 
   lint:keys:
     desc: >-
-      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers and uses only options
-      that OpenSSH 8.1 parses, that the update signers block in internal/update/signers.go equals
-      deploy/keys/update_signers (docs/m2/06 §8.3), and that README.md's "Release signing keys" section lists the
-      fingerprint of each key in them and no other one
+      Check that the key blocks embedded in deploy/install.sh and deploy/install-desktop.ps1 equal
+      deploy/keys/allowed_signers and use only options that OpenSSH 8.1 parses, that the update signers block in
+      internal/update/signers.go equals deploy/keys/update_signers (docs/m2/06 §8.3), and that README.md's "Release
+      signing keys" section lists the fingerprint of each key in them and no other one
     cmds:
       - go -C tools run ./repocheck -root .. keys
 
@@ -495,11 +556,110 @@ tasks:
 
   lint:ps:
     desc: >-
-      PSScriptAnalyzer (Warning and Error) and the ASCII check over deploy/install-desktop.ps1, deploy/test/windows/*.ps1,
-      deploy/windows/msvc-env.ps1 and native/windows/tools/*.ps1
+      PSScriptAnalyzer (Warning and Error, plus Windows PowerShell 5.1 syntax) and the ASCII check over
+      deploy/install-desktop.ps1, deploy/test/windows/*.ps1, deploy/windows/msvc-env.ps1 and native/windows/tools/*.ps1
+      (the ASCII check also over deploy/test/install-desktop.Tests.ps1, and LF line ends for install-desktop.ps1);
+      PSScriptAnalyzer at deploy/windows/tools.json's version runs under pwsh as test:ps does (PWSH=<binary>; outside CI
+      a missing one is skipped with a note, after the ASCII check)
+    vars:
+      PWSH: '{{.PWSH | default "pwsh"}}'
     cmds:
-      - cmd: "echo 'lint:ps: note: not implemented yet; README WA49 adds it with deploy/install-desktop.ps1 (docs/m2/06 §10.1). Nothing was checked.'"
+      # The ASCII check needs no PowerShell, so it runs first and everywhere. The 5.1 grammar check proper
+      # ([Parser]::ParseFile under powershell.exe) is in CI's windows-desktop job (docs/m2/06 §10.1, §16).
+      - cmd: |
+          files=''
+          for f in deploy/install-desktop.ps1 deploy/test/windows/*.ps1 deploy/windows/msvc-env.ps1 native/windows/tools/*.ps1; do
+            if [ -f "$f" ]; then files="$files $f"; fi
+          done
+          if [ -z "$files" ]; then
+            echo 'lint:ps: skipped, there are no PowerShell scripts to check yet'
+            exit 0
+          fi
+          status=0
+          for f in $files deploy/test/install-desktop.Tests.ps1; do
+            if [ ! -f "$f" ]; then continue; fi
+            # Bytes other than tab, CR, LF and printable ASCII (-a: a NUL byte counts too, not "binary file"). grep
+            # exits 1 when it finds none, which Task's errexit and pipefail would take for a failure.
+            bad=$(LC_ALL=C grep -a -n "$(printf '[^\t\r -~]')" "$f" | cut -d: -f1 | tr '\n' ' ' || true)
+            if [ -n "$bad" ]; then
+              echo "lint:ps: $f has characters that are not ASCII on lines: $bad" >&2
+              status=1
+            fi
+          done
+          # The server embeds install-desktop.ps1 and serves its bytes (docs/m2/06 §7.1, §7.4): LF line ends. A Git
+          # for Windows checkout keeps them only with the file's `text eol=lf` line in .gitattributes.
+          if [ -f deploy/install-desktop.ps1 ] && LC_ALL=C grep -q "$(printf '\r')" deploy/install-desktop.ps1; then
+            echo 'lint:ps: deploy/install-desktop.ps1 has CRLF line ends; it must have LF' >&2
+            status=1
+          fi
+          pwsh='{{.PWSH}}'
+          if ! command -v "$pwsh" >/dev/null 2>&1; then
+            if [ -n "${CI:-}" ]; then
+              echo "lint:ps: $pwsh is not installed" >&2
+              exit 1
+            fi
+            echo "lint:ps: ASCII check done; skipped PSScriptAnalyzer, $pwsh is not installed here (CI runs it; PWSH=<binary> picks another PowerShell)"
+            exit $status
+          fi
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cat >"$tmp/lint-ps.ps1" <<'EOF'
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $name = 'PSScriptAnalyzer'
+          $known = @{ '1.25.0' = '14e634c828eb98efb9f40b2918ba90f139ed5eccdf663a2a747736d996995d60' }
+          $version = [string](Get-Content -Raw -LiteralPath 'deploy/windows/tools.json' | ConvertFrom-Json).psScriptAnalyzer
+          $dir = [IO.Path]::Combine((Get-Location).Path, '.deps', 'psmodules', $name, $version)
+          $manifest = Join-Path -Path $dir -ChildPath "$name.psd1"
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+              $url = "https://www.powershellgallery.com/api/v2/package/$name/$version"
+              if (-not $known.ContainsKey($version)) {
+                  throw "deploy/windows/tools.json pins $name $version, whose SHA-256 lint:ps does not know: add the SHA-256 of $url to lint:ps in Taskfile.yml"
+              }
+              $null = New-Item -ItemType Directory -Force -Path (Split-Path -Path $dir -Parent)
+              [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+              $zip = "$dir.download.zip"
+              Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+              $sum = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+              if ($sum -ne $known[$version]) {
+                  Remove-Item -LiteralPath $zip -Force
+                  throw "$url has the SHA-256 $sum, not $($known[$version])"
+              }
+              if (Test-Path -LiteralPath "$dir.part") { Remove-Item -LiteralPath "$dir.part" -Recurse -Force }
+              # PowerShell 7 resolves the type without it, and its Add-Type may refuse the framework assembly.
+              try { Add-Type -AssemblyName System.IO.Compression.FileSystem } catch { Write-Verbose 'ZipFile: loaded' }
+              [IO.Compression.ZipFile]::ExtractToDirectory($zip, "$dir.part")
+              Remove-Item -LiteralPath $zip -Force
+              Move-Item -LiteralPath "$dir.part" -Destination $dir
+          }
+          Import-Module -Name $manifest -Force
+          # Every default rule, plus the syntax that Windows PowerShell 5.1 parses (the scripts run there).
+          $settings = @{
+              Rules = @{
+                  PSUseCompatibleSyntax = @{
+                      Enable         = $true
+                      TargetVersions = @('5.1')
+                  }
+              }
+          }
+          $found = @()
+          foreach ($file in $args) {
+              $found += @(Invoke-ScriptAnalyzer -Path $file -Settings $settings | Where-Object { $_.Severity -ne 'Information' })
+          }
+          if ($found.Count -gt 0) {
+              foreach ($record in $found) {
+                  Write-Host ('{0}:{1}: {2} {3}: {4}' -f $record.ScriptPath, $record.Line, $record.Severity, $record.RuleName, $record.Message)
+              }
+              Write-Host "lint:ps: PSScriptAnalyzer $version found $($found.Count) problems"
+              exit 1
+          }
+          Write-Host "lint:ps: PSScriptAnalyzer $version (Warning and Error, Windows PowerShell 5.1 syntax) over $($args.Count) scripts: clean"
+          EOF
+          # $files is split into one argument per script on purpose (the paths have no spaces).
+          "$pwsh" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$tmp/lint-ps.ps1" $files || status=1
+          exit $status
         silent: true
+        shopt: [nullglob]
 
   lint:unit:
     desc: Verify the systemd unit with systemd-analyze (Linux only; skipped elsewhere)
@@ -1083,7 +1243,9 @@ tasks:
   # Release
 
   release:prepare:
-    desc: goreleaser's before hook, no npm - check web/dist is for VERSION, write THIRD_PARTY_NOTICES, stamp install.sh
+    desc: >-
+      goreleaser's before hook, no npm - check web/dist is for VERSION, write THIRD_PARTY_NOTICES, stamp install.sh
+      (dist-extra/) and install-desktop.ps1 (dist-desktop/)
     cmds:
       - cmd: "echo 'release:prepare: note: web/package.json does not exist yet, skipping the web/dist check'"
         silent: true
@@ -1116,6 +1278,30 @@ tasks:
           echo 'release:prepare: stamped dist-extra/install.sh with {{.VERSION}}'
         silent: true
         if: '[ -f deploy/install.sh ]'
+      # The release asset install-desktop.ps1 is the script with its $IsshoniVersion line stamped (docs/m2/06 §7.1,
+      # §11.2); the server's copy keeps the placeholder and rewrites the whole prefill block itself (§7.4).
+      - cmd: "echo 'release:prepare: note: deploy/install-desktop.ps1 does not exist yet, nothing to stamp'"
+        silent: true
+        if: '[ ! -f deploy/install-desktop.ps1 ]'
+      - cmd: |
+          v='{{.VERSION}}'
+          # The script refuses any other version (its rule of 06 §7.1 step 3), so a release must not stamp one.
+          if ! printf '%s\n' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?'; then
+            echo "release:prepare: install-desktop.ps1 cannot carry the version $v (X.Y.Z or X.Y.Z-<prerelease>)" >&2
+            exit 1
+          fi
+          mkdir -p dist-desktop
+          if ! awk -v v="$v" -v q="'" '
+            $0 == "$IsshoniVersion = " q "@VERSION@" q { print "$IsshoniVersion = " q v q; n++; next }
+            { print }
+            END { if (n != 1) exit 1 }' deploy/install-desktop.ps1 >dist-desktop/install-desktop.ps1; then
+            echo "release:prepare: deploy/install-desktop.ps1 has no single line \$IsshoniVersion = '@VERSION@' to stamp" >&2
+            rm -f dist-desktop/install-desktop.ps1
+            exit 1
+          fi
+          echo "release:prepare: stamped dist-desktop/install-desktop.ps1 with $v"
+        silent: true
+        if: '[ -f deploy/install-desktop.ps1 ]'
 
   release:goreleaser:
     desc: Build the pinned goreleaser (.tool-versions, tools/goreleaser/go.mod) into .bin/; the release tasks run it
@@ -1429,8 +1615,8 @@ tasks:
 
   release:keys:
     desc: >-
-      Write deploy/keys/allowed_signers into the key block of deploy/install.sh, check it (lint:keys) and print the
-      keys' fingerprints (deploy/keys/README.md)
+      Write deploy/keys/allowed_signers into the key blocks of deploy/install.sh and deploy/install-desktop.ps1, check
+      them (lint:keys) and print the keys' fingerprints (deploy/keys/README.md)
     cmds:
       - cmd: |
           set -eu
@@ -1482,6 +1668,9 @@ tasks:
           cat "$tmp/install.sh" >deploy/install.sh
           echo "release:keys: wrote $keys into deploy/install.sh"
         silent: true
+      # The desktop script's block (docs/m2/06 §7.1, §7.2): repocheck checks the key file as lint:keys does before
+      # it writes the lines between the markers of install-desktop.ps1's here-string.
+      - go -C tools run ./repocheck -root .. ps1-keys
       - task: lint:keys
 
   release:compat:
