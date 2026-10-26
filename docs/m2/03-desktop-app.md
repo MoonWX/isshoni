@@ -433,9 +433,11 @@ font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-s
 ### 5.5 Navigation, links and drops
 
 Three layers, so no single one has to be perfect:
-1. **The SPA never navigates away.** Outside `platform/`, nothing sets `location` or calls `window.open` (lint rule
-   `no-restricted-properties` on `window.open`, `location.assign`, `location.replace`, `location.href=`; the
-   platform files are exempt). `DesktopPlatform` installs, at construction:
+1. **The SPA never navigates away.** Outside `platform/`, nothing sets `location` or calls `window.open`
+   (`web/eslint.config.js`: `no-restricted-syntax` selectors for `window.open` (also on `globalThis` and `self`),
+   `location.assign` and `location.replace`, and assigning `location` or `location.href`, for `src/` outside
+   `platform/`; `no-restricted-properties` can't match `window.location.assign` or an assignment; group 3's
+   integration). `DesktopPlatform` installs, at construction:
    - a capture-phase `click` and `auxclick` listener on `document`: an `<a>` whose resolved URL is not on the asset
      origin is cancelled and handed to `openExternal(url)`;
    - `window.open = (url) => { openExternal(String(url)); return null; }`;
@@ -773,8 +775,9 @@ export interface Platform {
   // … M1 members …
   /** desktop: { url, auth } with a bearer provider; browser: { url } (cookie). Was `auth?: HelloAuth` (unused). */
   signaling(): { url: string; auth?: HelloAuthProvider };
-  /** M2: the desktop app's features; null in the browser. */
-  readonly desktop: DesktopFeatures | null;
+  /** M2: the desktop app's features; null (or absent) in the browser. Optional (WA32): read it as
+   *  `platform.desktop ?? null`, so the M1 test platforms (test/, rooms/, viewer/, account/) stay valid. */
+  readonly desktop?: DesktopFeatures | null;
 }
 export type HelloAuthProvider = (o: { forceRefresh: boolean }) => Promise<HelloAuth | undefined>;
 
@@ -782,7 +785,7 @@ export interface PickedSource {
   kind: ShareKind;
   audioScope: 'window' | 'tab' | 'system' | 'none';   // native: 'system' (everything but the exclusions) or 'none'
   warning: 'screen-with-system-audio' | 'no-audio' | null; // native: null (voice apps are kept out)
-  preview: MediaStream | null;                         // M2: null for a native pick
+  preview: MediaStream;                                // WA65: MediaStream | null (null for a native pick)
   /** M2, native: the picker's name for the source; shown on this PC only, never sent. */
   label?: string;
   /** M2, native: one-time sheets to show before going live, in order (§10.2). */
@@ -811,9 +814,30 @@ export interface DesktopFeatures {
   readonly server: { id: string; origin: string; name: string } | null;
   readonly bridge: NativeBridge;                       // §7.4
   wizardSteps(): WizardStep[];                         // Windows: ['link', 'sound', 'voice']; later (M3) adds 'audio-permission'
+  /** Auth.SessionEnded and Auth.HelloRefused with this page's serverOrigin bound (02 §11.8). */
+  sessionEnded(code: SessionEndCode): Promise<AuthState>;
+  helloRefused(e: HelloRefusal): Promise<AuthState>;
+  /** C1 stopped with err (its SignalStateInfo.error): calls the two above as §7.3 says and tells the room runtime
+   *  what to do next. */
+  signalStopped(err: { code: string; params?: Readonly<Record<string, unknown>> }): Promise<SignalStopAction>;
 }
 export type WizardStep = 'link' | 'audio-permission' | 'sound' | 'voice';
+export type SessionEndCode = 'unauthenticated' | 'session_revoked' | 'account_disabled';
+export interface HelloRefusal { code: 'client_outdated' | 'protocol_unsupported'; params?: Record<string, unknown> }
+/** redial: SessionEnded says still linked, start C1 again once; relink: it isn't (the relink page follows auth.state,
+ *  §8.3); version: HelloRefused's state drives 02 §13.3's screen (§16.3); wait: the bridge answered not_found (this
+ *  page's server isn't active any more), stay stopped until the reload; none: not a desktop case, M1's handling. */
+export type SignalStopAction = 'redial' | 'relink' | 'version' | 'wait' | 'none';
 ```
+
+**As built by WA32** (where the code departs from the block above as first written): `Platform.desktop` is optional,
+not required, because a required member would break the M1 test platforms in `web/src/test/platform.ts`, `rooms/`,
+`viewer/` and `account/`; `BrowserPlatform` sets it to `null` explicitly and callers read `platform.desktop ?? null`.
+`PickedSource.preview` stays `MediaStream` until WA65's `DesktopSharing`, which makes it `MediaStream | null` together
+with its readers in `share/` (`BrowserSharing`, `BrowserShare`, `shareStore`; README WA65's row). `DesktopFeatures` has
+three members beyond the first draft, `sessionEnded`, `helloRefused` and `signalStopped`, which bind the page's
+`serverOrigin` (02 §11.8) and keep §7.3's C1-stop rules inside `platform/`, where they are tested; the room runtime
+calls `signalStopped` (WA42, in `web/src/rooms/`).
 
 `ActiveShare.setPaused` works for a native share when C2's `core.Status().Features` lists `share.pause`
 (01-client-core); `LocalShareState` `'paused'` is now used.
@@ -858,18 +882,18 @@ Boot (05 §4) in the desktop:
 | `role` | `'viewer'` (C1 never publishes; C2 does) |
 | `serverOrigin` | `server.origin`, `''` when none |
 | `capsNow()` | 01's `detectCaps()` in WebView2 (decode capabilities matter; C1 sends nothing) |
-| `capabilities()` | `caps`, `canShare` from `Share.Capabilities().canShare`, `fullscreen: 'element'` (W16, else `'none'`), `pip` by feature detection, `wakeLock` by feature detection, `push: 'unsupported'`, `install: 'none'` |
-| `apiFetch(path, init)` | 02 §11.8, with the origin bound: get `Auth.AccessToken(serverOrigin, false)`; on `null`, send the request **without** `Authorization` (Public routes such as `/info` work; others get the server's 401 `unauthenticated`, which clears `['me']`, 05 §6.2); with a token, `fetch(new URL(path, serverOrigin), {...init, headers + Authorization: Bearer <token>, credentials: 'omit', mode: 'cors', referrerPolicy: 'no-referrer'})`; on 401 `invalid_token` or `unauthenticated`: `Auth.AccessToken(serverOrigin, true)` and one retry; a second 401 goes to the SPA. `serverOrigin` is always `bridge.js`'s, so a token is only ever requested for the server the request goes to (§5.8) |
+| `capabilities()` | `caps`, `canShare` = `sharing !== null && Share.Capabilities().canShare` (so `canShare` keeps implying a sharing provider), `fullscreen: 'element'` (W16, else `'none'`), `pip` by feature detection, `wakeLock` by feature detection, `push: 'unsupported'`, `install: 'none'` |
+| `apiFetch(path, init)` | 02 §11.8, with the origin bound: get `Auth.AccessToken(serverOrigin, false)`; on `null`, send the request **without** `Authorization` (Public routes such as `/info` work; others get the server's 401 `unauthenticated`, which clears `['me']`, 05 §6.2); with a token, `fetch(new URL(path, serverOrigin), {...init, headers + Authorization: Bearer <token>, credentials: 'omit', mode: 'cors', referrerPolicy: 'no-referrer'})`; on 401 `invalid_token` or `unauthenticated`: `Auth.AccessToken(serverOrigin, true)` and one retry; a second 401 goes to the SPA, and so does the first one when the forced call fails (offline, `server_unreachable`), so the SPA's 401 rule runs either way. `serverOrigin` is always `bridge.js`'s, so a token is only ever requested for the server the request goes to (§5.8) |
 | `signaling()` | `{url: wss://<host>/ws, auth: ({forceRefresh}) => …}`: `Auth.AccessToken(serverOrigin, forceRefresh)`; the result as `{scheme: 'bearer', token}` (`undefined` when `null`, so a hello to a server that isn't active carries no token) |
 | `createPeerConnection` | `new RTCPeerConnection(config)` |
-| `sharing` | a `DesktopSharing` over `bridge` (§10); non-null on Windows and in dev/e2e builds (fake engine) |
+| `sharing` | a `DesktopSharing` over `bridge` (§10); non-null on Windows and in dev/e2e builds (fake engine). It comes from `DesktopPlatformOptions.sharing`, a factory WA65 plugs `DesktopSharing` into; until then `sharing` is `null` |
 | `notifications` | `support()` → `'unsupported'` (no Web Push in WebView2; the push card never shows) |
 | `pwa` | `null` |
 | `requestWakeLock()` | the Screen Wake Lock API when present, else `null` (Go keeps the display awake while sharing, §11.6) |
 | `inAppBrowser()` | `null` |
 | `openExternal(url)` | `App.OpenExternal(url)`; rejected URLs are logged and dropped |
 | `storage.local` | Web Storage with the key prefix `isshoni:<serverId>:` (§14.3); `storage.session` unprefixed |
-| `versionActions()` | `updateApp` and `openInBrowser` (§16.3): `openInBrowser = openExternal(serverOrigin + (currentRoomId ? '/r/' + currentRoomId : '/'))` |
+| `versionActions()` | `updateApp` (`() => Promise<AppUpdateOutcome>`) and `openInBrowser` (§16.3): `openInBrowser = openExternal(serverOrigin + (currentRoomId ? '/r/' + currentRoomId : '/'))`, the room taken from `location.pathname` (`/r/<room>`) |
 | `desktop` | the features object of §7.1 |
 
 Tokens: `platform/desktop/tokens.ts` is created with `serverOrigin` and passes it in every call; it caches `{token,
@@ -879,16 +903,27 @@ share one in-flight call; `rejected(token)` clears the cache when it holds that 
 the window is about to reload, §8.2), and clears its cache when the state for its origin leaves `linked`.
 
 **`SignalClient` change** (`web/src/protocol/signal-client.ts`, an M2 addition to 01 §16's TypeScript client):
-`SignalClientOptions.auth?: HelloAuthProvider`. Before every `hello` the client awaits `auth({forceRefresh: false})`
-and puts the result in `hello.auth`. When a bearer connection is stopped with a session-scope `unauthenticated`
-(01 §3.2), the client calls `auth({forceRefresh: true})` once and reconnects; a second `unauthenticated` stops it as
-in M1. `createConnection` passes `platform.signaling().auth`. `BrowserPlatform` gives none, so browsers are unchanged.
-In the desktop, a C1 stop with `session_revoked` or `account_disabled`, or a second `unauthenticated` right after the
-forced refresh, makes the room runtime call `Auth.SessionEnded(serverOrigin, code)` and reconnect once if the
-result's `status` is `linked`; otherwise the relink page follows `auth.state` (§8.3). A hello refused with
-`client_outdated` or `protocol_unsupported` calls `Auth.HelloRefused(serverOrigin, error)` and shows 02 §13.3's screen
-from the returned state (§16.3). A `not_found` from either (the server isn't active any more) stops C1 and waits for
-the reload.
+`SignalClientOptions.auth?: HelloAuthProvider`. Before every `hello` (the resuming ones too) the client awaits
+`auth({forceRefresh: false})` and puts the result in `hello.auth`; it is called before the socket opens, so the
+server's hello timeout never waits for it, and a rejection or no answer within `AuthTimeoutMs` (20 s, longer than the
+bridge's own 15 s `AccessToken` budget, §20) fails that attempt like a failed connect. When a bearer connection is
+stopped with a session-scope `unauthenticated` (01 §3.2), the client asks with `forceRefresh: true` and reconnects as
+a new connection; it keeps forcing in each attempt until one forced call answers (a failed forced call doesn't use up
+the refresh). A second `unauthenticated` before that connection has been ready for `BackoffResetMs` (10 s) stops it
+as in M1; the allowance resets only after 10 s of ready, not at every welcome, which stops a "welcome, then
+unauthenticated" loop. `createConnection` passes `platform.signaling().auth`. `BrowserPlatform` gives none, so
+browsers are unchanged.
+In the desktop, the room runtime hands every C1 stop to `platform.desktop.signalStopped(info.error)` (WA42 wires it in
+`web/src/rooms/`) and acts on the `SignalStopAction` it returns: a stop with `session_revoked` or `account_disabled`,
+or a second `unauthenticated` right after the forced refresh, calls `Auth.SessionEnded(serverOrigin, code)` and
+`redial`s once if the result's `status` is `linked`, else `relink` (the relink page follows `auth.state`, §8.3). A
+hello refused with `client_outdated` or `protocol_unsupported` calls `Auth.HelloRefused(serverOrigin, error)` and
+shows 02 §13.3's screen from the returned state (`version`, §16.3). A `not_found` from either (the server isn't active
+any more) stops C1 and waits for the reload (`wait`).
+
+`DesktopPlatform` uses TypeScript `private` members, not `#private` fields (the build target lowers those into
+helper code, which would count against the 4 KB budget), and keeps the C1-stop and update logic in `actions.ts`, a
+separate chunk loaded on first use.
 
 ### 7.4 `NativeBridge`: one interface, two transports
 
@@ -929,10 +964,22 @@ export type PromptAnswer = 'keep-out' | 'include';        // decide; dismissing 
 // No audio-mode type or method: M2 has no "All sound" mode (§6.2).
 ```
 
-- **`WailsBridge`** (M2): the generated bindings plus `@wailsio/runtime`'s `Events.On`; errors parsed per §6.4.
-- **`HttpBridge`** (M2, e2e only in practice): `POST /__bridge/call {service, method, args}` and an `EventSource` on
-  `/__bridge/events`, served by `internal/desktop/e2ehost` (§22.4). Selected only by `bridge.js`'s `transport`, which
-  only `e2ehost` sets to `"http"`.
+- **`WailsBridge`** (M2): the generated bindings plus `@wailsio/runtime`'s `Events.On`; errors parsed per §6.4. Until
+  WA48 generates the bindings, `wails/WailsBridge.ts` is a stub that throws `BridgeError` `not_implemented`, so the
+  dynamic import has a target; every bridge call of a real Wails build rejects with `not_implemented` meanwhile, and
+  the Mac dev app's boot shows the Offline screen instead of NotFound until WA42 and WA48 land.
+- **`HttpBridge`** (M2, e2e only in practice), served by `internal/desktop/e2ehost` (§22.4) on the asset origin and
+  selected only by `bridge.js`'s `transport`, which only `e2ehost` sets to `"http"`. The wire: a call is `POST
+  /__bridge/call` with `Content-Type: application/json` and `{"service", "method", "args"}`, where `service` and
+  `method` are the bound Go names (group `auth` → service `Auth`, method `accessToken` → `AccessToken`) and `args` is
+  the argument list without trailing `undefined`s; a 2xx body is the method's JSON result (`null` or no body for
+  none), any other status carries §6.4's bridge error JSON `{"code", "params"}` (a body that isn't one is
+  `internal`). Events: an `EventSource` on `/__bridge/events`, opened at once, each message's data `{"name":
+  "isshoni:<event>", "data": <payload>}`.
+- **The DTO types** (`AuthState`, `ShareView`, `FriendsHear`, `SettingsView`, `UpdateStatus`, …) are written by hand in
+  `platform/desktop/bridge.ts` from 02 §11.7, this doc's §6.2–§6.3 and §14.2, 05 §14.5 and 06 §8.9 until WA48's
+  generated bindings exist. `share.stats` and its event follow §6.3's `ShareStatsSample`, with `at` set by the
+  transport on receipt (`performance.now()`).
 - *Later (M4)*: a `RelayBridge` over 01's same-user relay (`share.request`, `share.status`, `exclusions.*`) lets a
   browser page drive the Linux agent through the same `DesktopSharing` code. Nothing of it is built now; the interface
   is shaped so its `share` and `audio` parts can be implemented over messages.
@@ -1863,6 +1910,11 @@ temporary profile therefore needs only `%LOCALAPPDATA%` (and a test credential p
 - **Reads**: unknown fields are kept and written back (a newer app's settings survive a downgrade); a file that doesn't
   parse is renamed `settings.json.bad-<UTC timestamp>` and `settings.json.bak` is tried; if both fail, defaults.
   Credentials are never touched by a settings problem (as 02 §11.6 does for `servers.json`).
+- **Size**: no JSON object anywhere in the file has more than 1024 keys (four times the largest one, 05's `appRules`
+  with at most 256; `serverPrefs` has at most 20). A file with a larger object counts as one that doesn't parse;
+  `Update` and `SetAudioSection` refuse a value with one (`FieldError`). A write keeps every key the app knows and as
+  many unknown keys as fit, the first ones in key order (one WARN with the count when some don't), so the app never
+  writes a file it would set aside, and a file it read never makes its writes fail.
 - **Migrations** are forward-only, one function per schema step, run at load; a file with a newer `schema` than the app
   knows is read best-effort and not migrated.
 - `SettingsView` (to the SPA) is everything above except `audio` (05's own view through `Audio.*`), plus
@@ -1973,10 +2025,14 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   - **`update_server`**: "This server runs isshoni {server version}, which is too old for this app. Ask your admin to
     update it." **[Open in browser]**;
   - both have **[Try again]** (`Auth.Recheck()`), and 02 re-checks every 10 min.
-- `versionActions().updateApp`: `Updates.Check()`, then wait on `update.state` for `ready`, `up_to_date` or `error`.
-  `ready` → `Updates.Install()`; `up_to_date` → "No newer version is available yet" with a link that opens
+- `versionActions().updateApp(): Promise<AppUpdateOutcome>` (WA32; it returns what happened so the version screen,
+  WA82, can show the texts below): `Updates.Check()`, then wait on `update.state` for `ready`, `up_to_date` or
+  `error`. `ready` → `Updates.Install()` → `{kind: 'installing'}` (the app quits within 5 s and the installer starts
+  it again); `up_to_date` → `{kind: 'up-to-date'}`: "No newer version is available yet" with a link that opens
   `serverOrigin + '/download'` (the server's page, which 06 pre-fills with its URL); `error` with `not_installed` (a
-  build run from a folder) → open `notesUrl`; any other error → its text.
+  build run from a folder) → open `notesUrl`, `{kind: 'not-installed', notesUrl}`; any other error (and `off` or
+  `disabled`) → `{kind: 'error', code}` with its text (`desktop.update.error.<code>`, or a bridge error's code). Nothing
+  in M1 implements `updateApp`.
 - `versionActions().openInBrowser`: `openExternal(serverOrigin + (currentRoomId ? '/r/' + currentRoomId : '/'))`.
 - `staleBuild` is off in the desktop (§7.2).
 - REST: the desktop SPA uses only the room's endpoints (`/info`, `/me`, `/rooms`, `/invites` for the invite dialog,
@@ -2102,6 +2158,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | End of session | share stopped within 2 s |
 | WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni" |
 | Settings write debounce | 500 ms |
+| `settings.json` objects | ≤ 1024 keys each (§14.2) |
 | Logs | 5 MiB × 5 files |
 | SPA → Go log | ≤ 10 lines/s, ≤ 1 KiB each |
 | Bridge calls | `Probe` 10 s, `Link` 15 s, `Start` 20 s, `AccessToken` 15 s, `Updates.Check` 45 s, other I/O 10 s |
@@ -2196,7 +2253,8 @@ there.
   `helloRefused(origin, error)` and the version screen; `not_found` from either stops C1 without a redial.
 - `readDesktopConfig`: refuses a wrong `v`, missing fields, extra types; `detectPlatform` picks Desktop only with a
   valid config.
-- `SignalClient` (`auth` option): awaited before every hello; forced refresh once after `unauthenticated`, then stop.
+- `SignalClient` (`auth` option): awaited before every hello; forced refresh once after `unauthenticated`, then stop;
+  a failed or slow forced call doesn't use up the refresh; the allowance resets only after 10 s of ready.
 - `DesktopSharing`/`DesktopShare`: state mapping from `share.state` (`ShareView`), `shareId` change on `replaces`,
   recovery methods as no-ops, `stopOther(roomId, shareId)`, `localConnectionIds`; the `hint` event from
   `ShareView.hint` (no `HintDetector`); `findShareElsewhere` with a list.
@@ -2358,7 +2416,7 @@ shows the encoder and the full layer's bitrate, and its windows stay out of the 
 | `Engine.Pick(ctx, media.PickRequest{OwnerWindow: <main HWND>})`; `ErrCancelled` → null; the app applies `WDA_EXCLUDEFROMCAPTURE` to its own windows (04 doesn't) | §10.1, §11.5 | 04, 01 |
 | `ShareView` fields used by the shell: `border` (from `Source.OSBorder`, then `ShareSnapshot.NoOSIndicator`), `label` (the controller's, from `Source.Name`; `ShareRequest.Label` always `""`), `kind`, `watching` (`len(Watchers)`) | §6.3, §10.1 | 01 and 04 add `NoOSIndicator` and `OSBorder` |
 | Bound services and events (§6.2, §6.3), bridge error codes (§6.4) in `internal/desktop/bridge/codes` → `web/src/platform/desktop/codes.gen.ts` (a new `tygo.yaml` entry) | §6, §18.1 | SPA; M3; M4's `RelayBridge` mirrors `NativeBridge` |
-| TS: `Platform.desktop`, `HelloAuthProvider`, `PickedSource.preview \| null`, `label`, `confirm`, `SharingProvider.current/localConnectionIds/stopOther(roomId, shareId)`, `LocalEndReason` additions, `NativeBridge`, `ShareView`, `RoomSession.adoptShare`, `SignalClientOptions.auth`; `RoomPage`'s `?conntest=1` | §7 | 05-web (browser parts unchanged), M3, M4 |
+| TS: `Platform.desktop` (optional, §7.1), `DesktopFeatures` (with `sessionEnded`, `helloRefused`, `signalStopped`), `HelloAuthProvider`, `PickedSource.preview \| null` (with WA65), `label`, `confirm`, `SharingProvider.current/localConnectionIds/stopOther(roomId, shareId)`, `LocalEndReason` additions, `NativeBridge`, `ShareView`, `RoomSession.adoptShare`, `SignalClientOptions.auth`; `RoomPage`'s `?conntest=1` | §7 | 05-web (browser parts unchanged), M3, M4 |
 | `web.DesktopCatalog()`, namespace `desktop`, Go keys `desktop.native.*` (incl. the mic-prompt toasts); 05's texts as `desktop.audio.*` | §18.1 | 05 (texts) |
 | Viewer tile state `paused` for `ShareStatus paused`; no freeze detection while paused | §11.3 | 01-client-core (server status) |
 | Project-site anchors the app links: `/download#windows-updates` (install_failed, manifest_expired), `/troubleshooting#desktop-webview2` (WebView2 message box), `#desktop-gpu-driver`, `#desktop-media-feature-pack` and `#desktop-smart-app-control` (§10.5's reason rows), `/privacy#desktop` and `/code-signing` (About) | §5.4, §10.5, §14.4, §16.2 | 06 (`TestDocsAnchors`) |

@@ -141,7 +141,8 @@ desktop apps relink).
 **User codes.**
 - Generation: rejection sampling over random bytes: a byte `b ≥ 240` is dropped, otherwise the symbol is
   `alphabet[b % 20]` with `alphabet = "BCDFGHJKLMNPQRSTVWXZ"`; 8 symbols. A collision with an existing row's
-  `user_code_hash` (UNIQUE) retries with a new code, at most 3 times, then `internal`.
+  `user_code_hash` (UNIQUE) retries with a new code, at most 3 times (4 codes in all), then `internal`; all 4 are
+  drawn before the `Write`, so `crypto/rand` never runs inside a transaction (WA30).
 - `api.NormalizeUserCode(s string) (string, bool)`: drop ASCII spaces, tabs and `-`, map ASCII `a`–`z` to upper case;
   the result must be exactly 8 letters of the alphabet. `api.FormatUserCode` inserts the `-` after 4. The TypeScript
   copy is `web/src/link/userCode.ts`; both test suites use these cases:
@@ -295,7 +296,8 @@ Order, every step before the next:
 1. `auth-ip` (03 §7.3: 20, then 1 per 15 s) → 429 `rate_limited`.
 2. `device-code-ip` (10, then 1 per 6 min), then, for an IPv6 client only, `device-code-ip48` (keyed by the
    client address's /48, `auth.IPKey48`: 30, then 1 per 2 min) → 429 `rate_limited`. An IPv4 client skips the second
-   bucket (its /32 key is already one address).
+   bucket (its /32 key is already one address). Both count every request, like `auth-ip`: a refusal by the /48
+   bucket keeps the `device-code-ip` token, and so do the 422 and 503 answers of the later steps (no refund).
 3. Validation → 422 `validation_failed` with these field codes:
    - `clientKind`: `desktop` or `mobile` (01 `ClientKind`; the Linux agent sends `desktop`), else `invalid`;
    - `os`: `windows`, `macos`, `linux`, `ios` or `android` (the `devices.os` CHECK), else `invalid`;
@@ -303,7 +305,8 @@ Order, every step before the next:
    - `appVersion`: 1–32 bytes of `[0-9A-Za-z.+-]`, else `required`/`too_long`/`invalid` (not necessarily SemVer: dev
      builds are `0.0.0-dev+<commit>`).
 4. Server-wide cap: 5,000 pending, unexpired codes (`CountPendingDeviceCodes`) → 503 `server_busy` with
-   `Retry-After: 60`. A row is about 200 bytes, so the cap bounds the table at about 1 MB; it is a backstop for
+   `Retry-After: 60`, counted inside step 5's `Write`, right before the insert, so the cap is exact under parallel
+   starts. A row is about 200 bytes, so the cap bounds the table at about 1 MB; it is a backstop for
    memory and disk, and the per-prefix buckets of step 2 keep one holder of many IPv6 /64s from reaching it (§5.5).
 5. One `Write`: `CreateDeviceCode` with `request_ip` = `ClientIP`, `expires_at = now + 600 s`, `interval_s = 5`.
 
@@ -322,14 +325,16 @@ and a throttled address writes `auth.throttled {scope: "ip"}` as in M1.
 
 ### 5.3 Approval: `POST /api/v1/device/lookup` and `POST /api/v1/device/decide` (cookie sessions only)
 
-Both have the access `UserSession` (§6.4): a bearer gets 403 `forbidden` with `params {credential: "session"}`.
+Both have the access `UserSession` (§6.4): a bearer gets 403 `forbidden` with `params {credential: "session"}`. The
+service refuses a bearer principal the same way itself (defence in depth behind httpapi's access check).
 
 **Lookup** (`api.DeviceLookupRequest {userCode}`), order:
 1. `NormalizeUserCode` fails → 422 `validation_failed {userCode: required|invalid}`; costs no token.
 2. `device-lookup` (key: user ID; 10, then 1 per min) takes a token **before** the read, like 03's per-username buckets,
    so parallel guesses all see the bucket as it is. Empty → 429 `rate_limited` with `retryAfter`.
 3. Read `DeviceCodeByUserCode`. Unknown, not `pending`, or `expires_at ≤ now` → 404 `device_code_invalid`; the token
-   is kept (a wrong code). Found → the token goes back (refund).
+   is kept (a wrong code). Every other end gives the token back (refund): a found code, and the ends that say nothing
+   about the code (the caller's session is gone, a store or context error).
 
 Response 200 (`api.DeviceLookup`):
 
@@ -353,7 +358,9 @@ present (§5.6, 422 `{deviceName: …}`), step 2, then one `Write`:
 - `DecideDeviceCode(h, approve ? "approved" : "denied", p.UserID, name, now)`. The caller is checked again in the same
   `Write` (an active user whose session still exists, 03's `loadSelf` rule).
 - 0 rows: when the code is already decided **by this user with the same decision**, the answer is 204 again (a double
-  click, a retried request); otherwise 404 `device_code_invalid` (the `device-lookup` token is kept).
+  click, a retried request); an approved code that the app has since collected (`consumed`) and an expired code this
+  user decided the same way count as decided the same way too. The repeat writes no second audit row and doesn't
+  apply a new `deviceName`. Otherwise 404 `device_code_invalid` (the `device-lookup` token is kept).
 - Audit `device.approved` or `device.denied` (§8). 204, and the `device-lookup` token goes back (also for the
   idempotent repeat).
 
@@ -383,13 +390,17 @@ and the handler sends the decided error after the commit):
 | `approved`, but the approver is no longer `active` | 400 `access_denied` | `last_poll_at = now` |
 | `approved` | 200 token pair (below) | device, tokens, `consumed`, audit |
 
+- The `access_denied` row for an approver who is no longer active is reached only when the status changed without M1
+  03 §7.7's cleanup: a real admin disable (`UpdateUser`) deletes the codes the user decided (`DeleteDeviceCodesOf`),
+  so the next poll finds an unknown hash and gets `invalid_grant` (WA30-R2; both paths are tested, §16.1).
 - The 1 s tolerance absorbs network jitter between two polls sent exactly `interval` apart; RFC 8628 §3.5 has the
   client add 5 s per `slow_down`, and `params.interval` says the new value outright.
-- **Success**, in the same `Write`: `TrimDevices(user, 19)` (the cap of 20, §6.7) with one `device.revoked {via:
-  "cap"}` row per evicted device; `CreateDevice` (name, kind, os and version from the code, `linked_via =
-  'device_flow'`, `last_seen_at = now`, `last_ip` = this poll's IP); one access and one refresh token with
-  `issued_by = NULL`; `ConsumeDeviceCode`; audit `device.linked`. After the commit: notify `{UserID}: devices`
-  (03 §12.5) and close the evicted devices' connections (`device_revoked`).
+- **Success**, in the same `Write`: `TrimDevices(user, 19)` (the cap of 20, §6.7) with one `device.revoked {via: "cap"}`
+  row per evicted device; `CreateDevice` (name, kind, os and version from the code, `linked_via = 'device_flow'`,
+  `last_seen_at = now`, `last_ip` = this poll's IP); one access and one refresh token with `issued_by = NULL`;
+  `ConsumeDeviceCode`; audit `device.linked`. After the commit: auth closes the evicted devices' connections
+  (`device_revoked`), and httpapi notifies `{UserID}: devices` (03 §12.5) after the call returns: auth has no notifier,
+  as under M1's layout (WA47's routes send it).
 
 Response 200 (`api.DeviceTokenResponse`, the same shape for both grants):
 
@@ -405,11 +416,11 @@ Response 200 (`api.DeviceTokenResponse`, the same shape for both grants):
 | Bucket | Key | Burst | Refill | Consumed by | Checked |
 |---|---|---|---|---|---|
 | `auth-ip` (03 §7.3, M1) | client IP key | 20 | 1 per 15 s | every `/device/code` and `/device/password` | first |
-| `device-code-ip` | client IP key | 10 | 1 per 6 min | every `/device/code` | after `auth-ip` |
-| `device-code-ip48` | the IPv6 client's /48 (`auth.IPKey48`); IPv4 clients skip it | 30 | 1 per 2 min | every `/device/code` from IPv6 | after `device-code-ip` |
+| `device-code-ip` | client IP key | 10 | 1 per 6 min | every `/device/code` (no refund) | after `auth-ip` |
+| `device-code-ip48` | the IPv6 client's /48 (`auth.IPKey48`); IPv4 clients skip it | 30 | 1 per 2 min | every `/device/code` from IPv6 (no refund) | after `device-code-ip` |
 | `device-token-ip` | client IP key | 60 | 1 per s | every `/device/token` (both grants) | first |
-| `device-lookup` (03's `lookup`, re-keyed) | user ID | 10 | 1 per min | `/device/lookup` and `/device/decide` with a wrong code; taken before the read, refunded when the code is found | after the shape check |
-| pending-code cap | server | 5,000 pending, unexpired codes | — | `/device/code` | last, before the insert |
+| `device-lookup` (03's `lookup`, re-keyed) | user ID | 10 | 1 per min | `/device/lookup` and `/device/decide` with a wrong code; taken before the read and kept only for 404 `device_code_invalid`, refunded on every other end (§5.3) | after the shape check |
+| pending-code cap | server | 5,000 pending, unexpired codes | — | `/device/code` | last, inside the insert's `Write` |
 
 - 03 keyed `lookup` by session ID; a user can hold 50 sessions (03 §7.4), so the user is the right key.
 - **Why a /48 bucket**: the per-/64 keys alone let one holder of many /64s fill the server-wide cap and block every
@@ -439,8 +450,10 @@ Response 200 (`api.DeviceTokenResponse`, the same shape for both grants):
 
 ### 5.6 Device names
 
-`auth.NormalizeDeviceName(in string) (string, error)`: trim spaces; `precis.Nickname` (the profile of room names,
-03 §8); 1–64 code points. Errors are field codes: empty → `required`, over 64 → `too_long`, refused by PRECIS →
+`auth.NormalizeDeviceName(in string) (string, error)`, in order: valid UTF-8 without U+FFFD (the room-name rule:
+`encoding/json` turns bad bytes into U+FFFD), else `invalid`; trim spaces; `precis.Nickname` (the profile of room names,
+03 §8), whose result must map to itself again (the stored name normalizes unchanged), else `invalid`; 1–64 code points.
+Errors are field codes: empty, or only spaces of any kind → `required`, over 64 → `too_long`, refused by PRECIS →
 `invalid`. The app sends `os.Hostname()` cut to 64 code points, or `Windows PC` when that is empty; the approver may
 replace it at `decide`, and the Devices page renames it later (`PATCH /me/devices/{id}`, §7.2). Names need not be
 unique.
@@ -747,6 +760,13 @@ func (s *Service) RevokeOwnDevice(ctx context.Context, p Principal, m ReqMeta) e
 
 func NormalizeDeviceName(in string) (string, error) // §5.6; field codes as errors
 ```
+
+**As built after WA30** (interfaces first): the device flow and the password link are real; `AuthenticateBearerToken`,
+`RenameDevice`, `RevokeOwnDevice`, the `refresh_token` grant of `DeviceToken`, the bearer cases of `Touch`,
+`RevokeDevice` and `LogoutEverywhere`, and `Principal.DeviceName` are declared and return not-implemented errors (or
+an empty value) until WA39. `Touch` keeps M1's signature (`error` only) until WA39 and the wiring slice change it
+together, because `wire.go` (WA56's and WA66's) calls it. auth sends no notifications: httpapi sends `{UserID}:
+devices` after the call (§5.4, WA47).
 
 `ReasonDeviceRevoked` (as built) is used for every device row of §6.5; `AdminAlert` kind `refresh_token_reused`
 (03 §7.11) is raised after a committed reuse. New limiter rates in `limiter.go`:
@@ -1159,6 +1179,12 @@ var (
   `expiresIn` must be positive. Any failure → `ErrBadResponse` (03-desktop-app shows its generic link error), and
   nothing is opened. On success the `LinkState` (§11.3) carries canonical strings that Go builds itself,
   `origin + "/link"` and `origin + "/link?code=" + FormatUserCode(n)`, never the server's raw strings.
+- **Checks of `NewClient` and the answers** (WA31): `NewClient` normalizes the origin again (one that doesn't
+  normalize is refused, wrapping `deeplink.ErrInvalidOrigin`) and copies the caller's `http.Client`, forcing the
+  no-redirect rule on the copy. `Refresh` sends `appVersion` only when it follows the server's rule (1–32 bytes of
+  `[0-9A-Za-z.+-]`, §5.2), so a long dev version can't turn every refresh into a 422. A token pair is shape-checked
+  (`isa_`/`isr_` plus 43 characters, a device id, `expiresIn > 0`), else `ErrBadResponse`. When `ctx` ends, its
+  error is returned as is, not wrapped in `ErrNetwork`.
 - Go reads no Windows system proxy settings (WinINET); `HTTPS_PROXY` works. A known M2 limit (WebView2 does use the
   system proxy, so on a PC that needs it the server can open in the browser or the app's viewer while Go's requests
   fail), explained in `docs/troubleshooting.md#desktop-linking` with the `HTTPS_PROXY` workaround; 03-desktop-app's
@@ -1234,10 +1260,12 @@ func (m *Manager) CancelLink()
 // server_busy, validation_failed), ErrNetwork or ErrIncompatible; the state stays unlinked on an error and a running
 // device-flow link is cancelled first. The password is passed on once, never stored, retried or logged.
 func (m *Manager) LinkWithPassword(ctx context.Context, username string, password protocol.Secret) error
-// AccessToken returns a token with at least 120 s left, refreshing when needed (single flight). It satisfies
-// 01-client-core's core.Auth. forceRefresh=true means the server refused the token the caller had: the cached token
-// is dropped and refreshed (single flight). At most one forced refresh per 10 s: a forced call within 10 s of the last
-// forced refresh gets the token that refresh issued, without a new request.
+// AccessToken returns a token with at least 120 s left, refreshing when needed (single flight). It is the
+// AccessToken of 01-client-core's core.Auth; the Manager itself is not a core.Auth (01's SessionEnded returns
+// nothing, this one returns State), so 03's session adapter wraps it (03 §9, README WA58). forceRefresh=true means
+// the server refused the token the caller had: the cached token is dropped and refreshed (single flight). At most one
+// forced refresh per 10 s: a forced call within 10 s of the last forced refresh gets the token that refresh issued,
+// without a new request.
 // Errors: ErrNotLinked (RelinkRequired), ErrIncompatible (UpdateRequired), ErrOffline (transient; wraps the
 // network error), ctx's error.
 func (m *Manager) AccessToken(ctx context.Context, forceRefresh bool) (protocol.Secret, error)
@@ -1262,8 +1290,12 @@ func (m *Manager) SetIncompatible(c compat.Check)
 // credential exists, else unlinked). Otherwise StatusIncompatible with the new check. A network failure returns the
 // ErrNetwork error and leaves the state as it was.
 func (m *Manager) Recheck(ctx context.Context) (State, error)
-// Unlink signs this app out: POST /device/revoke (10 s, best effort), then deletes the credential. It returns
-// ErrRevokeNotConfirmed (still unlinked locally) when the server couldn't be reached.
+// Unlink signs this app out: it forgets the credential in memory first (the state is unlinked at once), then
+// POST /device/revoke (10 s, best effort; with 10 s or less left on the access token, one refresh first, with its own
+// exchange id), then deletes the stored credential unless a new link stored one meanwhile, and clears the server's
+// user and device in servers.json. An answer saying the device is already gone (invalid_token, unauthenticated,
+// invalid_grant) counts as confirmed; a 5xx, a 429, another 4xx or a network error returns ErrRevokeNotConfirmed
+// (still unlinked locally).
 func (m *Manager) Unlink(ctx context.Context) error
 func (m *Manager) State() State
 func (m *Manager) Close() error // stops polling and timers; waits for its goroutines
@@ -1331,11 +1363,24 @@ var (
 3. On the manager's own context, poll every `interval` (at least 5 s): `authorization_pending` → go on; `slow_down`
    → `interval = params.interval` (or + 5 s); `access_denied` → unlinked, `denied`; `expired_token` or
    `invalid_grant` → unlinked, `code_expired` ("Get a new code"; no automatic restart, so an abandoned app doesn't
-   loop); a network error, 5xx or 429 → keep polling with the delay of §11.4 until `ExpiresAt`. `CancelLink` ends
-   the loop (unlinked, no notice); `Close` ends it with the manager.
+   loop); a network error, 5xx or 429 → keep polling until `ExpiresAt`, each time after max(`interval`, the delay of
+   §11.4), so it never polls faster than the interval (a lost answer still counted on the server and would earn a
+   `slow_down`); any other unexpected 4xx ends the link with `code_expired`. `CancelLink` ends the loop (unlinked, no
+   notice); `Close` ends it with the manager.
 4. 200: write the credential (§11.5) **first**, then `servers.json`, then `StatusLinked`. A failed credential write is
    retried once; if it fails again the app stays linked for this run with `save_failed` ("Couldn't save the sign-in to
-   Windows Credential Manager. You'll have to link again after restarting the app.").
+   Windows Credential Manager. You'll have to link again after restarting the app."), and the manager also tries to
+   delete what the store holds for that server, so a restart can't present a spent refresh token (which would trip
+   reuse detection and revoke the device). A later successful save clears `save_failed`.
+
+**Further rules** (WA31): compat checks use `compat.Default()` with `Version` replaced by `AppInfo.Version` (the same
+in the app, where `AppInfo.Version` is `version.Version()`; tests set their own). The Manager loads its credential on
+first need, so it works without `Start`, and the 10-minute `Recheck` while incompatible runs inside it. `Link` while a
+code is shown returns nil and keeps that code; `Link` with an existing credential is allowed, and `CancelLink`, a
+denial or an expiry then return to `linked`. `LinkWithPassword` clears a previous notice when it starts (except
+`save_failed`). `State` has no JSON tags (mapping it to §11.7's `AuthState`, `expiresAt` in milliseconds, is 03's
+binding); `State.LogValue` logs the origin, status, notice, verdict and reason, and `LinkState.LogValue` only the
+expiry, so user codes, user names and device names never reach a log.
 
 ### 11.4 Refresh and rotation
 
@@ -1351,9 +1396,12 @@ var (
   role and device name from the response, when they changed), then replace the cached access token, then return it.
   The window in which an honest app can lose a committed rotation is the time between the server's commit and the
   credential write: one round trip plus a few milliseconds.
-- **Retries**: on `ErrNetwork`, 5xx or `server_busy`: 1, 2, 4, 8, 16, 30 s, then every 30 s, with ±20 % jitter, same
-  exchange id; on 429: `retryAfter`. While the cached access token still has more than 10 s left, `AccessToken`
-  returns it during the retries; after that it returns `ErrOffline` and the state is `offline`.
+- **Retries**: on `ErrNetwork`, 5xx or `server_busy`, and also on `ErrBadResponse` (a broken 2xx body, a proxy's HTML
+  5xx) and on an unknown error code (which `api.StatusOf` makes 500), because the server may have committed the
+  rotation: 1, 2, 4, 8, 16, 30 s, then every 30 s, with ±20 % jitter, same exchange id; on 429: `retryAfter`. Any other
+  4xx ends that refresh with its error, which the core treats as transient. While the cached access token still has more
+  than 10 s left, `AccessToken` returns it during the retries; after that it returns `ErrOffline` and the state is
+  `offline`.
 - **`invalid_grant`**: delete the credential, clear the entry's user and device in `servers.json` (the server stays in
   the list), drop tokens, `StatusUnlinked` with `refresh_reused` when `params.reason` says so, else `signed_out` (or
   `account_disabled` when the `SessionEnded` code said so). The call whose refresh got it (and every caller waiting on
@@ -1489,6 +1537,15 @@ not the origin as typed. The server's Host, Origin and CSRF checks use its publi
 REST and WebSocket calls to an alternate name would be refused or answered 421. A `publicUrl` that doesn't normalize
 is `ErrBadResponse`. When the adopted origin is already in the list, that entry becomes active and `Existing` is true;
 no second entry or credential is made.
+
+**The rest of `Servers`** (WA31): `OpenServers` creates the managers and starts none (each reads its credential when
+made, so `State()` is linked or unlinked at once); the app calls `Start` on the active one at boot and after `Add` or
+`SetActive`. `OpenServers` skips entries whose origin isn't already normalized, duplicates and anything past 20 (one
+WARN), and falls back to the first entry when the saved active origin isn't listed. `Has`, `SetActive` and `Remove`
+accept any spelling that normalizes to a listed origin; `SetActive` and `Remove` of an unlisted one return an error.
+`Remove` drops the entry even when `Unlink` returns `ErrRevokeNotConfirmed`, returns that error, and makes the first
+remaining server active. `ForgetAll` also revokes credentials held only in memory (after `save_failed`), bounds its
+network part by min(ctx, 5 s) and returns the local steps' errors joined.
 
 `servers.json` (mode 0600 on Unix; on Windows it inherits the user profile's ACL; written atomically; at most 20
 servers, `Add` beyond that answers `ErrTooManyServers`):
@@ -1852,13 +1909,16 @@ WebView2's autofill off for it (03-desktop-app's note).
 4. `auth-hash` → 503 `server_busy` with `retryAfter`; then the hash under the semaphore (a full queue → 503
    `server_busy`). An unknown username, or an account without a password, hashes the dummy value.
 5. Wrong password → 401 `invalid_credentials` and M1's `auth.login_failed` row; a correct password for a pending or
-   disabled account → 403 `account_pending` / `account_disabled` (with the same row). Login's rehash rule applies.
+   disabled account → 403 `account_pending` / `account_disabled` (with the same row). Login's rehash rule applies
+   (the rehash is stored in step 6's `Write`).
 6. One `Write` that re-reads the user (password hash unchanged and status `active`, else as step 5, like login's
    `Write`) and then runs the device_code grant's success steps (§5.4): `TrimDevices(user, 19)` with its `cap` rows,
    `CreateDevice` with `linked_via = 'password'` and name, kind, OS and version from the request, `last_seen_at = now`,
    `last_ip` = this request's IP, a token pair with `issued_by = NULL`, audit `device.linked {clientKind, os, via:
-   "password"}`. No web session is created. After the commit: `{UserID}: devices` and the evicted devices'
-   connections closed (`device_revoked`).
+   "password"}`. No web session is created, `users.last_login_at` stays and no `auth.login` row is written (it is a
+   device link, not a web login). After the commit the attempt ends like a completed login (the `auth-user` token
+   back, this address's `auth-user-ip` bucket refilled), the evicted devices' connections are closed
+   (`device_revoked`), and httpapi notifies `{UserID}: devices` (§5.4).
 
 **Response**: 200 `DeviceTokenResponse` (§5.4's shape). Errors are #2's: 401 `invalid_credentials`, 403
 `account_pending`/`account_disabled`, 422, 429, 503 `server_busy`.
@@ -1915,11 +1975,11 @@ before their slice's PR; their seeds live in `testdata/fuzz`.
 | `internal/protocol` | `DesktopOrigins` is the §6.4 list, exact strings, no trailing slash; `DesktopOrigins()[0] == DesktopAssetOriginWindows`; two calls return distinct slices | Mac, CI ubuntu |
 | `internal/version` | the hub's SemVer tests moved with the code (precedence, pre-releases, invalid input); `Below` table | Mac, CI ubuntu |
 | `internal/server/store` | 0002 migrates a schema-1 file with device rows intact (`pre-1-*.db` written); the two columns and the index exist; `DecideDeviceCode` only from pending and unexpired; `SpendRefreshToken` twice → `ErrConflict`; `SupersedeRefreshToken` sets `spent_at`, `replaced_by` and a NULL `exchange_hash`, and on a spent row → `ErrConflict`; `DeleteAccessTokensIssuedBy` deletes only access rows (the issuer's refresh rows stay); `DeleteAccessTokensIssuedBy`, `TrimAccessTokens(5)`, `TrimDevices(19)` return what they removed; prune: a device with only spent or expired refresh tokens and `created_at` older than 1 h goes with a `device.expired` row, a younger one or one with a live token stays; boundaries exact (a row at its limit stays) | Mac, CI ubuntu |
-| `internal/server/auth` (device flow) | table test of §5.4 under a fake clock: pending → `authorization_pending`; a poll at 3.9 s → `slow_down {interval: 10}`, at 4.0 s with interval 5 → pending; repeated early polls cap at 60; deny → `access_denied`; approve → 200 once, then `invalid_grant`; expiry → `expired_token`, after prune → `invalid_grant`; approver disabled between approve and poll → `access_denied`; decide idempotent for the same user and decision, 404 otherwise; parallel decides by two users: exactly one 204; the 21st device evicts the least recently seen with a `cap` row and a `ConnCloser` call; the pending cap at 5,000 → `server_busy`; `device-code-ip48`: requests from 31 different /64s of one /48 → the 31st gets 429 while one from another /48 gets 200, an IPv4 client never takes its token, `IPKey48` table (IPv4 → false, IPv4-mapped → false, a zone dropped); `LookupUserCode`'s `network`: same IPv4 → `same`, two IPv4 → `different`, two addresses of one IPv6 /64 → `same`, a code started over IPv6 looked up over IPv4 (and the reverse) → `unknown`, IPv4-mapped IPv6 vs IPv4 of one address → `same`; every bucket: order, refusal without hashing or reads, refund of `device-lookup` on a found code, `auth.throttled` once per episode; **password link** (§14): login's bucket order and refusals (a counting hasher: a throttled request hashes nothing; an unknown user hashes the dummy), 401 with `auth.login_failed`, 403 pending/disabled only after a correct password, 422 for each device field, success creates a device with `linked_via = 'password'`, `device.linked {via: "password"}`, no session row, and the 21st device evicts as in the device flow; a password changed between the hash and the `Write` → 401 | Mac, CI ubuntu |
+| `internal/server/auth` (device flow) | table test of §5.4 under a fake clock: pending → `authorization_pending`; a poll at 3.9 s → `slow_down {interval: 10}`, at 4.0 s with interval 5 → pending; repeated early polls cap at 60; deny → `access_denied`; approve → 200 once, then `invalid_grant`; expiry → `expired_token`, after prune → `invalid_grant`; approver disabled between approve and poll, twice: a status change that leaves the code → `access_denied`, the real admin disable (`UpdateUser`, which deletes the codes the user decided, M1 03 §7.7) → `invalid_grant` (§5.4); decide idempotent for the same user and decision, 404 otherwise; parallel decides by two users: exactly one 204; the 21st device evicts the least recently seen with a `cap` row and a `ConnCloser` call; the pending cap at 5,000 → `server_busy`; `device-code-ip48`: requests from 31 different /64s of one /48 → the 31st gets 429 while one from another /48 gets 200, an IPv4 client never takes its token, `IPKey48` table (IPv4 → false, IPv4-mapped → false, a zone dropped); `LookupUserCode`'s `network`: same IPv4 → `same`, two IPv4 → `different`, two addresses of one IPv6 /64 → `same`, a code started over IPv6 looked up over IPv4 (and the reverse) → `unknown`, IPv4-mapped IPv6 vs IPv4 of one address → `same`; every bucket: order, refusal without hashing or reads, refund of `device-lookup` on a found code, `auth.throttled` once per episode; **password link** (§14): login's bucket order and refusals (a counting hasher: a throttled request hashes nothing; an unknown user hashes the dummy), 401 with `auth.login_failed`, 403 pending/disabled only after a correct password, 422 for each device field, success creates a device with `linked_via = 'password'`, `device.linked {via: "password"}`, no session row, and the 21st device evicts as in the device flow; a password changed between the hash and the `Write` → 401 | Mac, CI ubuntu |
 | `internal/server/auth` (tokens) | refresh rotates (old spent, `replaced_by` set, new pair `issued_by` old); **reuse**: replay after the child was used → device and tokens gone, `device.refresh_reused`, alert raised, `ConnCloser{UserID, DeviceID}` called after the commit, cache forgotten; **grace**: replay with the same `exchangeId` at +10 min while the child is unused → new pair, the old child's access token gone, the old child kept as a spent row (`replaced_by` = the new refresh, `exchange_hash` NULL); replay without id at +100 s → new pair once, a second replay at +110 s → reuse; replay at +121 s without id → reuse; replay with another id at +10 min → reuse (inside 120 s another id takes the restart row, since a restarted client draws a new id); **grace, then the superseded child**: replay without id at +100 s, then present the old child C → 400 `invalid_grant {reason: reused}`, device and tokens gone, `device.refresh_reused`, alert raised (once with C presented at +101 s, inside the 120 s window, and once at +15 min); the same after a same-`exchangeId` retry; a request without `exchangeId` never matches a NULL `exchange_hash`; bearer: wrong shapes → `invalid_token` without a DB read (counting fake), expired → `invalid_token`, cache hit within 30 s, a revoke invalidates the cache before `ConnCloser` runs; `Touch` for a bearer: device gone → `unauthenticated`, use recorded at most once per 5 min, the returned principal carries the device's current `DeviceName` (also from `AuthenticateBearerToken`); a session principal comes back unchanged; `MaybeRotate` no-op; `LogoutEverywhere` and `RevokeDevice` for a bearer; `NormalizeDeviceName` table; `FuzzDeviceToken` (random bodies never panic, never return 5xx) | Mac, CI ubuntu |
 | `internal/server/httpapi` | the §7.1 endpoint table (statuses and codes) through the real chain with a real `auth.Service`; the **credential matrix**: each of `Public`, `User`, `Admin`, `UserSession`, `UserDevice` × {none, cookie, bearer, bad bearer, cookie + bearer}, where `Admin` with an admin user's valid bearer → 403 `forbidden {credential: session}`, with a bad bearer → 401 `invalid_token`, with the admin's cookie → as M1; #29–#42 are registered `Admin`; #21–#23 accept an admin's bearer; a bearer request with a cross-site `Origin` and no CSRF headers passes, a cookie one doesn't; the **CORS matrix**: preflights from each desktop origin (allowed and refused methods and headers), from another origin (405 as M1), a desktop-origin request's `Cookie` header ignored, `Vary: Origin` everywhere, never `Allow-Credentials`, CORS headers on 401/413/429 answers; `/me` and `/me/devices` for a bearer (`device`, `current`); `/info` lists `deviceFlow`; `TestAuditCoverage` and `TestAuditActionsInSource` with §8's rows | Mac, CI ubuntu |
 | `internal/server/signal` | a socket from `http://wails.localhost` with `hello.auth` is accepted; with a valid cookie it gets 403 (as built); a successful bearer `hello` refunds the per-IP pre-auth token (21 bearer sockets of two users from one IP, opened one after another within a minute, all succeed; 21 sockets whose `hello` fails get 429 on the 21st); `Identity.DeviceName` never appears in `LogValue` output; a `Revalidate` result whose `DeviceName` changed is applied like a changed `Name` (M1 01 §3.2); `wire.go`'s `AuthenticateBearer` and `Revalidate` copy `DeviceName` (the wiring test of `internal/server`) | Mac, CI ubuntu |
-| `internal/client/deviceauth` | against an `httptest` server with scripted answers: the poll loop (pending, `slow_down` with and without `params.interval`, denied, expired, network errors until `ExpiresAt`); the credential is written before `linked` and before a refreshed token is returned (an ordering fake); `save_failed`; single flight (100 concurrent `AccessToken(ctx, false)` calls → one refresh); retries keep the `exchangeId` and stop on `invalid_grant`; `AccessToken(ctx, true)` refreshes even with a fresh cached token, a second forced call within 10 s returns that refresh's token without a request, one after 10 s refreshes again; **errors**: no credential → `errors.Is(err, ErrNotLinked)` and the chain has `RelinkRequired() == true`; the call whose refresh gets `invalid_grant` returns the same, after the store is empty; `ErrIncompatible` has `UpdateRequired() == true`; `ErrOffline` has neither method and unwraps to its network cause; `*deviceauth.Manager` satisfies `core.Auth` (a compile-time assertion in a test file); `Link` returns once `linking` is reached and polling continues after its ctx is cancelled, until `CancelLink` or `Close`; `LinkWithPassword`: 200 → credential then `linked`, 401 → stays `unlinked` with the `*api.Error`, compat refusal → `incompatible`; `SessionEnded` (each of its three codes) → refresh → `invalid_grant` → unlinked with `signed_out` or `account_disabled`, → success → stays `linked`, two concurrent calls → one refresh, another code → no request; `HelloRefused` with `client_outdated` → `incompatible`/`update_app`, with `protocol_unsupported` and no `serverMax` → a `/info` request (Recheck) decides; **verification URIs** (§11.2): `StartLink` → `ErrBadResponse`, the state unchanged and nothing to open, when either URI is `file:///C:/x`, `ms-settings:display`, `search-ms:query=x`, `javascript:alert(1)`, a UNC path (`\\host\share\x` and `file://host/share/x`), `https` on another host, `http` on a non-loopback host, carries userinfo or a fragment, has the path `/link/` or `/Link`, an extra query parameter (`code=…&next=…`), or a code that differs from `userCode`; accepted with an upper-case host or an explicit `:443`, and `LinkState` then holds Go's canonical strings, not the server's; `Recheck` back to `linked`; daily refresh under `synctest`; `Unlink` offline → `ErrRevokeNotConfirmed` and the credential deleted; redirects are not followed; the `User-Agent` is `isshoni-desktop/<version>`; a TLS failure is `ErrNetwork` with a reachable `*tls.CertificateVerificationError`; `Servers.Add` stores `info.server.publicUrl` normalized (a server reached as `alt.example` that calls itself `watch.example.com` → entry and credential key `https://watch.example.com`, `RequestedOrigin` kept), an adopted origin already listed → `Existing` and no second entry; `ForgetAll` with 20 servers, half of them hanging: returns within 6 s, every credential gone, users and devices cleared; `servers.json` round trip, the 20 cap, a corrupt file renamed `.bad` | Mac, CI ubuntu, CI windows (06 windows-go) |
+| `internal/client/deviceauth` | against an `httptest` server with scripted answers: the poll loop (pending, `slow_down` with and without `params.interval`, denied, expired, network errors until `ExpiresAt`); the credential is written before `linked` and before a refreshed token is returned (an ordering fake); `save_failed`; single flight (100 concurrent `AccessToken(ctx, false)` calls → one refresh); retries keep the `exchangeId` and stop on `invalid_grant`; `AccessToken(ctx, true)` refreshes even with a fresh cached token, a second forced call within 10 s returns that refresh's token without a request, one after 10 s refreshes again; **errors**: no credential → `errors.Is(err, ErrNotLinked)` and the chain has `RelinkRequired() == true`; the call whose refresh gets `invalid_grant` returns the same, after the store is empty; `ErrIncompatible` has `UpdateRequired() == true`; `ErrOffline` has neither method and unwraps to its network cause; `*deviceauth.Manager` has `core.Auth`'s `AccessToken(ctx, bool)` method (a compile-time assertion in `refresh_test.go`; the full `core.Auth` assertion is on 03's session adapter, WA58, because 01's `SessionEnded` returns nothing and this one returns `State`); `Link` returns once `linking` is reached and polling continues after its ctx is cancelled, until `CancelLink` or `Close`; `LinkWithPassword`: 200 → credential then `linked`, 401 → stays `unlinked` with the `*api.Error`, compat refusal → `incompatible`; `SessionEnded` (each of its three codes) → refresh → `invalid_grant` → unlinked with `signed_out` or `account_disabled`, → success → stays `linked`, two concurrent calls → one refresh, another code → no request; `HelloRefused` with `client_outdated` → `incompatible`/`update_app`, with `protocol_unsupported` and no `serverMax` → a `/info` request (Recheck) decides; **verification URIs** (§11.2): `StartLink` → `ErrBadResponse`, the state unchanged and nothing to open, when either URI is `file:///C:/x`, `ms-settings:display`, `search-ms:query=x`, `javascript:alert(1)`, a UNC path (`\\host\share\x` and `file://host/share/x`), `https` on another host, `http` on a non-loopback host, carries userinfo or a fragment, has the path `/link/` or `/Link`, an extra query parameter (`code=…&next=…`), or a code that differs from `userCode`; accepted with an upper-case host or an explicit `:443`, and `LinkState` then holds Go's canonical strings, not the server's; `Recheck` back to `linked`; daily refresh under `synctest`; `Unlink` offline → `ErrRevokeNotConfirmed` and the credential deleted; redirects are not followed; the `User-Agent` is `isshoni-desktop/<version>`; a TLS failure is `ErrNetwork` with a reachable `*tls.CertificateVerificationError`; `Servers.Add` stores `info.server.publicUrl` normalized (a server reached as `alt.example` that calls itself `watch.example.com` → entry and credential key `https://watch.example.com`, `RequestedOrigin` kept), an adopted origin already listed → `Existing` and no second entry; `ForgetAll` with 20 servers, half of them hanging: returns within 6 s, every credential gone, users and devices cleared; `servers.json` round trip, the 20 cap, a corrupt file renamed `.bad` | Mac, CI ubuntu, CI windows (06 windows-go) |
 | `internal/client/credstore` | file and memory stores: put/get/delete/list, 0600, atomic replace, a corrupt file; the Windows store with a random test prefix: put/get/overwrite/delete/list, the 2,560-byte check, a missing target → `ErrNotFound`; `ERROR_NO_SUCH_LOGON_SESSION` → `t.Skip` with a message (the manual check M-DA-1 covers it) | Mac, CI ubuntu (file); CI windows (06 windows-go; Credential Manager) |
 | `internal/client/deeplink` | `testdata/links.json`; `NormalizeOrigin` table (paths, ports, userinfo, IDN, loopback http only when allowed); `FuzzParse` (never panics; an accepted link always rebuilds with `Build` to an equal `Link`) | Mac, CI ubuntu |
 | `internal/client/compat` | §13.2's table, both functions, dev versions, a floor that isn't SemVer; `FromError` for `protocol_unsupported` with `serverMax` absent and with 0 → `(Check{}, false)` (M1's `errorForClose` case), with `serverMax` 1 and `MinProtocol` 1 → `update_app`/`protocol_too_new`; `client_outdated` → `update_app`/`min_client_version`; nil and other codes → `false` | Mac, CI ubuntu |
@@ -1946,8 +2006,8 @@ type linkedDevice struct {
 func linkDevice(t *testing.T, srv *servertest.Server, cookie, name string) linkedDevice
 
 // linkedManager returns a started deviceauth.Manager (memory credential store) that is already linked for the user
-// behind cookie, through Manager.Link and the cookie's lookup and decide. It satisfies core.Auth. Closed by
-// t.Cleanup. (DA11)
+// behind cookie, through Manager.Link and the cookie's lookup and decide. Its AccessToken is core.Auth's; a test
+// that hands it to 01's core wraps SessionEnded, as 03's session adapter does. Closed by t.Cleanup. (DA11)
 func linkedManager(t *testing.T, srv *servertest.Server, cookie string) *deviceauth.Manager
 ```
 
@@ -2066,8 +2126,9 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
   protocol.DesktopOrigins()` in `wire.go`, feeding `signal.Config.AllowedOrigins` (as built) and
   `httpapi.Deps.DesktopOrigins`; the store methods of §4.2; migration `0002_device_flow.sql`; `PruneStats.Devices`.
 - **Client Go** (for 01-client-core and 03-desktop-app):
-  - `deviceauth.Manager.AccessToken(ctx context.Context, forceRefresh bool) (protocol.Secret, error)`: satisfies
-    01-client-core's `core.Auth`; `forceRefresh` at most once per 10 s. For 01's signal client:
+  - `deviceauth.Manager.AccessToken(ctx context.Context, forceRefresh bool) (protocol.Secret, error)`: the
+    `AccessToken` of 01-client-core's `core.Auth` (03's session adapter supplies the rest, WA58); `forceRefresh` at
+    most once per 10 s. For 01's signal client:
     `Options.Token = func(ctx context.Context) (protocol.Secret, error) { return mgr.AccessToken(ctx, false) }`;
   - its errors: `ErrNotLinked` (its type has `RelinkRequired() bool` returning true; returned when no credential
     exists or this call's refresh got `invalid_grant`), `ErrIncompatible` (`UpdateRequired() bool` returning true),
@@ -2115,7 +2176,8 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
 
 **docs/m2/01-client-core.md**
 - The Go signaling client keeps `Options.Token` as 01 §15.3 built it (called before every `hello`); the core's
-  `core.Auth` is `AccessToken(ctx, forceRefresh bool)`, which `*deviceauth.Manager` implements. The core calls
+  `core.Auth` is `AccessToken(ctx, forceRefresh bool)` plus `SessionEnded(ctx, code)` without a result (01 §11.2);
+  `*deviceauth.Manager` has the first, and 03's session adapter (03 §9, WA58) supplies both over it. The core calls
   `AccessToken(ctx, true)` once after `unauthenticated`, then dials again (its §11.3), and decides "unlinked" from an
   error with `RelinkRequired() == true`. It treats an `Auth` error with `UpdateRequired() == true` like
   `client_outdated` (stop `update_required`), so it doesn't back off forever while the manager is incompatible.

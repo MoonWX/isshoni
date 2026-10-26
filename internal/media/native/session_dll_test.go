@@ -84,8 +84,8 @@ func startNative(t *testing.T, e *Engine, cfg media.Config) *session {
 }
 
 // TestDLLSession: the binding over the real session core: one EventLayer per layer before any media, each layer's
-// first packet a Reinit keyframe within 500 ms, the PCM tap, an EventLayer of the new profile before the Reinit
-// packets of Reconfigure{Profile}, Stats, and ErrStopped after Stop.
+// first packet a Reinit keyframe within 500 ms, PCM chunks through Next (TapPCM, 05 §13.2), an EventLayer of the new
+// profile before the Reinit packets of Reconfigure{Profile}, Stats, and ErrStopped after Stop.
 func TestDLLSession(t *testing.T) {
 	e := sessionEngine(t)
 	cfg := nativeConfig()
@@ -110,11 +110,20 @@ func TestDLLSession(t *testing.T) {
 		}
 	}
 	first := map[string]media.Packet{}
+	gotPCM := false
+	checkPCM := func(p media.Packet) {
+		t.Helper()
+		if p.Kind != media.KindPCM {
+			return
+		}
+		gotPCM = true
+		if len(p.Data) != pcmChunkBytes || p.CaptureNS < 0 {
+			t.Errorf("PCM chunk of %d bytes at %d", len(p.Data), p.CaptureNS)
+		}
+	}
 	for len(first) < 2 {
 		p := next()
-		if p.Kind == media.KindPCM {
-			t.Fatal("Next returned PCM")
-		}
+		checkPCM(p)
 		if p.Kind == media.KindVideo {
 			if _, ok := first[p.Layer]; !ok {
 				first[p.Layer] = p
@@ -127,18 +136,9 @@ func TestDLLSession(t *testing.T) {
 	if d := time.Since(started); d > 600*time.Millisecond {
 		t.Errorf("first packets %v after Start", d)
 	}
-	// PCM comes through im_next_packet like everything else: Next routes it to the tap while it pulls.
-	gotPCM := false
+	// PCM comes through im_next_packet like everything else, and Next returns it as KindPCM (TapPCM).
 	for deadline := time.Now().Add(time.Second); !gotPCM && time.Now().Before(deadline); {
-		next()
-		select {
-		case c, ok := <-s.PCMTap():
-			gotPCM = true
-			if !ok || len(c.Frames) != 960 || c.CaptureNS < 0 {
-				t.Errorf("PCM chunk %d frames at %d, open %v", len(c.Frames), c.CaptureNS, ok)
-			}
-		default:
-		}
+		checkPCM(next())
 	}
 	if !gotPCM {
 		t.Error("no PCM chunk with TapPCM")
@@ -176,8 +176,6 @@ func TestDLLSession(t *testing.T) {
 	}
 	if _, err := s.Next(ctx); !errors.Is(err, media.ErrStopped) {
 		t.Errorf("Next after Stop: %v", err)
-	}
-	for range s.PCMTap() { // drained, then closed by Stop
 	}
 }
 

@@ -1,0 +1,76 @@
+# gpu_warp_test's pointer golden (README WA33): the slot after CursorOverlay::Blend of
+# the color pointer at (4, 6),
+# over the four-quadrant background (gpu_warp_support.h). Straight alpha; the test allows 1 code value.
+size 64 64
+palette
+a FF202060
+e FF206020
+d FF6060E0
+. FFC0C0C0
+b FFE01010
+c FFFFFFFF
+pixels
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....b...........................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bb..........................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bcb.........................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bccb........................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bcccb.......................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bccccb......................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bcccccb.....................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bccccccb....................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bcccccccb...................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bcccccbbbb..................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bccbccb.....................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bcbdbccb....................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....bbdddbccb...................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+....b.ddd.bccb..................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+.......d...bcb..................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+............b...................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+cccccccccccccccccccccccccccccccceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee

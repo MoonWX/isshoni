@@ -38,7 +38,8 @@
 //      (`doctor.${check.code}`) does cover all of it, and the run says so in a note: rule 4 can't check there;
 //    - by rules 2 and 3: every errors.<code>, fix.firewall.<provider> and conntest.nat.<nat> they require;
 //    - as a whole namespace that code outside the t() calls reads (READ_WHOLE: the service worker's `push` texts,
-//      05 §16.2), or through $t(…) nesting in another message.
+//      05 §16.2, and the desktop app's `desktop.native` texts, which Go reads, M2 03 §18.1), or through $t(…)
+//      nesting in another message.
 //    A message that only tests use is unused. The warnings never fail the check: a key may wait for the code of a
 //    later slice, and keys built at run time are only followed as far as their written part.
 // 5. (W00) A lazy namespace is in the catalog before a key of it is asked for, and it is not in the main bundle.
@@ -928,11 +929,13 @@ export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
 }
 
 /**
- * Rule 4: namespaces that code reads as a whole, not by key: the service worker's `push` texts, which
- * build/sw-plugin.ts hands to it as one object (05 §16.2), and which src/sw/push.ts picks by the push's type.
+ * Rule 4: namespaces (or parts of one) that code reads as a whole, not by key: the service worker's `push` texts,
+ * which build/sw-plugin.ts hands to it as one object (05 §16.2), and which src/sw/push.ts picks by the push's type;
+ * and `desktop.native`, which the desktop app's Go code (internal/desktop/i18n) looks up in the same file
+ * (M2 03 §18.1).
  * @type {readonly string[]}
  */
-export const READ_WHOLE = Object.freeze(['push']);
+export const READ_WHOLE = Object.freeze(['push', 'desktop.native']);
 
 /** Rule 4: a template head of a key that is built at run time: a namespace, a dot, then key characters. */
 const KEY_HEAD = /^[A-Za-z][\w-]*\.[\w.-]*$/;

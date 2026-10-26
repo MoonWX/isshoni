@@ -13,19 +13,26 @@ import (
 
 // Self-service (03 §7.7, §12.4.3; README S58): what a logged-in user does to the own account. Revoking one session,
 // "sign out other browsers", "log out everywhere", changing the password, deleting the account, and revoking a
-// linked device. Each one is a row of the revocation table (revoke.go) with its audit row (03 §10).
+// linked device; and (M2 02 §6.4, §7.2; README WA39) renaming a device and the app's own sign-out. Each one is a row
+// of the revocation table (revoke.go) with its audit row (03 §10, M2 02 §8).
 //
-// Every call checks its caller again inside its own Write (loadSelf): the account must be active and the caller's
-// web session must still exist. All of them are for web sessions; a device's principal (M2) gets a
-// not-implemented error, as in Logout.
+// Every call checks its caller again inside its own Write (loadSelf, loadCaller): the account must be active and the
+// caller's web session, or for a device's principal its device, must still exist. Which credential a call takes
+// follows its route's access (M2 02 §6.4):
+//   - a web session only (UserSession routes, and Logout): ChangePassword, DeleteSelf, RevokeOtherSessions. A bearer
+//     is 403 forbidden {credential: session} (sessionCaller);
+//   - either (User routes): RevokeSession, LogoutEverywhere, RevokeDevice, RenameDevice (userCaller);
+//   - a device only (the UserDevice route): RevokeOwnDevice. A session is 403 forbidden {credential: device}
+//     (deviceCaller).
 
-// Audit actions written here (03 §10).
+// Audit actions written here (03 §10, M2 02 §8).
 const (
 	auditLogoutEverywhere = "auth.logout_everywhere"
 	auditPasswordChanged  = "auth.password_changed"
 	auditSessionRevoked   = "session.revoked"
 	auditUserDeleted      = "user.deleted"
-	auditDeviceRevoked    = "device.revoked"
+	auditDeviceRevoked    = "device.revoked" // detail {via: devices_page | app | cap}
+	auditDeviceRenamed    = "device.renamed" // detail {from, to}
 )
 
 // targetDevice is the audit target kind of a linked device (03 §5).
@@ -35,16 +42,39 @@ const targetDevice = "device"
 // validation_failed answer (CheckPassword names the field "password").
 const fieldNewPassword = "newPassword"
 
+// fieldName is the JSON name of a device's new name in PATCH /api/v1/me/devices/{id} (M2 02 §7.2), the key of its
+// validation_failed answer.
+const fieldName = "name"
+
 // errWrongPassword is 403 wrong_password: the re-authentication of a logged-in user failed.
 func errWrongPassword() error { return api.NewError(api.CodeWrongPassword) }
 
-// webCaller is the principal rule of the calls a web session makes for its own account: a device's principal (M2)
-// is told that method is not implemented for it, and a principal without a user or a session is unauthenticated.
-func webCaller(method string, p Principal) error {
-	if p.Method == MethodBearer {
-		return notImplemented(method + " for a device")
+// userCaller is the principal rule of the calls of User routes, which take either credential (M2 02 §6.4): a web
+// session's principal with its user and session, or a device's with its user and device. Anything else is
+// unauthenticated.
+func userCaller(p Principal) error {
+	switch {
+	case p.Method == MethodSession && p.UserID != "" && p.SessionID != "":
+		return nil
+	case p.Method == MethodBearer && p.UserID != "" && p.DeviceID != "":
+		return nil
 	}
-	if p.Method != MethodSession || p.UserID == "" || p.SessionID == "" {
+	return errUnauthenticated()
+}
+
+// errDeviceOnly is 403 forbidden {credential: device}: the answer of the UserDevice route (M2 02 §6.4) to a cookie.
+func errDeviceOnly() error {
+	return &api.Error{Code: api.CodeForbidden,
+		Params: map[string]any{api.ParamCredential: string(api.CredentialKindDevice)}}
+}
+
+// deviceCaller is the principal rule of RevokeOwnDevice, the UserDevice route's call: a web session is 403
+// forbidden {credential: device}, and a principal without a user or a device is unauthenticated.
+func deviceCaller(p Principal) error {
+	if p.Method == MethodSession {
+		return errDeviceOnly()
+	}
+	if p.Method != MethodBearer || p.UserID == "" || p.DeviceID == "" {
 		return errUnauthenticated()
 	}
 	return nil
@@ -204,14 +234,15 @@ func (s *Service) takePasswordChange(ctx context.Context, user store.UserID) (*c
 // of the user's own (unknown, another user's, or gone already) is *api.Error{not_found}.
 //
 // It may be the caller's own session: that is then a logout under another reason, and the caller's next request is
-// unauthenticated.
+// unauthenticated. A device may call it too (DELETE /me/sessions/{id} is a User route, M2 02 §6.4): it may revoke
+// any of its user's web sessions.
 func (s *Service) RevokeSession(ctx context.Context, p Principal, id store.SessionID, m ReqMeta) error {
-	if err := webCaller("RevokeSession", p); err != nil {
+	if err := userCaller(p); err != nil {
 		return err
 	}
 	now := s.now()
 	err := s.db.Write(ctx, func(q *store.Q) error {
-		me, err := loadSelf(q, p, now)
+		me, err := loadCaller(q, p, now)
 		if err != nil {
 			return err
 		}
@@ -243,7 +274,7 @@ func (s *Service) RevokeSession(ctx context.Context, p Principal, id store.Sessi
 // GET /me/sessions lists besides the caller's. A row that had expired already and that the janitor has not pruned
 // yet (03 §4.7) goes like the others, with its audit row, but was no session any more and is not counted.
 func (s *Service) RevokeOtherSessions(ctx context.Context, p Principal, m ReqMeta) (int, error) {
-	if err := webCaller("RevokeOtherSessions", p); err != nil {
+	if err := sessionCaller(p); err != nil {
 		return 0, err
 	}
 	now := s.now()
@@ -283,16 +314,19 @@ func (s *Service) RevokeOtherSessions(ctx context.Context, p Principal, m ReqMet
 // LogoutEverywhere deletes every web session and every device of the principal's user, the caller's session
 // included (POST /api/v1/auth/logout-everywhere; 03 §7.7 "Log out everywhere"). Their push subscriptions and the
 // device codes the user decided go with them; a pending reset link stays. It writes auth.logout_everywhere
-// {sessions, devices}. After the commit the user's sessions leave the cache and every connection of the user is
-// closed with ReasonLoggedOut.
+// {sessions, devices}. After the commit the user's sessions and devices leave the caches and every connection of
+// the user is closed with ReasonLoggedOut.
+//
+// A device may call it (a User route, M2 02 §6.4 #4): from the app it signs out everything, the app's own device
+// included.
 func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) error {
-	if err := webCaller("LogoutEverywhere", p); err != nil {
+	if err := userCaller(p); err != nil {
 		return err
 	}
 	now := s.now()
 	var rv revoked
 	err := s.db.Write(ctx, func(q *store.Q) error {
-		me, err := loadSelf(q, p, now)
+		me, err := loadCaller(q, p, now)
 		if err != nil {
 			return err
 		}
@@ -338,7 +372,7 @@ func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) 
 // fresh 30 days, or what is left of the 180).
 func (s *Service) ChangePassword(ctx context.Context, p Principal, current, next string, m ReqMeta) (LoginResult, error) {
 	const op = "change password"
-	if err := webCaller("ChangePassword", p); err != nil {
+	if err := sessionCaller(p); err != nil {
 		return LoginResult{}, err
 	}
 	me, err := s.readSelf(ctx, op, p)
@@ -443,7 +477,7 @@ func (s *Service) rotateForCaller(q *store.Q, sess store.Session, token string, 
 // ReasonAccountDeleted. The username is free again.
 func (s *Service) DeleteSelf(ctx context.Context, p Principal, password string, m ReqMeta) error {
 	const op = "delete account"
-	if err := webCaller("DeleteSelf", p); err != nil {
+	if err := sessionCaller(p); err != nil {
 		return err
 	}
 	now := s.now()
@@ -503,50 +537,133 @@ func refuseLastAdmin(q *store.Q, user store.User) error {
 // ---- devices ----
 
 // RevokeDevice deletes one of the principal's own linked devices (DELETE /api/v1/me/devices/{id}; 03 §7.7 "Revoke
-// device"): the row goes with its tokens and push subscriptions, device.revoked is written, and after the commit
-// the device's connections are closed with ReasonDeviceRevoked. A device that is not one of the user's own is
-// *api.Error{not_found}.
+// device", M2 02 §6.5): the row goes with its tokens and push subscriptions, and device.revoked is written with
+// {via: "devices_page"}. After the commit the device leaves the bearer cache and its connections are closed with
+// ReasonDeviceRevoked. A device that is not one of the user's own is *api.Error{not_found}. The device codes the
+// user decided stay: another app may be waiting for its approval.
 //
-// Linking an app is M2, so no device exists before then and every ID answers not_found; the devices table and this
-// path are there already, so that the Devices page's Revoke needs nothing new the day the list has rows. The device
-// codes the user decided stay: another app may be waiting for its approval. M2 adds what belongs to the flow: the
-// app's own "Sign out" (a bearer principal) and the refresh-token reuse row.
+// A device may call it too (a User route, M2 02 §6.4 #18): with its own ID that is the app signing itself out,
+// written {via: "app"} as RevokeOwnDevice does; another ID of its user's is removed as on the Devices page.
 func (s *Service) RevokeDevice(ctx context.Context, p Principal, id store.DeviceID, m ReqMeta) error {
-	if err := webCaller("RevokeDevice", p); err != nil {
+	if err := userCaller(p); err != nil {
 		return err
 	}
+	via := revokedViaDevicePage
+	if p.Method == MethodBearer && id == p.DeviceID {
+		via = revokedViaApp
+	}
+	return s.revokeDevice(ctx, p, id, via, m)
+}
+
+// RevokeOwnDevice is the app's own sign-out (POST /api/v1/device/revoke, #49, a UserDevice route; M2 02 §6.5, §7.2):
+// the bearer principal's device goes with its tokens and push subscriptions, device.revoked {via: "app"} is written,
+// and after the commit the device leaves the bearer cache and its connections are closed with ReasonDeviceRevoked.
+// A web session is 403 forbidden {credential: device}; a device that is gone already is unauthenticated, like any
+// call of a credential that went (loadCaller). httpapi notifies {UserID}: devices.
+func (s *Service) RevokeOwnDevice(ctx context.Context, p Principal, m ReqMeta) error {
+	if err := deviceCaller(p); err != nil {
+		return err
+	}
+	return s.revokeDevice(ctx, p, p.DeviceID, revokedViaApp, m)
+}
+
+// revokeDevice deletes the device id of the caller's user in one Write that checks the caller again (loadCaller),
+// with its device.revoked {via} row (actor the user with the request's IP), then runs devicesRevoked.
+func (s *Service) revokeDevice(ctx context.Context, p Principal, id store.DeviceID, via string, m ReqMeta) error {
 	now := s.now()
 	err := s.db.Write(ctx, func(q *store.Q) error {
-		me, err := loadSelf(q, p, now)
+		me, err := loadCaller(q, p, now)
 		if err != nil {
 			return err
 		}
-		devices, err := q.ListDevices(me.user.ID)
+		dev, err := deviceOfUser(q, me.user.ID, id)
 		if err != nil {
 			return err
-		}
-		var dev *store.Device
-		for i := range devices {
-			if devices[i].ID == id {
-				dev = &devices[i]
-			}
-		}
-		if dev == nil {
-			return api.NewError(api.CodeNotFound)
 		}
 		if _, err := q.DeleteDevice(me.user.ID, dev.ID); err != nil {
 			return err
 		}
 		return q.AppendAudit(store.AuditEntry{At: now, Action: auditDeviceRevoked, Actor: userActor(me.user, m),
-			TargetKind: targetDevice, TargetID: string(dev.ID), TargetName: dev.Name})
+			TargetKind: targetDevice, TargetID: string(dev.ID), TargetName: dev.Name,
+			Detail: map[string]any{"via": via}})
 	})
 	if err != nil {
 		return serviceErr("revoke device", err)
 	}
-	// No cache holds a device before M2 (the access-token cache comes with the flow), so only the connections are
-	// left to close.
-	if s.conns != nil {
-		s.conns.CloseConnections(ConnSelector{UserID: p.UserID, DeviceID: id}, ReasonDeviceRevoked)
-	}
+	s.devicesRevoked(p.UserID, id)
 	return nil
+}
+
+// RenameDevice renames one of the principal's own devices (PATCH /api/v1/me/devices/{id}, #52, a User route; M2 02
+// §7.2). In order:
+//
+//  1. the caller: a web session or a device (userCaller);
+//  2. the name (NormalizeDeviceName) → 422 validation_failed {name: required|too_long|invalid};
+//  3. one Write, which checks the caller again (loadCaller): a device that is not one of the user's own is
+//     *api.Error{not_found}; a name equal to the current one changes nothing and writes nothing; otherwise the name
+//     is set and device.renamed {from, to} is written (actor the user with the request's IP, target the device under
+//     its new name).
+//
+// It returns the device as it is now. After a rename the device leaves the bearer cache, so that its principal and
+// the hub's next Revalidate (TouchPrincipal) carry the new name. httpapi notifies {UserID}: devices.
+func (s *Service) RenameDevice(ctx context.Context, p Principal, id store.DeviceID, name string, m ReqMeta) (store.Device, error) {
+	if err := userCaller(p); err != nil {
+		return store.Device{}, err
+	}
+	n, err := NormalizeDeviceName(name)
+	if err != nil {
+		var fe *FieldError
+		if errors.As(err, &fe) {
+			return store.Device{}, validationFailed(map[string]string{fieldName: fe.Code})
+		}
+		return store.Device{}, internalErr("rename device", err)
+	}
+	now := s.now()
+	var out store.Device
+	renamed := false
+	err = s.db.Write(ctx, func(q *store.Q) error {
+		renamed = false
+		me, err := loadCaller(q, p, now)
+		if err != nil {
+			return err
+		}
+		dev, err := deviceOfUser(q, me.user.ID, id)
+		if err != nil {
+			return err
+		}
+		if dev.Name == n {
+			out = dev
+			return nil
+		}
+		if out, err = q.RenameDevice(me.user.ID, dev.ID, n); err != nil {
+			return err
+		}
+		renamed = true
+		return q.AppendAudit(store.AuditEntry{At: now, Action: auditDeviceRenamed, Actor: userActor(me.user, m),
+			TargetKind: targetDevice, TargetID: string(dev.ID), TargetName: n,
+			Detail: map[string]any{"from": dev.Name, "to": n}})
+	})
+	if err != nil {
+		return store.Device{}, serviceErr("rename device", err)
+	}
+	if renamed {
+		s.bearers.invalidateDevice(id)
+	}
+	return out, nil
+}
+
+// deviceOfUser returns one of the user's devices, or *api.Error{not_found} when the device does not exist or is
+// another user's.
+func deviceOfUser(q *store.Q, u store.UserID, id store.DeviceID) (store.Device, error) {
+	if id == "" {
+		return store.Device{}, api.NewError(api.CodeNotFound)
+	}
+	dev, _, err := q.DeviceByID(id)
+	switch {
+	case errors.Is(err, store.ErrNotFound) || (err == nil && dev.UserID != u):
+		return store.Device{}, api.NewError(api.CodeNotFound)
+	case err != nil:
+		return store.Device{}, err
+	}
+	return dev, nil
 }

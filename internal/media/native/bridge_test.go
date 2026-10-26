@@ -19,9 +19,10 @@ import (
 
 // bridge_test drives the session half of the binding through fakeCaller (04 §18.3, README WA23): media.Config →
 // im_start_config for every row of 04 §12.2, the status and token mapping of a failed start, the one-session rule,
-// EventLayer synthesis, the event table, ENDED, the packet copy and its limits, PCMTap, Stop and its races, the
-// controls, Reconfigure's order, Stats, the probe, sources and picks, and Close stopping the sessions. The DLL's own
-// behavior is session_fake_test's (native/windows/tests) and the Windows DLL tests' (session_windows_test.go).
+// EventLayer synthesis, the event table, ENDED, the packet copy and its limits, PCM through Next (README WA35), Stop
+// and its races, the controls, Reconfigure's order, Stats, the probe, sources and picks, and Close stopping the
+// sessions. The DLL's own behavior is session_fake_test's (native/windows/tests) and the Windows DLL tests'
+// (session_windows_test.go).
 
 // sessionFake scripts the session exports of a fakeCaller, reading and writing the binding's memory as the DLL does:
 // im_start records the config it was given (deep, during the call) and answers with info; im_next_packet hands out
@@ -826,46 +827,61 @@ func TestPacketCopyAndLimits(t *testing.T) {
 	}
 }
 
-func TestPCMTap(t *testing.T) {
+// TestPCMThroughNext: with AudioConfig.TapPCM, IM_PACKET_PCM chunks come out of Next as media.KindPCM packets in
+// their order among the other packets, copied into fresh memory, CaptureNS relative to the epoch (05 §13.2, 01 §5.1);
+// chunks of another size or from before the epoch are dropped, and a session without TapPCM never returns PCM.
+func TestPCMThroughNext(t *testing.T) {
 	sf := newSessionFake(t)
 	cfg := baseConfig()
 	cfg.Audio = &media.AudioConfig{Mode: media.AudioTestTone, TapPCM: true}
 	_, s := startFake(t, sf, cfg)
-	tap := s.PCMTap()
-	if tap == nil {
-		t.Fatal("no PCMTap with TapPCM")
-	}
 	skipStartEvents(t, s)
 	chunk := make([]byte, pcmChunkBytes)
-	for i := range 960 {
+	for i := range pcmChunkBytes / 4 {
 		binary.LittleEndian.PutUint32(chunk[4*i:], math.Float32bits(float32(i)/1000))
 	}
-	var items []nextItem
-	for i := range pcmTapCapacity + 5 {
-		items = append(items, nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: int64(10_000_000 * i),
-			data: chunk})
+	opus := []byte{0xFC, 0xFF, 0xFE}
+	sf.push(
+		nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: 0, data: chunk},
+		nextItem{st: imOK, kind: imPacketAudio, layer: imNoLayer, ts: 5_000_000, data: opus},
+		nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: 10_000_000, data: chunk[:pcmChunkBytes-4]},
+		nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: -1, data: chunk},
+		nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: 10_000_000, size: pcmChunkBytes + 1},
+		nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: 20_000_000, data: chunk},
+	)
+	got := nextN(t, s, 3)
+	p0, a, p1 := got[0], got[1], got[2]
+	if p0.Kind != media.KindPCM || p0.CaptureNS != 0 || len(p0.Data) != pcmChunkBytes || p0.Layer != "" ||
+		p0.Reinit || p0.Keyframe || p0.Event != nil {
+		t.Fatalf("first packet %+v, want a PCM chunk at 0", p0)
 	}
-	items = append(items, video(0, imPktKeyframe, 5))
-	sf.push(items...)
-	p := nextN(t, s, 1)[0]
-	if p.Kind != media.KindVideo {
-		t.Fatalf("Next returned %+v: PCM never comes out of Next", p)
+	if v := math.Float32frombits(binary.LittleEndian.Uint32(p0.Data[4*500:])); v != float32(500)/1000 {
+		t.Errorf("value 500 of the chunk is %v", v)
 	}
-	if len(tap) != pcmTapCapacity {
-		t.Errorf("tap holds %d chunks, want %d (the rest dropped)", len(tap), pcmTapCapacity)
+	if a.Kind != media.KindAudio || a.CaptureNS != 5_000_000 {
+		t.Errorf("second packet %+v, want the Opus packet", a)
 	}
-	c := <-tap
-	if c.CaptureNS != 0 || len(c.Frames) != 960 || c.Frames[500] != float32(500)/1000 {
-		t.Errorf("chunk %d frames, CaptureNS %d, frame 500 = %v", len(c.Frames), c.CaptureNS, c.Frames[500])
+	if p1.Kind != media.KindPCM || p1.CaptureNS != 20_000_000 || len(p1.Data) != pcmChunkBytes {
+		t.Errorf("third packet %+v: the short, early and oversized chunks are dropped", p1)
 	}
-	if err := s.Stop(); err != nil {
-		t.Fatal(err)
+	// Fresh memory: the fake overwrote its slot at the next call.
+	sf.push(video(0, imPktKeyframe, 30))
+	nextN(t, s, 1)
+	if string(p1.Data) != string(chunk) {
+		t.Error("Data aliases the engine's memory")
 	}
-	for range tap { // drained, then closed
+	if n := sf.f.count(procRequestKeyframe); n != 0 {
+		t.Errorf("%d keyframe requests for dropped PCM", n)
 	}
-	other := baseConfig()
-	if _, s2 := startFake(t, newSessionFake(t), other); s2.PCMTap() != nil {
-		t.Error("PCMTap without TapPCM")
+
+	// Without TapPCM, PCM never comes out of Next (the core's sessions: the pump never sees it).
+	sf2 := newSessionFake(t)
+	_, s2 := startFake(t, sf2, baseConfig())
+	skipStartEvents(t, s2)
+	sf2.push(nextItem{st: imOK, kind: imPacketPCM, layer: imNoLayer, ts: 0, data: chunk},
+		nextItem{st: imOK, kind: imPacketAudio, layer: imNoLayer, ts: 20_000_000, data: opus})
+	if p := nextN(t, s2, 1)[0]; p.Kind != media.KindAudio {
+		t.Errorf("without TapPCM: %+v, want the Opus packet after the dropped chunk", p)
 	}
 }
 

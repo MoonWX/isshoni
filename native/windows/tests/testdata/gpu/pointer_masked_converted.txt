@@ -1,0 +1,25 @@
+# gpu_warp_test's masked-color pointer after ConvertPointerShape (README WA33): replacing pixels opaque,
+# XOR 0 transparent, inverting ones black or white as over white (04 section 7.8).
+size 16 16
+palette
+a 00000000
+b FF000000
+. FF20C040
+c FFFFFFFF
+pixels
+........aaaaaaaa
+........aaaaaaaa
+..aaaa..aaaaaaaa
+..aaaa..aaaaaaaa
+..aaaa..aaaaaaaa
+..aaaa..aaaaaaaa
+........aaaaaaaa
+........aaaaaaaa
+aaaaaaaabaaaaaab
+aaaaaaaaabaaaaba
+aaaaaaaaaabaabaa
+aaaaaaaaaaabbaaa
+aaaaaaaaaaabbaaa
+aaaaaaaaaabaabaa
+ccccccccbaaaabaa
+cccccccbaaaaaaba

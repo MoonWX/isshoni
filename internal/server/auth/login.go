@@ -529,9 +529,11 @@ func currentAccount(q *store.Q, v verifiedLogin, now time.Time) (store.User, err
 
 // Logout deletes the principal's session, with its push subscriptions (03 §7.7 "Logout"), and writes auth.logout.
 // After the commit the session leaves the cache and its WebSocket connections are closed with ReasonLoggedOut. It is
-// idempotent: a session that is already gone is no error. (M2: a bearer principal's device.)
+// idempotent: a session that is already gone is no error. It is for web sessions only: POST /auth/logout is a Public
+// route that reads the cookie, and a device signs out with RevokeOwnDevice (POST /device/revoke, M2 02 §6.5), so a
+// bearer principal is 403 forbidden {credential: session}.
 func (s *Service) Logout(ctx context.Context, p Principal, m ReqMeta) error {
-	if err := webCaller("Logout", p); err != nil {
+	if err := sessionCaller(p); err != nil {
 		return err
 	}
 	now := s.now()

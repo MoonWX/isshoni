@@ -90,11 +90,12 @@ func TestAuthenticate(t *testing.T) {
 		t.Fatalf("AuthenticateCookie without a cookie: %v, want ErrNoCookie", err)
 	}
 
-	// M1 has no bearer tokens: any Authorization header is unauthenticated on REST, and ignored on /ws.
+	// An Authorization header takes the bearer path on REST (M2 02 §6.1), where the cookie counts for nothing: an
+	// unknown access token is invalid_token although the cookie is valid. /ws ignores the header.
 	r := e.request(http.MethodGet, res.Token)
 	r.Header.Set("Authorization", "Bearer isa_"+newToken(32))
 	_, err = e.svc.Authenticate(r)
-	wantCode(t, err, api.CodeUnauthenticated)
+	wantCode(t, err, api.CodeInvalidToken)
 	if p, err = e.svc.AuthenticateCookie(r); err != nil || p != want {
 		t.Fatalf("AuthenticateCookie with an Authorization header = %+v, %v", p, err)
 	}

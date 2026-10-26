@@ -9,9 +9,14 @@
     "copy": "Copy",
     "copied": "Copied",
     "goHome": "Go to isshoni",
+    "back": "Back",
     "notFound": {
       "title": "Nothing here",
       "body": "This page doesn't exist. Check the link, or go back to isshoni."
+    },
+    "openedInBrowser": {
+      "title": "Opened in your browser",
+      "body": "This page works in your web browser, so isshoni opened it there. Come back here when you're done."
     },
     "pageUnavailable": {
       "title": "Not in this build yet",
@@ -32,7 +37,8 @@
         "title": "Can't reach the server",
         "body": "Check your internet connection. isshoni keeps trying and opens as soon as the server answers.",
         "retry": "Try now",
-        "retrying": "Trying…"
+        "retrying": "Trying…",
+        "switchServer": "Switch server"
       },
       "needsHttps": {
         "title": "isshoni needs HTTPS",

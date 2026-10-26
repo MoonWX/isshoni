@@ -1,0 +1,143 @@
+# gpu_warp_test's rotation golden (README WA33): rotation_source.txt
+# turned 270 degrees clockwise: the red F's top-left corner is at the bottom left.
+# The expected upright picture; the test converts it with the CPU model and compares the NV12.
+# Written from rotation_source.txt by an independent grid rotation (not the converters' code).
+size 64 128
+palette
+d FF000000
+g FF2040E0
+b FF20C040
+a FF20D0E0
+c FFD040C0
+f FFE02020
+e FFF0E020
+. FFFFFFFF
+pixels
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+........bbbbbbbbbbbbbbbb........aaaaaaaaccccccccccccccccaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+ddddddddddddddddddddddddeeeeeeeeeeeeeeeedddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggddddddddggggggggdddddddddddddddddddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffggggggggggggggggggggggggggggggggggggggggdddddddddddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffdddddddd

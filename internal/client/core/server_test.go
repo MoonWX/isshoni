@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,12 @@ import (
 // signaltest-style fake server where cheap"): it answers each hello as the test says (a welcome, or an error and
 // the close code that follows it), answers requests (room.join, room.leave, share.start, share.stop) like the hub,
 // and records every message it receives. It answers no pub offer, so a share's pub PC never connects.
+//
+// Like the hub, a resumed welcome keeps the connection's id and room, and is followed by a room.state that lists
+// the connection's shares (as live); share.start gives each share an id of its own (s_1, s_2, …), and the same one
+// again for a ref it has seen on the connection. Like the SFU (M1 01 §9 rules 2 and 3), it keeps the gen and neg of
+// the connection's pub offers while the connection is in a room, resumes included, and answers an offer of an older
+// gen, or of an older neg in the current gen, with error{stale_negotiation, scope pc}.
 type fakeServer struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -28,15 +35,26 @@ type fakeServer struct {
 	hellos []protocol.Hello    // every hello, in order
 	got    []protocol.Envelope // every other message, in order
 	conns  []*fakeConn
+	shares []fakeShare // the shares started and not stopped
 	// hello answers the n-th hello (0-based); nil answers each with a welcome, resumed when it carries a resume
 	// token of this server.
 	hello func(n int, h protocol.Hello) fakeAnswer
-	// silent lists request types the server never answers; reject answers request types with an error.
-	silent []protocol.MessageType
-	reject map[protocol.MessageType]protocol.Error
+	// silent lists request types the server never answers; reject answers request types with an error, and
+	// rejectOnce the next request of a type (then it answers that type again).
+	silent     []protocol.MessageType
+	reject     map[protocol.MessageType]protocol.Error
+	rejectOnce map[protocol.MessageType]protocol.Error
+	// stale counts the pub offers answered with stale_negotiation.
+	stale int
 	// iceServers go into every welcome (none when nil, as M1's server sends).
 	iceServers []protocol.ICEServer
 	nextID     int
+	nextShare  int
+}
+
+// fakeShare is a share the fake server started.
+type fakeShare struct {
+	id, connID, room, ref string
 }
 
 // setHello replaces the hello answers while the server runs.
@@ -58,6 +76,9 @@ type fakeConn struct {
 	ws     *websocket.Conn
 	connID string
 	room   string
+	// pubGen and pubNeg are the newest pub offer's, as the SFU keeps them for the connection while it is in a room
+	// (the SFU's Conn of a room membership); 0 before the first.
+	pubGen, pubNeg uint32
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -128,10 +149,30 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fs.mu.Lock()
-	fs.nextID++
-	c := &fakeConn{ws: ws, connID: "c_" + strconv.Itoa(fs.nextID)}
+	c := &fakeConn{ws: ws}
+	var old *fakeConn
+	if ans.resumed {
+		id := strings.TrimPrefix(hello.ResumeToken.Reveal(), "rt-")
+		if i := slices.IndexFunc(fs.conns, func(c *fakeConn) bool { return c.connID == id }); i >= 0 {
+			old = fs.conns[i]
+		}
+	}
+	if old != nil {
+		c.connID, c.room, c.pubGen, c.pubNeg = old.connID, old.room, old.pubGen, old.pubNeg
+	} else {
+		ans.resumed = false
+		fs.nextID++
+		c.connID = "c_" + strconv.Itoa(fs.nextID)
+	}
 	fs.conns = append(fs.conns, c)
 	ice := append([]protocol.ICEServer{}, fs.iceServers...)
+	var shares []protocol.ShareInfo
+	for _, s := range fs.shares {
+		if s.connID == c.connID && s.room == c.room {
+			shares = append(shares, protocol.ShareInfo{ID: s.id, UserID: "u_alice", ConnectionID: s.connID,
+				Kind: protocol.ShareKindWindow, Preset: protocol.PresetAuto, Status: protocol.ShareStatusLive})
+		}
+	}
 	fs.mu.Unlock()
 	fs.write(ws, protocol.MessageTypeWelcome, "", env.ID, protocol.Welcome{
 		Protocol: protocol.Version, ServerVersion: "0.2.0-test",
@@ -141,10 +182,15 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		ConnectionID:  c.connID,
 		ResumeToken:   protocol.Secret("rt-" + c.connID),
 		Resumed:       ans.resumed,
+		RoomID:        c.room,
 		DefaultRoomID: "lounge",
 		User:          protocol.UserInfo{ID: "u_alice", Name: "alice"},
 		ServerTime:    time.Now(),
 	})
+	if c.room != "" {
+		fs.write(ws, protocol.MessageTypeRoomState, "", "", protocol.RoomState{RoomID: c.room, Rev: 2,
+			Participants: []protocol.ParticipantInfo{}, Shares: append([]protocol.ShareInfo{}, shares...)})
+	}
 	for {
 		_, b, err := ws.Read(ctx)
 		if err != nil {
@@ -158,6 +204,10 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		fs.got = append(fs.got, env)
 		silent := slices.Contains(fs.silent, env.Type)
 		rej, rejected := fs.reject[env.Type]
+		if once, ok := fs.rejectOnce[env.Type]; ok && !rejected {
+			rej, rejected = once, true
+			delete(fs.rejectOnce, env.Type)
+		}
 		fs.mu.Unlock()
 		switch {
 		case silent:
@@ -176,18 +226,86 @@ func (fs *fakeServer) answer(c *fakeConn, env protocol.Envelope) {
 		fs.write(c.ws, protocol.MessageTypePong, "", "", protocol.Pong{})
 	case protocol.MessageTypeRoomJoin:
 		j, _ := protocol.Decode[protocol.RoomJoin](env)
-		c.room = j.RoomID
+		fs.mu.Lock()
+		c.room, c.pubGen, c.pubNeg = j.RoomID, 0, 0
+		fs.mu.Unlock()
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.RoomJoinResult{Room: protocol.RoomInfo{ID: j.RoomID, Name: j.RoomID}})
 		fs.write(c.ws, protocol.MessageTypeRoomState, "", "", protocol.RoomState{RoomID: j.RoomID, Rev: 1,
 			Participants: []protocol.ParticipantInfo{}, Shares: []protocol.ShareInfo{}})
 	case protocol.MessageTypeRoomLeave:
-		c.room = ""
+		fs.mu.Lock()
+		c.room, c.pubGen, c.pubNeg = "", 0, 0
+		fs.shares = slices.DeleteFunc(fs.shares, func(s fakeShare) bool { return s.connID == c.connID })
+		fs.mu.Unlock()
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
 	case protocol.MessageTypeShareStart:
-		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, fakeParams("s_1"))
-	case protocol.MessageTypeShareStop, protocol.MessageTypeShareUpdate, protocol.MessageTypeStatsWatch:
+		st, _ := protocol.Decode[protocol.ShareStart](env)
+		fs.mu.Lock()
+		i := slices.IndexFunc(fs.shares, func(s fakeShare) bool { return s.connID == c.connID && s.ref == st.Ref })
+		if i < 0 {
+			fs.nextShare++
+			fs.shares = append(fs.shares, fakeShare{id: "s_" + strconv.Itoa(fs.nextShare), connID: c.connID, room: c.room,
+				ref: st.Ref})
+			i = len(fs.shares) - 1
+		}
+		id := fs.shares[i].id
+		fs.mu.Unlock()
+		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, fakeParams(id))
+	case protocol.MessageTypeShareStop:
+		st, _ := protocol.Decode[protocol.ShareStop](env)
+		fs.mu.Lock()
+		fs.shares = slices.DeleteFunc(fs.shares, func(s fakeShare) bool { return s.id == st.ShareID })
+		fs.mu.Unlock()
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
+	case protocol.MessageTypeShareUpdate, protocol.MessageTypeStatsWatch:
+		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
+	case protocol.MessageTypePCOffer:
+		o, err := protocol.Decode[protocol.PCOffer](env)
+		if err != nil || o.PC != protocol.PCKindPub {
+			return
+		}
+		fs.mu.Lock()
+		stale := o.Gen < c.pubGen || (o.Gen == c.pubGen && o.Neg < c.pubNeg)
+		if stale {
+			fs.stale++
+		} else {
+			c.pubGen, c.pubNeg = o.Gen, o.Neg
+		}
+		fs.mu.Unlock()
+		if stale {
+			e := protocol.NewError(protocol.ErrorCodeStaleNegotiation, protocol.ErrorScopePC)
+			e.PC, e.Gen, e.Neg = protocol.PCKindPub, o.Gen, o.Neg
+			fs.write(c.ws, protocol.MessageTypeError, "", "", e)
+		}
 	}
+}
+
+// staleOffers returns how many pub offers the server answered with stale_negotiation.
+func (fs *fakeServer) staleOffers() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.stale
+}
+
+// send writes a notification to the newest socket, as the hub sends one.
+func (fs *fakeServer) send(t protocol.MessageType, data any) {
+	fs.write(fs.last().ws, t, "", "", data)
+}
+
+// received decodes the messages of type t that the server received, in order.
+func received[T any](fs *fakeServer, t protocol.MessageType) []T {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	var out []T
+	for _, env := range fs.got {
+		if env.Type != t {
+			continue
+		}
+		if v, err := protocol.Decode[T](env); err == nil {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // fakeParams are the server's ShareParams: High, f at 1080p30 and q at 360p15 (small for the race detector), Opus.

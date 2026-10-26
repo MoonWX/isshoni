@@ -83,7 +83,9 @@ endif()
 
 # Shaders: shaders/<name>_vs.hlsl, _ps.hlsl and _cs.hlsl, compiled by the Windows SDK's fxc (no run-time compiler,
 # no d3dcompiler_47.dll dependency, 04 §13.1).
+# Every shader depends on every shared include (shaders/*.hlsli), so an edit to one recompiles them all.
 file(GLOB IM_SHADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.hlsl")
+file(GLOB IM_SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.hlsli")
 if(IM_SHADERS)
   find_program(IM_FXC fxc REQUIRED)
   set(_shader_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
@@ -104,7 +106,7 @@ if(IM_SHADERS)
       OUTPUT "${_shader_dir}/${_name}.h"
       COMMAND "${IM_FXC}" /nologo /WX /O3 /T ${_profile} /E main /Vn g_${_name} /Fh "${_shader_dir}/${_name}.h"
               "${_hlsl}"
-      DEPENDS "${_hlsl}"
+      DEPENDS "${_hlsl}" ${IM_SHADER_INCLUDES}
       COMMENT "fxc ${_name}.hlsl"
       VERBATIM)
     list(APPEND _shader_headers "${_shader_dir}/${_name}.h")

@@ -135,3 +135,22 @@ func TestErrorString(t *testing.T) {
 		}
 	}
 }
+
+func TestErrorRedacted(t *testing.T) {
+	for _, tc := range []struct {
+		err  *media.Error
+		want string
+	}{
+		{media.ErrSourceGone, "source_gone"},
+		{&media.Error{Code: media.CodeSourceGone, Op: "next"}, "next: source_gone"},
+		{&media.Error{Code: media.CodeDependency, Op: "probe", Reason: "missing", Detail: `C:\Users\alex\avcodec-61.dll`},
+			"probe: dependency (missing)"},
+		{&media.Error{Code: media.CodeInternal, Op: "pick", Detail: "Discord - #general"}, "pick: internal"},
+		{&media.Error{Code: media.CodeInvalid, Reason: "self_window", Detail: "x"}, "invalid (self_window)"},
+		{nil, "<nil>"},
+	} {
+		if got := tc.err.Redacted(); got != tc.want {
+			t.Errorf("Redacted() = %q, want %q", got, tc.want)
+		}
+	}
+}

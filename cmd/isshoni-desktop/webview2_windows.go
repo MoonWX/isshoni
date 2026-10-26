@@ -10,11 +10,12 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/MoonWX/isshoni/internal/desktop/i18n"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
-// The WebView2 message box (03 §5.4). WA41's internal/desktop/i18n moves the text to a desktop.native.* key; until
-// then it is English only. Neither link is clickable in a message box; Ctrl+C copies the box's text.
+// The WebView2 message box (03 §5.4): its text is desktop.native.webview2.missing. Neither link is clickable in a
+// message box; Ctrl+C copies the box's text.
 const (
 	// webview2DownloadURL is Microsoft's WebView2 page with the Evergreen runtime's download (the installer's message
 	// names the same page, 06 §6.5).
@@ -23,10 +24,9 @@ const (
 )
 
 // webview2Message is the message box's text.
-func webview2Message() string {
-	return "isshoni needs the Microsoft Edge WebView2 Runtime, version 120 or newer.\n\n" +
-		"Install or update it from Microsoft, then start isshoni again:\n" + webview2DownloadURL + "\n\n" +
-		"Help:\n" + version.DocsURL + webview2HelpAnchor
+func webview2Message(t *i18n.Catalog) string {
+	return t.T("desktop.native.webview2.missing", "downloadUrl", webview2DownloadURL,
+		"helpUrl", version.DocsURL+webview2HelpAnchor)
 }
 
 // webview2Usable reports whether pv, the runtime version EdgeUpdate records (four dotted numbers, such as
@@ -102,8 +102,8 @@ func readRegistryString(root registry.Key, path, name string) (string, bool) {
 
 // webView2Missing shows 03 §5.4's message box (no window exists yet; the exe has no console) and returns when the
 // user closes it.
-func webView2Missing() {
-	text, err := windows.UTF16PtrFromString(webview2Message())
+func webView2Missing(t *i18n.Catalog) {
+	text, err := windows.UTF16PtrFromString(webview2Message(t))
 	if err != nil {
 		return
 	}

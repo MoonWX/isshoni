@@ -284,7 +284,7 @@ func (s *Service) Approve(ctx context.Context, a store.Actor, id store.UserID) (
 	}
 	// Every status change invalidates the session cache (03 §7.4). A pending user has no session and no connection
 	// yet, so there is nothing to close.
-	s.sessions.invalidateUser(id)
+	s.forgetUser(id)
 	return user, nil
 }
 
@@ -313,7 +313,7 @@ func (s *Service) Reject(ctx context.Context, a store.Actor, id store.UserID) er
 	if err != nil {
 		return serviceErr("reject", err)
 	}
-	s.sessions.invalidateUser(id)
+	s.forgetUser(id)
 	return nil
 }
 
@@ -343,7 +343,7 @@ func (s *Service) RejectAll(ctx context.Context, a store.Actor) (int, error) {
 		return 0, serviceErr("reject all", err)
 	}
 	for _, id := range ids {
-		s.sessions.invalidateUser(id)
+		s.forgetUser(id)
 	}
 	return len(ids), nil
 }

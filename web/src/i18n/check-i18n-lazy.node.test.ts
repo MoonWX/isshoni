@@ -374,7 +374,7 @@ describe('check-i18n.mjs on this package', () => {
   it('passes, with the lazy namespaces of i18n/lazy/', async () => {
     const res = await checkI18n({ srcDir: WEB_SRC, catalogPath: EN_JSON });
     expect(res.problems).toEqual([]);
-    expect(res.lazyNamespaces).toEqual(['account', 'admin', 'setup']);
+    expect(res.lazyNamespaces).toEqual(['account', 'admin', 'desktop', 'setup']);
   });
 
   it('every lazy namespace is used, and only by folders that load it', async () => {
@@ -387,6 +387,9 @@ describe('check-i18n.mjs on this package', () => {
     expect(Object.fromEntries(lazy.map((ns) => [ns.name, folders(ns.name)]))).toEqual({
       account: ['account', 'download'],
       admin: ['admin'],
+      // Go reads desktop.native.* (web.DesktopCatalog()); the desktop/ and share/native/ folders that load the
+      // namespace come with their slices (README WA42 onward).
+      desktop: [],
       setup: ['setup'],
     });
     expect(checkLazyNamespaces({ lazy, imports: tree.imports, uses: tree.uses })).toEqual([]);

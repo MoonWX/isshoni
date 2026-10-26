@@ -1,5 +1,6 @@
-// Every route of 05 §5, declared once here (README "Shared files": S27 owns this file; page slices fill only their
-// folder). React Router data router: every page is in a lazy chunk, the room too.
+// Every route of 05 §5 and of M2 (docs/m2/03 §7.5, 02 §10.1), declared once here (README "Shared files": S27 owns
+// this file in M1, WA42 in M2; page slices fill only their folder). React Router data router: every page is in a lazy
+// chunk, the room too.
 //
 // Page folders. Each route loads one page component, by name, from its folder's entry module `<folder>/index.ts`
 // (or index.tsx), which exports the folder's pages:
@@ -10,9 +11,12 @@
 //              RoomsPage SettingsPage AuditPage DoctorPage
 //   download/  DownloadPage                                                       (later)
 //   rooms/     RootRedirect RoomPage, and InRoomBar for the layout                 (S34, S45)
+//   link/      DeviceLinkPage, the browser's approval of a desktop app            (M2: WA63)
+//   desktop/   SetupPage RelinkPage SettingsPage, the desktop app's own pages      (M2: WA42's stubs; WA71, WA82)
 // The folders are found with import.meta.glob, so a folder that doesn't exist yet is simply absent: its routes
-// render PageUnavailable (a missing AdminLayout renders just its child page) until the slice adds the export, and
-// no route here changes. A folder is one chunk, loaded on the first visit to one of its routes.
+// render PageUnavailable (a missing AdminLayout renders just its child page; /link renders NotFound, as in M1) until
+// the slice adds the export, and no route here changes. A folder is one chunk, loaded on the first visit to one of
+// its routes.
 //
 // The room is a lazy folder like the others (W00): the page, the session and the signaling client are about 24 KB
 // gzip, and /login, /invite and /setup, where a friend first arrives, need none of it. Two things go with that:
@@ -26,14 +30,22 @@
 // (i18n/lazy/<ns>.ts, 05 §16.5), and those are in the catalog once the entry module has run. A route's `lazy`
 // below resolves only after that, so a page is never rendered without its texts and the routes need no code for it.
 //
+// Two route tables, one per RouteTarget (M2, docs/m2/03 §7.5). The browser's and the desktop app's have the same
+// paths and guards and differ only in what their routes may load: RequireDesktop renders NotFound in the browser,
+// and RequireBrowser hands its pages to the system browser in the desktop app, so a page behind the other platform's
+// guard is never shown. In that table it has no `lazy` either, because a data router loads the lazy routes of every
+// match before any guard renders: a browser never fetches desktop/, and the desktop app never fetches link/ or any
+// other page of the browser.
+//
 // No route segment contains a dot: 04 §9.5 serves dotted paths as files.
 import type { ComponentType } from 'react';
 import { matchRoutes, Outlet, type RouteObject } from 'react-router';
 import { useStore } from 'zustand';
 import { createStore } from 'zustand/vanilla';
 
+import type { Platform } from '../platform/types';
 import { RouteErrorBoundary } from './ErrorBoundary';
-import { RequireAdmin, RequireAuth, RequireInviter } from './guards';
+import { RequireAdmin, RequireAuth, RequireBrowser, RequireDesktop, RequireInviter } from './guards';
 import { RootLayout } from './layouts/RootLayout';
 import { NotFound, PageUnavailable } from './NotFound';
 import { PageSpinner } from '../ui/Spinner';
@@ -41,12 +53,23 @@ import { PageSpinner } from '../ui/Spinner';
 /** A page folder's entry module: page components by export name. */
 export type FolderModule = Readonly<Record<string, unknown>>;
 
-export type PageFolder = 'auth' | 'setup' | 'account' | 'admin' | 'download' | 'rooms';
+export type PageFolder = 'auth' | 'setup' | 'account' | 'admin' | 'download' | 'rooms' | 'link' | 'desktop';
 
 /** What each route loads, for tests and debugging: route.handle. */
 export interface RouteHandle {
   readonly folder: PageFolder;
   readonly page: string;
+}
+
+/**
+ * Which platform a route table is for (docs/m2/03 §7.5): 'desktop' for the SPA inside the desktop app, 'browser' for
+ * every other page.
+ */
+export type RouteTarget = 'browser' | 'desktop';
+
+/** The route table of a platform: 'desktop' when it has the desktop app's features (platform.desktop). */
+export function routeTargetOf(platform: Pick<Platform, 'desktop'>): RouteTarget {
+  return (platform.desktop ?? null) !== null ? 'desktop' : 'browser';
 }
 
 export interface AppRouteSources {
@@ -96,6 +119,8 @@ export function defaultSources(): AppRouteSources {
       '../admin/index.{ts,tsx}',
       '../download/index.{ts,tsx}',
       '../rooms/index.{ts,tsx}',
+      '../link/index.{ts,tsx}',
+      '../desktop/index.{ts,tsx}',
     ]),
   );
   return ROOMS_IN_TESTS === undefined ? { lazy } : { lazy, eager: { rooms: ROOMS_IN_TESTS } };
@@ -116,7 +141,15 @@ function Exported({ component: Component }: { component: unknown }) {
   return isComponent(Component) ? <Component /> : null;
 }
 
-export function createAppRoutes(sources: AppRouteSources = defaultSources()): RouteObject[] {
+/**
+ * The app's routes for a target (default 'browser', which M1's callers and tests get). A page that only the other
+ * target shows keeps its handle but has no `lazy`: its folder is never loaded here, and NotFound stands in for the
+ * page, which its guard doesn't render anyway.
+ */
+export function createAppRoutes(
+  sources: AppRouteSources = defaultSources(),
+  target: RouteTarget = 'browser',
+): RouteObject[] {
   /** The folders that are loaded so far, by name: the layout shows a part of one of them (Root, below). */
   const loaded = createStore<Partial<Record<PageFolder, FolderModule>>>(() => ({ ...sources.eager }));
 
@@ -141,6 +174,17 @@ export function createAppRoutes(sources: AppRouteSources = defaultSources()): Ro
   /** A layout route: renders only its child until the folder has the layout. */
   const layout = (folder: PageFolder, name: string) => page(folder, name, OutletOnly);
 
+  /** page() and layout() for the pages of one target: in the other target's table they load nothing. */
+  const pagesOf = (where: RouteTarget): { page: typeof page; layout: typeof layout } => {
+    if (where === target) return { page, layout };
+    const elsewhere: typeof page = (folder, name) => ({ handle: { folder, page: name }, Component: NotFound });
+    return { page: elsewhere, layout: elsewhere };
+  };
+  /** The browser's pages: in the desktop app RequireBrowser opens them in the system browser instead. */
+  const browser = pagesOf('browser');
+  /** The desktop app's pages: RequireDesktop shows NotFound in the browser. */
+  const desktop = pagesOf('desktop');
+
   /**
    * The root route's layout, with rooms/'s InRoomBar above the pages from the moment rooms/ is loaded: the first
    * visit to `/` or to a room loads it, and only a room's page makes the runtime that the bar shows.
@@ -160,20 +204,83 @@ export function createAppRoutes(sources: AppRouteSources = defaultSources()): Ro
         {
           ErrorBoundary: RouteErrorBoundary,
           children: [
-            // Public (05 §5 "public"): these read ['me'] without redirecting.
-            { path: 'login', ...page('auth', 'LoginPage') },
-            { path: 'invite', ...page('auth', 'InvitePage') },
-            { path: 'signup', ...page('auth', 'SignupPage') },
-            { path: 'pending', ...page('auth', 'PendingPage') },
-            { path: 'reset', ...page('auth', 'ResetPage') },
-            // The trust model and versions (W3 writes it with the auth pages).
-            { path: 'about', ...page('auth', 'AboutPage') },
-            // Public + the fragment token; the server answers 404 once an admin exists (05 §14).
-            { path: 'setup', ...page('setup', 'SetupPage') },
-            // M1 placeholder; per-OS installers are later (M2).
-            { path: 'download', ...page('download', 'DownloadPage') },
+            // The browser's pages (docs/m2/03 §7.5, D7). In the desktop app RequireBrowser opens the page in the
+            // system browser (/link with its ?code=) and renders "Opened in your browser"; in the browser it renders
+            // the page.
+            {
+              Component: RequireBrowser,
+              children: [
+                // Public (05 §5 "public"): these read ['me'] without redirecting.
+                { path: 'login', ...browser.page('auth', 'LoginPage') },
+                { path: 'invite', ...browser.page('auth', 'InvitePage') },
+                { path: 'signup', ...browser.page('auth', 'SignupPage') },
+                { path: 'pending', ...browser.page('auth', 'PendingPage') },
+                { path: 'reset', ...browser.page('auth', 'ResetPage') },
+                // Public + the fragment token; the server answers 404 once an admin exists (05 §14).
+                { path: 'setup', ...browser.page('setup', 'SetupPage') },
+                // The server's download page (M2: the desktop installer, 06 §7.5).
+                { path: 'download', ...browser.page('download', 'DownloadPage') },
 
-            // Signed-in users.
+                // Signed-in users, with a cookie session: the desktop's bearer can't do what these pages do.
+                {
+                  Component: RequireAuth,
+                  children: [
+                    { path: 'account', ...browser.page('account', 'AccountPage') },
+                    { path: 'account/devices', ...browser.page('account', 'DevicesPage') },
+                    { path: 'account/notifications', ...browser.page('account', 'NotificationsPage') },
+                    // M2: the RFC 8628 approval page (/link?code=…, 02 §10.1). NotFound until link/ has it.
+                    { path: 'link', ...browser.page('link', 'DeviceLinkPage', NotFound) },
+                    {
+                      path: 'admin',
+                      children: [
+                        // Wizard steps 2–3, re-enterable (05 §14).
+                        {
+                          path: 'welcome',
+                          Component: RequireAdmin,
+                          children: [{ index: true, ...browser.page('setup', 'WelcomePage') }],
+                        },
+                        // Admins, and members with me.permissions.createInvites (they see only their own invites).
+                        {
+                          path: 'invites',
+                          Component: RequireInviter,
+                          children: [
+                            {
+                              ...browser.layout('admin', 'AdminLayout'),
+                              children: [{ index: true, ...browser.page('admin', 'InvitesPage') }],
+                            },
+                          ],
+                        },
+                        {
+                          Component: RequireAdmin,
+                          children: [
+                            {
+                              ...browser.layout('admin', 'AdminLayout'),
+                              children: [
+                                { index: true, ...browser.page('admin', 'DashboardPage') },
+                                { path: 'users', ...browser.page('admin', 'UsersPage') },
+                                // Nav badge from me.badges.pendingApprovals.
+                                { path: 'approvals', ...browser.page('admin', 'ApprovalsPage') },
+                                { path: 'rooms', ...browser.page('admin', 'RoomsPage') },
+                                { path: 'settings', ...browser.page('admin', 'SettingsPage') },
+                                // 03's audit log (GET /api/v1/admin/audit).
+                                { path: 'audit', ...browser.page('admin', 'AuditPage') },
+                                // Doctor report, connection test and bandwidth calculator.
+                                { path: 'doctor', ...browser.page('admin', 'DoctorPage') },
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+
+            // The trust model and versions (W3 writes it with the auth pages). Public, in both.
+            { path: 'about', ...page('auth', 'AboutPage') },
+
+            // Signed-in users, in both. The desktop's RequireAuth decides by the app's AuthState, never /login.
             {
               Component: RequireAuth,
               children: [
@@ -181,53 +288,22 @@ export function createAppRoutes(sources: AppRouteSources = defaultSources()): Ro
                 { index: true, ...page('rooms', 'RootRedirect') },
                 // ?focus=<shareId> focuses that share (push links, 04 §14.3).
                 { path: 'r/:roomId', ...page('rooms', 'RoomPage') },
-                { path: 'account', ...page('account', 'AccountPage') },
-                { path: 'account/devices', ...page('account', 'DevicesPage') },
-                { path: 'account/notifications', ...page('account', 'NotificationsPage') },
-                // later (M2): DeviceLinkPage, the RFC 8628 approval page (/link?code=…). Reserved: NotFound in M1.
-                { path: 'link', Component: NotFound },
-                {
-                  path: 'admin',
-                  children: [
-                    // Wizard steps 2–3, re-enterable (05 §14).
-                    {
-                      path: 'welcome',
-                      Component: RequireAdmin,
-                      children: [{ index: true, ...page('setup', 'WelcomePage') }],
-                    },
-                    // Admins, and members with me.permissions.createInvites (they see only their own invites).
-                    {
-                      path: 'invites',
-                      Component: RequireInviter,
-                      children: [
-                        {
-                          ...layout('admin', 'AdminLayout'),
-                          children: [{ index: true, ...page('admin', 'InvitesPage') }],
-                        },
-                      ],
-                    },
-                    {
-                      Component: RequireAdmin,
-                      children: [
-                        {
-                          ...layout('admin', 'AdminLayout'),
-                          children: [
-                            { index: true, ...page('admin', 'DashboardPage') },
-                            { path: 'users', ...page('admin', 'UsersPage') },
-                            // Nav badge from me.badges.pendingApprovals.
-                            { path: 'approvals', ...page('admin', 'ApprovalsPage') },
-                            { path: 'rooms', ...page('admin', 'RoomsPage') },
-                            { path: 'settings', ...page('admin', 'SettingsPage') },
-                            // 03's audit log (GET /api/v1/admin/audit).
-                            { path: 'audit', ...page('admin', 'AuditPage') },
-                            // Doctor report, connection test and bandwidth calculator.
-                            { path: 'doctor', ...page('admin', 'DoctorPage') },
-                          ],
-                        },
-                      ],
-                    },
-                  ],
-                },
+              ],
+            },
+
+            // The desktop app's own pages (docs/m2/03 §7.5): NotFound in the browser.
+            {
+              path: 'desktop',
+              Component: RequireDesktop,
+              children: [
+                // /desktop itself is no page: NotFound, as in the browser (and as in M1), not an empty layout.
+                { index: true, Component: NotFound },
+                // The first-run wizard (§8.2): ?add=<origin> for a new server, ?link=1 after Auth.AddServer.
+                { path: 'setup', ...desktop.page('desktop', 'SetupPage') },
+                // The active server signed this PC out (§8.3).
+                { path: 'relink', ...desktop.page('desktop', 'RelinkPage') },
+                // §14.4; anchors #servers, #sharing, #audio, #app, #updates, #about.
+                { path: 'settings', ...desktop.page('desktop', 'SettingsPage') },
               ],
             },
 
@@ -240,16 +316,21 @@ export function createAppRoutes(sources: AppRouteSources = defaultSources()): Ro
 }
 
 /**
- * Asks for the page folders of a path's routes without waiting for them: what the router loads for that path, one
- * round trip earlier. Boot calls it with the first path before it asks for /api/v1/info (05 §4), so the first
- * page's chunk and /info travel together. A folder that is loaded already answers the router's own import() at
+ * Asks for the page folders of a path's routes without waiting for them: what the router of `target` loads for that
+ * path, one round trip earlier. Boot calls it with the first path before it asks for /api/v1/info (05 §4), so the
+ * first page's chunk and /info travel together. A folder that is loaded already answers the router's own import() at
  * once; one that can't be loaded here is the router's to report when it gets to the route (RouteErrorBoundary).
  */
-export function preloadRoute(pathname: string, sources: AppRouteSources = defaultSources()): void {
+export function preloadRoute(
+  pathname: string,
+  sources: AppRouteSources = defaultSources(),
+  target: RouteTarget = 'browser',
+): void {
   const folders = new Set<PageFolder>();
-  for (const { route } of matchRoutes(createAppRoutes(sources), pathname) ?? []) {
+  for (const { route } of matchRoutes(createAppRoutes(sources, target), pathname) ?? []) {
     const handle = route.handle as RouteHandle | undefined;
-    if (handle !== undefined && sources.eager?.[handle.folder] === undefined) folders.add(handle.folder);
+    // What the router would load: a route with `lazy` (not an eager folder, not a page of the other target).
+    if (handle !== undefined && route.lazy !== undefined) folders.add(handle.folder);
   }
   for (const folder of folders) sources.lazy[folder]?.().catch(() => undefined);
 }
