@@ -11,16 +11,9 @@
 // - /link opens in the system browser (RequireBrowser), and no access token ever reaches web storage although the
 //   page was handed tokens.
 //
-// The last case needs a server that accepts the desktop origin (02's CORS for http://wails.localhost, wired into the
-// server by README WA56) and links with a password (POST /api/v1/device/password, WA47). The worker's e2e server is
-// used when it does; until then a small stand-in on loopback answers /info (the e2e server's own /info, with the
-// deviceFlow feature and its own address) and the device routes, with the CORS of 02 §6.4. Either way the page and
-// every Go part are the real ones.
-import { randomBytes } from 'node:crypto';
-import http from 'node:http';
-import type { AddressInfo } from 'node:net';
-
-import { DESKTOP_ORIGIN, expect, test, uniqueName, type DesktopApp, type E2EServer } from './fixtures.ts';
+// The last case links the app to the worker's unmodified e2e server with a password (POST /api/v1/device/password,
+// 02 §14), which answers the desktop origin with 02's CORS (protocol.DesktopOrigins, wired by README WA56).
+import { DESKTOP_ORIGIN, expect, test, type DesktopApp } from './fixtures.ts';
 
 /** The page is up: the router rendered a page (with no server, the wizard's stub). */
 async function ready(desktop: DesktopApp): Promise<void> {
@@ -164,165 +157,43 @@ test('the runtime refuses foreign origins and its own objects; a bound call pass
 });
 
 test('/link opens the system browser, and no access token reaches web storage', async ({ startDesktop, server }) => {
-  const linked = await linkableServer(server);
-  test.info().annotations.push({ type: 'server', description: linked.kind });
-  try {
-    const desktop = await startDesktop({ server: linked.url });
-    // Linked with a password, as the wizard's form does (02 §14): Go holds the tokens.
-    const st = await desktop.call<{ status: string; origin: string }>(
-      'Auth',
-      'LinkWithPassword',
-      linked.username,
-      linked.password,
-    );
-    expect(st).toMatchObject({ status: 'linked', origin: linked.url });
-
-    const { page } = desktop;
-    await page.goto(`${desktop.origin}/link?code=WDJB-MJHT`);
-    await expect(page.getByRole('heading', { name: 'Opened in your browser' })).toBeVisible();
-    await expect.poll(async () => (await desktop.state()).openedUrls).toEqual([`${linked.url}/link?code=WDJB-MJHT`]);
-    expect(new URL(page.url()).origin).toBe(DESKTOP_ORIGIN);
-
-    // The page was handed the active server's token for its own origin only (03 §5.8) …
-    const { tokens } = await desktop.state();
-    expect(tokens.length).toBeGreaterThan(0);
-    for (const t of tokens) expect(t).toMatchObject({ origin: linked.url, activeOrigin: linked.url });
-    // … and kept it in memory: nothing in web storage or cookies holds one.
-    const stored = await page.evaluate(() => {
-      const out: string[] = [document.cookie];
-      for (const s of [localStorage, sessionStorage]) {
-        for (let i = 0; i < s.length; i++) {
-          const k = s.key(i) ?? '';
-          out.push(k, s.getItem(k) ?? '');
-        }
-      }
-      return out.join('\n');
-    });
-    expect(stored).not.toContain('isa_');
-    expect(stored).not.toContain('isr_');
-  } finally {
-    await linked.close();
-  }
-});
-
-// ---- A server the desktop page can use ----
-
-interface LinkableServer {
-  readonly kind: 'e2e server' | 'stand-in';
-  readonly url: string;
-  readonly username: string;
-  readonly password: string;
-  close(): Promise<void>;
-}
-
-// TODO(README WA56, group 6): once WA56 wires protocol.DesktopOrigins() into the server's CORS and the e2e server
-// lists deviceFlow, the group-6 integration checks that the '/link …' test's "server" annotation reads "e2e server"
-// (03 §22.4 A runs against the unmodified e2e server of fixtures.ts), then deletes startStandIn, token() and the
-// stand-in branch here, leaving the e2e server the only path.
-/**
- * The worker's e2e server when it accepts the desktop origin and has the device routes, else the stand-in below
- * (see the file's comment).
- */
-async function linkableServer(server: E2EServer): Promise<LinkableServer> {
+  // The e2e server answers the desktop origin (02 §6.4's CORS) and offers the device flow.
   const res = await fetch(`${server.url}/api/v1/info`, { headers: { Origin: DESKTOP_ORIGIN } });
-  const info = (await res.json()) as { features?: string[] };
-  const cors = res.headers.get('access-control-allow-origin') === DESKTOP_ORIGIN;
-  if (cors && (info.features ?? []).includes('deviceFlow')) {
-    const account = await server.createUser();
-    return { kind: 'e2e server', url: server.url, ...account, close: () => Promise.resolve() };
-  }
-  return startStandIn(info);
-}
+  expect(res.headers.get('access-control-allow-origin')).toBe(DESKTOP_ORIGIN);
+  expect(((await res.json()) as { features?: string[] }).features).toContain('deviceFlow');
 
-/** "isa_" or "isr_" + 32 random bytes in unpadded base64url: 02 §3's token shape. */
-function token(prefix: 'isa_' | 'isr_'): string {
-  return prefix + randomBytes(32).toString('base64url');
-}
+  const account = await server.createUser();
+  const desktop = await startDesktop({ server: server.url });
+  // Linked with a password, as the wizard's form does (02 §14): Go holds the tokens.
+  const st = await desktop.call<{ status: string; origin: string }>(
+    'Auth',
+    'LinkWithPassword',
+    account.username,
+    account.password,
+  );
+  expect(st).toMatchObject({ status: 'linked', origin: server.url });
 
-/**
- * A loopback stand-in for a server with M2's device routes: GET /api/v1/info (the e2e server's /info with the
- * deviceFlow feature and the stand-in's own address), POST /api/v1/device/password and /device/token (a fresh token
- * pair), POST /device/revoke, and 401 unauthenticated for everything else under /api/v1 that needs an account. Every
- * answer to the desktop origin carries 02 §6.4's CORS headers, and its preflights are answered.
- */
-async function startStandIn(realInfo: unknown): Promise<LinkableServer> {
-  const username = uniqueName('desk');
-  const password = randomBytes(18).toString('base64url');
-  const pair = (): string =>
-    JSON.stringify({
-      accessToken: token('isa_'),
-      tokenType: 'Bearer',
-      expiresIn: 900,
-      refreshToken: token('isr_'),
-      refreshExpiresIn: 7_776_000,
-      device: { id: 'd_e2e', name: 'e2e PC' },
-      user: { id: 'u_e2e', username, role: 'user' },
-    });
-  let url = '';
-  const srv = http.createServer((req, res) => {
-    if (req.headers.origin === DESKTOP_ORIGIN) {
-      res.setHeader('Access-Control-Allow-Origin', DESKTOP_ORIGIN);
-      res.setHeader('Access-Control-Expose-Headers', 'Retry-After, WWW-Authenticate, X-Request-Id');
-      res.setHeader('Vary', 'Origin');
+  const { page } = desktop;
+  await page.goto(`${desktop.origin}/link?code=WDJB-MJHT`);
+  await expect(page.getByRole('heading', { name: 'Opened in your browser' })).toBeVisible();
+  await expect.poll(async () => (await desktop.state()).openedUrls).toEqual([`${server.url}/link?code=WDJB-MJHT`]);
+  expect(new URL(page.url()).origin).toBe(DESKTOP_ORIGIN);
+
+  // The page was handed the active server's token for its own origin only (03 §5.8) …
+  const { tokens } = await desktop.state();
+  expect(tokens.length).toBeGreaterThan(0);
+  for (const t of tokens) expect(t).toMatchObject({ origin: server.url, activeOrigin: server.url });
+  // … and kept it in memory: nothing in web storage or cookies holds one.
+  const stored = await page.evaluate(() => {
+    const out: string[] = [document.cookie];
+    for (const s of [localStorage, sessionStorage]) {
+      for (let i = 0; i < s.length; i++) {
+        const k = s.key(i) ?? '';
+        out.push(k, s.getItem(k) ?? '');
+      }
     }
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'Access-Control-Max-Age': '600',
-      });
-      res.end();
-      return;
-    }
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => {
-      const json = (status: number, body: string): void => {
-        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(body);
-      };
-      const path = new URL(req.url ?? '/', url).pathname;
-      if (req.method === 'GET' && path === '/api/v1/info') {
-        const info = structuredClone(realInfo) as { server: { publicUrl: string }; features: string[] };
-        info.server.publicUrl = url;
-        info.features = [...new Set([...info.features, 'deviceFlow'])];
-        json(200, JSON.stringify(info));
-        return;
-      }
-      if (req.method === 'POST' && path === '/api/v1/device/password') {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as {
-          username?: string;
-          password?: string;
-        };
-        if (body.username === username && body.password === password) json(200, pair());
-        else json(401, JSON.stringify({ error: { code: 'invalid_credentials' } }));
-        return;
-      }
-      if (req.method === 'POST' && path === '/api/v1/device/token') {
-        json(200, pair());
-        return;
-      }
-      if (req.method === 'POST' && path === '/api/v1/device/revoke') {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      json(401, JSON.stringify({ error: { code: 'unauthenticated' } }));
-    });
+    return out.join('\n');
   });
-  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
-  url = `http://127.0.0.1:${String((srv.address() as AddressInfo).port)}`;
-  return {
-    kind: 'stand-in',
-    url,
-    username,
-    password,
-    close: () =>
-      new Promise<void>((resolve) => {
-        srv.closeAllConnections();
-        srv.close(() => {
-          resolve();
-        });
-      }),
-  };
-}
+  expect(stored).not.toContain('isa_');
+  expect(stored).not.toContain('isr_');
+});

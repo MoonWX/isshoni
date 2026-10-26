@@ -1,6 +1,7 @@
 // @vitest-environment node
 // DesktopPlatform's weight in the entry chunk (docs/m2/03 §7.2): it stays under 4 KB gzip (1 KB = 1000 bytes, as in
-// check:size) and pulls in neither the Wails runtime nor a transport (wails/, http/, bindings/), which load on demand.
+// check:size) and pulls in neither the Wails runtime nor a transport (wails/, http/, bindings/), nor DesktopSharing
+// with its DesktopShare (which write share/'s store), all of which load on demand.
 //
 // Built in memory by the real Vite with the app's build target: the entry is what detect.ts takes from
 // platform/desktop/ (DesktopPlatform and readDesktopConfig); every module outside platform/desktop/ is external,
@@ -91,15 +92,32 @@ describe("DesktopPlatform's share of the entry chunk", () => {
   it('holds DesktopPlatform and its helpers, but no transport', () => {
     const modules = modulesOf(entry ?? ({ modules: {} } as Rolldown.OutputChunk));
     expect(modules).toEqual(
-      expect.arrayContaining(['DesktopPlatform.ts', 'config.ts', 'tokens.ts', 'links.ts', 'lazyBridge.ts']),
+      expect.arrayContaining([
+        'DesktopPlatform.ts',
+        'config.ts',
+        'tokens.ts',
+        'links.ts',
+        'lazyBridge.ts',
+        'lazySharing.ts',
+      ]),
     );
-    for (const m of modules) expect(m).not.toMatch(/^(wails|http|bindings)\/|^actions\.ts$/);
+    for (const m of modules) {
+      expect(m).not.toMatch(/^(wails|http|bindings)\/|^(actions|DesktopSharing|DesktopShare)\.ts$/);
+    }
     expect(entry?.imports.some((i) => i.includes('wailsio'))).toBe(false);
   });
 
-  it('loads each transport, and the rarely used actions, from chunks of their own', () => {
+  it('loads each transport, the rarely used actions and the sharing provider from chunks of their own', () => {
     const lazy = chunks.filter((c) => !c.isEntry).flatMap(modulesOf);
-    expect(lazy).toEqual(expect.arrayContaining(['http/HttpBridge.ts', 'wails/WailsBridge.ts', 'actions.ts']));
-    expect(entry?.dynamicImports).toHaveLength(3);
+    expect(lazy).toEqual(
+      expect.arrayContaining([
+        'http/HttpBridge.ts',
+        'wails/WailsBridge.ts',
+        'actions.ts',
+        'DesktopSharing.ts',
+        'DesktopShare.ts',
+      ]),
+    );
+    expect(entry?.dynamicImports).toHaveLength(4);
   });
 });

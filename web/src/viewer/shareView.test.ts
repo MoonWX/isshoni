@@ -24,6 +24,7 @@ function viewerShare(overrides: Partial<ViewerShare> = {}, info = shareInfo('s_a
     startedAt: info.startedAt,
     own: false,
     local: false,
+    localPreview: false,
     audio: info.audio,
     ownerName: 'Bea',
     watchers: [],
@@ -135,12 +136,26 @@ describe('shareView (05 §10.4, §12.6)', () => {
   });
 
   it('shows a preview of this page’s share as it is; only `stalled` applies', () => {
-    const mine = viewerShare({ own: true, local: true });
+    const mine = viewerShare({ own: true, local: true, localPreview: true });
     expect(shareView(mine, undefined, true, true)).toEqual({ overlay: null, badge: null });
     expect(shareView(mine, undefined, false)).toEqual({ overlay: null, badge: null });
     expect(shareView(mine, status('s_a', { reason: 'waiting' }), true)).toEqual({ overlay: null, badge: null });
-    const mineStalled = viewerShare({ own: true, local: true }, shareInfo('s_a', 'u_alex', 1, { status: 'stalled' }));
+    const mineStalled = viewerShare(
+      { own: true, local: true, localPreview: true },
+      shareInfo('s_a', 'u_alex', 1, { status: 'stalled' }),
+    );
     expect(shareView(mineStalled, undefined, true).overlay).toBe('stalled');
+  });
+
+  it('M2: the desktop app’s own share (local, no preview of the page) shows its subscribed layer like any share', () => {
+    // docs/m2/03 §10.4: C2's share is subscribed at the low layer; until that arrives the tile connects.
+    const native = viewerShare({ own: true, local: true, localPreview: false });
+    expect(shareView(native, undefined, false).overlay).toBe('connecting');
+    expect(shareView(native, status('s_a', { video: 'low', audio: 'off' }), true)).toEqual({
+      overlay: null,
+      badge: null,
+    });
+    expect(shareView(native, undefined, true, true).overlay).toBe('frozen');
   });
 
   it('has a text for every state', () => {

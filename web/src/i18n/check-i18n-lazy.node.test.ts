@@ -387,9 +387,9 @@ describe('check-i18n.mjs on this package', () => {
     expect(Object.fromEntries(lazy.map((ns) => [ns.name, folders(ns.name)]))).toEqual({
       account: ['account', 'download'],
       admin: ['admin'],
-      // Go reads desktop.native.* (web.DesktopCatalog()); the desktop/ and share/native/ folders that load the
-      // namespace come with their slices (README WA42 onward).
-      desktop: [],
+      // Go reads desktop.native.* (web.DesktopCatalog()); share/native/ loads the namespace (README WA65), and the
+      // desktop/ pages come with their slices (WA71 onward).
+      desktop: ['share'],
       // The approval page, and the Devices page's app rows (M2 02 §10.2).
       link: ['account', 'link'],
       setup: ['setup'],

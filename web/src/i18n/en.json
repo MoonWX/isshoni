@@ -102,7 +102,8 @@
     "tile": {
       "watch": "Watch {{title}}, {{watching}}",
       "watchOwn": "Watch your share from another device, {{watching}}",
-      "preview": "Show your preview on the stage, {{watching}}"
+      "preview": "Show your preview on the stage, {{watching}}",
+      "lowPreview": "Preview: what friends see"
     },
     "stage": {
       "watching": "Now watching: {{title}}",

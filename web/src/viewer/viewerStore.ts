@@ -46,16 +46,35 @@ export interface ViewerShare extends FocusShare {
   /** info.watchers with their names, in the server's order. Nobody watches unseen (05 §12.6). */
   readonly watchers: readonly ViewerWatcher[];
   /**
-   * Published by this page: its tile shows the local preview and it is never subscribed (05 §12.2). A share of
-   * the same user from another device is `own` but not `local`: it is watched like anyone's.
+   * Published by this page (05 §12.2), or by one of the platform's other local connections (the desktop app's C2,
+   * docs/m2/03 §10.4): never audible, never focused by itself, labelled as the page's own. A share of the same user
+   * from another device is `own` but not `local`: it is watched like anyone's.
    */
   readonly local: boolean;
+  /**
+   * Local, and published by this page's own connection: its tile shows the page's preview stream and it is never
+   * subscribed. A local share of another local connection has no stream here (the desktop has none): it is
+   * subscribed with the low layer at most and never its audio (layerPolicy.ts), and its tile shows that layer as
+   * "Preview: what friends see".
+   */
+  readonly localPreview: boolean;
 }
 
 /** Who this page is in the room: welcome.user.id and welcome.connectionId. */
 export interface ViewerSelf {
   readonly userId: string;
   readonly connectionId: string;
+  /**
+   * The platform's other connections whose shares are this page's own (platform.sharing.localConnectionIds(): the
+   * desktop app's C2, docs/m2/03 §10.4). Default none.
+   */
+  readonly localConnectionIds?: readonly string[];
+}
+
+/** Whether a share's connection is this page's own one, or another local connection of the platform. */
+function localOf(info: Pick<ShareInfo, 'connectionId'>, self: ViewerSelf): { local: boolean; localPreview: boolean } {
+  const localPreview = info.connectionId === self.connectionId;
+  return { local: localPreview || (self.localConnectionIds ?? []).includes(info.connectionId), localPreview };
 }
 
 /** The parts of room.state the viewer reads. */
@@ -253,7 +272,8 @@ function sameShare(
     a.watchers.length === watchers.length &&
     a.watchers.every((w, i) => w.name === watchers[i]?.name && w.self === watchers[i].self) &&
     a.own === (info.userId === self.userId) &&
-    a.local === (info.connectionId === self.connectionId) &&
+    a.local === localOf(info, self).local &&
+    a.localPreview === localOf(info, self).localPreview &&
     b.userId === info.userId &&
     b.connectionId === info.connectionId &&
     b.status === info.status &&
@@ -297,7 +317,7 @@ function roomEvents(
       userId: info.userId,
       startedAt: info.startedAt,
       own: info.userId === self.userId,
-      local: info.connectionId === self.connectionId,
+      ...localOf(info, self),
       audio: info.audio,
       info,
       ownerName,

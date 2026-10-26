@@ -1,0 +1,274 @@
+/*
+ * The native share UI (docs/m2/03 §10.2–§10.3): the desktop ShareSheet, the first-share sheet, the DND tip and the
+ * share panel. The panel keeps M1's SharePanel layout (05 §13.7): at the bottom of the room page, at most 45 % of
+ * the window high, its expander scrolling when it doesn't fit.
+ */
+
+/* ---- Sheets ---- */
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.lead {
+  font-weight: var(--weight-medium);
+}
+
+.picking {
+  padding: var(--space-3);
+  background-color: var(--color-surface-2);
+  border-radius: var(--radius-md);
+}
+
+.presets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+.legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+/* One line per preset: the radio, the name, then what it is for. */
+.preset {
+  display: flex;
+  gap: var(--space-3);
+  align-items: baseline;
+  min-height: var(--tap-target);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.preset:hover {
+  background-color: var(--color-surface-2);
+}
+
+.preset:has(input:checked) {
+  border-color: var(--color-accent);
+}
+
+.preset input,
+.option input,
+.switch input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.presetName {
+  flex: none;
+  min-width: 3.5rem;
+  font-weight: var(--weight-medium);
+}
+
+.presetHint {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.switch,
+.option {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  min-height: var(--tap-target);
+  cursor: pointer;
+}
+
+.elsewhere {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+}
+
+/* ---- A failure and what to do ---- */
+
+.error {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  align-items: center;
+}
+
+.errorText {
+  flex: 1 1 12rem;
+  min-width: 0;
+  color: var(--color-danger);
+}
+
+.errorActions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* ---- The panel ---- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 45vh;
+  max-height: 45dvh;
+  padding: var(--space-2) calc(var(--space-4) + var(--safe-right)) calc(var(--space-2) + var(--safe-bottom))
+    calc(var(--space-4) + var(--safe-left));
+  background-color: var(--color-surface);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.failed {
+  border-top-color: var(--color-danger);
+}
+
+.paused {
+  border-top-color: var(--color-warning);
+}
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+/* Grey until the share is live, red while live, amber while paused. */
+.dot {
+  flex: none;
+  width: 0.625rem;
+  height: 0.625rem;
+  background-color: var(--color-text-muted);
+  border-radius: var(--radius-full);
+}
+
+.dotLive {
+  background-color: var(--color-live);
+}
+
+.dotPaused {
+  background-color: var(--color-warning);
+}
+
+.status {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-weight: var(--weight-medium);
+}
+
+.actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.hint {
+  font-size: var(--text-sm);
+  color: var(--color-warning);
+}
+
+.note {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+/* Three columns on a wide window, stacked on a narrow one; it scrolls when the panel reaches its height. */
+.expander {
+  --ring-room: calc(var(--focus-ring-width) + var(--focus-ring-offset));
+
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-4);
+  min-height: 0;
+  padding: var(--space-2) var(--ring-room) var(--ring-room);
+  margin: 0 calc(-1 * var(--ring-room)) calc(-1 * var(--ring-room));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.panelPresets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.names {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.names li {
+  display: flex;
+  flex-direction: column;
+}
+
+.muted {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+/* The header's disabled Share on a PC that can't share: the wrapper carries the tooltip. */
+.disabledShare {
+  display: inline-flex;
+}
+
+/* ---- Details ---- */
+
+.details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  font-size: var(--text-sm);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--color-text-muted);
+}
+
+.facts dd {
+  min-width: 0;
+  margin: 0;
+}

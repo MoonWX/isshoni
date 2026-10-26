@@ -106,6 +106,39 @@ describe('viewerStore.syncRoom', () => {
     expect(store.getState().focusedShareId).toBe('s_bea');
   });
 
+  it('M2: marks the shares of the platform’s other local connections local, without a preview of the page', () => {
+    // docs/m2/03 §10.4: the desktop app's own share, which its C2 publishes.
+    const store = createViewerStore();
+    const desktop = { ...SELF, localConnectionIds: ['c_publisher'] };
+    store
+      .getState()
+      .syncRoom(
+        room(
+          shareInfo('s_bea', 'u_bea', 1),
+          shareInfo('s_native', 'u_alex', 2, { connectionId: 'c_publisher' }),
+          shareInfo('s_page', 'u_alex', 3, { connectionId: 'c_me' }),
+        ),
+        desktop,
+      );
+    const byId = Object.fromEntries(store.getState().shares.map((s) => [s.id, s]));
+    expect(byId['s_native']).toMatchObject({ own: true, local: true, localPreview: false });
+    expect(byId['s_page']).toMatchObject({ own: true, local: true, localPreview: true });
+    expect(byId['s_bea']).toMatchObject({ own: false, local: false, localPreview: false });
+    // Never focused automatically, never heard.
+    expect(store.getState().focusedShareId).toBe('s_bea');
+    store.getState().setAudible('s_native');
+    expect(store.getState().audibleShareId).toBe('s_bea');
+  });
+
+  it('M2: re-reads which shares are local when the local connections become known', () => {
+    const store = createViewerStore();
+    const snapshot = room(shareInfo('s_native', 'u_alex', 2, { connectionId: 'c_publisher' }));
+    store.getState().syncRoom(snapshot, SELF);
+    expect(store.getState().shares[0]).toMatchObject({ local: false });
+    store.getState().syncRoom(snapshot, { ...SELF, localConnectionIds: ['c_publisher'] });
+    expect(store.getState().shares[0]).toMatchObject({ local: true, localPreview: false });
+  });
+
   it('holds a pick against a new share and resumes auto-focus when the picked share ends (owner decision)', () => {
     const store = createViewerStore();
     const a = shareInfo('s_a', 'u_bea', 1);

@@ -84,6 +84,7 @@ describe('layerInputs', () => {
     state().setPageHidden(1_000);
     expect(layerInputs(state(), 4_500)).toEqual({
       remoteShares: ['s_cy', 's_bea'], // tile order, without the share this page publishes
+      localShares: [], // M2: the local shares without a preview of this page's own (none here)
       focused: 's_cy',
       audible: 's_cy',
       visible: { s_cy: true, s_bea: true },
@@ -134,6 +135,27 @@ describe('attachSubscriptions: audio only for the focused share', () => {
     await flush(SUBSCRIBE_DEBOUNCE_MS);
     expect(signal.updates.at(-1)).toEqual([want('s_bea', 'low', 'on')]);
     expect(signal.updates.flat().some((w) => w.shareId === 's_mine')).toBe(false);
+  });
+
+  it('M2: subscribes the desktop app’s own share (local, no preview of the page) at the low layer, never its audio', async () => {
+    // docs/m2/03 §10.4: C2 publishes it; the tile and the stage show its preview layer, labelled as such.
+    const NATIVE = shareInfo('s_native', 'u_alex', 5, { connectionId: 'c_publisher' });
+    render(<ViewerLayout viewer={viewer} />);
+    act(() => {
+      syncRoom(viewer, room(BEA, NATIVE), { ...SELF, localConnectionIds: ['c_publisher'] });
+    });
+    await flush(SUBSCRIBE_DEBOUNCE_MS);
+    expect(sorted(signal.updates.flat())).toEqual([want('s_bea', 'high', 'on'), want('s_native', 'low')]);
+    expect(screen.getByText('Preview: what friends see')).toBeInTheDocument();
+
+    // Put on the stage: still the low layer and no audio; the sound stays with the friend's share.
+    fireEvent.click(screen.getByRole('button', { name: /^Show your preview on the stage/ }));
+    expect(state().focusedShareId).toBe('s_native');
+    await flush(SUBSCRIBE_DEBOUNCE_MS);
+    const last = signal.updates.flat().filter((w) => w.shareId === 's_native');
+    expect(last.every((w) => w.video !== 'high' && w.audio === 'off')).toBe(true);
+    expect(viewerWants(state()).find((w) => w.shareId === 's_native')).toEqual(want('s_native', 'low'));
+    expect(state().audibleShareId).toBe('s_bea');
   });
 
   it('subscribes a share that auto-focus puts on the stage, with the audio moving in the same update', async () => {

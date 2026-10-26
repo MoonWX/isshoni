@@ -17,8 +17,9 @@ import { shareParams } from './testing/publish';
 type Fields = Omit<ShareFields, 'hostId' | 'panels'>;
 
 const fields = (store: ShareStore): Fields => {
-  const { phase, preset, withAudio, picked, soundOn, params, hint, unreachable, error, notice } = store.getState();
-  return { phase, preset, withAudio, picked, soundOn, params, hint, unreachable, error, notice };
+  const { phase, preset, withAudio, picked, confirming, soundOn, params, hint, unreachable, error, notice } =
+    store.getState();
+  return { phase, preset, withAudio, picked, confirming, soundOn, params, hint, unreachable, error, notice };
 };
 
 const IDLE: Fields = {
@@ -26,6 +27,7 @@ const IDLE: Fields = {
   preset: 'auto',
   withAudio: false,
   picked: null,
+  confirming: null,
   soundOn: true,
   params: null,
   hint: null,
@@ -159,6 +161,7 @@ describe('shareStore: the whole-screen warning (05 §13.3)', () => {
     expect(fields(store)).toEqual({
       ...IDLE,
       phase: 'confirming',
+      confirming: 'screen-audio',
       preset: 'movie',
       withAudio: true,
       picked: { kind: 'screen', audioScope: 'system', warning: 'screen-with-system-audio' },
@@ -259,6 +262,99 @@ describe('shareStore: the whole-screen warning (05 §13.3)', () => {
     src.stream.getVideoTracks()[0]?.end();
     expect(store.getState().phase).toBe('confirming');
     expect(next.release).not.toHaveBeenCalled();
+  });
+});
+
+/** A native pick (docs/m2/03 §10.2): no stream, the picker's name, and the one-time sheets due. */
+function nativePick(confirm: ('first-share' | 'dnd')[], audioScope: 'system' | 'none' = 'system') {
+  const release = vi.fn();
+  const src: PickedSource = {
+    kind: confirm.includes('dnd') ? 'screen' : 'window',
+    audioScope,
+    warning: null,
+    preview: null,
+    label: 'Minecraft',
+    confirm,
+    release,
+  };
+  return { src, release };
+}
+
+describe('shareStore: a native pick’s one-time sheets (M2 docs/m2/03 §10.2)', () => {
+  it('waits at the first-share sheet, then the DND tip, in that order, then starts', async () => {
+    const store = createShareStore();
+    const start = started();
+    const { src } = nativePick(['first-share', 'dnd']);
+    expect(await store.getState().pick(Promise.resolve(src), { preset: 'auto', start })).toEqual({
+      step: 'confirming',
+    });
+    expect(fields(store)).toEqual({
+      ...IDLE,
+      phase: 'confirming',
+      confirming: 'first-share',
+      withAudio: true,
+      picked: { kind: 'screen', audioScope: 'system', warning: null, label: 'Minecraft' },
+    });
+    expect(await store.getState().confirm()).toEqual({ step: 'confirming' });
+    expect(store.getState().confirming).toBe('dnd');
+    expect(start).not.toHaveBeenCalled();
+    const outcome = await store.getState().confirm();
+    expect(outcome).toMatchObject({ step: 'started', withAudio: true });
+    expect(start).toHaveBeenCalledWith(src, { preset: 'auto', withAudio: true });
+    expect(store.getState()).toMatchObject({ phase: 'starting', confirming: null });
+  });
+
+  it('a pick without sheets starts at once, with the sound the sheet chose', async () => {
+    const store = createShareStore();
+    const start = started();
+    const { src } = nativePick([], 'none');
+    expect(await store.getState().pick(Promise.resolve(src), { preset: 'text', start })).toMatchObject({
+      step: 'started',
+      withAudio: false,
+    });
+    expect(start).toHaveBeenCalledWith(src, { preset: 'text', withAudio: false });
+  });
+
+  it.each([
+    ['the first-share sheet', 0],
+    ['the DND tip', 1],
+  ])('a cancel at %s releases the pick and starts nothing', async (_name, steps) => {
+    const store = createShareStore();
+    const start = started();
+    const { src, release } = nativePick(['first-share', 'dnd']);
+    await store.getState().pick(Promise.resolve(src), { preset: 'auto', start });
+    for (let i = 0; i < steps; i++) await store.getState().confirm();
+    store.getState().cancel();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(start).not.toHaveBeenCalled();
+    expect(fields(store)).toEqual(IDLE);
+  });
+
+  it('the first-share sheet’s preset is the one the share starts with', async () => {
+    const store = createShareStore();
+    const start = started();
+    const { src } = nativePick(['first-share']);
+    await store.getState().pick(Promise.resolve(src), { preset: 'auto', start });
+    store.getState().setPreset('game');
+    await store.getState().confirm();
+    expect(start).toHaveBeenCalledWith(src, { preset: 'game', withAudio: true });
+    // Not while a share runs: the panel changes a running share's preset (Share.SetPreset).
+    store.getState().setPreset('movie');
+    expect(store.getState().preset).toBe('game');
+  });
+
+  it('a share published without a pick through the store (the app’s share after a reload) has no params', () => {
+    const store = createShareStore();
+    expect(
+      store.getState().publishing({
+        picked: { kind: 'window', audioScope: 'system', warning: null, label: 'Minecraft' },
+        preset: 'game',
+        withAudio: true,
+        params: null,
+      }),
+    ).toBe(true);
+    store.getState().advance('live');
+    expect(store.getState()).toMatchObject({ phase: 'live', params: null, preset: 'game' });
   });
 });
 

@@ -92,7 +92,8 @@ describe('DesktopPlatform basics (docs/m2/03 §7.3)', () => {
     expect(p.role).toBe('viewer');
     expect(p.serverOrigin).toBe(ORIGIN);
     expect(p.pwa).toBeNull();
-    expect(p.sharing).toBeNull();
+    // WA65: DesktopSharing by default (docs/m2/03 §7.3, §10.2), loaded on demand; DesktopSharing.test.ts has it.
+    expect(p.sharing?.mode).toBe('native');
     expect(p.inAppBrowser()).toBeNull();
     expect(p.desktop.app).toEqual({ version: '0.2.0', os: 'windows', osBuild: 26100 });
     expect(p.desktop.server).toEqual({ id: ID, origin: ORIGIN, name: 'Friends' });
@@ -354,7 +355,8 @@ describe('C1 stops (docs/m2/03 §7.3)', () => {
   });
 
   it.each(['room_full', 'forbidden', 'replaced', 'internal'])('%s is not a desktop case', async (code) => {
-    const { p, fake } = make();
+    // No sharing provider: its own first calls (Share.Current, App.Info) aren't C1's.
+    const { p, fake } = make({ sharing: () => null });
     expect(await p.desktop.signalStopped({ code })).toBe('none');
     expect(fake.calls).toEqual([]);
   });
@@ -561,7 +563,7 @@ describe('capabilities() (docs/m2/03 §7.3)', () => {
   };
 
   it('maps the desktop: no push, no install, no Share without a sharing provider', async () => {
-    const { p, fake } = make();
+    const { p, fake } = make({ sharing: () => null });
     const caps = await p.capabilities();
     expect(caps).toMatchObject({ canShare: false, push: 'unsupported', install: 'none', fullscreen: 'none' });
     expect(caps.caps).toEqual(p.capsNow());
@@ -660,7 +662,8 @@ describe('the transport (docs/m2/03 §7.2, §7.4)', () => {
       if (url.endsWith('/__bridge/call')) return Promise.resolve(json(200, { token: 'isa_http', expiresAt: 4e12 }));
       return Promise.resolve(json(200, {}));
     });
-    const p = new DesktopPlatform(config({ transport: 'http' }));
+    // Without the sharing provider, whose first calls (Share.Current, App.Info) would come first.
+    const p = new DesktopPlatform(config({ transport: 'http' }), { sharing: () => null });
     made.push(p);
     await p.apiFetch('/api/v1/me');
     const call = sent(0);

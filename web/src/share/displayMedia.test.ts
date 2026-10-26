@@ -322,9 +322,9 @@ describe('the fake-display seam in pick() (05 §19.3)', () => {
     const src = await pickDisplayMedia({ preset: 'game' }, env(md, { hostname: 'localhost', session: withKey(value) }));
     expect(md.getDisplayMedia).not.toHaveBeenCalled();
     expect(src).toMatchObject(want);
-    expect(src?.preview.getVideoTracks()).toHaveLength(1);
-    expect(src?.preview.getVideoTracks()[0]?.contentHint).toBe('motion');
-    expect(src?.preview.getAudioTracks()).toHaveLength(want.audioScope === 'none' ? 0 : 1);
+    expect(src?.preview?.getVideoTracks()).toHaveLength(1);
+    expect(src?.preview?.getVideoTracks()[0]?.contentHint).toBe('motion');
+    expect(src?.preview?.getAudioTracks()).toHaveLength(want.audioScope === 'none' ? 0 : 1);
     src?.release();
   });
 
