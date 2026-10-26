@@ -48,7 +48,12 @@ struct PatternGrid {
     }
     const auto elapsed = static_cast<uint64_t>(now - epoch_ns);
     const uint64_t s = static_cast<uint64_t>(kSecondNs);
+    // The newest frame captured at or before now: k's capture time is at most now, and frame k + 1's is too only when
+    // now is exactly its (rounded-down) capture time.
     uint64_t k = elapsed / s * rate() + (elapsed % s) * rate() / s;
+    if (FrameNs(k + 1) <= now) {
+      ++k;
+    }
     while (k > next && DueNs(k) > now) {
       --k;
     }

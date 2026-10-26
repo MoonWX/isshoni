@@ -18,7 +18,8 @@
 //   so the slots keep the frozen frame, §8.5), converts the frame (or black) into each encode's NV12 target, encodes
 //   what the pacer asks for, runs the normalizer (§9.4) and pushes into the rings; re-inits through the re-init
 //   planner (§9.5); recovers a failed encoder with the next candidate (ENCODER_CHANGED first, §9.8); ends the session
-//   when a device is removed or no candidate is left. It never waits on the consumer.
+//   when a device is removed (IM_ERR_ENCODER_LOST, or any failure while the device reports itself removed, §8.1) or no
+//   candidate is left. It never waits on the consumer.
 // - supervisor: the test pattern's frame timer (frames on a grid anchored at epoch_ns, pattern_grid.h, so the
 //   pattern's flash instants are the test tone's beeps; each frame drawn into a slot by the GPU, or only its time
 //   without a device), and the real-time flags into events: LIMIT_CHANGED (every edge of the pacer's overload rule),
@@ -57,6 +58,7 @@
 #include "im/h264/annexb.h"
 #include "im/os/clock.h"
 #include "im/pace/pacer.h"
+#include "im/pace/rate_meter.h"
 #include "im/ring/event_queue.h"
 #include "im/ring/packet_ring.h"
 #include "im/ring/pump.h"
@@ -216,6 +218,8 @@ private:
   void ApplyCommands(int64_t now);
   void Apply(const Command &c, int64_t now);
   void ApplyRingRequests();
+  // Records the frames captured since the last call for fpsIn (04 §5.6), whether or not the video thread takes them.
+  void CountCaptured(int64_t now) noexcept;
   // Takes the newest published frame for the pacer; count_skipped false: the frames published meanwhile were neither
   // seen nor dropped (a pause, §8.5).
   void TakeFrame(int64_t now, bool count_skipped);
@@ -246,6 +250,10 @@ private:
   // End on a removed or reset device (04 §9.8): ENDED{IM_ERR_ENCODER_LOST} with token device_removed; the probe's cache
   // is stale. what says where it was seen (logged).
   void EndDeviceRemoved(std::string_view what) noexcept;
+  // Whether the session's device was removed or reset (gpu::Device::Removed; false without a device). Every generic
+  // failure on the GPU path asks it (04 §8.1): a TDR may first show up as an encoder's or a pool's ordinary error, or
+  // as re-opens that fail, and still ends the session as device_removed (§9.8). Any session thread.
+  bool DeviceLost() const noexcept;
   // Releases the GPU path once no session thread can use it any more (the encoders first: they hold the device).
   void ReleaseVideo() noexcept;
   im_status Push(const Command &c);
@@ -294,6 +302,10 @@ private:
   int64_t retry_at_ = kNever;
   int64_t next_stats_ = 0;
   bool video_ended_ = false;
+  // fpsIn counts captured frames (04 §5.6), also while paused, when the video thread takes none and the pacer sees
+  // none (§8.5): frames_captured_'s growth, recorded when the video thread wakes for it.
+  pace::RateMeter<1024> captured_meter_;
+  uint64_t captured_seen_ = 0;
 
   // ---- commands and flags from other threads
   std::mutex cmd_mu_;

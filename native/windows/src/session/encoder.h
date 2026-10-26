@@ -90,12 +90,14 @@ public:
   // encoder's own gpu::Nv12Surface, which Encode reads back for a CPU encoder. Called right before each Encode; the
   // target stays the encoder's, valid until that Encode returns. When the conversion fails, no Encode follows: the
   // session recovers the layer (a re-open, §9.8) or ends, and a later NextTarget may hand out the same target again.
-  // IM_ERR_ENCODER_LOST on device loss (the session ends, device_removed); any other error is an encode error.
-  // The default, for encoders that take nothing, is IM_ERR_NOT_IMPLEMENTED.
+  // IM_ERR_ENCODER_LOST on device loss (the session ends, device_removed); any other error is an encode error, unless
+  // the session's device says it was removed (04 §8.1: then it is device loss too). The default, for encoders that
+  // take nothing, is IM_ERR_NOT_IMPLEMENTED.
   virtual im_status NextTarget(gpu::Nv12Target *out) noexcept;
   // Encodes one frame. IM_OK with out filled; IM_ERR_ENCODER_LOST when the device was removed or reset (the session
   // ends with token device_removed, §9.8); any other error is an encode error, which the session recovers from by
-  // re-opening the encoder once, then the next candidate (§9.8).
+  // re-opening the encoder once, then the next candidate (§9.8), unless the session's device says it was removed (an
+  // ordinary error after a TDR, 04 §8.1: the session ends as device_removed).
   virtual im_status Encode(const EncodeInput &in, EncodedAu *out) noexcept = 0;
   // A live bitrate change (encoders with IM_ENCF_LIVE_BITRATE): applied before the next frame, no IDR (§9.5).
   virtual im_status SetBitrate(uint32_t bps) noexcept = 0;

@@ -15,12 +15,16 @@
 // instant epoch_ns + k / 60 s is its capture_ts_ns) and flash box, on f (1:1) and q (downscaled 2:1); on a static
 // screen refreshes and keyframes show the one frame again; with no frame at all the first keyframe is black (Y 16,
 // Cb/Cr 128); while paused every picture shows one frame captured before the pause took effect, and resuming shows new
-// frames again.
+// frames again. Device loss that first shows up as an ordinary error (04 §8.1) ends the session with ENDED
+// {IM_ERR_ENCODER_LOST} device_removed and marks the probe's cache stale (§9.8), whether a conversion's target, the
+// re-opens of a recovery or a re-init's open meet it (session::SetDeviceRemovedForTest stands in for a removed device,
+// which WARP can't be); the same failure on a sound device is an encode error that the session recovers from.
 #include <gtest/gtest.h>
 
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -116,6 +120,31 @@ Recorder &TheRecorder() {
   return r;
 }
 
+// What the test's encoders do wrong next (every session of the test; SetUp and TearDown reset them).
+struct Knobs {
+  std::atomic<int> fail_targets{0};        // the next n NextTarget calls fail with an ordinary error (IM_ERR_INTERNAL)
+  std::atomic<bool> remove_on_open{false}; // an Open finds the device removed and fails with an ordinary error
+
+  void Reset() {
+    fail_targets.store(0);
+    remove_on_open.store(false);
+  }
+  bool TakeTargetFailure() {
+    int n = fail_targets.load();
+    while (n > 0) {
+      if (fail_targets.compare_exchange_weak(n, n - 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+Knobs &TheKnobs() {
+  static Knobs k;
+  return k;
+}
+
 // Where pattern_layout.h's bands and blocks are in a picture of out_w × out_h that shows the whole kSourceW × kSourceH
 // pattern (same aspect: no letterbox): source coordinates scaled.
 struct Probe {
@@ -151,6 +180,11 @@ public:
     if (p.device == nullptr) {
       return im::abi::Fail(IM_ERR_NO_ENCODER, im::abi::token::kOpenFailed, "test encoder: opened without a device");
     }
+    if (TheKnobs().remove_on_open.load()) {
+      // The device went (a TDR): this open fails with an ordinary error, and the device says it was removed.
+      im::session::SetDeviceRemovedForTest(true);
+      return im::abi::Fail(IM_ERR_INTERNAL, {}, "test encoder: the device was removed");
+    }
     auto e = std::unique_ptr<PixelEncoder>(new PixelEncoder(p));
     const im::video::Size size{p.width, p.height};
     if (const im_status st = im::gpu::Nv12Surface::Create(*p.device, size, &e->surface_); st != IM_OK) {
@@ -168,6 +202,9 @@ public:
   }
 
   im_status NextTarget(im::gpu::Nv12Target *out) noexcept override {
+    if (TheKnobs().TakeTargetFailure()) {
+      return im::abi::Fail(IM_ERR_INTERNAL, {}, "test encoder: no target (an ordinary error, as a pool's ENOMEM)");
+    }
     *out = surface_->target();
     return IM_OK;
   }
@@ -221,9 +258,13 @@ struct Pkt {
   uint32_t layer = IM_NO_LAYER;
   uint32_t flags = 0;
   int64_t ts = 0;
+  int32_t event = 0;
+  im_status status = IM_OK;
+  std::string json; // an event's document
   Clock::time_point at;
 
   bool video() const { return kind == IM_PACKET_VIDEO; }
+  bool ended() const { return kind == IM_PACKET_EVENT && event == IM_EVENT_ENDED; }
 };
 
 // Pulls packets for d, or until stop returns true for one.
@@ -245,6 +286,11 @@ std::vector<Pkt> Pull(im_session s, milliseconds d, const std::function<bool(con
     k.layer = p.layer;
     k.flags = p.flags;
     k.ts = p.capture_ts_ns;
+    k.event = p.event;
+    k.status = p.status;
+    if (p.kind == IM_PACKET_EVENT && p.data != nullptr) {
+      k.json.assign(reinterpret_cast<const char *>(p.data), p.size);
+    }
     k.at = Clock::now();
     out.push_back(k);
     if (stop && stop(out.back())) {
@@ -289,6 +335,8 @@ protected:
     e.input = im::session::FrameInput::kNv12;
     e.device.adapter = im::gpu::DeviceRequest::Adapter::kWarp;
     im::session::SetCatalogPrefixForTest({e});
+    im::session::SetDeviceRemovedForTest(false);
+    TheKnobs().Reset();
     im_init_params p{};
     p.struct_size = sizeof p;
     p.abi_version = IM_ABI_VERSION;
@@ -299,6 +347,8 @@ protected:
   void TearDown() override {
     im_shutdown();
     im::session::SetCatalogPrefixForTest({});
+    im::session::SetDeviceRemovedForTest(false);
+    TheKnobs().Reset();
     im::testhooks::Reset();
   }
 
@@ -353,6 +403,24 @@ void ExpectNoErrors() {
     ADD_FAILURE() << e;
   }
 }
+
+// The packets up to ENDED end with ENDED{IM_ERR_ENCODER_LOST} device_removed (04 §9.8): no fallback to another
+// encoder first, and the probe's cache is stale.
+void ExpectEndedDeviceRemoved(const std::vector<Pkt> &pkts) {
+  ASSERT_FALSE(pkts.empty());
+  const Pkt &last = pkts.back();
+  ASSERT_TRUE(last.ended()) << "no ENDED within the time";
+  EXPECT_EQ(last.status, IM_ERR_ENCODER_LOST);
+  EXPECT_NE(last.json.find("\"reason\":\"encoder_lost\""), std::string::npos) << last.json;
+  EXPECT_NE(last.json.find("\"detail\":\"device_removed: "), std::string::npos) << last.json;
+  for (const Pkt &p : pkts) {
+    EXPECT_FALSE(p.kind == IM_PACKET_EVENT && p.event == IM_EVENT_ENCODER_CHANGED)
+        << "no candidate can help on a removed device: " << p.json;
+  }
+  EXPECT_TRUE(im::testhooks::ProbeCacheStale()) << "the next start must not trust the probe's adapters";
+}
+
+bool IsEnded(const Pkt &p) { return p.ended(); }
 
 // ---------------------------------------------------------------------------------------------- the cases
 
@@ -497,6 +565,59 @@ TEST_F(SessionGpu, PausedPicturesShowOneFrameFromBeforeThePause) {
   ASSERT_TRUE(frozen.has_value());
   EXPECT_GE(after, 10u) << "resume encodes new frames again";
   EXPECT_EQ(newer_after, after) << "after the resume the pictures are newer than the frozen frame";
+}
+
+TEST_F(SessionGpu, AnOrdinaryFailureOnARemovedDeviceEndsTheSessionAsDeviceRemoved) {
+  Configure(im::session::Pattern::kMoving);
+  const im_session s = Start();
+  ASSERT_NE(s, 0u);
+  Pull(s, milliseconds(400));
+
+  // On a sound device a target that fails is an encode error: the encoder re-opens (REINIT|KEYFRAME) and the session
+  // runs on (§9.8).
+  TheKnobs().fail_targets.store(1);
+  const std::vector<Pkt> recovered = Pull(s, milliseconds(800), IsEnded);
+  EXPECT_EQ(TheKnobs().fail_targets.load(), 0) << "the failure happened";
+  uint32_t reinits = 0;
+  for (const Pkt &p : recovered) {
+    EXPECT_FALSE(p.ended()) << p.json;
+    reinits += p.video() && (p.flags & (IM_PKT_KEYFRAME | IM_PKT_REINIT)) == (IM_PKT_KEYFRAME | IM_PKT_REINIT) ? 1 : 0;
+  }
+  EXPECT_GE(reinits, 1u) << "the re-opened encoder's first packet";
+  EXPECT_FALSE(im::testhooks::ProbeCacheStale());
+
+  // The device is gone (a TDR) and the same ordinary failure comes first: device loss all the same (§8.1).
+  im::session::SetDeviceRemovedForTest(true);
+  TheKnobs().fail_targets.store(1);
+  ExpectEndedDeviceRemoved(Pull(s, milliseconds(1500), IsEnded));
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+TEST_F(SessionGpu, ReopensThatFailOnARemovedDeviceEndTheSessionAsDeviceRemoved) {
+  Configure(im::session::Pattern::kMoving);
+  const im_session s = Start();
+  ASSERT_NE(s, 0u);
+  Pull(s, milliseconds(400));
+  // An encode error on a sound device; the recovery's first re-open finds the device removed, and no candidate opens
+  // after it: without the device check the candidates would run out as a plain encoder_lost ("no encoder left").
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  TheKnobs().remove_on_open.store(true);
+  ASSERT_EQ(im::testhooks::Inject(s, 0, im::testhooks::Fault::kEncodeError), IM_OK);
+  ExpectEndedDeviceRemoved(Pull(s, milliseconds(1500), IsEnded));
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+TEST_F(SessionGpu, AReinitOnARemovedDeviceEndsTheSessionAsDeviceRemoved) {
+  Configure(im::session::Pattern::kMoving);
+  const im_session s = Start();
+  ASSERT_NE(s, 0u);
+  Pull(s, milliseconds(400));
+  // A new content hint re-inits every layer (§9.5); the re-open fails with an ordinary error on a removed device, which
+  // no fallback candidate may paper over (§9.8).
+  TheKnobs().remove_on_open.store(true);
+  ASSERT_EQ(im_set_content_hint(s, IM_CONTENT_DETAIL), IM_OK) << LastError();
+  ExpectEndedDeviceRemoved(Pull(s, milliseconds(1500), IsEnded));
+  EXPECT_EQ(im_stop(s), IM_OK);
 }
 
 } // namespace

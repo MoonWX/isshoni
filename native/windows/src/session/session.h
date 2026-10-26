@@ -76,6 +76,11 @@ uint64_t DeviceOf(im_session s);
 // Whether a live session runs the GPU path (session/frames.h: it has a gpu::Device); false for an unknown handle.
 // session_fake_test checks that IM_ENC_FAKE sessions don't (they stay off WARP), session_gpu_test that its do.
 bool GpuPathOf(im_session s);
+// session_gpu_test: while set, every session's gpu::Device counts as removed where a session checks it after a generic
+// failure (an encode, a conversion, a re-open: 04 §8.1, a failure while GetDeviceRemovedReason() is not S_OK is device
+// loss), as a WARP device can't be removed. Only failures look at it: a session whose calls succeed runs on. Any
+// thread; testhooks::Reset doesn't clear it (the test that sets it does).
+void SetDeviceRemovedForTest(bool removed) noexcept;
 #endif
 
 } // namespace im::session

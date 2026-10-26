@@ -22,6 +22,7 @@ using engine::os::QpcNs;
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 constexpr uint8_t kFaultNone = 0;
 constexpr uint8_t kFaultEncodeError = 1;
+std::atomic<bool> g_device_removed_for_test{false}; // SetDeviceRemovedForTest
 #endif
 
 std::string_view RidView(const char (&rid)[4]) noexcept {
@@ -48,6 +49,12 @@ template <class F> std::string EventJson(F &&fill) noexcept {
 bool ValidLayerBitrate(uint32_t layer, uint32_t bps) noexcept { return encpolicy::ValidVideoBitrate(layer, bps); }
 
 } // namespace
+
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+void SetDeviceRemovedForTest(bool removed) noexcept {
+  g_device_removed_for_test.store(removed, std::memory_order_release);
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------- small parts
 
@@ -598,6 +605,7 @@ void Session::VideoLoop() noexcept {
           EndDeviceRemoved("test hooks");
           return;
         }
+        CountCaptured(now);
         ApplyCommands(now);
         ApplyRingRequests();
         if (!pacer_->paused()) {
@@ -736,6 +744,17 @@ void Session::Apply(const Command &c, int64_t now) {
   }
 }
 
+void Session::CountCaptured(int64_t now) noexcept {
+  const uint64_t captured = frames_captured_.load(std::memory_order_relaxed);
+  // The capture side wakes this thread for every frame, so the arrivals are recorded within a wake-up; more than the
+  // meter holds can't be counted within its window anyway.
+  const uint64_t arrived = std::min<uint64_t>(captured - captured_seen_, 1024);
+  for (uint64_t i = 0; i < arrived; ++i) {
+    captured_meter_.Add(now);
+  }
+  captured_seen_ = captured;
+}
+
 void Session::TakeFrame(int64_t now, bool count_skipped) {
   const VideoFrames::Taken t = frames_->Take();
   if (!t.fresh) {
@@ -864,8 +883,10 @@ void Session::Reinit(uint32_t layer, const encpolicy::ReinitAction &a, int64_t n
   }
   const encpolicy::Candidate c = candidates_[L.candidate];
   const im_status st = OpenLayer(layer, c, profile);
-  if (st == IM_ERR_ENCODER_LOST) {
-    EndDeviceRemoved("re-init"); // the converter's new geometry met a removed device: no candidate can help (§9.8)
+  if (st == IM_ERR_ENCODER_LOST || (st != IM_OK && DeviceLost())) {
+    // The converter's new geometry met a removed device, or the open failed on one (§8.1): no candidate can help
+    // (§9.8).
+    EndDeviceRemoved("re-init");
     return;
   }
   if (st != IM_OK) {
@@ -889,8 +910,18 @@ void Session::Recover(uint32_t layer, encpolicy::Failure why, im_status cause, i
   Layer &L = layers_[layer];
   const uint32_t old_kind = L.kind;
   L.enc.reset();
+  if (DeviceLost()) {
+    EndDeviceRemoved("recover"); // the failure was the device's (§8.1): no candidate can help (§9.8)
+    return;
+  }
   const encpolicy::Recovery r =
       encpolicy::RecoverLayer(candidates_, L.candidate, layer, L.profile, why, cause, opener_);
+  if (DeviceLost()) {
+    // The device went while the candidates were tried: RecoverLayer takes their failures (a converter's
+    // IM_ERR_ENCODER_LOST among them) for open failures, and a candidate that did open would fail next (§9.8).
+    EndDeviceRemoved("recover");
+    return;
+  }
   abi::ClearLastError();
   switch (r.outcome) {
   case encpolicy::Recovery::Outcome::kSame:
@@ -989,7 +1020,9 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
 #endif
   const int64_t t1 = QpcNs();
   ++L.index;
-  if (st == IM_ERR_ENCODER_LOST) {
+  if (st == IM_ERR_ENCODER_LOST || (st != IM_OK && DeviceLost())) {
+    // A TDR may first show up as an ordinary error (an FFmpeg pool's ENOMEM): with the device gone it is device loss
+    // all the same (§8.1).
     EndDeviceRemoved("encode");
     return;
   }
@@ -1060,6 +1093,10 @@ void Session::PublishLimits() {
 void Session::PublishStats(int64_t now) {
   StatsSnapshot s;
   s.layer_count = layer_count_;
+  // fpsIn: the captured frames over the last 2 s (the pacer's own count stops while paused, §8.5).
+  const int64_t from = std::max(now - kStatsWindowNs, epoch_);
+  const double window_s = static_cast<double>(now - from) / 1e9;
+  const double fps_in = window_s > 0 ? static_cast<double>(captured_meter_.CountSince(from)) / window_s : 0.0;
   for (uint32_t l = 0; l < layer_count_; ++l) {
     const Layer &L = layers_[l];
     const pace::LayerStats ps = pacer_->Stats(l, now);
@@ -1071,7 +1108,7 @@ void Session::PublishStats(int64_t now) {
     o.width = L.out.size.width;
     o.height = L.out.size.height;
     o.active = ps.active;
-    o.fps_in = ps.fps_in;
+    o.fps_in = fps_in; // every layer sees the same captured frames
     o.fps_out = ps.fps_out;
     o.bitrate_bps = L.bytes.BitsPerSecond(now);
     o.target_bps = L.planner->bitrate();
@@ -1099,7 +1136,7 @@ bool Session::PublishPattern(const PatternGrid &grid, uint64_t k) {
   // Its capture time is its grid time, so the flashes land on epoch_ns + k × 1 s exactly.
   const int64_t ts = grid.FrameNs(k);
   const im_status st = frames_->PublishPattern(gpu::PatternFrame{k, ts - epoch_}, ts);
-  if (st == IM_ERR_ENCODER_LOST) {
+  if (st == IM_ERR_ENCODER_LOST || (st != IM_OK && DeviceLost())) {
     EndDeviceRemoved("test pattern");
     return false;
   }
@@ -1231,6 +1268,18 @@ void Session::EndDeviceRemoved(std::string_view what) noexcept {
   abi::ClearLastError();
   MarkProbeCacheStale();
   End(IM_ERR_ENCODER_LOST, "encoder_lost", "device_removed: the encoder's device was removed or reset");
+}
+
+bool Session::DeviceLost() const noexcept {
+  if (!gpu_) {
+    return false; // the test hooks' IM_ENC_FAKE sessions: no device to lose
+  }
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (g_device_removed_for_test.load(std::memory_order_acquire)) {
+    return true;
+  }
+#endif
+  return gpu_->Removed();
 }
 
 void Session::JoinThreads(int64_t deadline_ns) noexcept {
