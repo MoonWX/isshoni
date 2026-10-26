@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -170,6 +171,57 @@ func TestUnknownFieldsKept(t *testing.T) {
 	pos := m["pill"].(map[string]any)["positions"].(map[string]any)
 	if d1, _ := pos["D1"].(map[string]any); len(pos) != 1 || d1["x"] != 1.0 || d1["dpi"] != 144.0 {
 		t.Errorf("pill.positions = %v", pos)
+	}
+}
+
+// TestAudioSectionKeptExactly: the audio section is read and written back as it was, numbers included, also one past
+// float64's range (05 §14.1: unknown keys are written back unchanged); SetAudioSection and Update take such a section,
+// and still refuse anything but one JSON object.
+func TestAudioSectionKeptExactly(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, FileName),
+		`{"schema": 1, "audio": {"appRules": {"exe:a.exe": "include"}, "gain": 1e400, "big": 12345678901234567890}}`)
+	s := open(t, Options{Dir: dir})
+	const want = `{"appRules":{"exe:a.exe":"include"},"big":12345678901234567890,"gain":1e400}`
+	if got := string(s.AudioSection()); got != want {
+		t.Errorf("AudioSection() = %s, want %s", got, want)
+	}
+	if err := s.Update(func(v *Settings) { v.CloseToTray = true }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct{ Audio json.RawMessage }
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatal(err)
+	}
+	var written bytes.Buffer
+	if err := json.Compact(&written, file.Audio); err != nil || written.String() != want {
+		t.Errorf("audio written back as %s (%v), want %s", written.String(), err, want)
+	}
+
+	if err := s.SetAudioSection(json.RawMessage(`{"gain": 1e400}`)); err != nil {
+		t.Errorf("SetAudioSection of a number past float64's range: %v", err)
+	}
+	if err := s.Update(func(v *Settings) { v.Audio = json.RawMessage(`{"gain": -1e400}`) }); err != nil {
+		t.Errorf("Update of a number past float64's range: %v", err)
+	}
+	for _, bad := range []string{``, ` `, `null`, `[]`, `1`, `{}}`, `{}]`, `{} {}`, `{"a": }`, `{"a": 1`} {
+		if err := s.SetAudioSection(json.RawMessage(bad)); !errors.Is(err, ErrInvalid) {
+			t.Errorf("SetAudioSection(%q): %v", bad, err)
+		}
+		err := s.Update(func(v *Settings) { v.Audio = json.RawMessage(bad) })
+		if fe := (*FieldError)(nil); !errors.As(err, &fe) || fe.Field != "audio" {
+			t.Errorf("Update of audio %q: %v", bad, err)
+		}
+	}
+	if err := s.Flush(); err != nil {
+		t.Errorf("Flush after the refused changes: %v", err)
 	}
 }
 
@@ -770,5 +822,286 @@ func TestAudioStore(t *testing.T) {
 	}
 	if v := NewAudioStore[audioSettings](s3, nil).AudioSettings(); v.KeepOutMicUsers {
 		t.Error("nil defaults should be the zero value")
+	}
+}
+
+// object returns a JSON object with n members "k0": 0, "k1": 1, ….
+func object(n int) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i := range n {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"k` + strconv.Itoa(i) + `":` + strconv.Itoa(i))
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// TestObjectKeyBound: a JSON object of up to maxObjectKeys members anywhere in settings.json is read and written back;
+// a file with a larger one counts as one that doesn't parse (set aside, the last good copy used).
+func TestObjectKeyBound(t *testing.T) {
+	t.Run("at the bound", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, FileName), `{"schema": 1, "later": {"deep": `+object(maxObjectKeys)+`}}`)
+		s := open(t, Options{Dir: dir})
+		if err := s.Update(func(v *Settings) { v.CloseToTray = true }); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		m := readJSON(t, filepath.Join(dir, FileName))
+		if deep, _ := m["later"].(map[string]any)["deep"].(map[string]any); len(deep) != maxObjectKeys ||
+			m["closeToTray"] != true {
+			t.Errorf("later.deep has %d keys; closeToTray = %v", len(deep), m["closeToTray"])
+		}
+	})
+	t.Run("past it", func(t *testing.T) {
+		dir := t.TempDir()
+		big := `{"schema": 1, "later": {"deep": ` + object(maxObjectKeys+1) + `}}`
+		writeFile(t, filepath.Join(dir, FileName), big)
+		writeFile(t, filepath.Join(dir, bakName), `{"schema": 1, "closeToTray": true}`)
+		s := open(t, Options{Dir: dir})
+		if !s.Get().CloseToTray {
+			t.Error("the last good copy wasn't used")
+		}
+		if data, err := os.ReadFile(filepath.Join(dir, badName+"20261022T123045Z")); err != nil || string(data) != big {
+			t.Errorf("the file wasn't set aside: %d bytes, %v", len(data), err)
+		}
+		if _, ok := readJSON(t, filepath.Join(dir, FileName))["later"]; ok {
+			t.Error("the object past the bound was written back")
+		}
+	})
+	t.Run("a last good copy past it", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, FileName), `not json`)
+		writeFile(t, filepath.Join(dir, bakName), `{"schema": 1, "closeToTray": true, "x": `+object(maxObjectKeys+1)+`}`)
+		if g := open(t, Options{Dir: dir}).Get(); !reflect.DeepEqual(g, Defaults()) {
+			t.Errorf("not the defaults: %+v", g)
+		}
+	})
+	// A file at the bound that leaves no room for this build's keys is still written, with every key of this build
+	// and the unknown keys that fit (one WARN), and read back; it never makes the store's writes fail.
+	t.Run("no room for this build's keys", func(t *testing.T) {
+		dir := t.TempDir()
+		// The top level: schema, hotkeys and 1022 unknown keys; hotkeys: 1024 unknown keys.
+		writeFile(t, filepath.Join(dir, FileName),
+			`{"schema": 1, "hotkeys": `+object(maxObjectKeys)+`, `+object(maxObjectKeys - 2)[1:])
+		var logs logBuffer
+		s := open(t, Options{Dir: dir, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+		if err := s.Update(func(v *Settings) { v.CloseToTray = true }); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Flush(); err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		// 12 of this build's top-level keys and both hotkeys came in; as many unknown keys gave way.
+		if n := strings.Count(logs.String(), "too many keys"); n != 1 || !strings.Contains(logs.String(), "dropped=14") {
+			t.Errorf("%d WARN lines, want one with dropped=14:\n%s", n, logs.String())
+		}
+		m := readJSON(t, filepath.Join(dir, FileName))
+		hot, _ := m["hotkeys"].(map[string]any)
+		if len(m) != maxObjectKeys || m["closeToTray"] != true || len(hot) != maxObjectKeys || hot["pause"] == nil {
+			t.Errorf("the file has %d keys, hotkeys %d; closeToTray = %v", len(m), len(hot), m["closeToTray"])
+		}
+		for _, k := range []string{"schema", "serverPrefs", "wizardDone", "window", "autostart", "hideFromCapture",
+			"notifications", "pill", "updates", "tips", "log", "audio", "k0"} {
+			if _, ok := m[k]; !ok {
+				t.Errorf("%s wasn't written", k)
+			}
+		}
+		if g := open(t, Options{Dir: dir}).Get(); !g.CloseToTray || g.Hotkeys != Defaults().Hotkeys {
+			t.Errorf("not read back: %+v", g)
+		}
+		if _, err := os.Stat(filepath.Join(dir, badName+"20261022T123045Z")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the file was set aside: %v", err)
+		}
+	})
+	t.Run("at the bound without a schema", func(t *testing.T) {
+		// The migration to schema 1 adds the schema key: 1025 keys.
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, FileName), object(maxObjectKeys))
+		open(t, Options{Dir: dir})
+		m := readJSON(t, filepath.Join(dir, FileName))
+		if len(m) != maxObjectKeys || m["schema"] != 1.0 {
+			t.Errorf("the file has %d keys; schema = %v", len(m), m["schema"])
+		}
+		if _, err := os.Stat(filepath.Join(dir, badName+"20261022T123045Z")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the file was set aside: %v", err)
+		}
+		if g := open(t, Options{Dir: dir}).Get(); g.Schema != CurrentSchema {
+			t.Errorf("not read back: %+v", g)
+		}
+	})
+}
+
+// TestObjectKeyBoundOnChanges: Update and SetAudioSection refuse a value with an object past maxObjectKeys, so the
+// store never writes a file it would set aside.
+func TestObjectKeyBoundOnChanges(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, Options{Dir: dir})
+	prefs := func(n int) map[string]ServerPrefs {
+		m := make(map[string]ServerPrefs, n)
+		for i := range n {
+			m["https://s"+strconv.Itoa(i)+".example.com"] = ServerPrefs{Preset: protocol.PresetGame}
+		}
+		return m
+	}
+	if err := s.Update(func(v *Settings) { v.ServerPrefs = prefs(maxObjectKeys) }); err != nil {
+		t.Fatalf("serverPrefs at the bound: %v", err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(open(t, Options{Dir: dir}).Get().ServerPrefs); n != maxObjectKeys {
+		t.Errorf("read back %d serverPrefs", n)
+	}
+	before := s.Get()
+	positions := make(map[string]Point, maxObjectKeys+1)
+	for i := range maxObjectKeys + 1 {
+		positions[`\\.\DISPLAY`+strconv.Itoa(i)] = Point{X: i}
+	}
+	for field, fn := range map[string]func(*Settings){
+		"serverPrefs":    func(v *Settings) { v.ServerPrefs = prefs(maxObjectKeys + 1) },
+		"pill.positions": func(v *Settings) { v.Pill.Positions = positions },
+		"audio":          func(v *Settings) { v.Audio = json.RawMessage(`{"appRules": ` + object(maxObjectKeys+1) + `}`) },
+	} {
+		err := s.Update(fn)
+		var fe *FieldError
+		if !errors.As(err, &fe) || fe.Field != field || !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: %v", field, err)
+		}
+	}
+	if !reflect.DeepEqual(s.Get(), before) {
+		t.Error("a refused Update changed the settings")
+	}
+	if err := s.SetAudioSection(json.RawMessage(`{"appRules": ` + object(maxObjectKeys+1) + `}`)); !errors.Is(err,
+		ErrInvalid) {
+		t.Errorf("SetAudioSection past the bound: %v", err)
+	}
+	if err := s.SetAudioSection(json.RawMessage(`{"appRules": ` + object(maxObjectKeys) + `}`)); err != nil {
+		t.Errorf("SetAudioSection at the bound: %v", err)
+	}
+}
+
+// logBuffer is a log writer for a store, whose debounce timer may log from its own goroutine.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// TestSaveAudioSettingsBound: SaveAudioSettings keeps the section's keys that T doesn't have while the section stays
+// within maxObjectKeys; past it, T's keys are all written and the last unknown ones in key order give way (one
+// WARN), so a section near the bound never makes 05's saves fail.
+func TestSaveAudioSettingsBound(t *testing.T) {
+	var logs logBuffer
+	s := open(t, Options{Dir: t.TempDir(), Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	st := NewAudioStore(s, audioDefaults)
+	section := func() map[string]json.RawMessage {
+		t.Helper()
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(s.AudioSection(), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	// audioSettings has 4 keys, none of them k<n>: 1020 unknown keys and T's fill the section.
+	if err := s.SetAudioSection(json.RawMessage(object(maxObjectKeys - 4))); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAudioSettings(audioDefaults()); err != nil {
+		t.Fatalf("SaveAudioSettings at the bound: %v", err)
+	}
+	if m := section(); len(m) != maxObjectKeys || m["k1019"] == nil || m["keepOutMicUsers"] == nil {
+		t.Errorf("at the bound: the section has %d keys", len(m))
+	}
+	if strings.Contains(logs.String(), "too many keys") {
+		t.Errorf("a WARN at the bound:\n%s", logs.String())
+	}
+	// One unknown key more (k0…k1020): the last in key order, k999, gives way to T's.
+	if err := s.SetAudioSection(json.RawMessage(object(maxObjectKeys - 3))); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAudioSettings(audioSettings{AppRules: map[string]string{"exe:a.exe": "include"}}); err != nil {
+		t.Fatalf("SaveAudioSettings past the bound: %v", err)
+	}
+	m := section()
+	if _, ok := m["k999"]; len(m) != maxObjectKeys || ok || m["k1020"] == nil {
+		t.Errorf("past the bound: %d keys, k999 kept: %v", len(m), ok)
+	}
+	if got := st.AudioSettings(); got.KeepOutMicUsers || got.AppRules["exe:a.exe"] != "include" {
+		t.Errorf("T's values weren't all written: %+v", got)
+	}
+	if n := strings.Count(logs.String(), "too many keys"); n != 1 || !strings.Contains(logs.String(), "dropped=1") {
+		t.Errorf("%d WARN lines, want one with dropped=1:\n%s", n, logs.String())
+	}
+}
+
+// TestMergeKnownBound: a merged object has all of known's keys and base's others up to maxObjectKeys, the last ones
+// in key order dropped; a known object past the bound is errTooManyKeys.
+func TestMergeKnownBound(t *testing.T) {
+	// keys is what parse makes of object(n).
+	keys := func(n int) map[string]any {
+		m := make(map[string]any, n)
+		for i := range n {
+			m["k"+strconv.Itoa(i)] = json.Number(strconv.Itoa(i))
+		}
+		return m
+	}
+	for _, c := range []struct {
+		name        string
+		base, known map[string]any
+		path        string
+		n, dropped  int            // members of the result (of its "o" when it has one), keys left out
+		want        map[string]any // members the result (its "o") must have
+		gone        string         // a key of base that must be left out
+	}{
+		{"base at the bound", keys(maxObjectKeys), map[string]any{"k0": "x"}, "", maxObjectKeys, 0,
+			map[string]any{"k0": "x", "k999": json.Number("999")}, ""},
+		// The top-level object of a file at the bound that a migration gave a schema key.
+		{"base past it", keys(maxObjectKeys + 1), map[string]any{"schema": 1}, "", maxObjectKeys, 2,
+			map[string]any{"schema": 1, "k1024": json.Number("1024")}, "k999"},
+		{"merged past it", keys(maxObjectKeys), map[string]any{"new": true, "k5": "x"}, "", maxObjectKeys, 1,
+			map[string]any{"new": true, "k5": "x"}, "k999"},
+		{"nested past it", map[string]any{"o": keys(maxObjectKeys)}, map[string]any{"o": map[string]any{"new": 1}}, "",
+			maxObjectKeys, 1, map[string]any{"new": 1, "k0": json.Number("0")}, "k999"},
+		{"keyed: only known's keys", keys(maxObjectKeys), map[string]any{"k7": "x"}, "serverPrefs", 1, 0,
+			map[string]any{"k7": "x"}, "k0"},
+	} {
+		out, dropped, err := mergeKnown(c.base, c.known, c.path)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		got := out
+		if o, ok := out["o"].(map[string]any); ok {
+			got = o
+		}
+		_, kept := got[c.gone]
+		if len(got) != c.n || dropped != c.dropped || kept {
+			t.Errorf("%s: %d keys, %d dropped, %s kept: %v", c.name, len(got), dropped, c.gone, kept)
+		}
+		for k, v := range c.want {
+			if got[k] != v {
+				t.Errorf("%s: %s = %v, want %v", c.name, k, got[k], v)
+			}
+		}
+	}
+	if _, _, err := mergeKnown(map[string]any{}, keys(maxObjectKeys+1), ""); !errors.Is(err, errTooManyKeys) {
+		t.Errorf("known past the bound: %v", err)
 	}
 }

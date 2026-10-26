@@ -37,24 +37,40 @@ func (a *AudioStore[T]) AudioSettings() T {
 	return v
 }
 
-// SaveAudioSettings writes v as the section, keeping the section's keys that v doesn't have.
+// SaveAudioSettings writes v as the section, keeping the section's keys that v doesn't have, as many as fit in
+// maxObjectKeys (the first ones in key order; one WARN when some don't). A v that isn't a JSON object of at most
+// maxObjectKeys members is a *FieldError for audio, and the saved section stays.
 func (a *AudioStore[T]) SaveAudioSettings(v T) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	var next map[string]json.RawMessage
-	if err := json.Unmarshal(data, &next); err != nil || next == nil {
+	next, ok := members(data)
+	if !ok || len(next) > maxObjectKeys {
 		return fieldError("audio")
 	}
-	var old map[string]json.RawMessage
-	_ = json.Unmarshal(a.s.AudioSection(), &old)
-	merged := make(map[string]json.RawMessage, len(old)+len(next))
-	maps.Copy(merged, old)
+	old, _ := members(a.s.AudioSection())
+	merged := make(map[string]json.RawMessage, len(next))
 	maps.Copy(merged, next)
+	dropped := keepUnknown(merged, old)
 	out, err := json.Marshal(merged)
 	if err != nil {
 		return err
 	}
-	return a.s.SetAudioSection(out)
+	if err := a.s.SetAudioSection(out); err != nil {
+		return err
+	}
+	if dropped > 0 {
+		a.s.log.Warn("settings: the audio section had too many keys; ones 05 doesn't know past the limit weren't kept",
+			"dropped", dropped, "max", maxObjectKeys)
+	}
+	return nil
+}
+
+// members returns the members of the JSON object data; ok is false when data is anything else (null included).
+func members(data []byte) (m map[string]json.RawMessage, ok bool) {
+	if err := json.Unmarshal(data, &m); err != nil || m == nil {
+		return nil, false
+	}
+	return m, true
 }

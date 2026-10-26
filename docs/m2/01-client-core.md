@@ -473,6 +473,7 @@ type Error struct {
 }
 
 func (e *Error) Error() string        // "media: <op>: <code>" (+ " (<reason>)") (+ ": detail")
+func (e *Error) Redacted() string     // "<op>: <code>" (+ " (<reason>)"): never the Detail, for logs users share (03 §17)
 func (e *Error) Is(target error) bool // true for a target *Error with the same Code and empty Op, Reason and Detail
                                       // (every sentinel below, and 05's ErrAudioNotRunning, is such a target)
 func (e *Error) Unwrap() error        // context.DeadlineExceeded for CodeTimeout (04 §12.2), else nil
