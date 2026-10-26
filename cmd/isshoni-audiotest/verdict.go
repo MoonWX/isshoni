@@ -35,12 +35,14 @@ type recording struct {
 	roleStart   map[string]float64    // role → when its process started
 	engineAt    []engineSample        // the report's engine per sample
 	bannerAt    []bannerSample        // the service's banner codes per sample
+	promptAt    []promptSample        // the service's pending prompts per sample (cases 12, 13)
 	events      []recEvent            // engine events at or after the case's watcher start, each once
 	firstRender map[string]float64    // role → the fixture's logged first-render time
-	setStamp    float64               // the recorder's SetExclusions stamp for the rule change (case 15's T_set)
+	setStamp    float64               // the recorder's SetExclusions stamp for the rule change (cases 13, 15's T_set)
 	setStampOK  bool
 	counters    map[string]int // the final report's mixer counters (fastpathLateCuts, …)
 	opus        []opusPkt      // the Opus packets (case 21)
+	micFail     bool           // a fixture could not open the microphone (05 §18.4: a mic case SKIPs)
 }
 
 // roleTrack is one fixture's history in the report samples.
@@ -51,18 +53,28 @@ type roleTrack struct {
 }
 
 // roleSampleState is one report sample for one fixture role: its session (by pid) and the app row of that session's
-// app id.
+// app id. The session is the role's render session; capture marks a role that had only a microphone session in
+// that sample (its verdict says nothing about playback, its row is still the app's).
 type roleSampleState struct {
 	t       float64
 	active  bool   // the session's state is "active"
+	capture bool   // a microphone (capture-flow) session, not a render session
 	verdict string // the session's: "heard" | "kept_out" | "not_captured" | "pending"
 	reason  string
 	note    string // "" | "covered" | "no_handle"
 
-	row        bool // the report had a row for the session's app id
-	rowVerdict string
-	rowReason  string
-	rowDetail  string
+	row         bool // the report had a row for the session's app id
+	rowVerdict  string
+	rowReason   string
+	rowDetail   string
+	rowWarnings []string // the row's warnings ("shared_app_uses_mic", …)
+	rowBrowser  bool
+}
+
+// promptSample is the pending FriendsHear prompts at one sample.
+type promptSample struct {
+	t       float64
+	prompts []promptState
 }
 
 // engineSample is the report's engine at one sample.
@@ -203,34 +215,52 @@ func (rec recording) expectFrom(cs caseSpec) float64 {
 	return 1.5
 }
 
+// micSkip is the SKIP problem of a mic case whose fixture could not open the microphone (05 §18.4).
+const micSkip = "a fixture could not open the microphone: connect one and allow desktop apps to use it " +
+	"(Settings → Privacy & security → Microphone)"
+
 // evaluate runs the portable verdict for a non-special case (05 §18.6). A FAIL is downgraded to INCONCLUSIVE only by
 // the premises ("the premise couldn't be proven"), never by "it was close".
 func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
+	if rec.micFail && cs.needsMic() {
+		return skipped(cs, cfg, micSkip)
+	}
 	if p := premiseProblem(cs, rec); p != "" {
 		return inconclusive(cs, cfg, "%s", p)
 	}
 
-	// Resolve every event-relative window and measurement first: an event that never happened is INCONCLUSIVE.
+	// Resolve every event-relative window and measurement first: an event that never happened is INCONCLUSIVE,
+	// unless the case's prompt never appeared, which is why the decision that makes the event never came (case 13:
+	// a FAIL, the mic user was not detected).
+	unresolved := func(problem string) caseReport {
+		if pp := rec.promptProblem(cs); pp != "" {
+			cr := newCaseReport(cs, cfg)
+			cr.Problems = append(cr.Problems, pp, problem)
+			return withResult(cs, cfg, cr, resultFail)
+		}
+		return inconclusive(cs, cfg, "%s", problem)
+	}
 	type window struct{ from, to float64 }
 	wins := make([]window, len(cs.checks))
 	for i, c := range cs.checks {
 		from, ok1 := rec.resolveBound(c.from, false)
 		to, ok2 := rec.resolveBound(c.to, true)
 		if !ok1 || !ok2 {
-			return inconclusive(cs, cfg, "an event-relative window never resolved: a fixture didn't start")
+			return unresolved("an event-relative window never resolved: a fixture didn't start")
 		}
 		wins[i] = window{from, to}
 	}
 	for _, ms := range cs.measures {
 		if !rec.measureEventsHappened(ms) {
-			return inconclusive(cs, cfg, "the event %s is measured from never happened: a fixture didn't start", ms.key)
+			return unresolved(fmt.Sprintf("the event %s is measured from never happened: a fixture didn't start",
+				ms.key))
 		}
 	}
 
 	cr := newCaseReport(cs, cfg)
 	cr.Counters = cloneCounters(rec.counters)
 	cr.Engine = enginesSeen(rec)
-	cr.Events = redactEvents(rec.events, rec.roleApp)
+	cr.Events = reportEvents(rec.events, rec.roleApp)
 
 	m := mono(rec.left, rec.right)
 	fail := false
@@ -275,6 +305,10 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 			cr.Problems = append(cr.Problems, problem)
 			fail = true
 		}
+	}
+	if problem := rec.promptProblem(cs); problem != "" {
+		cr.Problems = append(cr.Problems, problem)
+		fail = true
 	}
 
 	// Clicks (05 §18.6): default window [1.5 s, end] unless the case overrides it or disables the check.
@@ -329,12 +363,10 @@ func evaluate(cs caseSpec, rec recording, cfg gateConfig) caseReport {
 		}
 	}
 
-	// Counters that must be zero (case 5's fastpathLateCuts).
-	for _, key := range cs.counterZero {
-		if rec.counters[key] != 0 {
-			cr.Problems = append(cr.Problems, fmt.Sprintf("counter %s is %d, want 0", key, rec.counters[key]))
-			fail = true
-		}
+	// Counters that must be zero (case 5's fastpathLateCuts) or stay under a ceiling.
+	if problems := counterProblems(cs, rec.counters); len(problems) > 0 {
+		cr.Problems = append(cr.Problems, problems...)
+		fail = true
 	}
 
 	result := resultPass
@@ -368,8 +400,8 @@ func (rec recording) controlProblem(c checkSpec, from, to float64) string {
 		return "a fixture never appeared in the report"
 	}
 	for _, s := range tr.samples {
-		if s.t < from || s.t > to || !s.active {
-			continue
+		if s.t < from || s.t > to || !s.active || s.capture {
+			continue // a microphone session says nothing about what the fixture plays
 		}
 		if want == controlNotKeptOut {
 			if s.verdict == controlKeptOut {
@@ -400,11 +432,16 @@ func (rec recording) rowCheckProblem(rc rowCheck) string {
 		if s.t < from || s.t > rec.recordDur || !s.active {
 			continue
 		}
-		seen = true
-		if rc.note != "" && s.note != rc.note {
-			return fmt.Sprintf("a fixture's session note was %q at %.2fs, want %q", s.note, s.t, rc.note)
+		if rc.note != "" {
+			if s.capture {
+				continue // the note is a render session's
+			}
+			if s.note != rc.note {
+				return fmt.Sprintf("a fixture's session note was %q at %.2fs, want %q", s.note, s.t, rc.note)
+			}
 		}
-		if rc.verdict == "" && rc.reason == "" && rc.detail == "" {
+		seen = true
+		if rc.verdict == "" && rc.reason == "" && rc.detail == "" && rc.warning == "" && !rc.browser {
 			continue
 		}
 		switch {
@@ -416,12 +453,67 @@ func (rec recording) rowCheckProblem(rc rowCheck) string {
 			return fmt.Sprintf("a fixture's app row reason was %q at %.2fs, want %q", s.rowReason, s.t, rc.reason)
 		case rc.detail != "" && !strings.EqualFold(s.rowDetail, rc.detail):
 			return fmt.Sprintf("a fixture's app row detail at %.2fs is not the expected app", s.t)
+		case rc.warning != "" && !slices.Contains(s.rowWarnings, rc.warning):
+			return fmt.Sprintf("a fixture's app row lacked the warning %q at %.2fs", rc.warning, s.t)
+		case rc.browser && !s.rowBrowser:
+			return fmt.Sprintf("a fixture's app row was not a browser's at %.2fs", s.t)
 		}
 	}
 	if !seen {
 		return "a fixture's session was never active in its row check's window"
 	}
 	return ""
+}
+
+// promptProblem checks cs's prompt expectations (05 §18.5 cases 12, 13: "a browser-mic prompt in FriendsHear", "the
+// mic prompt existed"): some sample inside each check's window shows a pending prompt of its kind for the app of its
+// role. It returns "" when every one held.
+func (rec recording) promptProblem(cs caseSpec) string {
+	for _, pc := range cs.promptChecks {
+		from, _ := rec.resolveBound(firstNonZero(pc.from, at(1.5)), false)
+		to, ok := rec.resolveBound(pc.to, true)
+		if !ok {
+			to = rec.recordDur
+		}
+		app, known := rec.roleApp[pc.role]
+		found := false
+		for _, ps := range rec.promptAt {
+			if ps.t < from || ps.t > to {
+				continue
+			}
+			for _, p := range ps.prompts {
+				if p.kind == pc.kind && known && p.appID == app {
+					found = true
+				}
+			}
+		}
+		if !found {
+			return fmt.Sprintf("no %q prompt for the fixture's app appeared in [%.2fs, %.2fs]", pc.kind, from, to)
+		}
+	}
+	return ""
+}
+
+// counterProblems are cs's counter expectations that rec's final counters break: a counter that must stay 0, or one
+// above its ceiling.
+func counterProblems(cs caseSpec, counters map[string]int) []string {
+	var out []string
+	for _, key := range cs.counterZero {
+		if counters[key] != 0 {
+			out = append(out, fmt.Sprintf("counter %s is %d, want 0", key, counters[key]))
+		}
+	}
+	keys := make([]string, 0, len(cs.counterMax))
+	for key := range cs.counterMax {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if limit := cs.counterMax[key]; counters[key] > limit {
+			out = append(out, fmt.Sprintf("counter %s is %d, want ≤ %d", key, counters[key], limit))
+		}
+	}
+	return out
 }
 
 // measureEventsHappened reports whether the events ms is measured from exist (an absent one is INCONCLUSIVE).
@@ -521,10 +613,11 @@ func enginesSeen(rec recording) []string {
 	return out
 }
 
-// redactEvents maps engine events to redacted report events (05 §18.7): the time in ms, the code, and the app as
-// "fixture:<role>" for a fixture's app id (roles sharing an app id show the first by name), "other" for any other
-// app, "" for an engine-wide event.
-func redactEvents(events []recEvent, roleApp map[string]string) []reportEvent {
+// reportEvents maps engine events to report events (05 §18.7): the time in ms, the code, and the app as
+// "fixture:<role>" for a fixture's app id (roles sharing an app id show the first by name), "" for an engine-wide
+// event, and any other app by its own id, which the report's redaction (redact.go) turns into "other" unless the run
+// is -no-redact.
+func reportEvents(events []recEvent, roleApp map[string]string) []reportEvent {
 	roles := make([]string, 0, len(roleApp))
 	for role := range roleApp {
 		roles = append(roles, role)
@@ -538,12 +631,9 @@ func redactEvents(events []recEvent, roleApp map[string]string) []reportEvent {
 	}
 	out := make([]reportEvent, 0, len(events))
 	for _, e := range events {
-		app := ""
-		if e.app != "" {
-			app = otherRedacted
-			if role, ok := appRole[e.app]; ok {
-				app = fixturePrefix + role
-			}
+		app := e.app
+		if role, ok := appRole[e.app]; ok && e.app != "" {
+			app = fixturePrefix + role
 		}
 		out = append(out, reportEvent{TMs: int(math.Round(e.t * 1000)), Code: e.code, App: app})
 	}

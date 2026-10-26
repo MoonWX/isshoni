@@ -5,13 +5,10 @@ import (
 	"strings"
 )
 
-// This file is the audiotest report schema, redaction and summary line (docs/m2/05-windows-audio.md §18.7). It is
-// portable: the report is built on every OS and written by run.go. The JSON field names and order are §18.7's.
-//
-// Redaction (the default; -no-redact is for local debugging only): the report carries no user, host or device
-// friendly names, no absolute paths, and no non-fixture app names. Fixture app ids become "fixture:<role>" and any
-// other app "other". The redaction of names collected during a run (record/merge) is WA62b's; WA62a redacts what the
-// cases it runs produce.
+// This file is the audiotest report schema and summary line (docs/m2/05-windows-audio.md §18.7). It is portable:
+// the report is built on every OS, redacted by redact.go (the default; -no-redact is for local debugging only),
+// written by run.go and extended with manual entries by manual.go (merge). The JSON field names and order are
+// §18.7's.
 
 // reportVersion is the schema version written into the report's "v".
 const reportVersion = 1
@@ -27,7 +24,7 @@ type report struct {
 	GateCfg gateConfig    `json:"gateConfig"` // §18.10's gate configuration
 	Summary summary       `json:"summary"`
 	Cases   []caseReport  `json:"cases"`
-	Manual  []manualEntry `json:"manual,omitempty"` // added by WA62b's merge
+	Manual  []manualEntry `json:"manual,omitempty"` // the manual real-app checks, added by merge (§18.8 step 5)
 }
 
 // dllInfo is the report's "dll": the engine DLL under test. sha256 is compared with native-manifest.json for the
@@ -46,13 +43,14 @@ type osInfo struct {
 }
 
 // machineInfo is the report's "machine": recorded, not enforced (05 §18.4). Endpoint names are already
-// {formFactor, bus}: no friendly names.
+// {formFactor, bus}: no friendly names. MasterVolume and Muted are the default render endpoint's master volume
+// (0..1) and mute from IAudioEndpointVolume; null when unreadable.
 type machineInfo struct {
 	CPU               string         `json:"cpu"`
 	RenderEndpoints   []endpointInfo `json:"renderEndpoints"`
 	Mic               bool           `json:"mic"`
-	MasterVolume      *float64       `json:"masterVolume"` // null: not read (needs the endpoint volume COM API)
-	Muted             *bool          `json:"muted"`        // null: not read
+	MasterVolume      *float64       `json:"masterVolume"` // null when unreadable
+	Muted             *bool          `json:"muted"`        // null when unreadable
 	DuckingPreference int            `json:"duckingPreference"`
 }
 
@@ -125,7 +123,7 @@ type reportEvent struct {
 	App  string `json:"app"`
 }
 
-// manualEntry is one manual real-app check merged into a gate report (05 §18.7; WA62b's merge).
+// manualEntry is one manual real-app check merged into a gate report (05 §18.7, §18.9: R1–R7).
 type manualEntry struct {
 	Label string `json:"label"`
 	Pass  bool   `json:"pass"`
@@ -257,13 +255,4 @@ func editionLabel(edition string) string {
 	default:
 		return edition
 	}
-}
-
-// redactAppID maps an app id to its redacted form (05 §18.7): a fixture id stays "fixture:<role>", every other app
-// is "other". A fixture role is recognized by the "fixture:" prefix the driver assigns.
-func redactAppID(id string) string {
-	if strings.HasPrefix(id, fixturePrefix) {
-		return id
-	}
-	return otherRedacted
 }

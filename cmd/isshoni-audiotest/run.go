@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -43,7 +42,7 @@ func runCases(w io.Writer, opts runOptions) int {
 	return runWith(w, drv, opts)
 }
 
-// runWith runs the selected cases on drv, writes the report and prints the summary line.
+// runWith runs the selected cases on drv, redacts and writes the report, and prints the summary line.
 func runWith(w io.Writer, drv driver, opts runOptions) int {
 	dll, osi, mach, err := drv.env()
 	if err != nil {
@@ -57,23 +56,27 @@ func runWith(w io.Writer, drv driver, opts runOptions) int {
 		fmt.Fprintln(w, "error:", err)
 		return exitSetup
 	}
-	if opts.long {
-		fmt.Fprintln(w, "note: -long (soak) cases are added by WA62b and are not in this build")
+	pre := preconditions{renderEndpoints: len(mach.RenderEndpoints), mic: mach.Mic}
+	if pre.renderEndpoints == 0 {
+		fmt.Fprintln(w, "note: no active render endpoint: every case is SKIP (05 §18.4)")
+	} else if !pre.mic {
+		fmt.Fprintln(w, "note: no microphone with desktop-app access: the mic cases are SKIP (05 §18.4)")
 	}
 	if opts.noRedact {
-		fmt.Fprintln(w, "note: -no-redact is added by WA62b; this build writes the redacted report")
-	}
-	if len(mach.RenderEndpoints) == 0 {
-		fmt.Fprintln(w, "note: no active render endpoint: every case is SKIP (05 §18.4)")
+		fmt.Fprintln(w, "note: -no-redact: the report names apps and paths; it is for local debugging only and "+
+			"must never be committed")
 	}
 
-	reports := runSelected(drv, selected, cfg, len(mach.RenderEndpoints) > 0)
+	reports := runSelected(w, drv, selected, cfg, pre)
 	exit := exitCode(reports)
 	r := report{
 		V: reportVersion, Harness: harnessVer(), DLL: dll, OS: osi, Machine: mach,
 		Gate: opts.gate, GateCfg: cfg, Summary: summarize(reports, exit), Cases: reports,
 	}
-	if err := writeReport(w, r, opts.outDir); err != nil {
+	if !opts.noRedact {
+		newRedactor(drv.redaction(), currentLocalIDs()).report(&r)
+	}
+	if err := writeReport(w, r, opts.outDir, opts.noRedact); err != nil {
 		fmt.Fprintln(w, "error: the report could not be written:", err)
 		if exit == exitAllPass {
 			exit = exitSetup
@@ -83,27 +86,41 @@ func runWith(w io.Writer, drv driver, opts runOptions) int {
 	return exit
 }
 
+// preconditions are the run-wide preconditions of 05 §18.4 that decide a SKIP before a case runs.
+type preconditions struct {
+	renderEndpoints int  // active render endpoints
+	mic             bool // a microphone with desktop-app access
+}
+
 // baselineBroken is the problem every case after a failed case 1 carries (05 §18.5).
 const baselineBroken = "case 1 (baseline-endpoint) failed: the audio setup is broken, not isshoni"
 
-// runSelected runs the cases in order (05 §18.4, §18.5): without an active render endpoint every case is SKIP; once
-// case 1 FAILs, every later case is INCONCLUSIVE without running.
-func runSelected(drv driver, selected []caseSpec, cfg gateConfig, haveEndpoint bool) []caseReport {
+// runSelected runs the cases in order (05 §18.4, §18.5): without an active render endpoint every case is SKIP; a
+// case that needs a microphone, or more endpoints than there are, is SKIP; once case 1 FAILs, every later case is
+// INCONCLUSIVE without running. It names each case on w as it starts (the soak takes 30 minutes).
+func runSelected(w io.Writer, drv driver, selected []caseSpec, cfg gateConfig, pre preconditions) []caseReport {
 	reports := make([]caseReport, 0, len(selected))
 	broken := false
 	for _, cs := range selected {
 		var cr caseReport
 		switch {
-		case !haveEndpoint:
+		case pre.renderEndpoints == 0:
 			cr = skipped(cs, cfg, "no active render endpoint")
 		case broken:
 			cr = inconclusive(cs, cfg, "%s", baselineBroken)
+		case cs.minEndpoints > pre.renderEndpoints:
+			cr = skipped(cs, cfg, fmt.Sprintf("needs %d active render endpoints, the machine has %d",
+				cs.minEndpoints, pre.renderEndpoints))
+		case cs.needsMic() && !pre.mic:
+			cr = skipped(cs, cfg, "no microphone with desktop-app access (05 §18.4)")
 		default:
+			fmt.Fprintf(w, "case %d %s …\n", cs.num, cs.name)
 			cr = runOne(drv, cs, cfg)
 		}
 		if cs.num == 1 && cr.Result == resultFail {
 			broken = true
 		}
+		fmt.Fprintf(w, "case %d %s: %s\n", cs.num, cs.name, cr.Result)
 		reports = append(reports, cr)
 	}
 	return reports
@@ -125,10 +142,20 @@ func runOne(drv driver, cs caseSpec, cfg gateConfig) caseReport {
 	return evaluate(cs, rec, cfg)
 }
 
-// selectCases is the cases to run: the explicit -case list (by name or number), or every case in the table.
+// selectCases is the cases to run: the explicit -case list (by name or number), or every case in the table. A
+// -long case (the soak) runs only with -long, and then last.
 func selectCases(opts runOptions) ([]caseSpec, error) {
 	if len(opts.cases) == 0 {
-		return cases(), nil
+		var out, long []caseSpec
+		for _, cs := range cases() {
+			switch {
+			case !cs.long:
+				out = append(out, cs)
+			case opts.long:
+				long = append(long, cs)
+			}
+		}
+		return append(out, long...), nil
 	}
 	var out []caseSpec
 	for _, want := range opts.cases {
@@ -136,39 +163,46 @@ func selectCases(opts runOptions) ([]caseSpec, error) {
 		if want == "" {
 			continue
 		}
+		var cs caseSpec
+		var ok bool
 		if n, err := strconv.Atoi(want); err == nil {
-			cs, ok := caseByNum(n)
-			if !ok {
-				return nil, fmt.Errorf("no case numbered %d (WA62b adds 9, 12–14, 22, 23)", n)
+			if cs, ok = caseByNum(n); !ok {
+				return nil, fmt.Errorf("no case numbered %d", n)
 			}
-			out = append(out, cs)
-			continue
-		}
-		cs, ok := caseByName(want)
-		if !ok {
+		} else if cs, ok = caseByName(want); !ok {
 			return nil, fmt.Errorf("no case named %q", want)
+		}
+		if cs.long && !opts.long {
+			return nil, fmt.Errorf("case %d (%s) runs only with -long", cs.num, cs.name)
 		}
 		out = append(out, cs)
 	}
 	return out, nil
 }
 
-// writeReport writes r into outDir under 05 §18.7's name (default "."). The name carries no machine identifier.
-func writeReport(w io.Writer, r report, outDir string) error {
+// unredactedSuffix ends the name of a report written with -no-redact, so it is never mistaken for a gate report.
+const unredactedSuffix = "-unredacted"
+
+// writeReport writes r into outDir under 05 §18.7's name (default "."); a -no-redact report's name ends in
+// "-unredacted". The name carries no machine identifier.
+func writeReport(w io.Writer, r report, outDir string, unredacted bool) error {
 	if outDir == "" {
 		outDir = "."
 	}
 	if err := os.MkdirAll(outDir, 0o750); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(r, "", "  ")
+	b, err := encodeReport(r)
 	if err != nil {
 		return err
 	}
 	stamp := time.Now().Format("20060102-1504")
 	name := reportName(r.OS.Product, r.OS.Build, stamp)
+	if unredacted {
+		name = strings.TrimSuffix(name, ".json") + unredactedSuffix + ".json"
+	}
 	path := filepath.Join(outDir, name)
-	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(path, b, 0o600); err != nil {
 		return err
 	}
 	fmt.Fprintln(w, "report:", path)

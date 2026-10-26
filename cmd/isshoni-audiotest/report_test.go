@@ -71,7 +71,7 @@ func TestReportJSONShape(t *testing.T) {
 			MaxShortDB: -128.4, MaxShortAtS: 6.31, Pass: true}},
 		Measured: map[string]measure{measureCut: {ValueMs: 58, BudgetMs: 100}},
 		ClicksAt: []float64{}, Counters: map[string]int{"underruns": 0},
-		Events: redactEvents([]recEvent{{t: 1.21, code: "stream_running", app: "exe:game.exe"}},
+		Events: reportEvents([]recEvent{{t: 1.21, code: "stream_running", app: "exe:game.exe"}},
 			map[string]string{"game": "exe:game.exe"}),
 	}
 	r := report{V: 1, Harness: "dev", Gate: true, GateCfg: gateConfig{FastPath: true},

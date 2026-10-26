@@ -27,7 +27,8 @@ const (
 )
 
 // The short-window rule's geometry (05 §18.6): 50 ms Hann windows hopped every 10 ms. A 50 ms Hann window's main
-// lobe is ±40 Hz, so the closest tone pair (907 and 1000 Hz, 93 Hz apart) stays separable.
+// lobe is ±40 Hz, so steady tones 90 Hz apart stay separable; a tone's onset or cut spreads wider, which is why
+// isshoni's own tone keeps 200 Hz from every other (cases.go's freqSelf).
 const (
 	shortWindowSec = 0.050
 	shortHopSec    = 0.010

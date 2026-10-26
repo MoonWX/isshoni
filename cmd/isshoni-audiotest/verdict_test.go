@@ -467,22 +467,30 @@ func TestRowChecks(t *testing.T) {
 	}
 }
 
-// TestRedactedEvents: events name fixtures by role through their app ids, any other app as "other", and an
-// engine-wide event with no app (05 §18.7).
+// TestRedactedEvents: events name fixtures by role through their app ids and engine-wide events with no app; any
+// other app keeps its id until the report's redaction makes it "other" (05 §18.7), which -no-redact skips.
 func TestRedactedEvents(t *testing.T) {
-	got := redactEvents([]recEvent{
+	got := reportEvents([]recEvent{
 		{t: 1.21, code: "stream_running", app: "exe:game.exe"},
 		{t: 1.5, code: "session_created", app: "exe:spotify.exe"},
 		{t: 2, code: "fastpath_enter"},
 	}, map[string]string{"game": "exe:game.exe", "gameChild": "exe:game.exe"})
 	want := []reportEvent{
 		{TMs: 1210, Code: "stream_running", App: "fixture:game"},
-		{TMs: 1500, Code: "session_created", App: otherRedacted},
+		{TMs: 1500, Code: "session_created", App: "exe:spotify.exe"},
 		{TMs: 2000, Code: "fastpath_enter", App: ""},
 	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("event %d: %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	cr := caseReport{Name: "x", Events: got}
+	newRedactor(redactInfo{}, localIDs{}).caseReport(&cr)
+	want[1].App = otherRedacted
+	for i := range want {
+		if cr.Events[i] != want[i] {
+			t.Errorf("redacted event %d: %+v, want %+v", i, cr.Events[i], want[i])
 		}
 	}
 }

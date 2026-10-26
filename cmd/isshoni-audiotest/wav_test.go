@@ -32,7 +32,7 @@ func TestToneWAV(t *testing.T) {
 	}
 }
 
-// TestWAVRoundTrip checks writeWAV/readWAV round-trip a 48 kHz float WAV (used by -keep-wav and WA62b's record).
+// TestWAVRoundTrip checks writeWAV/readWAV round-trip a 48 kHz float WAV (used by -keep-wav).
 func TestWAVRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	inter := make([]float32, 2*sampleRate)

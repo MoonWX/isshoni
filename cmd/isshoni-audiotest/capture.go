@@ -56,28 +56,52 @@ type capture struct {
 	watchNS int64 // the engine clock when the case's watcher started: events before it belong to earlier cases
 
 	left, right []float64
+	nSamples    int   // the timeline's length in samples (also when streaming)
 	tap0, last  int64 // the first and the latest tap chunk's capture time (session clock)
 	haveTap     bool
 	gaps        []tapGap
 	opus        []opusPkt
+	// sink, if set, gets every stretch of the timeline (chunks and the zeros that pad gaps) instead of left and
+	// right, and Opus packets are kept without their bytes: the soak's 30 minutes never sit in memory.
+	sink func(left, right []float64)
 
 	roles     map[string]*roleTrack
 	roleApp   map[string]string // role → its sessions' app id (the latest seen)
 	engineAt  []engineSample
 	bannerAt  []bannerSample
+	promptAt  []promptSample
 	events    []recEvent
 	seen      map[eventKey]bool
 	counters  map[string]int
 	foreign   []foreignSample
 	keptOther map[string]bool // exe names of kept-out sessions that are no fixture's (console only, never reported)
+	names     map[string]bool // app and exe names seen in the reports: what the report's redaction scrubs (05 §18.7)
 }
 
 func newCapture(offset, watchNS int64) *capture {
 	return &capture{
 		offset: offset, watchNS: watchNS,
 		roles: map[string]*roleTrack{}, roleApp: map[string]string{}, seen: map[eventKey]bool{},
-		counters: map[string]int{}, keptOther: map[string]bool{},
+		counters: map[string]int{}, keptOther: map[string]bool{}, names: map[string]bool{},
 	}
+}
+
+// newStreamCapture is a capture that hands the timeline to sink instead of keeping it (the soak, 05 §18.5 case 23).
+func newStreamCapture(offset, watchNS int64, sink func(left, right []float64)) *capture {
+	c := newCapture(offset, watchNS)
+	c.sink = sink
+	return c
+}
+
+// extend adds a stretch of the timeline: to left and right, or to the sink.
+func (c *capture) extend(l, r []float64) {
+	c.nSamples += min(len(l), len(r))
+	if c.sink != nil {
+		c.sink(l, r)
+		return
+	}
+	c.left = append(c.left, l...)
+	c.right = append(c.right, r...)
 }
 
 // packet adds one session packet: a PCM-tap chunk extends the timeline (a jump in capture times is zero-padded, so
@@ -94,16 +118,16 @@ func (c *capture) packet(pkt media.Packet) {
 		} else if jump := pkt.CaptureNS - c.last - pcmChunkNS; jump > pcmChunkNS/10 {
 			c.gaps = append(c.gaps, tapGap{at: pkt.CaptureNS, missing: jump})
 			pad := int(jump * sampleRate / 1e9)
-			c.left = append(c.left, make([]float64, pad)...)
-			c.right = append(c.right, make([]float64, pad)...)
+			c.extend(make([]float64, pad), make([]float64, pad))
 		}
 		c.last = pkt.CaptureNS
-		l, r := decodePCM(pkt.Data)
-		c.left = append(c.left, l...)
-		c.right = append(c.right, r...)
+		c.extend(decodePCM(pkt.Data))
 	case media.KindAudio:
-		c.opus = append(c.opus, opusPkt{captureNS: pkt.CaptureNS, data: append([]byte(nil), pkt.Data...),
-			reinit: pkt.Reinit})
+		p := opusPkt{captureNS: pkt.CaptureNS, reinit: pkt.Reinit}
+		if c.sink == nil {
+			p.data = append([]byte(nil), pkt.Data...)
+		}
+		c.opus = append(c.opus, p)
 	}
 }
 
@@ -123,11 +147,28 @@ func (c *capture) engineToTap(engineNS int64) float64 {
 	return float64(engineNS-c.offset-c.tap0) / 1e9
 }
 
+// fhState is what a report sample reads from the Service's FriendsHear: the banner codes, and the pending prompts
+// (05 §14.5, §14.6).
+type fhState struct {
+	banners []string
+	prompts []promptState
+}
+
+// promptState is one pending FriendsHear prompt: its kind and the app id it asks about.
+type promptState struct {
+	kind  string
+	appID string
+}
+
 // sample adds one report sample (05 §18.6: every 250 ms). pids maps the fixtures' pids to their roles (the harness's
-// own pid to selfRole when it plays); a session is a fixture's only by its pid. banners are FriendsHear's banner
-// codes; levels, if not nil, are the app levels of the same moment (another app heard above −60 dBFS). A sample
+// own pid to selfRole when it plays); a session is a fixture's only by its pid. fh is FriendsHear's banners and
+// prompts at the same moment; levels, if not nil, are the app levels (another app heard above −60 dBFS). A sample
 // before the first tap chunk is dropped.
-func (c *capture) sample(r media.AudioReport, banners []string, levels *media.AudioLevels, pids map[uint32]string) {
+//
+// A fixture role's sample is its render session (the active one when it has several); a role with only a
+// microphone session (Steam in case 9) is sampled through that session, flagged capture, which the playback controls
+// skip and the row checks read (finish counts it as active only for a role the case checks no tone of).
+func (c *capture) sample(r media.AudioReport, fh fhState, levels *media.AudioLevels, pids map[uint32]string) {
 	if !c.haveTap {
 		return // times are relative to the first tap chunk: nothing can be placed before it
 	}
@@ -136,33 +177,43 @@ func (c *capture) sample(r media.AudioReport, banners []string, levels *media.Au
 		t = c.engineToTap(r.QPCNanos)
 	}
 	c.engineAt = append(c.engineAt, engineSample{t: t, value: r.Engine})
-	c.bannerAt = append(c.bannerAt, bannerSample{t: t, codes: slices.Clone(banners)})
+	c.bannerAt = append(c.bannerAt, bannerSample{t: t, codes: slices.Clone(fh.banners)})
+	c.promptAt = append(c.promptAt, promptSample{t: t, prompts: slices.Clone(fh.prompts)})
 
 	rows := make(map[string]media.AudioApp, len(r.Apps))
 	for _, a := range r.Apps {
 		rows[a.ID] = a
+		c.noteName(a.Name)
+		c.noteName(a.Exe)
 	}
 	states := map[string]*roleSampleState{}
 	for _, s := range r.Sessions {
 		role, ok := pids[s.PID]
 		if !ok {
+			c.noteName(s.Exe)
 			if s.Verdict == controlKeptOut && s.Reason != "isshoni" {
 				c.keptOther[s.Exe] = true
 			}
 			continue
 		}
-		if s.Flow != "" && s.Flow != "render" {
-			continue // a fixture's microphone session (WA62b's mic cases) says nothing about its playback
+		if s.AppID != "" {
+			c.roleApp[role] = s.AppID
 		}
-		c.roleApp[role] = s.AppID
-		st := states[role]
+		capture := s.Flow == "capture"
 		active := s.State == "active"
-		if st != nil && st.active && !active {
-			continue // keep the active session of a role that has several
+		if st := states[role]; st != nil {
+			switch {
+			case !st.capture && capture:
+				continue // the render session says what the role plays
+			case st.capture == capture && st.active && !active:
+				continue // keep the active session of a role that has several
+			}
 		}
-		st = &roleSampleState{t: t, active: active, verdict: s.Verdict, reason: s.Reason, note: s.Note}
+		st := &roleSampleState{t: t, active: active, capture: capture, verdict: s.Verdict, reason: s.Reason,
+			note: s.Note}
 		if row, ok := rows[s.AppID]; ok {
 			st.row, st.rowVerdict, st.rowReason, st.rowDetail = true, row.Verdict, row.Reason, row.Detail
+			st.rowWarnings, st.rowBrowser = slices.Clone(row.Warnings), row.Browser
 		}
 		states[role] = st
 	}
@@ -203,6 +254,23 @@ func (c *capture) sample(r media.AudioReport, banners []string, levels *media.Au
 	}
 }
 
+// noteName remembers an app or exe name seen in a report, for the report's redaction (05 §18.7).
+func (c *capture) noteName(name string) {
+	if name != "" {
+		c.names[name] = true
+	}
+}
+
+// seenNames are the app and exe names the reports showed, sorted (the redaction's runtime names, 05 §18.7).
+func (c *capture) seenNames() []string {
+	out := make([]string, 0, len(c.names))
+	for n := range c.names {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // keptOutOthers are the exe names of kept-out sessions that belong to no fixture, sorted (console only).
 func (c *capture) keptOutOthers() []string {
 	out := make([]string, 0, len(c.keptOther))
@@ -224,8 +292,9 @@ type captureEnd struct {
 	firstRender map[string]int64 // role → firstRenderNs
 	start       map[string]int64 // role → the process's start (its {"startNs"} line)
 	exit        map[string]int64 // role → when the harness saw the process exit
-	setStamp    int64            // case 15's T_set: the first recorder stamp after SetAppDecision
+	setStamp    int64            // cases 13 and 15's T_set: the first recorder stamp after Decide or SetAppDecision
 	setStampOK  bool
+	micFail     bool // a fixture reported that it could not open the microphone (05 §18.4: the case SKIPs)
 }
 
 // gridSlackNS is how far an Opus Reinit packet's time may lie from a tap jump for the jump to count as a new
@@ -254,7 +323,7 @@ func (c *capture) lostGapMs(dur float64) int {
 			lost = g.missing
 		}
 	}
-	if short := int64(math.Round((dur - float64(len(c.left))/sampleRate) * 1e9)); short > lost {
+	if short := int64(math.Round((dur - float64(c.nSamples)/sampleRate) * 1e9)); short > lost {
 		lost = short
 	}
 	return int(lost / 1_000_000)
@@ -267,8 +336,9 @@ func (c *capture) finish(cs caseSpec, in captureEnd) recording {
 		reparented: in.reparented, silenceFail: in.silenceFail,
 		keptOutOther: in.keptOutPre || len(c.keptOther) > 0,
 		lostGapMs:    c.lostGapMs(in.dur), foreign: c.foreign, roles: c.roles, roleApp: c.roleApp,
-		roleStart: map[string]float64{}, engineAt: c.engineAt, bannerAt: c.bannerAt, events: c.events,
-		firstRender: map[string]float64{}, counters: c.counters, opus: c.opus,
+		roleStart: map[string]float64{}, engineAt: c.engineAt, bannerAt: c.bannerAt, promptAt: c.promptAt,
+		events: c.events, firstRender: map[string]float64{}, counters: c.counters, opus: c.opus,
+		micFail: in.micFail,
 	}
 	for role, ns := range in.firstRender {
 		rc.firstRender[role] = c.engineToTap(ns)
@@ -280,14 +350,17 @@ func (c *capture) finish(cs caseSpec, in captureEnd) recording {
 		rc.setStamp, rc.setStampOK = c.engineToTap(in.setStamp), true
 	}
 	// The positive controls (05 §18.6): every role the case checks must appear active, and must not exit before its
-	// planned end (or the end of the recording).
+	// planned end (or the end of the recording). A role the case checks a tone of must appear as an active render
+	// session: a fixture that holds the mic but never played proves nothing about its absent checks. Only a role of
+	// the row checks alone (Steam in case 9) counts through its microphone session.
+	playing := playingRoles(cs)
 	for _, role := range checkedRoles(cs) {
 		tr := c.roles[role]
 		if tr == nil {
 			tr = &roleTrack{}
 			c.roles[role] = tr
 		}
-		tr.neverActive = !anyActive(tr)
+		tr.neverActive = !anyActive(tr, slices.Contains(playing, role))
 		exitNS, exited := in.exit[role]
 		span, planned := in.plan[role]
 		if !exited || !planned {
@@ -308,9 +381,10 @@ func (c *capture) finish(cs caseSpec, in captureEnd) recording {
 // exitSlackSec is how much earlier than planned a fixture may exit before it counts as exited early.
 const exitSlackSec = 0.25
 
-func anyActive(tr *roleTrack) bool {
+// anyActive reports whether tr has an active sample; with renderOnly, a microphone session's sample doesn't count.
+func anyActive(tr *roleTrack, renderOnly bool) bool {
 	for _, s := range tr.samples {
-		if s.active {
+		if s.active && (!renderOnly || !s.capture) {
 			return true
 		}
 	}
@@ -340,5 +414,6 @@ func reportCounters(r media.AudioReport) map[string]int {
 		"fastpathExits":    r.Counters.FastpathExits,
 		"fastpathLateCuts": r.Counters.FastpathLateCuts,
 		"mixerResyncs":     r.Counters.MixerResyncs,
+		"maxResamplePpm":   r.Counters.MaxResamplePPM,
 	}
 }
