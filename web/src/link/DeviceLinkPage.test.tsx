@@ -283,7 +283,11 @@ describe('DeviceLinkPage: deciding', () => {
     const user = await confirmCard();
     // Saying no needs no tick.
     await user.click(screen.getByRole('button', { name: "Don't link" }));
-    expect(await screen.findByRole('heading', { level: 1, name: 'Not linked' })).toHaveFocus();
+    // The page moves the focus in an effect after the commit that shows the heading.
+    const focusTarget1 = await screen.findByRole('heading', { level: 1, name: 'Not linked' });
+    await waitFor(() => {
+      expect(focusTarget1).toHaveFocus();
+    });
     expect(screen.getByText('The app will show that you said no.')).toBeInTheDocument();
     expect(services.ui.getState().announcements.polite?.text).toBe('The app will show that you said no.');
     expect(decided).toEqual([{ userCode: 'WDJBMJHT', approve: false }]);
@@ -377,7 +381,11 @@ describe('DeviceLinkPage: deciding', () => {
     renderLink('/link?code=WDJB-MJHT');
     const user = await confirmCard();
     await user.click(linkButton());
-    expect(await screen.findByRole('heading', { level: 1, name: "This code doesn't work" })).toHaveFocus();
+    // The page moves the focus in an effect after the commit that shows the heading.
+    const focusTarget2 = await screen.findByRole('heading', { level: 1, name: "This code doesn't work" });
+    await waitFor(() => {
+      expect(focusTarget2).toHaveFocus();
+    });
   });
 });
 
@@ -406,7 +414,11 @@ describe('DeviceLinkPage: the lookup’s other answers', () => {
   it('429: too many wrong codes, with the wait in minutes', async () => {
     onLookup(() => apiError(429, { code: 'rate_limited', retryAfter: 90 }));
     const { services } = renderLink('/link?code=WDJB-MJHT');
-    expect(await screen.findByRole('heading', { level: 1, name: 'Too many wrong codes' })).toHaveFocus();
+    // The page moves the focus in an effect after the commit that shows the heading.
+    const focusTarget3 = await screen.findByRole('heading', { level: 1, name: 'Too many wrong codes' });
+    await waitFor(() => {
+      expect(focusTarget3).toHaveFocus();
+    });
     expect(screen.getByText('Try again in 2 min.')).toBeInTheDocument();
     expect(services.ui.getState().announcements.polite?.text).toBe('Try again in 2 min.');
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
