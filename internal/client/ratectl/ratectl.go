@@ -54,7 +54,8 @@ const (
 	// MinInterval is the shortest time between two changes of such a layer ("at most every 2 s").
 	MinInterval = 2 * time.Second
 	// ReinitMinChange is the smallest change, in percent of the applied value, of a layer whose encoder re-initializes
-	// (and sends an IDR) for a new bitrate.
+	// (and sends an IDR) for a new bitrate, for the moves the controller may skip: a decrease to the layer's ceiling
+	// or its share of the cap, and a step up to exactly its ceiling, pass whatever their size (passes, README WF6).
 	ReinitMinChange = 30
 	// ReinitMinInterval is the shortest time between two changes of such a layer.
 	ReinitMinInterval = 10 * time.Second
@@ -431,9 +432,12 @@ func (c *Controller) limited() bool { return c.limit == "cpu" || c.limit == "gpu
 // the full layer's ceiling and toward the cap, while the full layer is active, no cap binds at or below the ramp,
 // no congestion hold runs and the encoder isn't limited now or in the last HoldAfterLimit. The full layer of an
 // encoder without live bitrate takes one step instead, OneStepDelay after Live, straight to its ceiling or the cap;
-// its guards (30 %, 10 s) then decide whether the step applies. A live full layer's ramp steps only from a value in
-// effect (applied at the ramp: settled keeps it from being below), so a step the guards hold back is not followed by
-// another; a ramp held by the cap takes its next step at the first Tick after the cap rises or goes.
+// its guards then decide whether the step applies (passes): ReinitMinInterval after the layer's last change, if it
+// had one, a step to the ceiling whatever its size and one to the cap only when it is ReinitMinChange. After a
+// backoff's hold it steps the same way again, to the cap or, once the server lifts it, back to the ceiling. A live
+// full layer's ramp steps only from a value in effect (applied at the ramp: settled keeps it from being below), so a
+// step the guards hold back is not followed by another; a ramp held by the cap takes its next step at the first Tick
+// after the cap rises or goes.
 func (c *Controller) rampStep(now time.Time) {
 	f := c.fullLayer()
 	if f == nil || !c.isLive || !f.active || c.ramp >= f.ceiling {
@@ -508,16 +512,27 @@ func (c *Controller) apply(now time.Time, bypass func(*layer) bool) []Action {
 
 // passes reports whether the active layer l's change from applied to wanted may apply now (§9.4), by the guards of
 // its encoder: live, at least MinChange and MinInterval since the layer's last change; re-init, ReinitMinChange
-// and ReinitMinInterval. The interval always holds. These changes pass without the minimum step:
+// and ReinitMinInterval. The interval always holds. The minimum change is for the moves the controller may skip; a
+// move that the ceiling or a cap forces passes without it (README WF6):
 //   - a ramp step of a live full layer (wanted is the ramp, which is above the applied value only after a ramp step:
 //     settled): the ramp grows by 15 %, rounded up, so only its last step, clamped at the ceiling or the cap, is
 //     smaller (6.996 → 8 Mbit/s is 14.4 %). Held back, it would leave f short of the ceiling for good, or short of
 //     the cap with an upload hint the cap doesn't call for;
-//   - a live layer's step up to exactly its ceiling, such as the preview's way back once the server lifts a cap;
+//   - a step up to exactly the layer's ceiling, whatever its encoder: the preview's way back once the server lifts a
+//     cap, and a re-init full layer's step to the ceiling, its one step after Live or its way back once the server
+//     lifts the cap (7.0 → 8 Mbit/s is 14.3 %). Nothing would ever take such a layer the rest of the way: held back,
+//     it would stay short of its ceiling for good;
 //   - a decrease of a layer applied above its ceiling, whatever its encoder: the ceilings carry the admin's cap,
-//     which the layer must come down to, however small the step.
+//     which the layer must come down to, however small the step;
+//   - a decrease of a re-init layer applied above its share of the cap (§9.2): the cap is what the server found the
+//     uplink takes, and a layer held above it sends into a full uplink, in steady loss, until the cap falls 30 %
+//     below the applied value. A backoff to 80 % of what got through is often less than that (WF5-R3: a full layer
+//     at 2.72 Mbit/s stayed over a 3 Mbit/s policer for D10's whole limit, since its backoff to 1.98 Mbit/s was
+//     27 %). A live layer keeps MinChange here (§9.4; README WF6 changed only the re-init guard).
 //
-// So for a re-init encoder only the admin's cap ever passes a step below ReinitMinChange.
+// So a re-init layer changes by less than ReinitMinChange only when the ceiling or a cap forces it: down to its
+// ceiling or its share of the cap, or up to exactly its ceiling. A rise to a higher cap that stays below the ceiling
+// is not forced, and waits until it is ReinitMinChange.
 func (c *Controller) passes(l *layer, now time.Time) bool {
 	live := c.live[l.rid]
 	pct, gap := MinChange, MinInterval
@@ -528,9 +543,9 @@ func (c *Controller) passes(l *layer, now time.Time) bool {
 		return false
 	}
 	switch {
-	case live && l.wanted > l.applied && (l.wanted == l.ceiling || (l.full && l.wanted == c.ramp)):
+	case l.wanted > l.applied && (l.wanted == l.ceiling || (live && l.full && l.wanted == c.ramp)):
 		return true
-	case l.wanted < l.applied && l.applied > l.ceiling:
+	case l.wanted < l.applied && (l.applied > l.ceiling || (!live && c.overCap(l))):
 		return true
 	}
 	diff := int64(l.wanted) - int64(l.applied)
@@ -538,4 +553,11 @@ func (c *Controller) passes(l *layer, now time.Time) bool {
 		diff = -diff
 	}
 	return diff*100 >= int64(l.applied)*int64(pct)
+}
+
+// overCap reports whether the active layer l is applied above its share of the server's cap, which its target then
+// is too (the ramp is never below the applied value: settled).
+func (c *Controller) overCap(l *layer) bool {
+	share, capped := c.capSplit(l)
+	return capped && l.applied > share
 }

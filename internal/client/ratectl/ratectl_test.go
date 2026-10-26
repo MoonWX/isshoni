@@ -290,7 +290,8 @@ func TestRampCongestionHold(t *testing.T) {
 func TestLiveGuards(t *testing.T) {
 	t.Run("15 percent", func(t *testing.T) {
 		c := ramped(t, bothLive)
-		// T = 7.3: f 7.0, 12.5 % below 8.0.
+		// T = 7.3: f 7.0, 12.5 % below 8.0. A live layer keeps MinChange for a decrease to the cap (README WF6
+		// waived ReinitMinChange only).
 		checkActions(t, "a 12.5 % change", c.Hint(congestion(7_300_000), at(13)))
 		checkEvents(t, "ticks", tickRange(c, 13.5, 40), nil)
 		if st := c.State(); st.Wanted["f"] != 7_000_000 || st.Applied["f"] != 8_000_000 {
@@ -335,30 +336,94 @@ func TestReinitGuards(t *testing.T) {
 	})
 	t.Run("30 percent and 10 seconds", func(t *testing.T) {
 		c := ramped(t, fReinit) // the one step at 10
-		// T = 6.3: f 6.0, 25 % below: never.
-		checkActions(t, "25 %", c.Hint(congestion(6_300_000), at(12)))
-		checkEvents(t, "ticks", tickRange(c, 12.5, 13), nil)
-		// T = 5.0: f 4.7, 41 %: 10 s after the one step.
+		// T = 5.0: f 4.7, 41 % below: 10 s after the one step.
 		checkActions(t, "41 % after 3 s", c.Hint(congestion(5_000_000), at(13)))
-		checkEvents(t, "ticks", tickRange(c, 13.5, 40), []event{{20, reinitBitrate("f", 4_700_000)}})
+		checkEvents(t, "ticks", tickRange(c, 13.5, 25), []event{{20, reinitBitrate("f", 4_700_000)}})
+		// T = 5.8: f's share of the cap is 5.5, 17 % up. The cap allows the rise but doesn't force it, and 5.5 is not
+		// the ceiling: it waits for 30 %, for good.
+		checkActions(t, "17 % up", c.Hint(congestion(5_800_000), at(25.2)))
+		checkEvents(t, "ticks", tickRange(c, 25.5, 40), nil)
+		if st := c.State(); st.Wanted["f"] != 5_500_000 || st.Applied["f"] != 4_700_000 {
+			t.Errorf("wanted %d applied %d, want 5500000 waiting at 4700000", st.Wanted["f"], st.Applied["f"])
+		}
+		// T = 6.5: f 6.2, 32 % up: the ramp's next step, to the cap's split, applies at once.
+		checkActions(t, "32 % up", c.Hint(congestion(6_500_000), at(40.2)))
+		checkEvents(t, "ticks", tickRange(c, 40.5, 50), []event{{40.5, reinitBitrate("f", 6_200_000)}})
 	})
-	t.Run("one step below 30 percent", func(t *testing.T) {
-		// The admin's cap of 5000 kbit/s: the one step would be 4 → 5 Mbit/s, 25 %; it never applies.
+	t.Run("a decrease to the cap below 30 percent", func(t *testing.T) {
+		// README WF6, with WF5-R3's numbers: the full layer came down to 2.72 Mbit/s under a 3 Mbit/s policer, and
+		// the estimator's next backoff, to 80 % of what got through (2.28 Mbit/s), asks for 1.98 Mbit/s, 27 % below.
+		// The cap forces it: it applies 10 s after the layer's last change, not a Tick earlier, and so does a
+		// decrease of 2.5 %.
+		c := ramped(t, fReinit) // the one step at 10
+		checkActions(t, "T = 3.02 Mbit/s", c.Hint(congestion(3_020_000), at(15)))
+		checkEvents(t, "ticks", tickRange(c, 15.5, 27), []event{{20, reinitBitrate("f", 2_720_000)}})
+		checkActions(t, "T = 2.28 Mbit/s: 27 % below", c.Hint(congestion(2_280_000), at(27.2)))
+		checkEvents(t, "ticks", tickRange(c, 27.5, 31), []event{{30, reinitBitrate("f", 1_980_000)}})
+		checkActions(t, "T = 2.23 Mbit/s: 2.5 % below", c.Hint(congestion(2_230_000), at(31.2)))
+		checkEvents(t, "ticks", tickRange(c, 31.5, 50), []event{{40, reinitBitrate("f", 1_930_000)}})
+
+		// A decrease of 25 %; and the same one cancelled by a higher cap while it waits for its interval (latest
+		// wins).
+		c = ramped(t, fReinit)
+		checkActions(t, "T = 6.3 Mbit/s: 25 % below, 2 s after the one step", c.Hint(congestion(6_300_000), at(12)))
+		checkEvents(t, "ticks", tickRange(c, 12.5, 20), []event{{20, reinitBitrate("f", 6_000_000)}})
+		c = ramped(t, fReinit)
+		checkActions(t, "T = 6.3 Mbit/s", c.Hint(congestion(6_300_000), at(12)))
+		checkActions(t, "T = 9 Mbit/s: f's share is its ceiling", c.Hint(congestion(9_000_000), at(15)))
+		checkEvents(t, "ticks", tickRange(c, 15.5, 40), nil)
+
+		// Any cap, the admin's total too: f's ceiling is the admin's 5000 kbit/s, which the one step reaches, and a
+		// hint with that total gives f 4.7, 6 % below.
+		c = newController(fReinit, presetParams(protocol.PresetAuto, 5000))
+		c.Live(at(0))
+		checkEvents(t, "the one step", tickRange(c, 0.5, 11), []event{{10, reinitBitrate("f", 5_000_000)}})
+		admin := protocol.QualityHint{Reason: protocol.HintReasonAdmin, MaxBitrate: 5_000_000,
+			Encodings: encs(5_000_000, 60, true, true)}
+		checkActions(t, "the admin's total", c.Hint(admin, at(12)))
+		checkEvents(t, "ticks", tickRange(c, 12.5, 30), []event{{20, reinitBitrate("f", 4_700_000)}})
+	})
+	t.Run("the last step up to the ceiling below 30 percent", func(t *testing.T) {
+		// README WF6: a re-init full layer less than 30 % below its ceiling when the server lifts the cap (WF5's D10
+		// runs ended at 6.57 and 7.00 Mbit/s for good) steps up to it, 10 s after its last change.
+		c := ramped(t, fReinit) // the one step at 10
+		checkActions(t, "T = 7.0 Mbit/s: 16 % below", c.Hint(congestion(7_000_000), at(12)))
+		checkEvents(t, "ticks", tickRange(c, 12.5, 25), []event{{20, reinitBitrate("f", 6_700_000)}})
+		// The hold ended at 22; once the cap is gone the ramp steps to the ceiling at the next Tick: 19 % up.
+		checkActions(t, "cap lifted", c.Hint(congestion(0), at(25.2)))
+		checkEvents(t, "ticks", tickRange(c, 25.5, 40), []event{{30, reinitBitrate("f", 8_000_000)}})
+		if st := c.State(); st.Ramping || st.Applied["f"] != 8_000_000 {
+			t.Errorf("Ramping %v, f applied %d; want the ramp done at 8000000", st.Ramping, st.Applied["f"])
+		}
+
+		// A cap that gives f its ceiling is the same step: 7.0 → 8 Mbit/s is 14.3 %.
+		c = ramped(t, fReinit)
+		checkActions(t, "T = 7.3 Mbit/s", c.Hint(congestion(7_300_000), at(12)))
+		checkEvents(t, "ticks", tickRange(c, 12.5, 25), []event{{20, reinitBitrate("f", 7_000_000)}})
+		checkActions(t, "T = 8.5 Mbit/s: f's share is its ceiling", c.Hint(congestion(8_500_000), at(25.2)))
+		checkEvents(t, "ticks", tickRange(c, 25.5, 40), []event{{30, reinitBitrate("f", 8_000_000)}})
+	})
+	t.Run("the one step to a ceiling below 30 percent", func(t *testing.T) {
+		// The admin's cap of 5000 kbit/s: the one step goes 4 → 5 Mbit/s, 25 %, to the ceiling: it applies.
 		c := newController(fReinit, presetParams(protocol.PresetAuto, 5000))
 		c.Live(at(0))
-		checkEvents(t, "ticks", tickRange(c, 0.5, 40), nil)
-		if st := c.State(); st.Wanted["f"] != 5_000_000 || st.Ramping {
-			t.Errorf("wanted %d, ramping %v; want 5000000 waiting, the ramp done", st.Wanted["f"], st.Ramping)
+		checkEvents(t, "ticks", tickRange(c, 0.5, 40), []event{{10, reinitBitrate("f", 5_000_000)}})
+		if st := c.State(); st.Applied["f"] != 5_000_000 || st.Ramping {
+			t.Errorf("applied %d, ramping %v; want 5000000, the ramp done", st.Applied["f"], st.Ramping)
 		}
 	})
-	t.Run("a step that never applied, then a higher ceiling", func(t *testing.T) {
-		// The one step to the admin's 5 Mbit/s stays below 30 %; once the admin lifts the cap, the ramp steps to the
-		// new ceiling at the next Tick, which is 100 % above the start.
-		c := newController(fReinit, presetParams(protocol.PresetAuto, 5000))
+	t.Run("a step to a cap below 30 percent, then the cap lifted", func(t *testing.T) {
+		// A congestion cap of 5.3 Mbit/s before the one step: the step to its split, 5.0, is 25 % and not to the
+		// ceiling, so it never applies; once the server lifts the cap, the ramp steps to the ceiling at the next Tick,
+		// which is 100 % above the start.
+		c := newController(fReinit, autoParams)
 		c.Live(at(0))
-		tickRange(c, 0.5, 20)
-		lift := protocol.QualityHint{Reason: protocol.HintReasonAdmin, Encodings: encs(8_000_000, 60, true, true)}
-		checkActions(t, "admin cap lifted", c.Hint(lift, at(20.2)))
+		checkActions(t, "T = 5.3 Mbit/s", c.Hint(congestion(5_300_000), at(5)))
+		checkEvents(t, "ticks", tickRange(c, 5.5, 20), nil)
+		if st := c.State(); st.Wanted["f"] != 5_000_000 || st.Applied["f"] != 4_000_000 {
+			t.Errorf("wanted %d applied %d, want 5000000 waiting at 4000000", st.Wanted["f"], st.Applied["f"])
+		}
+		checkActions(t, "cap lifted", c.Hint(congestion(0), at(20.2)))
 		checkEvents(t, "ticks", tickRange(c, 20.5, 40), []event{{20.5, reinitBitrate("f", 8_000_000)}})
 	})
 	t.Run("the one step waits for a limit", func(t *testing.T) {
@@ -391,9 +456,25 @@ func TestSetLiveSwitch(t *testing.T) {
 		c := ramped(t, qReinit)
 		checkActions(t, "600 kbit/s", c.Hint(congestion(600_000), at(12)),
 			bitrate("f", 420_000), reinitBitrate("q", 180_000))
-		// 16.7 % each: f applies after 2 s, q never (below 30 %).
+		// 16.7 % down each: f's applies after its 2 s; q's too, since the cap forces it (README WF6), but only 10 s
+		// after q's last change.
 		checkActions(t, "500 kbit/s", c.Hint(congestion(500_000), at(15)), bitrate("f", 350_000))
-		checkEvents(t, "ticks", tickRange(c, 15.5, 40), nil)
+		checkEvents(t, "ticks", tickRange(c, 15.5, 40), []event{{22, reinitBitrate("q", 150_000)}})
+	})
+	t.Run("q re-init: its share of a cap, then its ceiling", func(t *testing.T) {
+		c := ramped(t, qReinit)
+		// 800 kbit/s: q's share is 240 kbit/s, 20 % down; the cap forces it, and q never changed: at once.
+		checkActions(t, "800 kbit/s", c.Hint(congestion(800_000), at(12)),
+			bitrate("f", 560_000), reinitBitrate("q", 240_000))
+		// 900 kbit/s: 270 kbit/s, 12.5 % up, is a rise the cap allows but doesn't force: it waits for 30 %. f (live,
+		// its hold over) ramps to its new split at the next Tick.
+		checkActions(t, "900 kbit/s", c.Hint(congestion(900_000), at(23)))
+		checkEvents(t, "ticks", tickRange(c, 23.5, 30), []event{{23.5, bitrate("f", 630_000)}})
+		if st := c.State(); st.Wanted["q"] != 270_000 || st.Applied["q"] != 240_000 {
+			t.Errorf("q wanted %d applied %d, want 270000 waiting at 240000", st.Wanted["q"], st.Applied["q"])
+		}
+		// The server lifts the cap: q's way back to its ceiling is 25 % up, its last step there: at once.
+		checkActions(t, "cap lifted", c.Hint(congestion(0), at(30.2)), reinitBitrate("q", 300_000))
 	})
 	t.Run("an unchanged flag is no change", func(t *testing.T) {
 		c := ramped(t, fReinit) // the one step at 10
@@ -460,15 +541,15 @@ func TestParams(t *testing.T) {
 	})
 	t.Run("a pending change keeps its guards", func(t *testing.T) {
 		// Every M2 preset has the same ceilings (M1 02 §8.6): a preset change only changes the audio, and a change
-		// waiting for its guards goes on waiting.
+		// waiting for its guards goes on waiting: here a decrease to the cap, for its interval.
 		c := ramped(t, fReinit) // the one step at 10
-		checkActions(t, "25 %", c.Hint(congestion(6_300_000), at(12)))
+		checkActions(t, "25 % down to the cap", c.Hint(congestion(6_300_000), at(12)))
 		checkActions(t, "movie, 3 s after the one step", c.Params(presetParams(protocol.PresetMovie, 0), at(13)),
 			audioBitrate(256_000))
 		if st := c.State(); st.Applied["f"] != 8_000_000 || st.Wanted["f"] != 6_000_000 {
 			t.Errorf("f applied %d wanted %d, want 6000000 still waiting at 8000000", st.Applied["f"], st.Wanted["f"])
 		}
-		checkEvents(t, "ticks", tickRange(c, 13.5, 40), nil)
+		checkEvents(t, "ticks", tickRange(c, 13.5, 40), []event{{20, reinitBitrate("f", 6_000_000)}})
 
 		c = ramped(t, bothLive) // f's last change at 10
 		checkActions(t, "12.5 %", c.Hint(congestion(7_300_000), at(10.5)))

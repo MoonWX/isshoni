@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"slices"
 	"strconv"
@@ -34,9 +35,10 @@ import (
 //     upload allows about 540p; once the policer allows 20 Mbit/s, the full layer ramps back to its 8 Mbit/s and the
 //     upload hint clears.
 //   - D10: D9's script with an encoder that re-initializes for every new bitrate (fake's probe without LiveBitrate):
-//     every change is 30 % or more and 10 s or more after the last one, and each starts with the new encoder's
-//     keyframe: the engine hands the core that Reinit keyframe for each of the core's calls (engineTap), and the
-//     viewers that watch the layer get it.
+//     every change is 10 s or more after the last one and 30 % or more, unless the ceiling or a cap forces it (a
+//     decrease to the layer's share of the cap, the last step up to its ceiling: README WF6), and each starts with
+//     the new encoder's keyframe: the engine hands the core that Reinit keyframe for each of the core's calls
+//     (engineTap), and the viewers that watch the layer get it.
 //   - D19: a queueing link of 6 Mbit/s with a 1 s buffer (sfutest.NewQueueLink), like a home router's, is there from
 //     the start: the ramp crosses its capacity, and the queueing delay backs the estimate off before the buffer
 //     overflows, so the queue drains within 6 s and no datagram is ever lost at it.
@@ -84,8 +86,9 @@ const (
 	// 57 s at 3 s and 45 s at 2 s. With WF5's (the loss counted once, on the last second's arrivals) it took 29–54 s in
 	// five runs under -race on the Mac.
 	recoverWithin = 75 * time.Second
-	// ceilingF is the Auto preset's full layer (M1 02 §8.6), where the ramp ends.
+	// ceilingF is the Auto preset's full layer (M1 02 §8.6), where the ramp ends, and ceilingQ its preview's.
 	ceilingF = 8_000_000
+	ceilingQ = 300_000
 	// rampWithin bounds the wait for the ramp to reach ceilingF from live: RampDelay and four RampEvery (01 §9.3),
 	// or the one step OneStepDelay after live (re-init), with every step on a Tick and the waits the guards add.
 	rampWithin = ratectl.RampDelay + 4*ratectl.RampEvery + 5*time.Second
@@ -184,13 +187,15 @@ func TestDesktopUplinkCongestion(t *testing.T) {
 }
 
 // TestDesktopReinitCongestion is D10: D9's script with an encoder that has no live bitrate. The full layer ramps in
-// one step and comes down when the hints say so, but no layer's target changes less than 10 s after its last change
-// or by less than 30 %, and each change is applied as a re-init: the core's rate action says so (ratectl's
-// Action.Reinit), and for the engine call the engine hands the core the layer's EventLayer and then the new
-// encoder's Reinit keyframe, within reinitWithin and once per change (engineTap: the source, before anything on the
-// way could lose it). The intervals are measured on the engine's calls (fake.Call.At), against the full
-// ReinitMinInterval: the share's actor gives ratectl time.Now() and re-arms its rate timer after each Tick's engine
-// calls (internal/client/core's share.go), so ratectl's guards bound the engine's calls too.
+// one step and comes down when the hints say so, but no layer's target changes less than 10 s after its last change,
+// or by less than 30 % unless the ceiling or a cap forces the move (README WF6): a decrease to exactly the layer's
+// share of the cap in effect, which the core's log gives (rateDecisions), or a rise to exactly its ceiling. Each
+// change is applied as a re-init: the core's rate action says so (ratectl's Action.Reinit), and for the engine call
+// the engine hands the core the layer's EventLayer and then the new encoder's Reinit keyframe, within reinitWithin
+// and once per change (engineTap: the source, before anything on the way could lose it). The intervals are measured
+// on the engine's calls (fake.Call.At), against the full ReinitMinInterval: the share's actor gives ratectl
+// time.Now() and re-arms its rate timer after each Tick's engine calls (internal/client/core's share.go), so
+// ratectl's guards bound the engine's calls too.
 //
 // What the viewers get of those keyframes is the end-to-end evidence (sightOf, by the keyframe's capture time, so
 // that nothing else's keyframe can stand in for it): a viewer that watched the layer across a change got its Reinit
@@ -238,6 +243,7 @@ func TestDesktopReinitCongestion(t *testing.T) {
 		initial[l.RID] = l.TargetBps
 	}
 	logs := run.app.logs.String()
+	decisions := rateDecisions(logs)
 	frames := viewerFrames([]*sfutest.Viewer{run.viewer, preview}, run.snap.ID)
 	seen, missed := map[string]int{}, map[string]int{} // the keyframes the viewers got, and those lost at the policer
 	for rid, calls := range changes {
@@ -251,8 +257,21 @@ func TestDesktopReinitCongestion(t *testing.T) {
 			t.Logf("%s: %d → %d bit/s (%+.1f %%) at %v%s", rid, prev, c.Bps, step,
 				c.At.Sub(run.liveAt).Round(time.Millisecond), note)
 			if step > -ratectl.ReinitMinChange && step < ratectl.ReinitMinChange {
-				t.Errorf("%s's target changed by %.1f %% (%d → %d bit/s), want at least %d %%", rid, step, prev, c.Bps,
-					ratectl.ReinitMinChange)
+				// Only a move that the ceiling or a cap forces may be smaller (README WF6).
+				var d rateDecision
+				if i < len(decisions[rid]) {
+					d = decisions[rid][i]
+				}
+				switch why := forcedMove(rid, prev, c.Bps, d); {
+				case d.bps != c.Bps:
+					t.Errorf("%s's change %d is %d bit/s, but the core's log has %+v for it", rid, i, c.Bps, d)
+				case why == "":
+					t.Errorf("%s's target changed by %.1f %% (%d → %d bit/s; the cap was %d bit/s), want at least "+
+						"%d %% or a move that the ceiling or the cap forces", rid, step, prev, c.Bps, d.capBps,
+						ratectl.ReinitMinChange)
+				default:
+					t.Logf("  below %d %%: %s", ratectl.ReinitMinChange, why)
+				}
 			}
 			if i > 0 {
 				gap := c.At.Sub(prevAt)
@@ -749,6 +768,71 @@ func parseHints(logs string) []loggedHint {
 		out = append(out, h)
 	}
 	return out
+}
+
+// rateDecision is a rate action of the core's log that set a layer's bitrate in the engine (an OpBitrate, or a
+// resume's), with the server's cap then (D10).
+type rateDecision struct {
+	bps    int
+	capBps int64 // the cap of the last quality hint before it that set one; 0 = none
+}
+
+// rateDecisions returns, per layer, the core's "rate action" lines that call Session.SetBitrate for it, in the order
+// of the log, each with the cap in effect: the max_bitrate of the last "quality hint" line before it that carried a
+// cap or encodings (a hint with neither, a codec hint, changes no cap: ratectl's Hint). The share's actor writes both
+// lines, so their order in the log is the order in which ratectl got the hint and made the change, with no clock in
+// between; and every engine bitrate call of a layer comes from one such line, so the i-th is the i-th call's.
+func rateDecisions(logs string) map[string][]rateDecision {
+	out := map[string][]rateDecision{}
+	var capBps int64
+	for line := range strings.SplitSeq(logs, "\n") {
+		hint, action := strings.Contains(line, `msg="quality hint"`), strings.Contains(line, `msg="rate action"`)
+		if !hint && !action {
+			continue
+		}
+		kv := map[string]string{}
+		for field := range strings.FieldsSeq(line) {
+			k, v, _ := strings.Cut(field, "=")
+			kv[k] = v
+		}
+		if hint {
+			if kv["max_bitrate"] != "0" || kv["encodings"] != "0" {
+				capBps, _ = strconv.ParseInt(kv["max_bitrate"], 10, 64)
+			}
+			continue
+		}
+		bps, _ := strconv.Atoi(kv["bps"])
+		if kv["op"] == "bitrate" || (kv["op"] == "active" && kv["active"] == "true" && bps > 0) {
+			out[kv["layer"]] = append(out[kv["layer"]], rateDecision{bps: bps, capBps: capBps})
+		}
+	}
+	return out
+}
+
+// forcedMove says why a re-init layer's change from prev to bps, by less than ratectl.ReinitMinChange, is one that
+// the ceiling or a cap forces (README WF6), or "" when it is neither: a rise to exactly the layer's ceiling (the
+// Auto preset's), or a decrease to exactly its share of the cap in effect (d, 01 §9.2) from above it. The log has no
+// Active flags, so the share is the one with both layers active, as bob and carol keep them, or the layer's alone.
+func forcedMove(rid string, prev, bps int, d rateDecision) string {
+	ceiling := map[string]int{protocol.RIDHigh: ceilingF, protocol.RIDLow: ceilingQ}[rid]
+	if bps > prev && bps == ceiling {
+		return fmt.Sprintf("the last step up to the layer's ceiling of %d bit/s", ceiling)
+	}
+	if bps >= prev || d.capBps <= 0 {
+		return ""
+	}
+	t := int(min(d.capBps, 1_000_000_000))
+	q := min(ceilingQ, max(ratectl.FloorQ, int(math.Round(ratectl.QShare*float64(t)))))
+	both := min(max(q, ratectl.MinBitrateLayer), ratectl.MaxBitrateLayer)
+	alone := min(max(max(ratectl.FloorQ, min(ceilingQ, t)), ratectl.MinBitrateLayer), ratectl.MaxBitrateLayer)
+	if rid == protocol.RIDHigh {
+		both = min(max(max(ratectl.FloorF, min(ceilingF, t-q)), ratectl.MinBitrateF), ratectl.MaxBitrateF)
+		alone = min(max(max(ratectl.FloorF, min(ceilingF, t)), ratectl.MinBitrateF), ratectl.MaxBitrateF)
+	}
+	if bps == both || bps == alone {
+		return fmt.Sprintf("a decrease to the layer's share of the cap of %d bit/s", d.capBps)
+	}
+	return ""
 }
 
 // ---- what the engine hands the core ----
