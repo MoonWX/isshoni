@@ -66,6 +66,35 @@
   flex: none;
 }
 
+/* A linked app's row (M2 02 §10.2): Rename and Remove, which wrap under the details when the row is narrow. */
+.appRow {
+  flex-wrap: wrap;
+}
+
+.appRow > .what {
+  flex: 1 1 16rem;
+}
+
+.rowActions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* The inline rename field and its two buttons, in place of the name. */
+.rename {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.renameActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;

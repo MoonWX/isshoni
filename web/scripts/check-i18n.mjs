@@ -53,6 +53,17 @@
 //    namespace that the entry itself depends on in that way is a problem too (it would be in the main bundle), and
 //    so is a lazy file without its lazy/<ns>.ts. Keys that are built at run time are not followed, as in rule 1.
 //    A src tree without lazy namespaces (test fixtures) has nothing to check.
+// 6. (M2 WA63, docs/m2/03-desktop-app.md §18.1) Every desktop bridge error code (platform/desktop/codes.gen.ts, which
+//    `task gen` makes from internal/desktop/bridge/codes) has a desktop.errors.<code> message: the SPA shows a bridge
+//    error by its code, so these keys are never t('…') literals (BRIDGE_ERRORS). The update.* codes are exempt for
+//    now (the prefix is the file's own UpdatePrefix constant): their texts are the update screens'
+//    desktop.update.error.<code>, which WA82 writes (README §3 item 42). Dropping the exemption here would demand
+//    desktop.errors.update.* keys nobody writes, so then this rule maps an update.* code to
+//    desktop.update.error.<code> instead; README's WA82 row names only codes.node.test.ts, so the write-back after
+//    group 7 adds this file to its Touches. The codes are read from the generated `Code` union like rule 2's, so a
+//    code added in Go and regenerated fails the check until desktop.en.json has its text, and rule 4 counts every
+//    required message as used. A src tree without the file (test fixtures) skips the rule with a note.
+//    web/src/platform/desktop/codes.node.test.ts checks the same in test:web, with 03 §10.5's reason texts.
 //
 // Usage: node scripts/check-i18n.mjs [--src <dir>] [--catalog <en.json>]
 // Paths default to this package's src/ and src/i18n/en.json, so it runs the same from the repo root and from web/.
@@ -929,6 +940,66 @@ export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
 }
 
 /**
+ * Rule 6: where the bridge's error codes are (relative to the src dir), the prefix of their messages, and the name
+ * of the constant that starts every exempt (update) code.
+ */
+export const BRIDGE_ERRORS = Object.freeze({
+  file: path.join('platform', 'desktop', 'codes.gen.ts'),
+  prefix: 'desktop.errors',
+  exemptPrefixConstant: 'UpdatePrefix',
+});
+
+/**
+ * Rule 6: every desktop bridge error code but the update.* ones has a desktop.errors.<code> message (a string, or
+ * plural forms: the SPA shows the key as it is).
+ * @param {{ srcDir: string, catalog: Catalog, catalogName: CatalogName }} opts
+ * @returns {Promise<{ problems: Problem[], codes: number | null, required: string[] }>} codes: the codes that need a
+ *   message, or null when the src tree has no codes.gen.ts (the rule is skipped); required: their keys, which rule 4
+ *   counts as used
+ */
+export async function checkBridgeCodes({ srcDir, catalog, catalogName }) {
+  const file = path.join(srcDir, BRIDGE_ERRORS.file);
+  if (!(await exists(file))) return { problems: [], codes: null, required: [] };
+  const shown = path.relative(process.cwd(), file) || file;
+  const text = await readFile(file, 'utf8');
+  const res = unionConstants(shown, text, 'Code');
+  if (!res) {
+    return {
+      problems: [{ file: shown, line: 1, column: 1, message: 'no `export type Code` union found' }],
+      codes: 0,
+      required: [],
+    };
+  }
+  // The exempt prefix: a string constant of the same file (`export const UpdatePrefix = "update.";`).
+  const exempt = new RegExp(`^export const ${BRIDGE_ERRORS.exemptPrefixConstant}\\s*=\\s*"([^"\\\\]+)"`, 'm').exec(
+    text,
+  )?.[1];
+  /** @type {Problem[]} */
+  const problems = [...res.problems];
+  /** @type {string[]} */
+  const required = [];
+  for (const c of res.constants) {
+    if (exempt !== undefined && c.value.startsWith(exempt)) continue;
+    const key = `${BRIDGE_ERRORS.prefix}.${c.value}`;
+    required.push(key);
+    const why = keyProblem(catalog, key);
+    if (why) {
+      const where = fileFor(catalogName, key);
+      problems.push({
+        file: c.file,
+        line: c.line,
+        column: c.column,
+        message:
+          why === 'missing'
+            ? `bridge error code "${c.value}" (${c.name}) has no ${key} in ${where}`
+            : `bridge error code "${c.value}" (${c.name}): ${key} ${why} in ${where}`,
+      });
+    }
+  }
+  return { problems, codes: required.length, required };
+}
+
+/**
  * Rule 4: namespaces (or parts of one) that code reads as a whole, not by key: the service worker's `push` texts,
  * which build/sw-plugin.ts hands to it as one object (05 §16.2), and which src/sw/push.ts picks by the push's type;
  * and `desktop.native`, which the desktop app's Go code (internal/desktop/i18n) looks up in the same file
@@ -1023,11 +1094,12 @@ export function namespacesBuiltWhole({ catalog, heads }) {
  * @param {{ srcDir: string, catalogPath: string }} opts catalogPath: the main catalog file (readCatalog)
  * @returns {Promise<{ problems: Problem[], warnings: Problem[], builtWhole: string[], keysUsed: number,
  *   files: number, errorCodes: number | null, constantKeys: Record<string, number> | null,
- *   lazyNamespaces: string[] }>}
+ *   lazyNamespaces: string[], bridgeCodes: number | null }>}
  *   warnings: rule 4's unused messages, at their place in the catalog files; builtWhole: the namespaces in which
  *   rule 4 can't find unused messages (namespacesBuiltWhole); errorCodes: the distinct error codes rule 2 checked,
  *   or null when it was skipped; constantKeys: the constants rule 3 checked per union type name (CloudProvider,
- *   NATKind), or null when it was skipped; lazyNamespaces: the lazy namespaces rule 5 checked
+ *   NATKind), or null when it was skipped; lazyNamespaces: the lazy namespaces rule 5 checked; bridgeCodes: the
+ *   bridge error codes rule 6 checked, or null when it was skipped
  */
 export async function checkI18n({ srcDir, catalogPath }) {
   const { catalog, lazy, fileOf, positionOf, problems } = await readCatalog({ srcDir, catalogPath });
@@ -1049,12 +1121,14 @@ export async function checkI18n({ srcDir, catalogPath }) {
   const constantKeys = await checkConstantKeys({ srcDir, catalog, catalogName: fileOf });
   problems.push(...constantKeys.problems);
   problems.push(...checkLazyNamespaces({ lazy, imports: tree.imports, uses: tree.uses, shown: tree.shown }));
+  const bridgeCodes = await checkBridgeCodes({ srcDir, catalog, catalogName: fileOf });
+  problems.push(...bridgeCodes.problems);
   const unused = unusedMessages({
     catalog,
     keys: tree.uses.map((use) => use.key),
     strings: tree.strings,
     heads: tree.heads,
-    required: [...errorCodes.required, ...constantKeys.required],
+    required: [...errorCodes.required, ...constantKeys.required, ...bridgeCodes.required],
   });
   // In the order of the files, as an editor goes through them.
   const warnings = unused
@@ -1069,6 +1143,7 @@ export async function checkI18n({ srcDir, catalogPath }) {
     errorCodes: errorCodes.codes,
     constantKeys: constantKeys.counts,
     lazyNamespaces: lazy.map((ns) => ns.name),
+    bridgeCodes: bridgeCodes.codes,
   };
 }
 
@@ -1084,9 +1159,8 @@ async function main() {
   }
   const srcDir = path.resolve(values.src ?? path.join(WEB_ROOT, 'src'));
   const catalogPath = path.resolve(values.catalog ?? path.join(WEB_ROOT, 'src', 'i18n', 'en.json'));
-  const { problems, warnings, builtWhole, keysUsed, files, errorCodes, constantKeys, lazyNamespaces } = await checkI18n(
-    { srcDir, catalogPath },
-  );
+  const { problems, warnings, builtWhole, keysUsed, files, errorCodes, constantKeys, lazyNamespaces, bridgeCodes } =
+    await checkI18n({ srcDir, catalogPath });
   for (const w of warnings) console.error(`${w.file}:${w.line}:${w.column}: warning: ${w.message}`);
   if (warnings.length > 0) console.error(`check:i18n: ${warnings.length} unused message(s): warnings, not problems`);
   for (const p of problems) console.error(`${p.file}:${p.line}:${p.column}: ${p.message}`);
@@ -1117,6 +1191,12 @@ async function main() {
     console.log(`check:i18n: note: no ${unions} in protocol/api.gen.ts and no ${families} text, fix-text rule skipped`);
   } else {
     for (const f of CONSTANT_KEYED) summary += `, ${constantKeys[f.typeName] ?? 0} ${f.what}s`;
+  }
+  // Its own line, before the summary, which stays the last line.
+  if (bridgeCodes === null) {
+    console.log(`check:i18n: note: no ${BRIDGE_ERRORS.file} under the src dir, bridge-code rule skipped`);
+  } else {
+    console.log(`check:i18n: ${bridgeCodes} bridge error codes, each with its ${BRIDGE_ERRORS.prefix}.<code> text`);
   }
   console.log(summary);
 }

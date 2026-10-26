@@ -1,8 +1,10 @@
 // a11y.spec (05 §19.3, §16.6): axe (WCAG 2.0 A and AA, 2.1 AA) on the pages a friend meets, against a real server,
 // finds no serious or critical violation, in the light and the dark colour scheme (05 §16.6: AA in both): the login,
-// invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), and the admin's
-// user list. In the room the tile list is reachable with the keyboard and F switches the stage's fullscreen, and the
-// overlay shows the friend's tile as the page receives it and as the server forwards it, with no IP address.
+// invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), the admin's user
+// list, and every state of the device-link page (M2 02 §10.1: enter, invalid, confirm on the same, a different and an
+// unknown network, linked, denied, rate_limited, error). In the room the tile list is reachable with the keyboard and
+// F switches the stage's fullscreen, and the overlay shows the friend's tile as the page receives it and as the
+// server forwards it, with no IP address.
 //
 // What axe can't judge (a screen reader's reading order, the live regions' timing) is the manual matrix's and the
 // component tests' (05 §19.2, §19.4).
@@ -119,6 +121,97 @@ test('the setup page', async ({ startServer, browser }) => {
   } finally {
     await page.context().close();
   }
+});
+
+/**
+ * The app's start of a device flow from `from` (POST /api/v1/device/code, 02 §5.2), as its Go code sends it: no
+ * cookie, no Origin. Returns the link the app shows, with the code.
+ */
+async function startLinkFlow(server: E2EServer, from: string): Promise<string> {
+  const res = await fetch(`${server.url}/api/v1/device/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': from },
+    body: JSON.stringify({ clientKind: 'desktop', deviceName: 'DESKTOP-A11Y', os: 'windows', appVersion: '0.2.0' }),
+  });
+  expect(res.status, 'POST /api/v1/device/code').toBe(200);
+  const flow = (await res.json()) as { verificationUriComplete: string };
+  return flow.verificationUriComplete;
+}
+
+test('the device-link page (M2 02 §10.1): every state', async ({ server, page }) => {
+  const account = await server.createUser();
+  await server.signIn(page.context(), account);
+  // The confirm card's network note compares the browser's address with the app's (02 §5.3). The e2e server reads
+  // both from X-Forwarded-For (fixtures.ts); link.spec uses 198.18.0.0/16 and 2001:db8:18::/48, this test
+  // 198.19.0.0/16 and 2001:db8:19::/48.
+  const browserIp = '198.19.0.1';
+  await page.context().setExtraHTTPHeaders({ 'X-Forwarded-For': browserIp });
+
+  await page.goto(`${server.url}/link`);
+  await pageReady(page, 'Enter the code shown in the isshoni app');
+  await expectAccessible(page, 'the link page: enter');
+
+  // A code nobody was given: invalid, with the code field.
+  await page.getByLabel('Code').fill('bcdfbcdf');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await pageReady(page, "This code doesn't work");
+  await expectAccessible(page, 'the link page: invalid');
+
+  // `different`: the app on another IPv4 address. The warning and the tick; Link anyway, then linked.
+  await page.goto(await startLinkFlow(server, '198.19.0.2'));
+  await pageReady(page, 'Link the isshoni app?');
+  await expect(page.getByRole('checkbox', { name: 'I started this myself' })).toBeVisible();
+  await expectAccessible(page, 'the link page: confirm, from a different network');
+
+  await page.getByRole('checkbox', { name: 'I started this myself' }).check();
+  await page.getByRole('button', { name: 'Link anyway' }).click();
+  await pageReady(page, 'Linked');
+  await expectAccessible(page, 'the link page: linked');
+
+  // `same`: the app on the browser's own address. No note and no tick; Don't link, then denied.
+  await page.goto(await startLinkFlow(server, browserIp));
+  await pageReady(page, 'Link the isshoni app?');
+  await expect(page.getByRole('checkbox')).toHaveCount(0);
+  await expectAccessible(page, 'the link page: confirm, from the same network');
+
+  await page.getByRole('button', { name: "Don't link" }).click();
+  await pageReady(page, 'Not linked');
+  await expectAccessible(page, 'the link page: denied');
+
+  // `unknown`: the app over IPv6, the browser over IPv4. The softer note, and the tick.
+  await page.goto(await startLinkFlow(server, '2001:db8:19::1'));
+  await pageReady(page, 'Link the isshoni app?');
+  await expect(page.getByText("isshoni couldn't check whether this request came from your network.")).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'I started this myself' })).toBeVisible();
+  await expectAccessible(page, 'the link page: confirm, from an unknown network');
+
+  // Wrong codes until this user's device-lookup bucket is empty (10, then 1 per minute, 02 §5.3; the invalid code
+  // above spent one, the found codes were refunded), then rate_limited. The bound leaves room for refills on a slow
+  // run.
+  await page.goto(`${server.url}/link`);
+  await pageReady(page, 'Enter the code shown in the isshoni app');
+  for (let tries = 1; ; tries++) {
+    expect(tries, 'wrong codes until the lookup answers 429').toBeLessThanOrEqual(15);
+    await page.getByLabel('Code').fill('bcdfbcdf');
+    const answer = page.waitForResponse((r) => new URL(r.url()).pathname === '/api/v1/device/lookup');
+    await page.getByRole('button', { name: 'Continue' }).click();
+    if ((await answer).status() === 429) break;
+    await pageReady(page, "This code doesn't work");
+  }
+  await pageReady(page, 'Too many wrong codes');
+  await expectAccessible(page, 'the link page: rate limited');
+
+  // error: a lookup the server couldn't answer, with its request id and Try again.
+  await page.route('**/api/v1/device/lookup', (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: { code: 'internal', requestId: 'req-a11y' } }),
+    }),
+  );
+  await page.goto(`${server.url}/link?code=BCDF-BCDF`);
+  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
+  await expectAccessible(page, 'the link page: error');
 });
 
 test('the admin’s user list', async ({ server, page }) => {

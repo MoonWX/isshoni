@@ -374,7 +374,7 @@ describe('check-i18n.mjs on this package', () => {
   it('passes, with the lazy namespaces of i18n/lazy/', async () => {
     const res = await checkI18n({ srcDir: WEB_SRC, catalogPath: EN_JSON });
     expect(res.problems).toEqual([]);
-    expect(res.lazyNamespaces).toEqual(['account', 'admin', 'desktop', 'setup']);
+    expect(res.lazyNamespaces).toEqual(['account', 'admin', 'desktop', 'link', 'setup']);
   });
 
   it('every lazy namespace is used, and only by folders that load it', async () => {
@@ -390,6 +390,8 @@ describe('check-i18n.mjs on this package', () => {
       // Go reads desktop.native.* (web.DesktopCatalog()); the desktop/ and share/native/ folders that load the
       // namespace come with their slices (README WA42 onward).
       desktop: [],
+      // The approval page, and the Devices page's app rows (M2 02 §10.2).
+      link: ['account', 'link'],
       setup: ['setup'],
     });
     expect(checkLazyNamespaces({ lazy, imports: tree.imports, uses: tree.uses })).toEqual([]);
@@ -399,6 +401,7 @@ describe('check-i18n.mjs on this package', () => {
     ['admin/index.ts', 'admin'],
     ['account/index.ts', 'account'],
     ['download/index.ts', 'account'],
+    ['link/index.ts', 'link'],
     ['setup/index.ts', 'setup'],
   ])('fails when %s no longer loads the %s namespace', async (entry, ns) => {
     const [{ lazy }, tree] = await Promise.all([
@@ -417,6 +420,26 @@ describe('check-i18n.mjs on this package', () => {
     for (const p of problems) {
       expect(path.dirname(p.file)).toBe(folder);
       expect(p.message).toContain(`is in the lazy namespace "${ns}", which nothing loads on the way main.tsx → `);
+    }
+  });
+
+  it('fails when account/index.ts no longer loads the link namespace: its app rows and the helpers they import', async () => {
+    const [{ lazy }, tree] = await Promise.all([
+      readCatalog({ srcDir: WEB_SRC, catalogPath: EN_JSON }),
+      scanTree(WEB_SRC),
+    ]);
+    const imports = new Map(tree.imports);
+    const own = imports.get('account/index.ts') ?? [];
+    const kept = own.filter((i) => !i.spec.endsWith('/i18n/lazy/link'));
+    expect(kept).toHaveLength(own.length - 1);
+    imports.set('account/index.ts', kept);
+    const problems = checkLazyNamespaces({ lazy, imports, uses: tree.uses });
+    // DevicesPage.tsx's own link.devices.* keys, and those of link/'s helpers it imports (appName.ts, deviceName.ts):
+    // the link folder's page still loads the namespace, but the account folder reaches those helpers without it.
+    const files = [...new Set(problems.map((p) => p.file.split(path.sep).join('/')))].sort();
+    expect(files).toEqual(['src/account/DevicesPage.tsx', 'src/link/appName.ts', 'src/link/deviceName.ts']);
+    for (const p of problems) {
+      expect(p.message).toContain('is in the lazy namespace "link", which nothing loads on the way main.tsx → ');
     }
   });
 
