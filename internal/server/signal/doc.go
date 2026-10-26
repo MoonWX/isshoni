@@ -32,7 +32,8 @@
 //     from the MediaPeer's media facts, both 30 s timeouts, room.event share.started and the Web Push call, once per
 //     share; and subscribe.update (01 §8.9), the desired subscriptions from which room.state computes the watchers.
 //     M2 adds the pause bit (M2 01 §10.3, feature share.pause): share.update{paused} from a connection of the user
-//     with the feature, shown as paused while the share would be live (stalled wins), with no timeout;
+//     with the feature, shown as paused while the share is live or starting (stalled wins), with no timeout: it
+//     suspends a starting share's start timeout, and the resume starts a fresh one;
 //   - stats.go: stats (01 §8.11): the client metrics from the counters of the clients' reports, and the MediaPeer's
 //     stats, read every 2 s for stats.watch and kept for the live snapshot;
 //   - relay.go: the same-user relay (01 §8.14, feature agent.relay): agent.send goes out as agent.recv to the

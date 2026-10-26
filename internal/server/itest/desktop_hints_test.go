@@ -757,8 +757,9 @@ func TestDesktopEncoderFallback(t *testing.T) {
 // TestDesktopRepublishKeepsPauseAndPreset is README WA38's hand-over: the server restarts while the share is paused
 // and set to Text. The core publishes it again with share.start{replaces, preset: text} and sends
 // share.update{paused: true} for the new share, so the server has the pause (the hub logs it; a paused share sends
-// no keyframe, so it stays starting until it would be live), while the engine stays paused. The resume brings it
-// live, and the viewer follows it by replaces.
+// no keyframe, so the new share shows paused while starting, its start timeout suspended, WF3), while the engine stays
+// paused. The resume brings it live, and the viewer follows it by replaces. TestDesktopPausedAcrossRestart keeps it
+// paused past the start timeout.
 func TestDesktopRepublishKeepsPauseAndPreset(t *testing.T) {
 	noLeaks(t)
 	udp, tcp := freePort(t, "udp"), freePort(t, "tcp")
@@ -796,10 +797,13 @@ func TestDesktopRepublishKeepsPauseAndPreset(t *testing.T) {
 	}, func() string {
 		return fmt.Sprintf("bob's room.state %+v, want the new share %s", bob.roomState(), next)
 	})
-	if info.Replaces != snap.ID || info.Preset != protocol.PresetText || info.Status != protocol.ShareStatusStarting {
-		t.Errorf("the new share is %+v, want it replacing %s, preset text, starting (paused before it is live)", info,
-			snap.ID)
+	// It is starting until its share.update{paused} lands, then paused; room.state's coalescing may show either first.
+	if info.Replaces != snap.ID || info.Preset != protocol.PresetText ||
+		(info.Status != protocol.ShareStatusStarting && info.Status != protocol.ShareStatusPaused) {
+		t.Errorf("the new share is %+v, want it replacing %s, preset text, starting or paused (it isn't live yet)",
+			info, snap.ID)
 	}
+	waitShareStatus(bob, next, protocol.ShareStatusPaused)
 	eventually(t, func() bool {
 		for line := range strings.SplitSeq(w.srv.Logs(), "\n") {
 			if strings.Contains(line, "share paused") && strings.Contains(line, next) {
