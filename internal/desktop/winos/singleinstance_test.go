@@ -130,6 +130,13 @@ func (in *fakeInstance) accept() ([]byte, error) {
 	in.p.mu.Lock()
 	in.p.accepted++
 	in.p.mu.Unlock()
+	// A message already waiting comes back first, as on Windows, where accept doesn't look at the stop event when a
+	// client is already connected: serveLoop's own stopped check then decides.
+	select {
+	case m := <-in.msg:
+		return m.data, m.err
+	default:
+	}
 	select {
 	case m := <-in.msg:
 		return m.data, m.err

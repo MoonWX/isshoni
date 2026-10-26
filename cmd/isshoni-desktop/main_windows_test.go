@@ -321,7 +321,10 @@ func TestVersionGUISubsystem(t *testing.T) {
 		t.Skip("no go command on PATH")
 	}
 	exe := filepath.Join(t.TempDir(), "isshoni.exe")
-	build := exec.CommandContext(t.Context(), goTool, "build", "-tags", "production", "-ldflags=-H=windowsgui", "-o", exe, ".")
+	// -buildvcs=false: a test binary carries no VCS stamp, so the exe's --version must not either for
+	// checkVersionLine's comparison with version.Version() and version.Commit() (0.0.0-dev, no commit).
+	build := exec.CommandContext(t.Context(), goTool, "build", "-buildvcs=false", "-tags", "production",
+		"-ldflags=-H=windowsgui", "-o", exe, ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
