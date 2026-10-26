@@ -134,8 +134,8 @@ func (s *Share) begin() *endRequest {
 	return nil
 }
 
-// tick is the actor's regular look: a republish that is due, else the pub PC (pubdriver.go). Nothing once end has
-// asked the actor to end the share: its request is next.
+// tick is the actor's regular look: a republish that is due, else the pub PC (pubdriver.go) and an owed
+// share.update{paused} (hints.go). Nothing once end has asked the actor to end the share: its request is next.
 func (s *Share) tick(now time.Time) *endRequest {
 	if s.ctx.Err() != nil {
 		return nil
@@ -146,6 +146,7 @@ func (s *Share) tick(now time.Time) *endRequest {
 	if info := s.drive(now); info != nil {
 		return &endRequest{info: *info, stop: true, leave: true}
 	}
+	s.resendPause(now)
 	return nil
 }
 
@@ -171,8 +172,8 @@ func (s *Share) holdOver() *endRequest {
 	return &endRequest{info: EndInfo{Reason: EndServerUnreachable}, stop: true, leave: true}
 }
 
-// onWelcome handles signaling's return: the hold stops, and the share resumes on its connection or is published
-// again on a new one.
+// onWelcome handles signaling's return: the hold stops, an owed share.update{paused} goes at the next look, and the
+// share resumes on its connection or is published again on a new one.
 func (s *Share) onWelcome(m msgWelcome) *endRequest {
 	if m.seq <= s.rec.seq {
 		return nil // takeSignal had it
@@ -180,6 +181,7 @@ func (s *Share) onWelcome(m msgWelcome) *endRequest {
 	s.rec.seq, s.rec.conn, s.rec.online = m.seq, m.connID, true
 	s.rec.stopHold()
 	s.rec.retryAt = time.Time{}
+	s.pauseOwedNow()
 	offline := s.rec.offline
 	s.rec.offline = nil
 	if !m.resumed || m.connID != s.connID {

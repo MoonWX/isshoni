@@ -3,6 +3,7 @@ package itest
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -10,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/MoonWX/isshoni/internal/client/core"
+	"github.com/MoonWX/isshoni/internal/client/publish"
 	"github.com/MoonWX/isshoni/internal/client/signal"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/fake"
@@ -243,8 +246,9 @@ func watchedShare(t *testing.T, app *desktopApp, bob *client, viewer *sfutest.Vi
 // TestDesktopCodecSwitch is D7: a viewer that decodes only Constrained Baseline joins the room; the SFU's codec
 // policy drops to CB and the core gets quality.hint{codec: h264/42e0}: the Publisher offers again with CB first
 // (gen 1, neg 2), and on the answer the engine re-initializes in CB (Session.Reconfigure{Profile: 42e0}). The viewer
-// gets the CB video from the re-init's keyframe. A minute after it left the policy is High again, and the core
-// switches back the same way. It takes over a minute, so -short skips it.
+// gets the CB video from the re-init's keyframe, whose SPS is Constrained Baseline (profile_idc 66, constraint_set1),
+// not only its payload type. A minute after it left the policy is High again, and the core switches back the same
+// way: the first keyframe after that re-init has a High SPS. It takes over a minute, so -short skips it.
 func TestDesktopCodecSwitch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D7 waits for the SFU's minute of codec hold")
@@ -297,6 +301,12 @@ func TestDesktopCodecSwitch(t *testing.T) {
 		t.Errorf("the CB viewer's first frame was captured %v before the engine's re-init: it isn't the re-init's",
 			reconf.At.Sub(captured))
 	}
+	// The bitstream is CB too, not only the payload type: the keyframe's SPS says Constrained Baseline.
+	full := layerOf(sh.Snapshot(), "f")
+	if sps := keyframeSPS(t, vp, frames[0], full.Width, full.Height); sps[1] != spsBaseline || sps[2]&spsConstraintSet1 == 0 {
+		t.Errorf("the CB viewer's first keyframe has the SPS % x, want profile_idc %d with constraint_set1", sps,
+			spsBaseline)
+	}
 	dan.waitStatus(want(snap.ID, true))
 	// Out of the room, dan's sub PC recovery asks for what a room member may (not_in_room): checked before it leaves.
 	dan.check()
@@ -323,6 +333,17 @@ func TestDesktopCodecSwitch(t *testing.T) {
 	if got := sh.Snapshot().ID; got != snap.ID {
 		t.Errorf("the share's id is %s, want %s: a codec switch keeps the share", got, snap.ID)
 	}
+	// bob's first keyframe of f captured after the re-init (every frame of the old encoder was captured before it)
+	// carries a High SPS again.
+	var key sfutest.Frame
+	var keyPkts []sfutest.Packet
+	eventually(t, func() bool {
+		key, keyPkts = firstKeyframeAfter(bobView, snap.ID, sess.Origin(), back.At)
+		return keyPkts != nil
+	}, func() string { return "bob got no keyframe of f captured after the switch back" })
+	if sps := keyframeSPS(t, keyPkts, key, full.Width, full.Height); sps[1] != spsHigh {
+		t.Errorf("bob's first keyframe after the switch back has the SPS % x, want profile_idc %d", sps, spsHigh)
+	}
 	// bob watched all along (on whichever sub PC the SFU gave each profile), and still does.
 	before := shareFrames(bobView, snap.ID)
 	eventually(t, func() bool { return shareFrames(bobView, snap.ID) >= before+30 },
@@ -331,6 +352,121 @@ func TestDesktopCodecSwitch(t *testing.T) {
 		})
 	bob.waitStatus(want(snap.ID, true))
 	bob.check()
+}
+
+// What D7 reads from an SPS (H.264 7.3.2.1.1; RFC 6184 for the RTP payload).
+const (
+	nalSPS            = 7
+	nalSTAPA          = 24
+	spsBaseline       = 66   // profile_idc of (Constrained) Baseline
+	spsHigh           = 100  // profile_idc of High
+	spsConstraintSet1 = 0x40 // constraint_set1_flag: Constrained Baseline with profile_idc 66
+)
+
+// keyframeSPS returns the SPS that a viewer's keyframe carried (its NAL header byte first, then profile_idc and the
+// constraint flags): key is the keyframe, pkts the packets of its track, and width and height the layer's encoded
+// size. A Recorder keeps a hash of each payload, not the payload, so the keyframe's STAP-A (its SPS and PPS) is
+// matched against the ones the fake engine makes for a layer of that size and of the track's frame rate (which sets
+// the level) in each engine profile, packetized as the Publisher does (pion's H264Payloader at publish.PayloadMTU);
+// the SPS is read from the STAP-A that matches. It fails the test when none does.
+func keyframeSPS(t *testing.T, pkts []sfutest.Packet, key sfutest.Frame, width, height int) []byte {
+	t.Helper()
+	i := slices.IndexFunc(pkts, func(p sfutest.Packet) bool { return p.TS == key.TS && p.KeyStart && !p.Dup })
+	if i < 0 {
+		t.Fatalf("the keyframe %+v has no packet with its SPS", key)
+	}
+	fps := frameRate(pkts, key.Mark.RID)
+	for _, profile := range []string{publish.ConstrainedBaselineProfile, publish.HighProfile} {
+		src, err := fake.New(fake.Config{Profile: profile, FlashEvery: -1, Layers: []fake.VideoLayer{
+			{RID: key.Mark.RID, Width: width, Height: height, FPS: fps, Bitrate: 1_000_000}}})
+		if err != nil {
+			t.Fatalf("a fake layer %dx%d@%d in %s: %v", width, height, fps, profile, err)
+		}
+		au, err := src.Next(context.Background()) // the first frame, due at once, is a keyframe
+		_ = src.Close()
+		if err != nil || !au.Keyframe {
+			t.Fatalf("the fake layer's first frame: %+v, %v", au, err)
+		}
+		stap := (&codecs.H264Payloader{}).Payload(publish.PayloadMTU, au.Data)[0]
+		if sfutest.PayloadHash(stap) != pkts[i].Hash {
+			continue
+		}
+		if sps := stapNAL(stap, nalSPS); len(sps) >= 3 {
+			return sps
+		}
+		t.Fatalf("the fake's STAP-A % x has no SPS", stap)
+	}
+	t.Fatalf("the keyframe's STAP-A (%d bytes) is neither the CB nor the High one of a %dx%d@%d layer",
+		pkts[i].Size, width, height, fps)
+	return nil
+}
+
+// frameRate returns the frame rate of a track's layer rid, from the capture times of two consecutive frames; 0 when
+// it has none.
+func frameRate(pkts []sfutest.Packet, rid string) int {
+	var prev *sfutest.Frame
+	frames := sfutest.Frames(pkts)
+	for i := range frames {
+		f := &frames[i]
+		if !f.HasMark || f.Mark.RID != rid {
+			continue
+		}
+		if prev != nil && f.Mark.Frame == prev.Mark.Frame+1 && f.Mark.CaptureNS > prev.Mark.CaptureNS {
+			return int(math.Round(float64(time.Second) / float64(f.Mark.CaptureNS-prev.Mark.CaptureNS)))
+		}
+		prev = f
+	}
+	return 0
+}
+
+// stapNAL returns the NAL unit of type typ in a STAP-A payload (or the payload itself when it is that NAL unit), nil
+// when it has none.
+func stapNAL(payload []byte, typ byte) []byte {
+	switch {
+	case len(payload) == 0:
+		return nil
+	case payload[0]&0x1f == typ:
+		return payload
+	case payload[0]&0x1f != nalSTAPA:
+		return nil
+	}
+	for i := 1; i+2 <= len(payload); {
+		size := int(payload[i])<<8 | int(payload[i+1])
+		i += 2
+		if size == 0 || i+size > len(payload) {
+			return nil
+		}
+		if payload[i]&0x1f == typ {
+			return payload[i : i+size]
+		}
+		i += size
+	}
+	return nil
+}
+
+// firstKeyframeAfter returns the earliest captured keyframe of f, over a Viewer's video tracks of a share, whose
+// capture (the engine session's origin plus its Marker's CaptureNS) is not before at, with the packets of its track;
+// nil packets when there is none.
+func firstKeyframeAfter(v *sfutest.Viewer, shareID string, origin, at time.Time) (sfutest.Frame, []sfutest.Packet) {
+	var (
+		key     sfutest.Frame
+		keyPkts []sfutest.Packet
+	)
+	for _, r := range v.Recorders() {
+		if r.Kind() != webrtc.RTPCodecTypeVideo || r.StreamID() != shareID {
+			continue
+		}
+		pkts := r.Packets()
+		for _, f := range sfutest.Frames(sfutest.WithoutPartialTail(pkts)) {
+			if !f.KeyStart || !f.HasMark || f.Mark.RID != "f" || origin.Add(time.Duration(f.Mark.CaptureNS)).Before(at) {
+				continue
+			}
+			if keyPkts == nil || f.Mark.CaptureNS < key.Mark.CaptureNS {
+				key, keyPkts = f, pkts
+			}
+		}
+	}
+	return key, keyPkts
 }
 
 // shareFrames counts the whole frames of f a Viewer got of a share, over all its video tracks of it.

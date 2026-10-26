@@ -1,10 +1,14 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,8 +20,10 @@ import (
 
 // hints.go against fakeServer (docs/m2/01-client-core.md §11.7's reconcile, §11.8): the hints' layer actions,
 // ratectl's Ticks, pause and resume (the app's own, and one from room.state, with the share.update that room.state
-// has yet to show), presets (SetPreset, and one from room.state), and a republish that sends the pause again and
-// keeps the preset. The codec switch needs a server that answers offers: the itests' D7 (desktop_hints_test.go).
+// has yet to show, sent again by the actor when it has no ok reply, and concurrent calls kept in order), presets
+// (SetPreset, and one from room.state), a republish that sends the pause again and keeps the preset, and the codec
+// switch's check (per layer, older events, refusals). The codec switch itself needs a server that answers offers:
+// the itests' D7 (desktop_hints_test.go).
 
 // pauseServer is a fake server that offers share.pause.
 func pauseServer(t *testing.T) *fakeServer {
@@ -299,8 +305,48 @@ func TestReconcilePause(t *testing.T) {
 	}
 }
 
-// TestPauseOwed: a share.update{paused} the server refused goes again when room.state still shows the share live
-// (at most every resendEvery), and the share stays paused meanwhile.
+// within waits until cond holds, for at most d.
+func within(t *testing.T, d time.Duration, cond func() bool, what func() string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("not within %v: %s", d, what())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// serverStatus waits until the fake server's share s_1 has status, for at most d.
+func serverStatus(t *testing.T, fs *fakeServer, d time.Duration, status protocol.ShareStatus) {
+	t.Helper()
+	within(t, d, func() bool {
+		info, ok := fs.shareInfo("s_1")
+		return ok && info.Status == status
+	}, func() string {
+		info, _ := fs.shareInfo("s_1")
+		return fmt.Sprintf("the server's share is %+v, want it %s", info, status)
+	})
+}
+
+// waitServerView waits until the share's actor has taken a room.state that shows v, and has no update of its own
+// that room.state has yet to show.
+func waitServerView(t *testing.T, sh *Share, v serverView) {
+	t.Helper()
+	view := func() (serverView, bool) {
+		sh.pz.mu.Lock()
+		defer sh.pz.mu.Unlock()
+		return sh.pz.server, sh.pz.pending
+	}
+	eventually(t, func() bool { got, pending := view(); return got == v && !pending }, func() string {
+		got, pending := view()
+		return fmt.Sprintf("the share's view of the server is %d (pending %t), want %d", got, pending, v)
+	})
+}
+
+// TestPauseOwed: a share.update{paused} the server refused goes again from the share's actor at most every
+// resendEvery, with no room.state to prompt it (room.state comes only when something changes); the share stays
+// paused meanwhile.
 func TestPauseOwed(t *testing.T) {
 	fs := pauseServer(t)
 	fs.rejectOnce = map[protocol.MessageType]protocol.Error{
@@ -310,6 +356,7 @@ func TestPauseOwed(t *testing.T) {
 	sh := startedShare(t, e)
 	sess := sessionOf(t, e)
 	n := len(sess.Calls())
+	called := time.Now()
 	err := sh.SetPaused(ctxFor(t), true)
 	var perr *protocol.Error
 	if !errors.As(err, &perr) || perr.Code != protocol.ErrorCodeInternal {
@@ -318,16 +365,125 @@ func TestPauseOwed(t *testing.T) {
 	if !sh.Snapshot().Paused {
 		t.Error("the refused share.update undid the local pause")
 	}
-	roomState(fs, 3, shareAs(protocol.ShareStatusLive, protocol.PresetAuto))
 	settle()
 	waitUpdates(t, fs, "s_1 paused=true") // within resendEvery: not yet
-	time.Sleep(resendEvery)
-	roomState(fs, 4, shareAs(protocol.ShareStatusLive, protocol.PresetAuto))
+	serverStatus(t, fs, resendEvery+time.Second-time.Since(called), protocol.ShareStatusPaused)
 	waitUpdates(t, fs, "s_1 paused=true, s_1 paused=true")
 	waitCalls(t, sess, n, "paused true, audio_muted true", "paused", "audio_muted")
-	if info, _ := fs.shareInfo("s_1"); info.Status != protocol.ShareStatusPaused {
-		t.Errorf("the server's share is %+v, want it paused", info)
+	settle()
+	waitUpdates(t, fs, "s_1 paused=true, s_1 paused=true") // answered: nothing more
+}
+
+// TestPauseOwedAcrossDrop: a pause, and a resume, made while signaling is down reach the server from the share's
+// actor at its first look after signaling is back (within a second here), with no room.state from the test: the
+// resume's room.state, which still shows the server's old view, neither undoes them nor has to prompt the update.
+func TestPauseOwedAcrossDrop(t *testing.T) {
+	for _, pause := range []bool{true, false} {
+		t.Run(fmt.Sprintf("paused=%t", pause), func(t *testing.T) {
+			fs := pauseServer(t)
+			gate := make(chan struct{})
+			var once sync.Once
+			open := func() { once.Do(func() { close(gate) }) }
+			t.Cleanup(open) // before the server's close: a hello it holds back gets its answer
+			e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
+			sh := startedShare(t, e)
+			sess := sessionOf(t, e)
+			from, to := protocol.ShareStatusLive, protocol.ShareStatusPaused
+			if !pause { // the resume of a share that is paused, and that the server shows paused
+				if err := sh.SetPaused(ctxFor(t), true); err != nil {
+					t.Fatal(err)
+				}
+				waitUpdates(t, fs, "s_1 paused=true")
+				from, to = to, from
+			}
+			roomState(fs, 3, shareAs(from, protocol.PresetAuto))
+			waitServerView(t, sh, viewOf(!pause))
+			n, m := len(sess.Calls()), len(updates(fs))
+
+			// Signaling goes down, and stays down until the test lets the next hello through.
+			fs.setHello(func(_ int, h protocol.Hello) fakeAnswer {
+				<-gate
+				return fakeAnswer{resumed: h.ResumeToken != ""}
+			})
+			fs.kill()
+			eventually(t, func() bool { return sh.Snapshot().State == StateReconnecting },
+				func() string { return fmt.Sprintf("the share is %+v, want reconnecting", sh.Snapshot()) })
+			if err := sh.SetPaused(ctxFor(t), pause); err != nil {
+				t.Fatalf("SetPaused(%t) while signaling is down = %v, want nil (owed)", pause, err)
+			}
+			open()
+			e.waitOnline()
+			serverStatus(t, fs, resendEvery+time.Second, to)
+			settle()
+			if got := updateList(updates(fs)[m:]); got != fmt.Sprintf("s_1 paused=%t", pause) {
+				t.Errorf("the server got %q after the drop, want the owed update once", got)
+			}
+			if snap := sh.Snapshot(); snap.Paused != pause || snap.ID != "s_1" {
+				t.Errorf("the share is %+v, want s_1 with paused %t", snap, pause)
+			}
+			want := "paused true, audio_muted true"
+			if !pause {
+				want = "audio_muted false, paused false"
+			}
+			waitCalls(t, sess, n, want, "paused", "audio_muted") // the resume's room.state undid nothing
+		})
 	}
+}
+
+// slowUpdateLog holds each "share update" record for up to 2 ms before its handler takes it, outside the handler's
+// lock: the core logs a share.update just before it sends it, so concurrent calls get the time to overtake each
+// other between their local transition and their request.
+type slowUpdateLog struct{ slog.Handler }
+
+func (h slowUpdateLog) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "share update" {
+		time.Sleep(rand.N(2 * time.Millisecond)) //nolint:gosec // G404: test timing jitter, not security
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h slowUpdateLog) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return slowUpdateLog{h.Handler.WithAttrs(attrs)}
+}
+
+func (h slowUpdateLog) WithGroup(name string) slog.Handler {
+	return slowUpdateLog{h.Handler.WithGroup(name)}
+}
+
+// TestPauseConcurrent: SetPaused from two goroutines at once (03's hotkey and the pill) leaves the server with the
+// pause the core has: the share.update requests reach it in the order of the local transitions.
+func TestPauseConcurrent(t *testing.T) {
+	fs := pauseServer(t)
+	e := newEnv(t, fs, envOptions{tweak: func(o *Options) {
+		fastTiming(nil)(o)
+		o.Logger = slog.New(slowUpdateLog{o.Logger.Handler()})
+	}})
+	sh := startedShare(t, e)
+	ctx := ctxFor(t)
+	check := func() {
+		t.Helper()
+		paused := sh.Snapshot().Paused
+		if info, _ := fs.shareInfo("s_1"); (info.Status == protocol.ShareStatusPaused) != paused {
+			t.Errorf("the server's share is %+v while the core's is paused %t", info, paused)
+		}
+	}
+	for range 5 {
+		var wg sync.WaitGroup
+		for _, p := range []bool{true, false} {
+			wg.Go(func() {
+				for range 20 {
+					if err := sh.SetPaused(ctx, p); err != nil {
+						t.Errorf("SetPaused(%t): %v", p, err)
+						return
+					}
+				}
+			})
+		}
+		wg.Wait()
+		check()
+	}
+	settle()
+	check() // and nothing sent later changes it
 }
 
 // TestSetPreset: share.update{preset}, then the reply's ShareParams: Session.Reconfigure with the preset and Text's
@@ -470,6 +626,28 @@ func TestCodecHintKeptAcrossRebuild(t *testing.T) {
 	waitOffers(t, fs, "1/1 2/1") // nothing more: the new offer carries the change
 }
 
+// askProfile records a SetProfile of profile for every layer, as the send loop's consumer.SetProfile does before
+// Session.Reconfigure, once the engine events of the session's start have reached the actor.
+func askProfile(t *testing.T, sh *Share, profile string) {
+	t.Helper()
+	eventually(t, func() bool {
+		snap := sh.Snapshot()
+		return len(snap.Layers) > 0 && !slices.ContainsFunc(snap.Layers, func(l LayerSnapshot) bool { return l.Profile == "" })
+	}, func() string { return fmt.Sprintf("the share is %+v, want every layer's EventLayer", sh.Snapshot()) })
+	sh.ask.set(sh.pump.layers, profile, sh.pump.events.Load())
+}
+
+// emitLayer has the session report a layer's EventLayer with profile.
+func emitLayer(sess *fake.Session, rid, profile string) {
+	sess.Emit(media.Event{Code: media.EventLayer, Layer: rid, Width: 640, Height: 360, FPS: 30,
+		Encoder: fake.EncoderName, Profile: profile, LiveBitrate: true, NoOSIndicator: true})
+}
+
+// reoffersOf counts the core's re-offers with the profile the session runs.
+func reoffersOf(e *testEnv) int {
+	return strings.Count(e.logs.String(), `msg="offering the profile the session runs"`)
+}
+
 // TestCodecActualProfile: when the EventLayer after the send loop's SetProfile reports another profile than the one
 // asked for, or the session refuses the profile, the core puts the profile the session runs first again (§8.6). The
 // re-offer waits for the pending offer, as every change does.
@@ -478,9 +656,8 @@ func TestCodecActualProfile(t *testing.T) {
 	e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
 	sh := startedShare(t, e)
 	sess := sessionOf(t, e)
-	sh.ask.set("42e0") // as the send loop does before Session.Reconfigure (consumer.SetProfile)
-	sess.Emit(media.Event{Code: media.EventLayer, Layer: "f", Width: 640, Height: 360, FPS: 30,
-		Encoder: fake.EncoderName, Profile: "6400", LiveBitrate: true, NoOSIndicator: true})
+	askProfile(t, sh, "42e0")
+	emitLayer(sess, "f", "6400")
 	eventually(t, func() bool {
 		return strings.Contains(e.logs.String(), `msg="the session runs another profile than asked for" asked=42e0 profile=6400`)
 	}, func() string { return "the core never noticed that the session runs another profile than asked for" })
@@ -489,6 +666,79 @@ func TestCodecActualProfile(t *testing.T) {
 		return strings.Contains(e.logs.String(), `msg="the session did not switch profiles" asked=42e0 profile=6400`)
 	}, func() string { return "the core never noticed the refused profile" })
 	waitOffers(t, fs, "1/1")
+}
+
+// TestCodecCheckPerLayer: the switch's check is the main layer's. While f switches to the profile asked for, an
+// EventLayer of q that stays in the old one (its encoder lacks the profile, 04 §9.7) neither answers f's ask nor
+// re-offers, and the profile the session runs stays f's though q reports last.
+func TestCodecCheckPerLayer(t *testing.T) {
+	fs := newFakeServer(t)
+	e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
+	sh := startedShare(t, e)
+	sess := sessionOf(t, e)
+	askProfile(t, sh, "42e0")
+	emitLayer(sess, "q", "6400")
+	emitLayer(sess, "f", "42e0")
+	emitLayer(sess, "q", "6400")
+	eventually(t, func() bool {
+		snap := sh.Snapshot()
+		return snap.layer("f").Profile == "42e0" && snap.layer("q").Profile == "6400"
+	}, func() string { return fmt.Sprintf("the share is %+v, want f in 42e0 and q in 6400", sh.Snapshot()) })
+	settle()
+	if logs := e.logs.String(); strings.Contains(logs, "the session runs another profile than asked for") ||
+		reoffersOf(e) != 0 {
+		t.Error("q's EventLayer in the old profile had the core offer f's old profile again")
+	}
+	// A refusal now offers the profile f runs.
+	sh.post(msgProfileFailed{profile: "6400"})
+	eventually(t, func() bool {
+		return strings.Contains(e.logs.String(), `msg="the session did not switch profiles" asked=6400 profile=42e0`)
+	}, func() string { return "the profile the session runs isn't f's" })
+}
+
+// TestProfileRefusedTwice: the session refusing the same profile twice in a row has the core offer the profile it
+// runs once, so the cycle answer → refusal → re-offer doesn't repeat; a new codec hint lets a refusal offer again.
+func TestProfileRefusedTwice(t *testing.T) {
+	fs := newFakeServer(t)
+	e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
+	sh := startedShare(t, e)
+	sh.post(msgProfileFailed{profile: "42e0"})
+	sh.post(msgProfileFailed{profile: "42e0"})
+	eventually(t, func() bool { return strings.Contains(e.logs.String(), `msg="the session refused the profile again"`) },
+		func() string { return "the second refusal never reached the core" })
+	if n := reoffersOf(e); n != 1 {
+		t.Errorf("two refusals of 42e0 made %d re-offers, want 1", n)
+	}
+	fs.send(protocol.MessageTypeQualityHint, protocol.QualityHint{ShareID: "s_1", Reason: protocol.HintReasonCodec,
+		Codec: protocol.CodecH264ConstrainedBaseline})
+	eventually(t, func() bool { return strings.Contains(e.logs.String(), `msg="codec switch"`) },
+		func() string { return "the codec hint never reached the core" })
+	sh.post(msgProfileFailed{profile: "42e0"})
+	eventually(t, func() bool { return reoffersOf(e) == 2 },
+		func() string {
+			return fmt.Sprintf("%d re-offers after the codec hint's refusal, want 2", reoffersOf(e))
+		})
+}
+
+// TestProfileAskStale: an ask answers only each layer's first EventLayer that the pump read after it; one read
+// before is of an earlier re-init. A refusal forgets it.
+func TestProfileAskStale(t *testing.T) {
+	var a profileAsk
+	a.set([]string{"f", "q"}, "42e0", 5)
+	for _, c := range []struct {
+		layer string
+		seq   uint64
+		want  string
+	}{{"f", 5, ""}, {"f", 6, "42e0"}, {"f", 7, ""}, {"h", 8, ""}, {"q", 9, "42e0"}} {
+		if got := a.take(c.layer, c.seq); got != c.want {
+			t.Errorf("take(%s, %d) = %q, want %q", c.layer, c.seq, got, c.want)
+		}
+	}
+	a.set([]string{"f"}, "6400", 10)
+	a.clear()
+	if got := a.take("f", 11); got != "" {
+		t.Errorf("take after clear = %q, want nothing", got)
+	}
 }
 
 // TestPauseAfterEnd: SetPaused and SetPreset on an ended share are errors and change nothing.

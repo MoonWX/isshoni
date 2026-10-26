@@ -23,9 +23,13 @@ import (
 //     ratectl.Hint, whose actions apply in order (apply). Hints for other ids are ignored, and the same values again
 //     change nothing (a resume sends them again, M1 01 §8.10).
 //   - ratectl.Tick every 500 ms while the share is live and not paused: the ramp and the guards.
-//   - The codec switch's check (§8.6): an EventLayer after the Publisher's ProfileSource.SetProfile that reports
-//     another profile than the one asked for, or a SetProfile that failed, has the core offer again with the profile
-//     the session runs.
+//   - The codec switch's check (§8.6): an EventLayer of the share's main layer (f, or the first layer of a share
+//     without one) after the Publisher's ProfileSource.SetProfile that reports another profile than the one asked
+//     for, or a SetProfile that failed, has the core offer again with the profile the session runs. The ask is kept
+//     per layer and remembers how many engine events the pump had read, so neither another layer's EventLayer (layers
+//     may run different encoders, 04 §9.7) nor one of an earlier re-init answers it; and a profile the session
+//     refused has the core offer again at most once per refusedHold, until a new codec hint, so the cycle answer →
+//     refusal → re-offer doesn't repeat when the room's policy needs a profile the session can't switch to.
 //   - Presets (D13): SetPreset, and the reconcile of a preset another connection changed: share.update{preset}, the
 //     reply's ShareParams to ratectl.Params and Session.Reconfigure (the preset, and a layer's frame rate or size).
 //   - Pause (D14): SetPaused, and the reconcile of a pause or resume another connection made. A pause drops media at
@@ -41,8 +45,12 @@ import (
 // reply by its coalescing interval), and the signaling client hands replies and notifications over on separate
 // paths, so a room.state sent before the change can reach the share's actor after the reply. Until a room.state
 // shows what the core asked for, one that disagrees is taken for an older one (for intentWindow after the reply), and
-// a share.update that never got its reply (signaling went down, a republish made a new share) goes again rather than
-// letting the server's view undo it: a pause is a safety control.
+// a share.update{paused} that has no ok reply (signaling went down, the server refused it, a republish made a new
+// share) is owed: the share's actor sends it again (resendPause: at most every resendEvery, and at its first look
+// after a welcome) whatever room.state says, which is sent only when something changes. A pause is a safety
+// control, and a resume the server never heard of would leave the SFU swallowing new viewers' keyframe requests.
+// The share.update{paused} requests go out one at a time (pauseState.sending), each with the newest intent, so they
+// reach the server in the order of the local transitions.
 
 // The timers of this file.
 const (
@@ -55,6 +63,9 @@ const (
 	resendEvery = 2 * time.Second
 	// engineCallTimeout bounds the AudioController calls of a pause or resume.
 	engineCallTimeout = 2 * time.Second
+	// refusedHold: after the session refused a profile (Session.Reconfigure), the core offers again with the profile
+	// it runs; the same profile refused again within this long, without a codec hint between, offers nothing more.
+	refusedHold = 10 * time.Second
 )
 
 // errEnded is what SetPaused and SetPreset return once the share has ended.
@@ -84,13 +95,18 @@ type pauseState struct {
 	paused bool       // the pump drops media; the engine is paused and muted
 	server serverView // the newest room.state of the share's current id
 	// A pause or resume of the core's own that room.state has yet to show (pending): want is its value; owed says
-	// share.update{paused: want} has no ok reply yet (signaling went down, or a republish made a new share), so it
-	// goes again (at most every resendEvery, triedAt); sentAt is when the ok reply came.
+	// share.update{paused: want} has no ok reply yet (signaling went down, the server refused it, or a republish made
+	// a new share), so the actor sends it again (at most every resendEvery, triedAt); sentAt is when the ok reply
+	// came.
 	pending bool
 	want    bool
 	owed    bool
 	sentAt  time.Time
 	triedAt time.Time
+
+	// sending is the one slot of share.update{paused}: held across each request (SetPaused's, the actor's resend), so
+	// the requests reach the server one at a time, in the order of the local transitions. newShare makes it.
+	sending chan struct{}
 }
 
 // presetState is a share's preset (D13). The actor's alone.
@@ -102,26 +118,45 @@ type presetState struct {
 	wantAt time.Time
 }
 
-// profileAsk is the engine profile the Publisher's send loop last asked the session for (consumer.SetProfile), until
-// the actor sees the EventLayer of that re-init. The send loop sets it, the actor takes it.
+// profileAsk is the engine profile the Publisher's send loop last asked the session for (consumer.SetProfile), per
+// video layer, until the actor sees that layer's EventLayer of the re-init. after is how many engine events the pump
+// had read when it was asked: an EventLayer the pump read before then is of an earlier re-init (a preset, a bitrate
+// re-init, a resize), not of this one. The send loop sets it, the actor takes it.
 type profileAsk struct {
-	mu      sync.Mutex
-	profile string
+	mu    sync.Mutex
+	after uint64
+	asked map[string]string // rid → the engine profile asked for
 }
 
-func (a *profileAsk) set(p string) {
+// set records that every layer of layers was asked for profile once the pump had read after events.
+func (a *profileAsk) set(layers []string, profile string, after uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.profile = p
+	a.after = after
+	a.asked = make(map[string]string, len(layers))
+	for _, l := range layers {
+		a.asked[l] = profile
+	}
 }
 
-// take returns the profile asked for and forgets it ("" when none is).
-func (a *profileAsk) take() string {
+// take returns the profile layer was asked for and forgets it, for an EventLayer of layer that was the pump's seq-th
+// event: "" when the layer wasn't asked for, or the event is older than the ask.
+func (a *profileAsk) take(layer string, seq uint64) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	p := a.profile
-	a.profile = ""
+	if seq <= a.after {
+		return ""
+	}
+	p := a.asked[layer]
+	delete(a.asked, layer)
 	return p
+}
+
+// clear forgets every layer's ask: the session refused it.
+func (a *profileAsk) clear() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.asked = nil
 }
 
 // msgProfileFailed: the session refused the profile the send loop asked for (consumer.SetProfile).
@@ -156,19 +191,23 @@ func (s *Share) call(ctx context.Context, fn func() error) error {
 // ---- quality hints and rate control ----
 
 // onHint applies a quality.hint for the share's current id (§11.8): its codec (§8.6), then its encodings and cap
-// through ratectl.Hint. A hint for another id is ignored.
-func (s *Share) onHint(h protocol.QualityHint) {
+// through ratectl.Hint. A hint for another id is ignored. The EndInfo is set when the codec switch's offer failed and
+// the share must end.
+func (s *Share) onHint(h protocol.QualityHint) *EndInfo {
 	if h.ShareID != s.params.ShareID {
-		return
+		return nil
 	}
 	s.log.Debug("quality hint", slog.String("reason", string(h.Reason)), slog.String("codec", string(h.Codec)),
 		slog.Int64("max_bitrate", h.MaxBitrate), slog.Int("encodings", len(h.Encodings)))
 	if h.Codec != "" {
-		s.onCodecHint(h.Codec)
+		if info := s.onCodecHint(h.Codec); info != nil {
+			return info
+		}
 	}
 	now := time.Now()
 	s.apply(s.ctl.Hint(h, now))
 	s.syncRates(now)
+	return nil
 }
 
 // rateTick is ratectl's Tick (every TickEvery) while the share is live and not paused (§11.8). The upload hint is
@@ -263,78 +302,114 @@ func (s *Share) sentProfile() string {
 	return s.running
 }
 
+// mainLayer is the layer whose EventLayer says which profile the session runs: f, or the first layer of a share
+// without one. Layers may run different encoders (04 §9.7); the Publisher's one profile is f's.
+func (s *Share) mainLayer() string {
+	for _, e := range s.params.Encodings {
+		if e.RID == protocol.RIDHigh {
+			return e.RID
+		}
+	}
+	if len(s.params.Encodings) > 0 {
+		return s.params.Encodings[0].RID
+	}
+	return protocol.RIDHigh
+}
+
 // onCodecHint runs M1's path for quality.hint{codec} (§8.6): the Publisher puts the profile first and offers again
 // (same gen, neg + 1); its answer has the send loop switch the engine. A hint naming the profile already sent needs
 // nothing. Without a Publisher (before the first EventLayer, during a rebuild or a republish) the next one offers it
-// first.
-func (s *Share) onCodecHint(codec protocol.CodecKey) {
+// first. The EndInfo is set when the offer failed and the share must end.
+func (s *Share) onCodecHint(codec protocol.CodecKey) *EndInfo {
 	key := codec.H264Profile()
 	if key == "" || key == s.sentProfile() {
-		return
+		return nil
 	}
 	pub := s.publisher()
 	if pub != nil {
 		if err := pub.SetProfile(key); err != nil {
 			s.log.Warn("codec hint not applied", slog.String("codec", string(codec)), logx.Err(err))
-			return
+			return nil
 		}
 	}
 	s.log.Info("codec switch", slog.String("share_id", s.params.ShareID), slog.String("profile", key))
 	s.sendProfile = key
-	if pub != nil {
-		s.reoffer()
+	s.refusedProfile = "" // a new switch: a profile the session refused before may be asked for again
+	if pub == nil {
+		return nil
 	}
+	return s.reoffer()
 }
 
-// onLayerProfile follows the profile the session runs, from each EventLayer, and checks the switch the send loop
-// asked for (consumer.SetProfile): when the re-init's EventLayer reports another profile than the one asked for
-// (a CB-only encoder asked for High stays CB, 04 §9.6), the core offers again with the profile the session runs.
-func (s *Share) onLayerProfile(ev media.Event) {
-	if ev.Profile != "" {
+// onLayerProfile follows the profile the session runs, from the main layer's EventLayers (any layer's until the main
+// one has reported), and checks the switch the send loop asked for (consumer.SetProfile): when the main layer's
+// EventLayer of that re-init (seq is its place among the engine events the pump read) reports another profile than
+// the one asked for (a CB-only encoder asked for High stays CB, 04 §9.6), the core offers again with the profile the
+// session runs. Another layer that stays in its profile only logs: the Publisher sends f's. The EndInfo is set when
+// the offer failed and the share must end.
+func (s *Share) onLayerProfile(ev media.Event, seq uint64) *EndInfo {
+	main := ev.Layer == s.mainLayer()
+	if ev.Profile != "" && (main || s.running == "") {
 		s.running = ev.Profile
 	}
-	asked := s.ask.take()
+	asked := s.ask.take(ev.Layer, seq)
 	if asked == "" || ev.Profile == "" || publish.EngineProfile(asked) == ev.Profile {
-		return
+		return nil
+	}
+	if !main {
+		s.log.Debug("a layer runs another profile than asked for", slog.String("layer", ev.Layer),
+			slog.String("asked", asked), slog.String("profile", ev.Profile))
+		return nil
 	}
 	s.log.Info("the session runs another profile than asked for", slog.String("asked", asked),
 		slog.String("profile", ev.Profile))
-	s.offerActual(ev.Profile)
+	return s.offerActual(ev.Profile)
 }
 
 // onProfileFailed: Session.Reconfigure refused the profile the send loop asked for, so the session goes on in the
-// one it runs, and the core offers again with that one (§8.6).
-func (s *Share) onProfileFailed(m msgProfileFailed) {
-	s.ask.take()
+// one it runs, and the core offers again with that one (§8.6). The same profile refused again within refusedHold,
+// without a codec hint between, offers nothing more: the room's policy may need a profile that the session's encoder
+// lacks while another encoder lists it, and each answer would ask for it again. The EndInfo is set when the offer
+// failed and the share must end.
+func (s *Share) onProfileFailed(m msgProfileFailed) *EndInfo {
+	s.ask.clear()
+	now := time.Now()
+	if m.profile == s.refusedProfile && now.Sub(s.refusedProfileAt) < refusedHold {
+		s.log.Info("the session refused the profile again", slog.String("asked", m.profile),
+			slog.String("profile", s.running))
+		return nil
+	}
+	s.refusedProfile, s.refusedProfileAt = m.profile, now
 	s.log.Info("the session did not switch profiles", slog.String("asked", m.profile),
 		slog.String("profile", s.running))
-	if s.running != "" {
-		s.offerActual(s.running)
+	if s.running == "" {
+		return nil
 	}
+	return s.offerActual(s.running)
 }
 
-// offerActual puts the profile the session runs first and offers again.
-func (s *Share) offerActual(profile string) {
+// offerActual puts the profile the session runs first and offers again. The EndInfo is set when the offer failed and
+// the share must end.
+func (s *Share) offerActual(profile string) *EndInfo {
 	s.sendProfile = profile
 	pub := s.publisher()
 	if pub == nil {
-		return
+		return nil
 	}
 	if err := pub.SetProfile(profile); err != nil {
 		s.log.Warn("publisher profile", slog.String("profile", profile), logx.Err(err))
-		return
+		return nil
 	}
-	s.reoffer()
+	s.log.Info("offering the profile the session runs", slog.String("profile", profile))
+	return s.reoffer()
 }
 
 // reoffer asks for an offer on the current PC (same gen, neg + 1): now, or once the outstanding offer has its answer
 // and signaling is ready (01 §9 rule 3: changes fold into one follow-up). Any offer carries the change, an ICE
-// restart's included.
-func (s *Share) reoffer() {
+// restart's included. The EndInfo is set when the offer failed and the share must end, as for every other offer.
+func (s *Share) reoffer() *EndInfo {
 	s.drv.reoffer = true
-	if info := s.maybeReoffer(); info != nil {
-		s.log.Warn("pub re-offer failed", slog.String("protocol", string(info.Protocol)))
-	}
+	return s.maybeReoffer()
 }
 
 // maybeReoffer makes the owed re-offer when it can go now; the EndInfo is set when the offer failed and the share
@@ -488,9 +563,13 @@ func (s *Share) reconcilePreset(p protocol.Preset) {
 // share.pause feature only the local part happens (viewers see a frozen frame without the "Paused" label). "Share
 // sound" off is 05's Service.SetShareSound(false).
 //
-// The local part always happens. A share.update that signaling's drop cut short goes again once the server's
-// room.state shows otherwise, and SetPaused then returns nil; it returns the server's refusal (the local part stays)
-// and ctx's error. It returns an error, and changes nothing, once the share has ended.
+// The local part always happens. A share.update that has no ok reply (signaling's drop cut it short, the server
+// refused it, ctx ended first) is owed: the share's actor sends it again, at most every resendEvery and at its first
+// look after signaling is back, until the server answers it ok or its room.state shows the pause. SetPaused returns
+// nil when signaling's drop cut the update short; it returns the server's refusal (the local part stays) and ctx's
+// error. It returns an error, and changes nothing, once the share has ended. Calls from several goroutines (03's
+// hotkey and the pill) reach the server in the order of their local transitions: one share.update{paused} is on its
+// way at a time, and a call whose transition a later one undid sends nothing (the later one sends its own).
 func (s *Share) SetPaused(ctx context.Context, paused bool) error {
 	select {
 	case <-s.done:
@@ -509,10 +588,14 @@ func (s *Share) SetPaused(ctx context.Context, paused bool) error {
 	if !send {
 		return nil
 	}
-	err := s.sendPaused(ctx, s.snapID(), paused)
+	err := s.lockSend(ctx)
+	if err == nil {
+		err = s.sendPausedLocked(ctx, paused)
+		s.unlockSend()
+	}
 	switch {
 	case err == nil, lostSignaling(err) && ctx.Err() == nil:
-		return nil // owed: it goes again once room.state shows otherwise
+		return nil // owed: the share's actor sends it again once signaling is back
 	case ctx.Err() != nil:
 		return ctx.Err()
 	}
@@ -520,9 +603,46 @@ func (s *Share) SetPaused(ctx context.Context, paused bool) error {
 	return fmt.Errorf("core: Share.SetPaused: %w", err)
 }
 
-// sendPaused sends share.update{paused} for share id, bounded by ctx and updateTimeout, and records an ok reply for
-// the pause the core wants the server to show.
-func (s *Share) sendPaused(ctx context.Context, id string, paused bool) error {
+// lockSend takes the one slot of share.update{paused} (pauseState.sending), waiting for the update on its way, or
+// returns ctx's error.
+func (s *Share) lockSend(ctx context.Context) error {
+	select {
+	case s.pz.sending <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// tryLockSend takes the slot if it is free.
+func (s *Share) tryLockSend() bool {
+	select {
+	case s.pz.sending <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// unlockSend gives the slot back.
+func (s *Share) unlockSend() { <-s.pz.sending }
+
+// sendPausedLocked is SetPaused's share.update{paused} once it holds the slot. A call whose transition a later call
+// undid meanwhile sends nothing: the later one sends its own, after it.
+func (s *Share) sendPausedLocked(ctx context.Context, paused bool) error {
+	s.pz.mu.Lock()
+	current := s.pz.paused == paused
+	s.pz.mu.Unlock()
+	if !current {
+		return nil
+	}
+	return s.putPaused(ctx, s.snapID(), paused)
+}
+
+// putPaused sends share.update{paused} for share id, bounded by ctx and updateTimeout, and records an ok reply for
+// the pause the core wants the server to show (for the share's current id: an older id's reply says nothing of the
+// new share). The caller holds the slot (lockSend).
+func (s *Share) putPaused(ctx context.Context, id string, paused bool) error {
 	rctx, cancel := context.WithTimeout(ctx, updateTimeout)
 	defer cancel()
 	u := protocol.ShareUpdate{ShareID: id, Paused: &paused}
@@ -531,12 +651,45 @@ func (s *Share) sendPaused(ctx context.Context, id string, paused bool) error {
 	err := s.c.request(rctx, protocol.MessageTypeShareUpdate, u, &params)
 	if err == nil {
 		s.pz.mu.Lock()
-		if s.pz.pending && s.pz.want == paused && s.pz.owed {
+		if s.pz.pending && s.pz.want == paused && s.pz.owed && id == s.snapID() {
 			s.pz.owed, s.pz.sentAt = false, time.Now()
 		}
 		s.pz.mu.Unlock()
 	}
 	return err
+}
+
+// resendPause sends an owed share.update{paused} again (the actor's regular look, tick): at most every resendEvery,
+// whatever room.state says, while signaling is ready and no republish is due (that one owes the update for the new
+// id). When another update is on its way (SetPaused holds the slot), the next look sees what that one left owed: the
+// actor never waits for the slot.
+func (s *Share) resendPause(now time.Time) {
+	if !s.rec.online || s.rec.republish || s.ctx.Err() != nil || !s.tryLockSend() {
+		return
+	}
+	defer s.unlockSend()
+	s.pz.mu.Lock()
+	due := s.pz.pending && s.pz.owed && now.Sub(s.pz.triedAt) >= resendEvery
+	want := s.pz.want
+	if due {
+		s.pz.triedAt = now
+	}
+	s.pz.mu.Unlock()
+	if !due {
+		return
+	}
+	if err := s.putPaused(s.ctx, s.params.ShareID, want); err != nil {
+		s.log.Info("share update for the pause, again", logx.Err(err))
+	}
+}
+
+// pauseOwedNow has an owed share.update{paused} go at the actor's next look: signaling is back.
+func (s *Share) pauseOwedNow() {
+	s.pz.mu.Lock()
+	defer s.pz.mu.Unlock()
+	if s.pz.owed {
+		s.pz.triedAt = time.Time{}
+	}
 }
 
 // pauseLocked runs the local part of a pause or a resume (D14) when the share isn't in that state yet; remote says
@@ -596,9 +749,9 @@ func (s *Share) snapID() string {
 // reconcilePause follows the status of the share's own ShareInfo (§11.7, D14): paused while the share isn't pauses it
 // locally, live while it is paused resumes it, the same way as SetPaused but without another share.update. A pause
 // or resume of the core's own that room.state has yet to show keeps it from that: within intentWindow of the ok reply
-// the room.state is an older one; a share.update that has no ok reply goes again (at most every resendEvery). Other
-// statuses (starting, stalled) say nothing of the pause. Without the server's share.pause feature the server never
-// shows a pause, and the share's pause is the app's alone.
+// the room.state is an older one; a share.update that has no ok reply is owed, and the actor sends it again
+// (resendPause). Other statuses (starting, stalled) say nothing of the pause. Without the server's share.pause
+// feature the server never shows a pause, and the share's pause is the app's alone.
 func (s *Share) reconcilePause(status protocol.ShareStatus) {
 	var view serverView
 	switch status {
@@ -621,17 +774,8 @@ func (s *Share) reconcilePause(status protocol.ShareStatus) {
 			s.pz.mu.Unlock()
 			return
 		case s.pz.owed:
-			want, due := s.pz.want, time.Since(s.pz.triedAt) >= resendEvery
-			if due {
-				s.pz.triedAt = time.Now()
-			}
 			s.pz.mu.Unlock()
-			if due && s.rec.online {
-				if err := s.sendPaused(s.ctx, s.params.ShareID, want); err != nil {
-					s.log.Info("share update for the pause, again", logx.Err(err))
-				}
-			}
-			return
+			return // the server hasn't heard of it yet: the actor sends it again (resendPause)
 		case time.Since(s.pz.sentAt) < intentWindow:
 			s.pz.mu.Unlock()
 			return // a room.state from before the update
@@ -653,8 +797,10 @@ func (s *Share) reconcileHints(info protocol.ShareInfo) {
 
 // republished takes a republish's ShareParams (§11.7, README WA38's hand-over): the new share's encodings go to the
 // rate controller (its layers are all active until the server says otherwise), the room's codec policy goes first in
-// the new Publisher's offers, the server's views of the old id are forgotten, and a paused share sends
-// share.update{paused: true} again: the server's new share doesn't have it. The preset went in share.start.
+// the new Publisher's offers, the server's views of the old id are forgotten, and a paused share owes
+// share.update{paused: true} for the new id, which goes now (or, while a SetPaused's update is on its way, at the
+// actor's next look): the server's new share doesn't have it. The preset went in share.start. s.params is the new
+// share's.
 func (s *Share) republished(params protocol.ShareParams) {
 	now := time.Now()
 	s.apply(s.ctl.Params(params, now))
@@ -666,16 +812,11 @@ func (s *Share) republished(params protocol.ShareParams) {
 	feature := s.c.hasFeature(protocol.FeatureSharePause)
 	s.pz.mu.Lock()
 	s.pz.server = viewUnknown
-	send := s.pz.paused && feature
-	if send {
-		s.pz.pending, s.pz.want, s.pz.owed, s.pz.triedAt = true, true, true, now
+	if s.pz.paused && feature {
+		s.pz.pending, s.pz.want, s.pz.owed, s.pz.triedAt = true, true, true, time.Time{}
 	} else {
 		s.pz.pending = false
 	}
 	s.pz.mu.Unlock()
-	if send {
-		if err := s.sendPaused(s.ctx, params.ShareID, true); err != nil {
-			s.log.Info("share update for the pause after the republish", logx.Err(err))
-		}
-	}
+	s.resendPause(now)
 }

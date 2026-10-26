@@ -162,11 +162,14 @@ type Share struct {
 	inState bool // the share (its current id) was in a room.state
 	live    bool // the share has been live (§11.4 step 5); it stays so across a republish
 	rec     recovery
-	// hints.go: the profile the session runs (its newest EventLayer's), the one the Publisher puts first ("" = the
-	// one the session runs: a codec hint's, or the server's policy after a republish), and the preset.
-	running     string
-	sendProfile string
-	ps          presetState
+	// hints.go: the profile the session runs (its main layer's newest EventLayer's), the one the Publisher puts first
+	// ("" = the one the session runs: a codec hint's, or the server's policy after a republish), the profile the
+	// session last refused and when (onProfileFailed), and the preset.
+	running          string
+	sendProfile      string
+	refusedProfile   string
+	refusedProfileAt time.Time
+	ps               presetState
 
 	// hints.go, safe for concurrent use: the pause (its own mutex), and the profile the Publisher's send loop asked
 	// the session for.
@@ -248,6 +251,7 @@ func newShare(c *Client, r ShareRequest, abort context.CancelFunc) *Share {
 		c: c, req: r, log: c.log, abort: abort,
 		ends: make(chan endRequest), done: make(chan struct{}), run: make(chan struct{}),
 		seen: map[string]bool{}, limits: map[string]string{}, ps: presetState{applied: r.Preset},
+		pz: pauseState{sending: make(chan struct{}, 1)},
 		snap: ShareSnapshot{RoomID: r.RoomID, Kind: shareKind(r.Source.Kind), Preset: r.Preset, State: StateJoining,
 			Audio: r.Audio},
 	}
@@ -645,7 +649,7 @@ func (s *Share) actor() {
 				s.finish(endRequest{info: engineEnd(m.err), stop: true, leave: true})
 				return
 			}
-			if info := s.onEngineEvent(*m.ev); info != nil {
+			if info := s.onEngineEvent(*m.ev, m.seq); info != nil {
 				s.finish(endRequest{info: *info, stop: true, leave: true})
 				return
 			}
@@ -695,11 +699,15 @@ func (s *Share) onMessage(m any) *endRequest {
 	case msgCall:
 		m.done <- m.fn()
 	case msgProfileFailed:
-		s.onProfileFailed(m)
+		if info := s.onProfileFailed(m); info != nil {
+			return &endRequest{info: *info, stop: true, leave: true}
+		}
 	case msgError:
 		return s.onError(m.e)
 	case msgHint:
-		s.onHint(m.h)
+		if info := s.onHint(m.h); info != nil {
+			return &endRequest{info: *info, stop: true, leave: true}
+		}
 	case msgRestart:
 		if info := s.onRestart(m.r); info != nil {
 			return &endRequest{info: *info, stop: true, leave: true}
@@ -790,9 +798,9 @@ func (s *Share) onError(e protocol.Error) *endRequest {
 	return nil
 }
 
-// onEngineEvent applies an engine event (§11.5). The first EventLayer sets the profile the Publisher sends in and
-// starts the pub PC.
-func (s *Share) onEngineEvent(ev media.Event) *EndInfo {
+// onEngineEvent applies an engine event (§11.5), the pump's seq-th. The first EventLayer sets the profile the
+// Publisher sends in and starts the pub PC.
+func (s *Share) onEngineEvent(ev media.Event, seq uint64) *EndInfo {
 	now := time.Now()
 	switch ev.Code {
 	case media.EventLayer:
@@ -814,7 +822,9 @@ func (s *Share) onEngineEvent(ev media.Event) *EndInfo {
 			}
 		})
 		// The profile the session runs (the first EventLayer's is the Publisher's), and the codec switch's check.
-		s.onLayerProfile(ev)
+		if info := s.onLayerProfile(ev, seq); info != nil {
+			return info
+		}
 		if first && !s.rec.republish { // a republish that is due starts the Publisher itself
 			if err := s.startPublisher(); err != nil {
 				if s.ctx.Err() != nil {
