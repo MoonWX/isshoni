@@ -268,6 +268,7 @@ func (s *Share) republish() *endRequest {
 	s.inState = false
 	s.update(func(snap *ShareSnapshot) { snap.ID = params.ShareID })
 	s.log.Info("share published again", slog.String("share_id", params.ShareID), slog.String("replaces", old))
+	s.republished(params) // the new params to the rate controller, and the pause again (hints.go)
 	if len(s.seen) == 0 {
 		return nil
 	}

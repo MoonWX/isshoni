@@ -231,12 +231,16 @@ func (p *pump) activeLocked() []string {
 }
 
 // setActive records whether a video layer is active (01 §11.8's OpActive): only active layers get the keyframe
-// requests of an attach or a resume.
+// requests of an attach or a resume. A layer turned on again is forwarded from its first keyframe (the engine starts
+// it with one).
 func (p *pump) setActive(layer string, active bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.active[layer]; ok {
+	if was, ok := p.active[layer]; ok {
 		p.active[layer] = active
+		if active && !was {
+			p.needKey[layer] = true
+		}
 	}
 }
 
@@ -339,6 +343,10 @@ type consumer struct {
 	p        *pump
 	once     sync.Once
 	detached bool // guarded by p.mu
+	// ask gets the profile of every SetProfile before the session re-initializes, and failed hears of a SetProfile the
+	// session refused: the share's check of the codec switch (hints.go). Either may be nil.
+	ask    *profileAsk
+	failed func(profile string)
 }
 
 var (
@@ -380,7 +388,15 @@ func (k *consumer) RequestKeyframe(layer string) { k.p.requestKey(layer) }
 // Now implements publish.Clock: the engine's clock (D6).
 func (k *consumer) Now() int64 { return k.p.sess.Now() }
 
-// SetProfile implements publish.ProfileSource: the engine re-initializes its encoders in profile (§8.6).
+// SetProfile implements publish.ProfileSource: the engine re-initializes its encoders in profile (§8.6). The share
+// hears of the profile asked for before the call, so the EventLayer of the re-init finds it, and of a refusal.
 func (k *consumer) SetProfile(profile string) error {
-	return k.p.sess.Reconfigure(media.Reconfig{Profile: profile})
+	if k.ask != nil {
+		k.ask.set(profile)
+	}
+	err := k.p.sess.Reconfigure(media.Reconfig{Profile: profile})
+	if err != nil && k.failed != nil {
+		k.failed(profile)
+	}
+	return err
 }
