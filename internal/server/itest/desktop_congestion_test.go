@@ -35,7 +35,8 @@ import (
 //     upload hint clears.
 //   - D10: D9's script with an encoder that re-initializes for every new bitrate (fake's probe without LiveBitrate):
 //     every change is 30 % or more and 10 s or more after the last one, and each starts with the new encoder's
-//     keyframe.
+//     keyframe: the engine hands the core that Reinit keyframe for each of the core's calls (engineTap), and the
+//     viewers that watch the layer get it.
 //   - D19: a queueing link of 6 Mbit/s with a 1 s buffer (sfutest.NewQueueLink), like a home router's, is there from
 //     the start: the ramp crosses its capacity, and the queueing delay backs the estimate off before the buffer
 //     overflows, so the queue drains within 6 s and no datagram is ever lost at it.
@@ -85,27 +86,23 @@ const (
 	// rampWithin bounds the wait for the ramp to reach ceilingF from live: RampDelay and four RampEvery (01 §9.3),
 	// or the one step OneStepDelay after live (re-init), with every step on a Tick and the waits the guards add.
 	rampWithin = ratectl.RampDelay + 4*ratectl.RampEvery + 5*time.Second
-	// reinitKeyBefore and reinitKeyAfter: each change of a re-init encoder's layer is followed by a keyframe of it
-	// captured from reinitKeyBefore before the change to reinitKeyAfter after it (D10). The new encoder's first frame
-	// is the old one's next capture instant (fake's swap): the next frame's, or one up to the 200 ms the pump may
-	// lag behind the engine's clock before its lag cap skips.
-	reinitKeyBefore = 250 * time.Millisecond
-	reinitKeyAfter  = 100 * time.Millisecond
-	// reinitSeenWithin: a change can be seen at a viewer when one got frames of the layer captured within this of it.
-	// While the uplink is congested the SFU may forward another layer to every viewer of the full one (its layers
-	// switch on keyframes, 02 §9), and a change then is seen at none.
-	reinitSeenWithin = time.Second
-	// A keyframe near a change is the new encoder's only when nothing else made it (sightOf): not the GOP, which
-	// makes a keyframe a whole GOP (gopFull, gopOther) after the layer's last one (fake.Session's GOPs, 04 §9.4's;
-	// a GOP is a whole number of frames, so within half a frame of it: gopSlack is half a frame at 5 fps), and not a
-	// keyframe request of the layer (a PLI or the SFU's layer switch: fake's "keyframe" call), whose keyframe is
-	// captured from keyRequestBefore before the request (the pump's lag) to keyRequestAfter after it (the 250 ms
-	// spacing of forced keyframes, 04 §6.4, and two frames).
-	gopFull          = 4 * time.Second
-	gopOther         = 2 * time.Second
-	gopSlack         = 100 * time.Millisecond
-	keyRequestBefore = 250 * time.Millisecond
-	keyRequestAfter  = 500 * time.Millisecond
+	// reinitWithin: the engine hands the core the new encoder's Reinit keyframe within this of the bitrate call that
+	// re-initialized the layer (D10, at the source: engineTap). The fake swaps encoders on the pump's next Next, and
+	// the new encoder's first frame is the old one's next capture instant: a frame interval after the call, or the
+	// pump's lag (at most the 200 ms of the lag cap) and a goroutine that -race keeps waiting.
+	reinitWithin = time.Second
+	// reinitWatched: a viewer watched a layer across a change when it got frames of the layer captured within this
+	// before and after the new encoder's keyframe (sightOf). While the uplink is congested the SFU's downlink
+	// allocator may forward another layer to a viewer of the full one (02 §10.2; layers switch on keyframes, 02 §9),
+	// and a change of the full layer is then watched by no viewer.
+	reinitWatched = time.Second
+	// keyPassWithin: a keyframe that the engine handed the core at t has reached the uplink's policer by t +
+	// keyPassWithin (the pump's queue, the Publisher and the uplink's pipe, with the waits of -race). A keyframe that
+	// a viewer watching its layer missed counts as lost at the policer when the policer lost RTP datagrams from t to
+	// then (lostBetween; its samples widen that by up to linkSampleEvery on either side). What the policer loses is
+	// repaired with retransmissions, which it may lose too while the share sends more than it lets through: a viewer
+	// can then miss a keyframe for good (the SFU asks for another one, 02 §9.7).
+	keyPassWithin = time.Second
 	// callSlack is how much closer together than ReinitMinInterval two engine calls (fake.Call.At) of a layer may
 	// be: D10 asserts ReinitMinInterval − callSlack between them, 9 s, not the 10 s of its acceptance. ratectl keeps
 	// its guards on the instants its Ticks carry, and the share's actor (internal/client/core's share.go) passes it
@@ -122,8 +119,8 @@ const (
 const (
 	queueCapacity = 6_000_000
 	queueLimit    = time.Second
-	// queueSampleEvery: Queued() is sampled this often (D19).
-	queueSampleEvery = 100 * time.Millisecond
+	// linkSampleEvery: a Link's Queued() (D19) and its losses (D10) are sampled this often.
+	linkSampleEvery = 100 * time.Millisecond
 	// queueDrained and queueDrainWithin: the queue is below queueDrained queueDrainWithin after the ramp crossed the
 	// capacity (D19).
 	queueDrained     = 150 * time.Millisecond
@@ -196,11 +193,17 @@ func TestDesktopUplinkCongestion(t *testing.T) {
 // TestDesktopReinitCongestion is D10: D9's script with an encoder that has no live bitrate. The full layer ramps in
 // one step and comes down when the hints say so, but no layer's target changes less than 10 s after its last change
 // or by less than 30 %, and each change is applied as a re-init: the core's rate action says so (ratectl's
-// Action.Reinit), the fake re-initializes the layer for the engine call (its EventLayer, then a Reinit keyframe), and
-// a viewer of the layer gets that keyframe, captured at the change (reinitKeyBefore, reinitKeyAfter) and made by
-// nothing else (sightOf). The intervals are measured on the engine's calls, which ratectl's guards don't bound to
-// the 10 s (callSlack). A change while the SFU forwards another layer is seen at no viewer; the full layer's ramp step
-// and its way back once the limit lifts are, and so is the preview's, which carol watches.
+// Action.Reinit), and for the engine call the engine hands the core the layer's EventLayer and then the new
+// encoder's Reinit keyframe, within reinitWithin and once per change (engineTap: the source, before anything on the
+// way could lose it). The intervals are measured on the engine's calls, which ratectl's guards don't bound to the
+// 10 s (callSlack).
+//
+// What the viewers get of those keyframes is the end-to-end evidence (sightOf, by the keyframe's capture time, so
+// that nothing else's keyframe can stand in for it): a viewer that watched the layer across a change got its Reinit
+// keyframe, unless the policer lost datagrams while the keyframe passed it (keyPassWithin: it can be lost there for
+// good). A change while the SFU forwards another layer is watched by no viewer (its downlink allocator caps the full
+// layer when the uplink's loss reaches the viewer, 02 §10.2); the full layer's ramp step and its way back once the
+// limit lifts are watched, and so are the preview's changes, which carol watches.
 func TestDesktopReinitCongestion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("D10 runs for about two minutes")
@@ -219,10 +222,12 @@ func TestDesktopReinitCongestion(t *testing.T) {
 
 	changes := map[string][]fake.Call{}
 	requests := map[string][]time.Time{} // each layer's keyframe requests: PLIs and the SFU's layer switches
+	var last time.Time
 	for _, c := range run.sess.Calls() {
 		switch {
 		case c.Op == "bitrate" && c.Layer != media.LayerAudio:
 			changes[c.Layer] = append(changes[c.Layer], c)
+			last = c.At
 		case c.Op == "keyframe":
 			requests[c.Layer] = append(requests[c.Layer], c.At)
 		}
@@ -231,19 +236,26 @@ func TestDesktopReinitCongestion(t *testing.T) {
 		t.Errorf("the full layer's target changed %d times, want the ramp's step and a backoff at least",
 			len(changes["f"]))
 	}
+	// The last change's keyframe reaches the core within reinitWithin, and the viewers get frames after it.
+	time.Sleep(time.Until(last.Add(reinitWithin + max(reinitWatched, keyPassWithin))))
+	losses := tr.losses.stop()
 	initial := map[string]int{}
 	for _, l := range run.snap.Layers {
 		initial[l.RID] = l.TargetBps
 	}
 	logs := run.app.logs.String()
-	viewers := []*sfutest.Viewer{run.viewer, preview}
-	seen, unsure := map[string]int{}, map[string]int{}
+	frames := viewerFrames([]*sfutest.Viewer{run.viewer, preview}, run.snap.ID)
+	seen, missed := map[string]int{}, map[string]int{} // the keyframes the viewers got, and those lost at the policer
 	for rid, calls := range changes {
 		prev, prevAt := initial[rid], time.Time{}
 		for i, c := range calls {
 			step := 100 * float64(c.Bps-prev) / float64(prev)
-			t.Logf("%s: %d → %d bit/s (%+.1f %%) at %v", rid, prev, c.Bps, step,
-				c.At.Sub(run.liveAt).Round(time.Millisecond))
+			note := ""
+			if !c.At.Before(tr.limitedAt) && c.At.Before(tr.liftedAt) {
+				note = ", while the policer limited the uplink"
+			}
+			t.Logf("%s: %d → %d bit/s (%+.1f %%) at %v%s", rid, prev, c.Bps, step,
+				c.At.Sub(run.liveAt).Round(time.Millisecond), note)
 			if step > -ratectl.ReinitMinChange && step < ratectl.ReinitMinChange {
 				t.Errorf("%s's target changed by %.1f %% (%d → %d bit/s), want at least %d %%", rid, step, prev, c.Bps,
 					ratectl.ReinitMinChange)
@@ -252,37 +264,55 @@ func TestDesktopReinitCongestion(t *testing.T) {
 				t.Errorf("%s's target changed %v after its last change, want at least %v (ReinitMinInterval less "+
 					"callSlack)", rid, c.At.Sub(prevAt).Round(time.Millisecond), ratectl.ReinitMinInterval-callSlack)
 			}
+			prev, prevAt = c.Bps, c.At
 			action := fmt.Sprintf(`msg="rate action" op=bitrate layer=%s bps=%d active=false reinit=true`, rid, c.Bps)
 			if !strings.Contains(logs, action) {
 				t.Errorf("the core's log has no re-init action for %s's %d bit/s", rid, c.Bps)
 			}
-			switch sight := sightOf(viewers, run.snap.ID, run.origins.at, rid, c.At, requests[rid]); sight {
-			case sightNone:
-				t.Logf("  no viewer got %s within %v of this change: its keyframe can't be seen", rid, reinitSeenWithin)
-			case sightNoKey:
-				t.Errorf("the viewers got no keyframe of %s captured from %v before to %v after its change to %d bit/s",
-					rid, reinitKeyBefore, reinitKeyAfter, c.Bps)
-			case sightUnsure:
-				t.Logf("  the viewers' keyframes of %s at this change may be the GOP's or a keyframe request's", rid)
-				unsure[rid]++
+
+			// ---- at the source: the engine's Reinit keyframe for the call, as the core got it ----
+			var until time.Time
+			if i+1 < len(calls) {
+				until = calls[i+1].At
+			}
+			key, err := run.tap.reinitFor(rid, c.At, until)
+			if err != nil {
+				t.Errorf("%s's change to %d bit/s: %v", rid, c.Bps, err)
+				continue
+			}
+			t.Logf("  the engine handed the core the new encoder's keyframe %v after the call, captured %v after it",
+				key.at.Sub(c.At).Round(time.Millisecond), key.captured().Sub(c.At).Round(time.Millisecond))
+
+			// ---- at the viewers ----
+			switch sightOf(frames[rid], key.captureNS) {
 			case sightReinit:
 				seen[rid]++
+			case sightNone:
+				t.Logf("  no viewer watched %s across this change (the SFU forwarded another layer): its keyframe "+
+					"can't be seen", rid)
+			case sightMissed:
+				near := nearKeyframe(frames[rid], key, requests[rid])
+				if lost := lostBetween(losses, key.at, key.at.Add(keyPassWithin)); lost > 0 {
+					t.Logf("  the viewers watched %s across this change but got its keyframe nowhere: lost at the "+
+						"policer, which lost %d RTP datagrams while it passed (%s)", rid, lost, near)
+					missed[rid]++
+				} else {
+					t.Errorf("the viewers watched %s across its change to %d bit/s but got the new encoder's keyframe "+
+						"nowhere, and the policer lost nothing while it passed (%s)", rid, c.Bps, near)
+				}
 			}
-			prev, prevAt = c.Bps, c.At
 		}
 	}
+	// End to end: the full layer's changes before the limit and after the lift are watched by bob, and carol watches
+	// every change of the preview.
 	if seen["f"] < 2 {
-		t.Errorf("the viewers saw the new encoder's keyframe at %d of the full layer's %d changes, want 2 at least",
+		t.Errorf("the viewers got the new encoder's keyframe at %d of the full layer's %d changes, want 2 at least",
 			seen["f"], len(changes["f"]))
 	}
-	// The preview's keyframes are often the GOP's or a keyframe request's as well (carol joins q, the 4 s GOP): a
-	// change whose keyframe can't be told apart from those doesn't count against it (a missing keyframe already
-	// failed above, sightNoKey); one that came and is certainly the new encoder's is wanted only when none was unsure.
-	if len(changes["q"]) > 0 && seen["q"] == 0 && unsure["q"] == 0 {
-		t.Errorf("the viewers saw the new encoder's keyframe at none of the preview's %d changes, want 1 at least",
-			len(changes["q"]))
+	if len(changes["q"]) > 0 && seen["q"]+missed["q"] == 0 {
+		t.Errorf("the viewers watched none of the preview's %d changes, want carol to watch them", len(changes["q"]))
 	}
-	skips, skipped := run.origins.skips()
+	skips, skipped := run.tap.skips()
 	t.Logf("D10: the first congestion hint %s after the limit; the full layer settled %s after it; the viewer lost "+
 		"%.2f %% for good after that; the engine's clock skipped %d times, %v in all",
 		sinceOrNever(tr.limitedAt, tr.hint.at), sinceOrNever(tr.limitedAt, tr.settled), tr.finalLossPct, skips, skipped)
@@ -302,7 +332,7 @@ func TestDesktopBufferbloat(t *testing.T) {
 	noLeaks(t)
 	link := sfutest.NewQueueLink(queueCapacity, queueLimit)
 	run := startCongestion(t, congestionEngine(93, false), link)
-	samples := run.sampleQueue(link)
+	samples := run.sampleLink(link)
 
 	// ---- the crossing ----
 	var crossing fake.Call
@@ -387,8 +417,8 @@ type congestionRun struct {
 	sess   *fake.Session
 	video  *sfutest.Recorder
 	liveAt time.Time
-	// origins follows the session's Origin from live on.
-	origins *originTrace
+	// tap is what the engine handed the core.
+	tap *engineTap
 }
 
 // startCongestion starts a server, alice's app on engine behind an uplink with link on it (nil: none yet), and bob
@@ -396,7 +426,7 @@ type congestionRun struct {
 func startCongestion(t *testing.T, engine fake.EngineConfig, link *sfutest.Link) *congestionRun {
 	t.Helper()
 	w := newWorld(t, servertest.Options{})
-	r := &congestionRun{t: t, w: w, up: newUplink(t)}
+	r := &congestionRun{t: t, w: w, up: newUplink(t), tap: &engineTap{}}
 	if link != nil {
 		r.up.SetLink(link)
 	}
@@ -406,14 +436,13 @@ func startCongestion(t *testing.T, engine fake.EngineConfig, link *sfutest.Link)
 	se.SetICEUDPMux(mux)
 	r.bob = w.connect(w.member("bob"), protocol.RoleViewer)
 	r.viewer = r.bob.watch(sfutest.LoopbackSettings(), 0)
-	r.app = w.recoveringDesktop(w.member("alice"), engine, &se)
+	r.app = w.recoveringDesktopOn(w.member("alice"), engine, &se, r.tap.engine)
 	r.sh = r.app.start(defaultRoom(r.bob))
 	r.snap = r.app.waitState(r.sh, core.StateLive)
 	r.liveAt = time.Now()
 	if r.sess = r.app.engine.Session(); r.sess == nil {
 		t.Fatal("no engine session while the share is live")
 	}
-	r.origins = r.traceOrigin()
 	r.bob.waitLive(r.snap.ID)
 	r.bob.subscribe(want(r.snap.ID, true))
 	r.video = track(t, r.viewer, r.snap.ID, webrtc.RTPCodecTypeVideo)
@@ -449,6 +478,8 @@ type policeTrace struct {
 	// recovered is when the full layer was at its ceiling with no upload hint and a last congestion hint that lifted
 	// the cap; zero if never.
 	recovered time.Time
+	// losses samples the policer from the limit until the test stops it, or ends.
+	losses *linkSampler
 }
 
 // police runs D9's script on a share whose full layer has reached its ceiling: steadyFor at it, then a policer of
@@ -461,6 +492,7 @@ func (r *congestionRun) police() *policeTrace {
 	tr := &policeTrace{}
 	callMark, eventMark := len(r.sess.Calls()), len(r.app.shareEvents())
 	link := sfutest.NewLink(policedCapacity)
+	tr.losses = r.sampleLink(link)
 	r.up.SetLink(link)
 	tr.limitedAt = time.Now()
 
@@ -594,80 +626,94 @@ func (r *congestionRun) crossing(capacity int) (fake.Call, bool) {
 	return fake.Call{}, false
 }
 
-// changeSight is what the viewers saw of a change of a layer (sightOf).
+// changeSight is what the viewers got of a change of a layer (sightOf).
 type changeSight int
 
 const (
-	sightNone   changeSight = iota // no frame of the layer captured within reinitSeenWithin of the change
-	sightNoKey                     // frames, but no keyframe captured in the change's window (reinitKeyBefore/After)
-	sightUnsure                    // keyframes there, but each may be the GOP's or a keyframe request's
-	sightReinit                    // a keyframe there that only the change's re-init explains
+	sightReinit changeSight = iota // a viewer got the new encoder's keyframe
+	sightMissed                    // a viewer watched the layer across the change, but none got the keyframe
+	sightNone                      // no viewer watched the layer across the change
 )
 
-// sightOf looks at the frames of layer rid of the share that the viewers got around a change of the layer at at,
-// given the layer's keyframe requests. A frame's capture instant is its Marker's CaptureNS from the engine session's
-// Origin at the time it arrived (originAt). A keyframe captured from reinitKeyBefore before the change to
-// reinitKeyAfter after it is the re-init's when it is forced, not the GOP's (the viewers also got a keyframe of the
-// layer less than a GOP before it: the GOP's comes a whole GOP after the layer's last keyframe, whatever made that
-// one, and CaptureNS keeps its frame grid across re-inits and skips), and no keyframe request of the layer explains
-// it (keyRequestBefore, keyRequestAfter).
-func sightOf(viewers []*sfutest.Viewer, shareID string, originAt func(time.Time) time.Time, rid string,
-	at time.Time, requests []time.Time) changeSight {
-	gop := gopOther
-	if rid == protocol.RIDHigh {
-		gop = gopFull
-	}
-	type key struct {
-		frame uint32
-		ns    int64     // its Marker's CaptureNS
-		at    time.Time // its capture instant
-	}
-	var (
-		got        bool
-		keys, near []key // the layer's keyframes the viewers got; those in the change's window
-	)
+// seenFrame is a frame of the share's video that a viewer got: its Marker's CaptureNS, and whether a decoder can start
+// there (a keyframe, and its first packet carries the SPS).
+type seenFrame struct {
+	ns  int64
+	key bool
+}
+
+// viewerFrames returns the frames of the share's video that the viewers got, per layer (the Marker's RID), each
+// viewer's in the order they began to arrive.
+func viewerFrames(viewers []*sfutest.Viewer, shareID string) map[string][]seenFrame {
+	out := map[string][]seenFrame{}
 	for _, v := range viewers {
 		for _, rec := range v.Recorders() {
 			if rec.Kind() != webrtc.RTPCodecTypeVideo || rec.StreamID() != shareID {
 				continue
 			}
 			for _, f := range sfutest.Frames(rec.Packets()) {
-				if !f.HasMark || f.Mark.RID != rid {
-					continue
-				}
-				captured := originAt(f.First).Add(time.Duration(f.Mark.CaptureNS))
-				d := captured.Sub(at)
-				got = got || (d >= -reinitSeenWithin && d <= reinitSeenWithin)
-				if !f.KeyStart && !f.Mark.Keyframe {
-					continue
-				}
-				k := key{frame: f.Mark.Frame, ns: f.Mark.CaptureNS, at: captured}
-				keys = append(keys, k)
-				if d >= -reinitKeyBefore && d <= reinitKeyAfter {
-					near = append(near, k)
+				if f.HasMark {
+					out[f.Mark.RID] = append(out[f.Mark.RID],
+						seenFrame{ns: f.Mark.CaptureNS, key: f.Mark.Keyframe && f.KeyStart})
 				}
 			}
 		}
 	}
-	switch {
-	case len(near) == 0 && !got:
-		return sightNone
-	case len(near) == 0:
-		return sightNoKey
-	}
-	for _, k := range near {
-		forced := slices.ContainsFunc(keys, func(p key) bool {
-			return p.frame < k.frame && time.Duration(k.ns-p.ns) < gop-gopSlack
-		})
-		requested := slices.ContainsFunc(requests, func(r time.Time) bool {
-			d := k.at.Sub(r)
-			return d >= -keyRequestBefore && d <= keyRequestAfter
-		})
-		if forced && !requested {
+	return out
+}
+
+// sightOf looks for the keyframe of a layer captured at keyNS (its Marker's CaptureNS: a Reinit packet's CaptureNS,
+// engineTap) among the viewers' frames of the layer. A layer's CaptureNS is unique to its frame (a layer's frames go
+// on at the next capture instant across re-inits and lag skips, fake.Session), so the frame of that CaptureNS is the
+// new encoder's keyframe, whatever else asked for a keyframe then. A viewer watched the layer across the change when
+// it got frames of it captured within reinitWatched before and after the keyframe.
+func sightOf(frames []seenFrame, keyNS int64) changeSight {
+	var before, after bool
+	for _, f := range frames {
+		switch d := time.Duration(f.ns - keyNS); {
+		case d == 0 && f.key:
 			return sightReinit
+		case d < 0 && d >= -reinitWatched:
+			before = true
+		case d > 0 && d <= reinitWatched:
+			after = true
 		}
 	}
-	return sightUnsure
+	if before && after {
+		return sightMissed
+	}
+	return sightNone
+}
+
+// nearKeyframe describes, for a keyframe the viewers missed, the viewers' first keyframe of the layer after it and
+// the keyframe requests of the layer (requests) around it.
+func nearKeyframe(frames []seenFrame, key tapRecord, requests []time.Time) string {
+	next := int64(-1)
+	for _, f := range frames {
+		if f.key && f.ns > key.captureNS && (next < 0 || f.ns < next) {
+			next = f.ns
+		}
+	}
+	var b strings.Builder
+	if next < 0 {
+		b.WriteString("no keyframe of the layer after it")
+	} else {
+		fmt.Fprintf(&b, "their next keyframe of the layer was captured %v after it",
+			time.Duration(next-key.captureNS).Round(time.Millisecond))
+	}
+	var reqs []string
+	for _, r := range requests {
+		if d := r.Sub(key.captured()); d >= -reinitWatched && d <= 2*reinitWatched {
+			reqs = append(reqs, d.Round(time.Millisecond).String())
+		}
+	}
+	if len(reqs) == 0 {
+		fmt.Fprintf(&b, "; no keyframe request of the layer from %v before its capture to %v after it", reinitWatched,
+			2*reinitWatched)
+	} else {
+		fmt.Fprintf(&b, "; keyframe requests of the layer at %s from its capture", strings.Join(reqs, ", "))
+	}
+	return b.String()
 }
 
 // hints returns the quality hints in the core's log.
@@ -706,108 +752,185 @@ func parseHints(logs string) []loggedHint {
 	return out
 }
 
-// ---- the engine's clock ----
+// ---- what the engine hands the core ----
 
-// originTrace follows an engine session's Origin, which moves when the fake's lag cap skips (the pump fell 200 ms
-// behind, fake.Source.Next): a frame's capture instant is the Origin of its time plus its Marker's CaptureNS.
-type originTrace struct {
-	mu    sync.Mutex
-	moves []originMove // in time order; the first is the Origin when the trace started
-	quit  chan struct{}
-	done  chan struct{}
-	once  sync.Once
+// engineTap records what the engine's sessions hand the core (media.Session.Next, the core's pump): every video
+// packet and EventLayer, with when Next returned it and the session's Origin then, which moves when the fake's lag
+// cap skips (the pump fell 200 ms behind, fake.Source.Next). It is D10's source: the Reinit keyframes the core got
+// for its bitrate calls, before anything on the way to the viewers (the pump's queues, the Publisher, the policer,
+// the SFU's layer switches) could lose them.
+type engineTap struct {
+	mu      sync.Mutex
+	records []tapRecord
+	origins []time.Time // the sessions' Origins: the first one, then each one it moved to
 }
 
-// originMove is an Origin and when the trace first saw it.
-type originMove struct{ seen, origin time.Time }
+// tapRecord is a video packet or an EventLayer that Next handed the core.
+type tapRecord struct {
+	at        time.Time // when Next returned it
+	origin    time.Time // the session's Origin then
+	layer     string
+	event     bool // an EventLayer; the fields below are a video packet's
+	keyframe  bool
+	reinit    bool
+	captureNS int64
+}
 
-// originEvery is how often an originTrace looks at the Origin.
-const originEvery = 20 * time.Millisecond
+// captured is a video packet's capture instant.
+func (r tapRecord) captured() time.Time { return r.origin.Add(time.Duration(r.captureNS)) }
 
-// traceOrigin starts following the run's session's Origin, until the test ends.
-func (r *congestionRun) traceOrigin() *originTrace {
-	o := &originTrace{
-		moves: []originMove{{seen: time.Now(), origin: r.sess.Origin()}},
-		quit:  make(chan struct{}), done: make(chan struct{}),
+// engine is the wrap for recoveringDesktopOn: the fake, with its sessions tapped.
+func (t *engineTap) engine(e *fake.Engine) media.Engine { return &tapEngine{Engine: e, tap: t} }
+
+// note records what Next returned at at, when the session's Origin was origin.
+func (t *engineTap) note(p media.Packet, at, origin time.Time) {
+	r := tapRecord{at: at, origin: origin}
+	switch {
+	case p.Kind == media.KindVideo:
+		r.layer, r.keyframe, r.reinit, r.captureNS = p.Layer, p.Keyframe, p.Reinit, p.CaptureNS
+	case p.Kind == media.KindEvent && p.Event != nil && p.Event.Code == media.EventLayer:
+		r.layer, r.event = p.Event.Layer, true
 	}
-	go func() {
-		defer close(o.done)
-		tick := time.NewTicker(originEvery)
-		defer tick.Stop()
-		for {
-			select {
-			case <-o.quit:
-				return
-			case now := <-tick.C:
-				origin := r.sess.Origin()
-				o.mu.Lock()
-				if !origin.Equal(o.moves[len(o.moves)-1].origin) {
-					o.moves = append(o.moves, originMove{seen: now, origin: origin})
-				}
-				o.mu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n := len(t.origins); n == 0 || !origin.Equal(t.origins[n-1]) {
+		t.origins = append(t.origins, origin)
+	}
+	if r.layer != "" {
+		t.records = append(t.records, r)
+	}
+}
+
+// reinitFor returns the Reinit keyframe that the engine handed the core for a bitrate call of layer rid at at, the
+// layer's next call coming at until (zero: none yet). After the call Next returned the layer's EventLayer, then, as
+// the layer's next video packet, a keyframe marked Reinit, within reinitWithin of the call; and no other Reinit
+// packet of the layer before until. The packets of the old encoder that Next returns between the call and the
+// EventLayer don't matter.
+func (t *engineTap) reinitFor(rid string, at, until time.Time) (tapRecord, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var (
+		event, found bool
+		key          tapRecord
+		reinits      int
+	)
+	for _, r := range t.records {
+		if r.layer != rid || !r.at.After(at) || (!until.IsZero() && !r.at.Before(until)) {
+			continue
+		}
+		switch {
+		case r.event:
+			event = true
+		case event && !found:
+			if !r.keyframe || !r.reinit {
+				return r, fmt.Errorf("after the call the engine's EventLayer was followed by a packet with keyframe=%v "+
+					"reinit=%v, captured %v after the call, want the new encoder's Reinit keyframe", r.keyframe, r.reinit,
+					r.captured().Sub(at).Round(time.Millisecond))
 			}
+			found, key = true, r
 		}
-	}()
-	r.t.Cleanup(func() {
-		o.once.Do(func() { close(o.quit) })
-		<-o.done
-	})
-	return o
-}
-
-// at returns the Origin at t: the last one seen at or before t (the first one for an earlier t).
-func (o *originTrace) at(t time.Time) time.Time {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	origin := o.moves[0].origin
-	for _, m := range o.moves[1:] {
-		if m.seen.After(t) {
-			break
+		if !r.event && r.reinit {
+			reinits++
 		}
-		origin = m.origin
 	}
-	return origin
+	switch {
+	case !event:
+		return key, fmt.Errorf("the engine handed the core no EventLayer of %s after the call", rid)
+	case !found:
+		return key, fmt.Errorf("the engine handed the core no packet of %s after the call's EventLayer, want the new "+
+			"encoder's Reinit keyframe", rid)
+	case reinits != 1:
+		return key, fmt.Errorf("the engine handed the core %d Reinit packets of %s for the call, want 1", reinits, rid)
+	case key.at.Sub(at) > reinitWithin:
+		return key, fmt.Errorf("the engine handed the core the new encoder's keyframe %v after the call, want within "+
+			"%v", key.at.Sub(at).Round(time.Millisecond), reinitWithin)
+	}
+	return key, nil
 }
 
 // skips returns how often the Origin moved, and by how much in all.
-func (o *originTrace) skips() (n int, by time.Duration) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return len(o.moves) - 1, o.moves[len(o.moves)-1].origin.Sub(o.moves[0].origin)
+func (t *engineTap) skips() (n int, by time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.origins) == 0 {
+		return 0, 0
+	}
+	return len(t.origins) - 1, t.origins[len(t.origins)-1].Sub(t.origins[0])
 }
 
-// ---- the queue's samples ----
+// tapEngine is a fake.Engine whose sessions are tapped (tapSession). Everything else, the AudioController included,
+// is the fake's.
+type tapEngine struct {
+	*fake.Engine
+	tap *engineTap
+}
 
-// queueSample is one sample of a queueing Link's wait.
-type queueSample struct {
+// Start implements media.Engine: the fake's session, tapped.
+func (e *tapEngine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
+	s, err := e.Engine.Start(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	fs, ok := s.(*fake.Session)
+	if !ok {
+		_ = s.Stop()
+		return nil, fmt.Errorf("itest: the fake's session is a %T", s)
+	}
+	return &tapSession{Session: fs, tap: e.tap}, nil
+}
+
+// tapSession is a fake.Session whose Next notes what it returns in the tap.
+type tapSession struct {
+	*fake.Session
+	tap *engineTap
+}
+
+// Next implements media.Session.
+func (s *tapSession) Next(ctx context.Context) (media.Packet, error) {
+	p, err := s.Session.Next(ctx)
+	if err == nil {
+		s.tap.note(p, time.Now(), s.Origin())
+	}
+	return p, err
+}
+
+// ---- the Link's samples ----
+
+// linkSample is one sample of a Link: a queueing Link's wait, and the RTP datagrams it has lost so far.
+type linkSample struct {
 	at     time.Time
 	queued time.Duration
+	lost   int64
 }
 
-// queueSampler samples a queueing Link's Queued() every queueSampleEvery, from its start until stop.
-type queueSampler struct {
+// linkSampler samples a Link's Queued() and its losses (Counts) at its start and every linkSampleEvery, until stop.
+type linkSampler struct {
 	mu      sync.Mutex
-	samples []queueSample
+	samples []linkSample
 	quit    chan struct{}
 	done    chan struct{}
 	once    sync.Once
 }
 
-// sampleQueue starts sampling link. The samples end at stop, or when the test ends.
-func (r *congestionRun) sampleQueue(link *sfutest.Link) *queueSampler {
-	s := &queueSampler{quit: make(chan struct{}), done: make(chan struct{})}
+// sampleLink starts sampling link. The samples end at stop, or when the test ends.
+func (r *congestionRun) sampleLink(link *sfutest.Link) *linkSampler {
+	sample := func(at time.Time) linkSample {
+		_, _, lost := link.Counts()
+		return linkSample{at: at, queued: link.Queued(), lost: lost}
+	}
+	s := &linkSampler{samples: []linkSample{sample(time.Now())}, quit: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
-		tick := time.NewTicker(queueSampleEvery)
+		tick := time.NewTicker(linkSampleEvery)
 		defer tick.Stop()
 		for {
 			select {
 			case <-s.quit:
 				return
 			case now := <-tick.C:
-				q := link.Queued()
+				ls := sample(now)
 				s.mu.Lock()
-				s.samples = append(s.samples, queueSample{at: now, queued: q})
+				s.samples = append(s.samples, ls)
 				s.mu.Unlock()
 			}
 		}
@@ -817,12 +940,32 @@ func (r *congestionRun) sampleQueue(link *sfutest.Link) *queueSampler {
 }
 
 // stop ends the sampling and returns the samples.
-func (s *queueSampler) stop() []queueSample {
+func (s *linkSampler) stop() []linkSample {
 	s.once.Do(func() { close(s.quit) })
 	<-s.done
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.samples)
+}
+
+// lostBetween returns how many RTP datagrams the sampled Link lost from from to to, as far as its samples tell: from
+// the last sample at or before from (the first one, taken at the start, for an earlier from) to the first one at or
+// after to (the last one for a later to). That covers the span and up to a sample interval on either side.
+func lostBetween(samples []linkSample, from, to time.Time) int64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	lower, upper := samples[0].lost, samples[0].lost
+	for _, s := range samples {
+		if !s.at.After(from) {
+			lower = s.lost
+		}
+		upper = s.lost
+		if !s.at.Before(to) {
+			break
+		}
+	}
+	return upper - lower
 }
 
 // ---- the uplink ----
