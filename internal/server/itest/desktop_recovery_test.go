@@ -280,6 +280,42 @@ func watched(t *testing.T, app *recoveryApp, bob *client, viewer *sfutest.Viewer
 	return sh, snap, video, audio
 }
 
+// checkResumedVideo checks the viewer's video after a UDP outage of the core, as D4 asks: it started again on a
+// keyframe that decodes. resumed is waitResumed's: the packets from the first keyframe after the outage on. The
+// keyframe's frame is checked once the Viewer has had the time to ask for what it missed of it
+// (sfutest.FinalLossAfter, slept here): every packet of it there, one run of sequence numbers from the SPS to the
+// RTP marker bit, with the fake marker of a keyframe. A second copy of one of its packets is no fault: it is a
+// retransmission that overtook the original, which a jitter buffer drops.
+//
+// What follows the keyframe is not checked for gaps, as M1's TestUDPBlackHole checks its share's: D4 doesn't ask
+// for it, and at the core's bitrate it doesn't hold on a loaded machine. M1's share sends 0.5 Mbit/s, the core about
+// 4 Mbit/s here, and the end of an outage brings a storm of repairs ten times as large: the SFU asks for every packet
+// of the outage that its NACK window holds, the core's NACK responder sends at once all of them that its 4096 packets
+// hold (01 §8.4; over a thousand here, which doubles what the SFU receives after the outage), and the Viewer asks
+// for the whole gap for a second, which the SFU serves from a budget of a quarter of the layer's rate (M1 02 §9.5).
+// On CI's runners, under -race, a packet after the keyframe then comes back late (twice, when the original was only
+// queued) or not within the Viewer's second: loss that a browser answers with a keyframe request. The rest of the
+// recovery is checked by the callers: the video came back within 5 s, on the track it had, with frames of the full
+// layer after the keyframe.
+func checkResumedVideo(t *testing.T, video *sfutest.Recorder, resumed []sfutest.Packet) {
+	t.Helper()
+	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
+	key := resumed[0]
+	var frame []sfutest.Packet
+	for _, p := range sfutest.InSeqOrder(video.Packets()) {
+		if p.TS == key.TS && !p.Dup && p.Seq-key.Seq < 1<<15 { // the keyframe's, from its first packet on
+			frame = append(frame, p)
+		}
+	}
+	for _, check := range []func([]sfutest.Packet) error{
+		sfutest.CheckStartsOnSPS, sfutest.CheckContinuous, sfutest.CheckVideoMarkers,
+	} {
+		if err := check(frame); err != nil {
+			t.Errorf("the keyframe the video came back with (seq %d, %d packets): %v", key.Seq, len(frame), err)
+		}
+	}
+}
+
 // TestDesktopSocketKilled is D3: the core's WebSocket dies mid-share, its TCP connection closed under it. The core
 // resumes on one new socket, with its connection id, and nothing is published or negotiated again: one pub offer in
 // all, the share's id unchanged, no room event about it. The share is held meanwhile, and its pub PC, still
@@ -425,14 +461,7 @@ func TestDesktopResumeICERestart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("the audio didn't come back: %v", err)
 	}
-	videoTo := newestSeq(video)
-	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
-	vp := seqRange(video, resumed[0].Seq, videoTo)
-	for _, check := range []func([]sfutest.Packet) error{sfutest.CheckContinuous, sfutest.CheckStartsOnSPS} {
-		if err := check(sfutest.WithoutPartialTail(vp)); err != nil {
-			t.Errorf("the video since the network came back: %v", err)
-		}
-	}
+	checkResumedVideo(t, video, resumed)
 	bob.waitLive(snap.ID)
 	app.waitState(sh, core.StateLive)
 	t.Logf("the share's states since the outage: %s", app.shareStates(shareMark))
@@ -611,14 +640,7 @@ func desktopBlackHole(t *testing.T, rebuild bool) {
 	}); err != nil {
 		t.Fatalf("the audio didn't come back: %v", err)
 	}
-	videoTo := newestSeq(video)
-	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
-	vp := seqRange(video, resumed[0].Seq, videoTo)
-	for _, check := range []func([]sfutest.Packet) error{sfutest.CheckContinuous, sfutest.CheckStartsOnSPS} {
-		if err := check(sfutest.WithoutPartialTail(vp)); err != nil {
-			t.Errorf("the video since the network came back: %v", err)
-		}
-	}
+	checkResumedVideo(t, video, resumed)
 	bob.waitLive(snap.ID)
 	if runs := shareRuns(bob, snap.ID, roomMark); runs != "live stalled live" {
 		t.Errorf("the share went %q in room.state since the outage, want live, stalled, live again", runs)
