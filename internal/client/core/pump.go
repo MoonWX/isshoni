@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/client/publish"
@@ -25,9 +26,11 @@ const (
 	pumpOutDepth = 64                     // events waiting for the share's actor
 )
 
-// pumpMsg is what the pump tells the share's actor: an engine event, or the error that ended the session.
+// pumpMsg is what the pump tells the share's actor: an engine event (the seq-th the pump read, from 1), or the
+// error that ended the session.
 type pumpMsg struct {
 	ev  *media.Event
+	seq uint64
 	err error
 }
 
@@ -39,6 +42,7 @@ type pump struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{} // closed when the goroutine has ended
+	events atomic.Uint64 // the engine events read so far: a pumpMsg's seq, and profileAsk's after
 
 	mu       sync.Mutex // guards the fields below
 	wake     chan struct{}
@@ -102,7 +106,7 @@ func (p *pump) run() {
 		switch pkt.Kind {
 		case media.KindEvent:
 			if pkt.Event != nil {
-				p.tell(pumpMsg{ev: pkt.Event})
+				p.tell(pumpMsg{ev: pkt.Event, seq: p.events.Add(1)})
 			}
 		case media.KindVideo, media.KindAudio:
 			p.push(pkt)
@@ -231,12 +235,16 @@ func (p *pump) activeLocked() []string {
 }
 
 // setActive records whether a video layer is active (01 §11.8's OpActive): only active layers get the keyframe
-// requests of an attach or a resume.
+// requests of an attach or a resume. A layer turned on again is forwarded from its first keyframe (the engine starts
+// it with one).
 func (p *pump) setActive(layer string, active bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.active[layer]; ok {
+	if was, ok := p.active[layer]; ok {
 		p.active[layer] = active
+		if active && !was {
+			p.needKey[layer] = true
+		}
 	}
 }
 
@@ -339,6 +347,10 @@ type consumer struct {
 	p        *pump
 	once     sync.Once
 	detached bool // guarded by p.mu
+	// ask gets the profile of every SetProfile for each video layer before the session re-initializes, and failed
+	// hears of a SetProfile the session refused: the share's check of the codec switch (hints.go). Either may be nil.
+	ask    *profileAsk
+	failed func(profile string)
 }
 
 var (
@@ -380,7 +392,16 @@ func (k *consumer) RequestKeyframe(layer string) { k.p.requestKey(layer) }
 // Now implements publish.Clock: the engine's clock (D6).
 func (k *consumer) Now() int64 { return k.p.sess.Now() }
 
-// SetProfile implements publish.ProfileSource: the engine re-initializes its encoders in profile (§8.6).
+// SetProfile implements publish.ProfileSource: the engine re-initializes its encoders in profile (§8.6). The share
+// hears of the profile asked for before the call, for every video layer and with the count of the events read so
+// far, so each layer's EventLayer of the re-init finds it (and none read before the call does), and of a refusal.
 func (k *consumer) SetProfile(profile string) error {
-	return k.p.sess.Reconfigure(media.Reconfig{Profile: profile})
+	if k.ask != nil {
+		k.ask.set(k.p.layers, profile, k.p.events.Load())
+	}
+	err := k.p.sess.Reconfigure(media.Reconfig{Profile: profile})
+	if err != nil && k.failed != nil {
+		k.failed(profile)
+	}
+	return err
 }

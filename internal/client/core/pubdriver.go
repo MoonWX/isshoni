@@ -27,9 +27,11 @@ import (
 //   - 5 rebuilds without connecting: the share is unreachable (03: "Can't reach the server's media port"), and the
 //     rebuilds go on every 30 s.
 //
-// While signaling isn't ready the driver only records; what follows a welcome (the pending offer sent again, an ICE
-// restart, a republish) is recovery.go's. The local candidates go in the offer itself: publish.Publisher.Offer waits
-// for their gathering (host candidates only while the server sends no ICE servers), so nothing is trickled.
+// A codec switch (hints.go, §8.6) asks for one more offer on the current PC, which goes out once no offer is pending
+// and signaling is ready (01 §9 rule 3). While signaling isn't ready the driver only records; what follows a welcome
+// (the pending offer sent again, an ICE restart, a republish) is recovery.go's. The local candidates go in the offer
+// itself: publish.Publisher.Offer waits for their gathering (host candidates only while the server sends no ICE
+// servers), so nothing is trickled.
 
 // offerTimeout bounds the gathering of one offer's candidates.
 const offerTimeout = 10 * time.Second
@@ -42,6 +44,9 @@ type pubDriver struct {
 	gen, neg uint32            // of the last offer; gen 0 before the first (and after a republish dropped the PC)
 	pending  *protocol.PCOffer // the offer that waits for its answer, or nil (01 §9 rule 3: one at a time)
 	started  bool              // Publisher.Start ran on the current Publisher (after its first answer)
+	// reoffer: a change of the Publisher's codec preferences (hints.go, §8.6) waits for the next offer, which goes
+	// out once no offer is pending (01 §9 rule 3: changes fold into one follow-up).
+	reoffer bool
 
 	connected     bool      // the current PC's ICE is connected
 	everConnected bool      // a PC of this share on this connection has been connected: one that isn't is recovering
@@ -86,6 +91,7 @@ func (s *Share) offer(restart bool) error {
 		s.drv.gen = 1
 	}
 	s.drv.neg++
+	s.drv.reoffer = false // this offer carries the Publisher's codec preferences as they are
 	o := protocol.PCOffer{
 		PC: protocol.PCKindPub, Gen: s.drv.gen, Neg: s.drv.neg, SDP: protocol.SDP(sd.SDP),
 		Tracks: trackRefs(pub.Tracks(), s.params.ShareID),
@@ -278,7 +284,7 @@ func (s *Share) drive(now time.Time) *EndInfo {
 	case !d.down.IsZero() && now.Sub(d.down) >= t.iceRestartAfter:
 		return s.restartICE(now)
 	}
-	return nil
+	return s.maybeReoffer() // a codec switch that waited for an answer or for signaling (hints.go)
 }
 
 // restartICE offers an ICE restart on the current PC (01 §10.4): the same gen, the next neg, new ICE credentials.

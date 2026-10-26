@@ -157,12 +157,24 @@ type Share struct {
 	// The actor's alone.
 	drv     pubDriver
 	cons    *consumer
-	profile string          // the profile the session runs: its first EventLayer's
 	seen    map[string]bool // the layers whose first EventLayer arrived
 	limits  map[string]string
 	inState bool // the share (its current id) was in a room.state
 	live    bool // the share has been live (§11.4 step 5); it stays so across a republish
 	rec     recovery
+	// hints.go: the profile the session runs (its main layer's newest EventLayer's), the one the Publisher puts first
+	// ("" = the one the session runs: a codec hint's, or the server's policy after a republish), the profile the
+	// session last refused and when (onProfileFailed), and the preset.
+	running          string
+	sendProfile      string
+	refusedProfile   string
+	refusedProfileAt time.Time
+	ps               presetState
+
+	// hints.go, safe for concurrent use: the pause (its own mutex), and the profile the Publisher's send loop asked
+	// the session for.
+	pz  pauseState
+	ask profileAsk
 
 	mu   sync.Mutex // guards the fields below
 	snap ShareSnapshot
@@ -238,7 +250,8 @@ func newShare(c *Client, r ShareRequest, abort context.CancelFunc) *Share {
 	s := &Share{
 		c: c, req: r, log: c.log, abort: abort,
 		ends: make(chan endRequest), done: make(chan struct{}), run: make(chan struct{}),
-		seen: map[string]bool{}, limits: map[string]string{},
+		seen: map[string]bool{}, limits: map[string]string{}, ps: presetState{applied: r.Preset},
+		pz: pauseState{sending: make(chan struct{}, 1)},
 		snap: ShareSnapshot{RoomID: r.RoomID, Kind: shareKind(r.Source.Kind), Preset: r.Preset, State: StateJoining,
 			Audio: r.Audio},
 	}
@@ -616,11 +629,14 @@ func (m *mailbox) take() []any {
 }
 
 // actor is the share's goroutine: engine events and the session's end from the pump, the server's messages, the
-// pub PC's looks (pubdriver.go) and the hold (recovery.go), and the requests to end the share.
+// pub PC's looks (pubdriver.go), the hold (recovery.go), the rate controller's Ticks (hints.go), and the requests
+// to end the share.
 func (s *Share) actor() {
 	close(s.run)
 	tick := time.NewTicker(s.c.timing.pcPoll)
 	defer tick.Stop()
+	rate := time.NewTicker(ratectl.TickEvery)
+	defer rate.Stop()
 	if req := s.begin(); req != nil {
 		s.finish(*req)
 		return
@@ -633,7 +649,7 @@ func (s *Share) actor() {
 				s.finish(endRequest{info: engineEnd(m.err), stop: true, leave: true})
 				return
 			}
-			if info := s.onEngineEvent(*m.ev); info != nil {
+			if info := s.onEngineEvent(*m.ev, m.seq); info != nil {
 				s.finish(endRequest{info: *info, stop: true, leave: true})
 				return
 			}
@@ -654,6 +670,8 @@ func (s *Share) actor() {
 				s.finish(*req)
 				return
 			}
+		case now := <-rate.C:
+			s.rateTick(now)
 		case req := <-s.ends:
 			s.finish(req)
 			return
@@ -675,10 +693,21 @@ func (s *Share) onMessage(m any) *endRequest {
 		if info := s.onAnswer(m.a); info != nil {
 			return &endRequest{info: *info, stop: true, leave: true}
 		}
+		if info := s.maybeReoffer(); info != nil {
+			return &endRequest{info: *info, stop: true, leave: true}
+		}
+	case msgCall:
+		m.done <- m.fn()
+	case msgProfileFailed:
+		if info := s.onProfileFailed(m); info != nil {
+			return &endRequest{info: *info, stop: true, leave: true}
+		}
 	case msgError:
 		return s.onError(m.e)
 	case msgHint:
-		s.onHint(m.h)
+		if info := s.onHint(m.h); info != nil {
+			return &endRequest{info: *info, stop: true, leave: true}
+		}
 	case msgRestart:
 		if info := s.onRestart(m.r); info != nil {
 			return &endRequest{info: *info, stop: true, leave: true}
@@ -738,6 +767,7 @@ func (s *Share) reconcile(st protocol.RoomState, resync bool) *endRequest {
 	}
 	s.update(func(snap *ShareSnapshot) { snap.Watchers = slices.Clone(info.Watchers) })
 	s.syncState()
+	s.reconcileHints(info)
 	s.stopOrphans(st)
 	return nil
 }
@@ -768,9 +798,9 @@ func (s *Share) onError(e protocol.Error) *endRequest {
 	return nil
 }
 
-// onEngineEvent applies an engine event (§11.5). The first EventLayer sets the profile the Publisher sends in and
-// starts the pub PC.
-func (s *Share) onEngineEvent(ev media.Event) *EndInfo {
+// onEngineEvent applies an engine event (§11.5), the pump's seq-th. The first EventLayer sets the profile the
+// Publisher sends in and starts the pub PC.
+func (s *Share) onEngineEvent(ev media.Event, seq uint64) *EndInfo {
 	now := time.Now()
 	switch ev.Code {
 	case media.EventLayer:
@@ -791,8 +821,9 @@ func (s *Share) onEngineEvent(ev media.Event) *EndInfo {
 				snap.Encoder, snap.HW = ev.Encoder, ev.HW
 			}
 		})
-		if first {
-			s.profile = ev.Profile
+		// The profile the session runs (the first EventLayer's is the Publisher's), and the codec switch's check.
+		if info := s.onLayerProfile(ev, seq); info != nil {
+			return info
 		}
 		if first && !s.rec.republish { // a republish that is due starts the Publisher itself
 			if err := s.startPublisher(); err != nil {
@@ -850,9 +881,10 @@ func shareLimit(limits map[string]string) string {
 	return out
 }
 
-// startPublisher makes the share's Publisher (§11.4 step 4): its layers are the rids of the share's encodings (an
-// inactive one is turned off), its profile the session's, the other profiles of §8.6 offered after it, the video
-// paced at the first targets; then the first offer goes out.
+// startPublisher makes the share's Publisher (§11.4 step 4): its layers are the rids of the share's encodings (the
+// ones the rate controller has off are turned off), its profile the one the session runs, the other profiles of §8.6
+// offered after it, with a codec hint's profile (or the server's policy after a republish) put first, the video paced
+// at the applied targets; then the first offer goes out.
 func (s *Share) startPublisher() error {
 	var available []string
 	for _, e := range s.probe.Encoders {
@@ -860,7 +892,7 @@ func (s *Share) startPublisher() error {
 			available = append(available, e.Profiles...)
 		}
 	}
-	profile := s.profile
+	profile := s.running
 	if profile != highProfile && profile != cbProfile {
 		profile = engineProfile(s.params.Codec, firstEncoder(s.probe, s.c.o.Encoder))
 	}
@@ -868,7 +900,7 @@ func (s *Share) startPublisher() error {
 	for _, e := range s.params.Encodings {
 		layers = append(layers, e.RID)
 	}
-	s.cons = &consumer{p: s.pump}
+	s.cons = &consumer{p: s.pump, ask: &s.ask, failed: func(p string) { s.post(msgProfileFailed{profile: p}) }}
 	pub, err := publish.New(publish.Options{
 		Source:     s.cons,
 		Settings:   s.c.settings,
@@ -883,9 +915,16 @@ func (s *Share) startPublisher() error {
 	if err != nil {
 		return err
 	}
-	for _, e := range s.params.Encodings {
-		if !e.Active {
-			_ = pub.SetActive(e.RID, false)
+	active := s.ctl.State().Active
+	for _, rid := range layers {
+		if on, ok := active[rid]; ok && !on {
+			_ = pub.SetActive(rid, false)
+		}
+	}
+	if want := s.sendProfile; want != "" && want != profile {
+		if err := pub.SetProfile(want); err != nil {
+			s.log.Info("publisher profile", slog.String("profile", want), logx.Err(err))
+			s.sendProfile = ""
 		}
 	}
 	pub.SetPacingTargets(s.videoTargets())
