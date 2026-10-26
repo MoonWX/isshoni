@@ -102,11 +102,17 @@ image carries `THIRD_PARTY_NOTICES` with the licenses of everything isshoni bund
 
 See also the [code signing policy](/code-signing).
 
+<!-- The section's first paragraph goes once the Windows app is released (06 R14, which turns /download into the
+Windows page). -->
+
 ## Linked apps {#linked-apps}
 
-The [desktop apps](/download) never keep your password or a browser cookie. You link an app to your server once, and
-the server gives that app a sign-in of its own. This is that sign-in's threat model: what it is, where it is kept,
-what someone who copies it can do, and how it ends.
+The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 ([Desktop apps](/download)).
+This section describes how they will sign in.
+
+The desktop apps never keep your password or a browser cookie. You link an app to your server once, and the server gives
+that app a sign-in of its own. This is that sign-in's threat model: what it is, where it is kept, what someone who
+copies it can do, and how it ends.
 
 ### Linking {#linked-apps-linking}
 

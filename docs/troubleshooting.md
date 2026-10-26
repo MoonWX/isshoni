@@ -232,9 +232,13 @@ outside, `7882:7882/udp` and `7882:7882/tcp`, and open them in your provider's f
 so ufw rules neither help nor block them ([Docker](/install/docker#host)).
 
 <!-- The desktop app links to #desktop-linking from its "Can't reach the server" texts (docs/m2/03-desktop-app.md
-§8.1, §9): never rename or remove that anchor. -->
+§8.1, §9): never rename or remove that anchor. The section's first paragraph goes once the Windows app is released
+(06 R14, which turns /download into the Windows page). -->
 
 ## Linking the app {#desktop-linking}
+
+The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 and links only to a server that
+runs 0.2 or later ([Desktop apps](/download)). This section describes linking as it will work.
 
 The desktop app signs in to your server once, when you link it: it shows a code and opens your server's page in your
 browser, where you approve it while signed in. "Sign in with username and password instead" in the app links it
@@ -260,6 +264,9 @@ it the proxy yourself:
    or under **Edit environment variables for your account** (search for it in Start): New, name `HTTPS_PROXY`, value
    `http://proxy.example.com:8080`.
 3. Quit isshoni from its tray icon and start it again: a program reads the setting when it starts.
+
+If the proxy asks for a sign-in of its own (office proxies often use your Windows account), the app can't use it yet:
+ask whoever runs the network to let `isshoni.exe`, or your server's address, through without one.
 
 Other programs that read `HTTPS_PROXY`, such as some command-line tools, use it too; delete the variable once you
 no longer need it. If the browser works without any proxy, look at your firewall or security software instead: one
@@ -287,7 +294,8 @@ The app asks you to link it again when the server no longer accepts its sign-in:
 
 - **"This PC was signed out"**: it was removed on your account's Devices page, or not used for 90 days; or you
   changed your password or used "Log out everywhere"; or an admin created a reset link for you or signed you out
-  everywhere; or the server's admin restored an older backup or replaced the server's keys. Click **Link again**.
+  everywhere; or the server's admin restored an older backup or replaced the server's keys; or a 21st app was linked
+  to your account, which removes the app seen least recently (an account has at most 20). Click **Link again**.
 - **"Someone else used this PC's sign-in"**: the server saw the app's sign-in used twice, which happens when it was
   copied, so it removed the app. Rarely, the app causes it itself, when it was closed by a crash or a power cut right
   after the server renewed its sign-in. Link again, then check your Devices page for apps you don't recognize. If

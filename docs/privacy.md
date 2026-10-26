@@ -20,7 +20,13 @@ stores, every connection it makes to others, and what the installer and this sit
 - **No telemetry.** The server never contacts the project; its only call home is the optional daily release check
   below. The desktop apps will check GitHub Releases for updates, and that can be turned off.
 
+<!-- 06 R14, when it adds #desktop: drop this section's first paragraph and link the PC side from here, e.g. "What
+the app keeps on your PC: [The desktop app](#desktop)." -->
+
 ## Linked apps {#linked-apps}
+
+The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 ([Desktop apps](/download)).
+This section says what a server will keep for them.
 
 A desktop app signs in to a server once, when you link it to your account: you approve it in your browser, or sign
 in with your username and password in the app ([how that sign-in is protected](/security#linked-apps)). For that,

@@ -22,8 +22,8 @@ from here.
 the desktop origins, which routes take which credential, the device rows of revocation, audit and privacy, the device
 endpoints and their JSON, the throttles and the limits. Where M2 02 changes the sketch here, M2 02 holds and says
 why; M1's behavior stays as built. Each section it supersedes carries an **M2** note that points to the M2 02 section:
-§2.1, §3.2, §4.7, §5 (its last note), §6, §7.3, §7.5, §7.6, §7.7, §7.12, §7.13, §10, §11, §12.1 to §12.5, §14 and
-slice 15 of §18.
+§2.1, §3.2, §4.7, §5 (its last note), §6, §7.3, §7.5, §7.6, §7.7, §7.11, §7.12, §7.13, §10, §11, §12.1 to §12.5, §14
+and slice 15 of §18.
 
 ---
 
@@ -1597,6 +1597,11 @@ invite's use back, and the session of a cookie the request arrived with is delet
   reset is pending any more (`admin.users`, §12.5).
 
 ### 7.11 Roles, the last-admin rule and admin alerts
+
+**M2:** `refresh_token_reused` is raised as written, after the reuse commits, to every admin with `adminAlerts` on,
+with actor `system` and the username as target
+([M2 02 §8](../m2/02-device-auth.md#8-audit-alerts-notifications-and-logs), §6.2). `/api/v1/admin/*` is cookie-only:
+a bearer, even an admin's, gets 403 `forbidden {credential: "session"}` (M2 02 §6.4).
 
 - There are two roles, `admin` and `user`. Only admins reach `/api/v1/admin/*`; everyone else gets 403 `forbidden`.
   The role is checked on every request (the cache is invalidated on change).
