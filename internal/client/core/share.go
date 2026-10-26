@@ -170,6 +170,7 @@ type Share struct {
 	refusedProfile   string
 	refusedProfileAt time.Time
 	ps               presetState
+	st               statsState // stats.go: the engine's stats poll and the stats reports
 
 	// hints.go, safe for concurrent use: the pause (its own mutex), and the profile the Publisher's send loop asked
 	// the session for.
