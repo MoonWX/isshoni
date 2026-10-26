@@ -58,7 +58,7 @@ func TestDesktopLatency(t *testing.T) {
 
 	sh := app.start(defaultRoom(bob))
 	snap := app.waitState(sh, core.StateLive)
-	liveAt, start := time.Now(), layerOf(snap, "f").TargetBps // the ramp's first step is RampDelay after live
+	liveAt := time.Now()
 	sess := app.engine.Session()
 	if sess == nil {
 		t.Fatal("no engine session while the share is live")
@@ -72,8 +72,16 @@ func TestDesktopLatency(t *testing.T) {
 	if f.Width != 1920 || f.Height != 1080 || !f.Active {
 		t.Fatalf("the full layer is %+v, want 1920×1080 and active", f)
 	}
-	ramped := fullAt8Mbps(t, sh, sess, liveAt, start)
-	f = layerOf(sh.Snapshot(), "f")
+	// The core's ramp takes the full layer from ratectl's start of 4 Mbit/s to its ceiling, 8 Mbit/s, in RampDelay
+	// and four RampEvery (§9.3).
+	waitLong(t, ratectl.RampDelay+4*ratectl.RampEvery+5*time.Second, func() bool {
+		f = layerOf(sh.Snapshot(), "f")
+		return f.TargetBps >= latencyBitrate
+	}, func() string {
+		return fmt.Sprintf("%v after live the full layer is %+v, want it at %d bit/s: the ramp did not end",
+			time.Since(liveAt).Round(time.Millisecond), f, latencyBitrate)
+	})
+	rampedIn := time.Since(liveAt)
 
 	// The window. The session's clock is the clock of the Markers' CaptureNS; its Origin moves only when the fake's
 	// lag cap skips, which needs the pump 200 ms behind (fake.Source.Next). The capture instants are taken against
@@ -121,11 +129,11 @@ func TestDesktopLatency(t *testing.T) {
 	all, keys := summarizeLatency(lat), summarizeLatency(keyLat)
 	fa := layerOf(after, "f")
 	t.Logf("D16 (%s/%s, race %s): %d frames of the full layer over %v at %.2f Mbit/s (the core's target %d bit/s, "+
-		"ramped %t): "+
+		"ramped in %v): "+
 		"last-packet latency p50 %v, p95 %v, max %v, min %v; %d keyframes, max %v; "+
 		"the core's capture-to-send p50 %v, p95 %v, max %v; sent %d bit/s at %.1f fps",
 		runtime.GOOS, runtime.GOARCH, raceBuild(), all.n, span.Round(time.Millisecond), rate/1e6, f.TargetBps,
-		ramped, all.p50, all.p95, all.max, all.min, keys.n, keys.max,
+		rampedIn.Round(time.Millisecond), all.p50, all.p95, all.max, all.min, keys.n, keys.max,
 		fa.CaptureToSend.P50, fa.CaptureToSend.P95, fa.CaptureToSend.Max, fa.SentBps, fa.FPS)
 
 	// What was measured is what D16 says: 60 frames a second at 8 Mbit/s, every one of them whole.
@@ -160,39 +168,6 @@ func TestDesktopLatency(t *testing.T) {
 		t.Errorf("last-packet latency max %v, want under %v", all.max, latencyMax)
 	}
 	bob.check()
-}
-
-// fullAt8Mbps brings the share's full layer to D16's 8 Mbit/s and says whether the core's ramp did it. The ramp
-// takes the layer there from ratectl's start of 4 Mbit/s in 12 s (§9.3); its Ticks are README WA46's, and a core
-// without them keeps the layer at its first target (start, its target at live). When the target hasn't moved by the
-// time of the ramp's second step plus 2 s, the test sets the engine's full layer to 8 Mbit/s itself, through the
-// session control the ramp uses, so the load is D16's either way. The core's pacer then still paces for the first
-// targets (3 × 4.3 Mbit/s rather than 3 × 8.3), which drains a frame more slowly than a ramped share's would: that
-// makes the bounds harder to meet, not easier.
-func fullAt8Mbps(t *testing.T, sh *core.Share, sess *fake.Session, liveAt time.Time, start int) (ramped bool) {
-	t.Helper()
-	for probe := liveAt.Add(ratectl.RampDelay + 2*ratectl.RampEvery + 2*time.Second); time.Now().Before(probe); {
-		if layerOf(sh.Snapshot(), "f").TargetBps != start {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if f := layerOf(sh.Snapshot(), "f"); f.TargetBps == start && start < latencyBitrate {
-		t.Logf("the core's full layer stays at its first target, %d bit/s (no ramp): the test sets the engine's to "+
-			"%d bit/s", start, latencyBitrate)
-		if err := sess.SetBitrate("f", latencyBitrate); err != nil {
-			t.Fatalf("SetBitrate(f, %d): %v", latencyBitrate, err)
-		}
-		return false
-	}
-	var f core.LayerSnapshot
-	eventually(t, func() bool {
-		f = layerOf(sh.Snapshot(), "f")
-		return f.TargetBps >= latencyBitrate
-	}, func() string {
-		return fmt.Sprintf("the full layer is %+v, want it at %d bit/s: the ramp did not end", f, latencyBitrate)
-	})
-	return true
 }
 
 // latencySummary is the distribution of a set of latencies; the percentiles are nearest-rank.
