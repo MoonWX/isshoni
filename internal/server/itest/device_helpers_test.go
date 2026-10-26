@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/client/credstore"
+	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/client/signal"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -25,10 +28,17 @@ import (
 // The helpers of docs/m2/02-device-auth.md §16.2 (device_test.go; README WA56): a device linked with raw HTTP, the
 // app's REST calls, and its signaling connections on 01's Go signal client with the device's access token. They
 // live in itest, not servertest, so that servertest never imports client packages. WA64 adds linkedManager, the
-// same link through the real deviceauth.Manager.
+// same link through the real deviceauth.Manager, and the app's connections that take their tokens from it.
 
 // deviceAppVersion is the version the test app reports: in its device code request and in its hello.
 const deviceAppVersion = "0.2.0"
+
+// deviceHostName is the name the test app proposes for itself (its Windows host name, M2 02 §5.6), and linkedName
+// the one the user gives it on the approval page.
+const (
+	deviceHostName = "DESKTOP-TEST"
+	linkedName     = "Test PC"
+)
 
 // linkedDevice is a device that linkDevice linked: its id and its first token pair.
 type linkedDevice struct {
@@ -44,7 +54,7 @@ type linkedDevice struct {
 func linkDevice(t *testing.T, srv *servertest.Server, cookie, name string) linkedDevice {
 	t.Helper()
 	var code api.DeviceCodeResponse
-	rest(t, srv, restCall{method: http.MethodPost, path: "/api/v1/device/code", body: appCodeRequest("DESKTOP-TEST")}).
+	rest(t, srv, restCall{method: http.MethodPost, path: "/api/v1/device/code", body: appCodeRequest(deviceHostName)}).
 		decodeAs(t, "POST /device/code", http.StatusOK, &code)
 	rest(t, srv, restCall{method: http.MethodPost, path: "/api/v1/device/decide", cookie: cookie,
 		body: api.DeviceDecideRequest{UserCode: code.UserCode, Approve: true, DeviceName: &name}}).
@@ -59,6 +69,104 @@ func linkDevice(t *testing.T, srv *servertest.Server, cookie, name string) linke
 	}
 	return linkedDevice{DeviceID: pair.Device.ID, Access: protocol.Secret(pair.AccessToken),
 		Refresh: protocol.Secret(pair.RefreshToken)}
+}
+
+// ---- the app's deviceauth.Manager (DA11) ----
+
+// pollInterval is the device flow's polling interval (M2 02 §5.2: interval 5). The Manager waits it out on the real
+// clock before each poll: ManagerOptions.Clock reads the time but schedules nothing, so the server's clock hook can't
+// shorten it, and every link through the Manager takes one interval.
+const pollInterval = 5 * time.Second
+
+// newManager returns a started deviceauth.Manager for srv on store, as the desktop app makes one per server: the
+// identity of appCodeRequest (deviceAppVersion, desktop on Windows, deviceHostName), its requests on the harness's
+// transport, without an Origin and from the loopback address. It is unlinked unless store holds a credential for
+// srv. It is closed by t.Cleanup, before the server stops, and its log is printed when the test failed.
+func newManager(t *testing.T, srv *servertest.Server, store credstore.Store) *deviceauth.Manager {
+	t.Helper()
+	dc, err := deviceauth.NewClient(srv.URL, deviceauth.AppInfo{Version: deviceAppVersion,
+		ClientKind: protocol.ClientKindDesktop, OS: protocol.ClientOSWindows, DeviceName: deviceHostName},
+		deviceauth.ClientOptions{HTTP: &http.Client{Transport: srv.Client.Transport}, AllowInsecureLoopback: true})
+	if err != nil {
+		t.Fatalf("deviceauth.NewClient(%s): %v", srv.URL, err)
+	}
+	logs := &lockedBuffer{}
+	mgr := deviceauth.NewManager(deviceauth.ManagerOptions{Client: dc, Store: store,
+		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	t.Cleanup(func() {
+		if err := mgr.Close(); err != nil {
+			t.Errorf("Manager.Close: %v", err)
+		}
+		if t.Failed() {
+			t.Logf("the device manager's log:\n%s", logs.String())
+		}
+	})
+	if err := mgr.Start(waitCtx(t)); err != nil {
+		t.Fatalf("Manager.Start: %v", err)
+	}
+	return mgr
+}
+
+// linkManager links mgr for the user behind cookie as the app and the user's browser do (M2 02 §16.2 case 1):
+// Manager.Link returns at linking with the code; the test plays the browser, which looks the code up (network same:
+// the app and the browser both come from the loopback address) and approves it with deviceName linkedName; the
+// manager's first poll, one interval after Link, takes the pair. It fails t unless the manager is linked to that
+// device within one poll interval of the approval, and returns the linked state.
+func linkManager(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, cookie string) deviceauth.State {
+	t.Helper()
+	if err := mgr.Link(waitCtx(t)); err != nil {
+		t.Fatalf("Manager.Link: %v", err)
+	}
+	started := time.Now()
+	st := mgr.State()
+	if st.Status != deviceauth.StatusLinking || st.Link == nil ||
+		st.Link.VerificationURIComplete != srv.URL+"/link?code="+st.Link.UserCode {
+		t.Fatalf("after Link the manager is %s with code %v, want linking with a code to open on %s/link", st.Status,
+			st.Link != nil, srv.URL)
+	}
+	var lookup api.DeviceLookup
+	rest(t, srv, restCall{method: http.MethodPost, path: "/api/v1/device/lookup", cookie: cookie,
+		body: api.DeviceLookupRequest{UserCode: st.Link.UserCode}}).decodeAs(t, "the browser's lookup", http.StatusOK, &lookup)
+	if lookup.UserCode != st.Link.UserCode || lookup.Network != api.NetworkMatchSame || lookup.DeviceName != deviceHostName ||
+		lookup.ClientKind != string(protocol.ClientKindDesktop) || lookup.OS != string(protocol.ClientOSWindows) ||
+		lookup.AppVersion != deviceAppVersion {
+		t.Fatalf("the lookup = the manager's code %v, network %q, kind %q, os %q, version %q; want same, desktop, windows, %s",
+			lookup.UserCode == st.Link.UserCode, lookup.Network, lookup.ClientKind, lookup.OS, lookup.AppVersion,
+			deviceAppVersion)
+	}
+	name := linkedName
+	rest(t, srv, restCall{method: http.MethodPost, path: "/api/v1/device/decide", cookie: cookie,
+		body: api.DeviceDecideRequest{UserCode: st.Link.UserCode, Approve: true, DeviceName: &name}}).
+		expect(t, "the browser's approval", http.StatusNoContent)
+	eventually(t, func() bool {
+		st = mgr.State()
+		return st.Status == deviceauth.StatusLinked
+	}, func() string {
+		return fmt.Sprintf("the manager is %s after the approval, want linked", mgr.State().Status)
+	})
+	// The first poll comes one interval after Link and the approval came before it; a second poll could come no
+	// sooner than another interval later.
+	if took := time.Since(started); took >= 2*pollInterval {
+		t.Errorf("the manager was linked %v after Link, want within one poll interval (%v) of the approval", took,
+			pollInterval)
+	}
+	if st.Device == nil || st.Device.ID == "" || st.Device.Name != name || st.User == nil || st.Notice != deviceauth.NoticeNone {
+		t.Fatalf("the linked state has device %+v, user %v, notice %q; want the device named %q, a user, no notice",
+			st.Device, st.User != nil, st.Notice, name)
+	}
+	return st
+}
+
+// linkedManager returns a started deviceauth.Manager (memory credential store) that is already linked for the user
+// behind cookie, through Manager.Link and the cookie's lookup and decide (linkManager), and that store, in which a
+// test sees what the app saved. Its AccessToken is core.Auth's; a test that hands it to 01's core wraps
+// SessionEnded, as 03's session adapter does. Closed by t.Cleanup. (DA11)
+func linkedManager(t *testing.T, srv *servertest.Server, cookie string) (*deviceauth.Manager, credstore.Store) {
+	t.Helper()
+	store := credstore.NewMemory()
+	mgr := newManager(t, srv, store)
+	linkManager(t, srv, mgr, cookie)
+	return mgr, store
 }
 
 // appCodeRequest is the test app's POST /api/v1/device/code, proposing the name name (M2 02 §5.2).
@@ -262,20 +370,26 @@ type deviceDial struct {
 	origin  string // the Origin header: "" for the app's Go connection, protocol.DesktopAssetOriginWindows for its SPA
 	version string // client.version; "" means deviceAppVersion
 	from    string // the client address the harness's proxy reports (X-Forwarded-For); "" for loopback
+	// resumes makes the connection resume after a dropped socket, as the app's connections do: the client
+	// reconnects (Options.NoReconnect off), and its sockets are recorded, so that the test can cut one
+	// (deviceConn.killSocket). Without it a drop or a refusal ends the connection.
+	resumes bool
 }
 
 // deviceConn is one signaling connection of a linked device: 01's Go signal client with the device's access token
 // in hello.auth (Options.Token), as the app's core and its SPA connect (M2 02 §16.2 case 2). Its notifications and
-// its stop are recorded for as long as it runs. It does not reconnect: a drop or a refusal ends it.
+// its stop are recorded for as long as it runs. It does not reconnect unless it was dialed with deviceDial.resumes.
 type deviceConn struct {
 	t     *testing.T
 	name  string
 	sig   *signal.Client
+	sock  *sockets // the TCP connections of its WebSocket upgrades (deviceDial.resumes only)
 	alive sync.WaitGroup
 
 	mu        sync.Mutex
 	rooms     []protocol.RoomState
 	conns     []protocol.UserConnections
+	resumed   int                 // the welcomes that resumed the connection
 	stopped   *signal.StateChange // the client's StateStopped; nil while it runs
 	stoppedAt time.Time           // when the recorder saw it
 	failed    []error
@@ -285,6 +399,22 @@ type deviceConn struct {
 // desktop on Windows, the user.connections feature. It returns Dial's error as it is: a *protocol.Error when the
 // server refused the hello. The connection is closed when the test ends.
 func dialDevice(t *testing.T, srv *servertest.Server, token protocol.Secret, name string, o deviceDial) (*deviceConn, error) {
+	t.Helper()
+	return dialWithToken(t, srv, func(context.Context) (protocol.Secret, error) { return token, nil }, name, o)
+}
+
+// dialApp is dialDevice for a connection of the app that takes its token from the app's deviceauth.Manager before
+// every hello, a resuming one too: Options.Token is AccessToken(ctx, false), as 01's core and 03's binding for the
+// SPA hand them out (M2 02 §16.2 case 2).
+func dialApp(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, name string, o deviceDial) (*deviceConn, error) {
+	t.Helper()
+	return dialWithToken(t, srv, func(ctx context.Context) (protocol.Secret, error) { return mgr.AccessToken(ctx, false) },
+		name, o)
+}
+
+// dialWithToken is dialDevice with Options.Token.
+func dialWithToken(t *testing.T, srv *servertest.Server, token func(context.Context) (protocol.Secret, error), name string,
+	o deviceDial) (*deviceConn, error) {
 	t.Helper()
 	h := http.Header{}
 	if o.origin != "" {
@@ -297,23 +427,28 @@ func dialDevice(t *testing.T, srv *servertest.Server, token protocol.Secret, nam
 	if version == "" {
 		version = deviceAppVersion
 	}
+	sock := &sockets{}
+	transport := srv.Client.Transport
+	if o.resumes {
+		transport = sock.transport(t, transport)
+	}
 	sig, err := signal.Dial(waitCtx(t), signal.Options{
 		URL:    srv.WSURL,
 		Header: h,
-		Token:  func(context.Context) (protocol.Secret, error) { return token, nil },
+		Token:  token,
 		Client: protocol.ClientInfo{Kind: protocol.ClientKindDesktop, Version: version, OS: protocol.ClientOSWindows},
 		Role:   o.role,
 		Caps:   caps,
 		// The list of the user's own connections with their device names (M2 01 §10.4).
 		Features: []protocol.Feature{protocol.FeatureUserConnections},
 		// No cookie jar: a bearer socket carries no cookie (a cookie from a desktop origin gets 403).
-		HTTPClient:  &http.Client{Transport: srv.Client.Transport},
-		NoReconnect: true,
+		HTTPClient:  &http.Client{Transport: transport},
+		NoReconnect: !o.resumes,
 	})
 	if err != nil {
 		return nil, err
 	}
-	d := &deviceConn{t: t, name: name, sig: sig}
+	d := &deviceConn{t: t, name: name, sig: sig, sock: sock}
 	d.alive.Go(d.pump)
 	d.alive.Go(d.watch)
 	t.Cleanup(d.close)
@@ -327,16 +462,56 @@ func connectDevice(t *testing.T, srv *servertest.Server, token protocol.Secret, 
 	if err != nil {
 		t.Fatalf("%s: dial: %v", name, err)
 	}
-	if room != "" {
-		var joined protocol.RoomJoinResult
-		if err := d.sig.Request(waitCtx(t), protocol.MessageTypeRoomJoin, protocol.RoomJoin{RoomID: room}, &joined); err != nil {
-			t.Fatalf("%s: room.join %s: %v", name, room, err)
-		}
-		if joined.Room.ID != room {
-			t.Fatalf("%s: joined %+v, want %s", name, joined.Room, room)
-		}
-	}
+	d.join(room)
 	return d
+}
+
+// connectApp is dialApp for a connection that must come up; it joins room unless room is "".
+func connectApp(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, name string, o deviceDial, room string) *deviceConn {
+	t.Helper()
+	d, err := dialApp(t, srv, mgr, name, o)
+	if err != nil {
+		t.Fatalf("%s: dial: %v", name, err)
+	}
+	d.join(room)
+	return d
+}
+
+// join joins room, unless room is "".
+func (d *deviceConn) join(room string) {
+	d.t.Helper()
+	if room == "" {
+		return
+	}
+	var joined protocol.RoomJoinResult
+	if err := d.sig.Request(waitCtx(d.t), protocol.MessageTypeRoomJoin, protocol.RoomJoin{RoomID: room}, &joined); err != nil {
+		d.t.Fatalf("%s: room.join %s: %v", d.name, room, err)
+	}
+	if joined.Room.ID != room {
+		d.t.Fatalf("%s: joined %+v, want %s", d.name, joined.Room, room)
+	}
+}
+
+// killSocket closes the TCP connection under the connection's WebSocket, without a close frame (client.killSocket's
+// cut). A connection dialed with deviceDial.resumes resumes it at once.
+func (d *deviceConn) killSocket() {
+	d.t.Helper()
+	d.sock.mu.Lock()
+	conn := d.sock.last
+	d.sock.mu.Unlock()
+	if conn == nil {
+		d.t.Fatalf("%s has no socket to kill (dial it with resumes)", d.name)
+	}
+	if err := conn.Close(); err != nil {
+		d.t.Fatalf("%s: closing its socket: %v", d.name, err)
+	}
+}
+
+// resumes returns how many welcomes have resumed the connection.
+func (d *deviceConn) resumes() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.resumed
 }
 
 // pump records the room.state and user.connections notifications until the client has stopped.
@@ -367,12 +542,17 @@ func (d *deviceConn) pump() {
 	}
 }
 
-// watch records the client's stop: the error that ended it, and when.
+// watch records the client's stop, the error that ended it and when, and the welcomes that resumed it.
 func (d *deviceConn) watch() {
 	for sc := range d.sig.States() {
-		if sc.State == signal.StateStopped {
+		switch {
+		case sc.State == signal.StateStopped:
 			d.mu.Lock()
 			d.stopped, d.stoppedAt = &sc, time.Now()
+			d.mu.Unlock()
+		case sc.State == signal.StateReady && sc.Resumed:
+			d.mu.Lock()
+			d.resumed++
 			d.mu.Unlock()
 		}
 	}
