@@ -64,17 +64,18 @@ export function DeviceLinkPage() {
   }, [location, navigate]);
 
   // The session's end under the page (a 401, or "Not you? Sign out") waits until the code is back in the address bar
-  // and committed: RequireAuth's redirect reads the location it renders with, and a router update is a transition
-  // that the signed-out render could otherwise overtake, leaving next= without the code.
+  // and committed (the effect below): RequireAuth's redirect reads the location it renders with, and a router update
+  // is a transition that the signed-out render could otherwise overtake, leaving next= without the code. The
+  // navigation is a plain one, not flushSync: react-router would then run React's effects inside its own state
+  // update, so this effect's sign-out and RequireAuth's redirect would start while that navigation still counts as
+  // the current one, and the redirect would finish without its history.replace (the login form under an address bar
+  // that still says /link?code=…).
   const { logout, pending: signingOut } = useLogout();
   const endSession = useRef<{ readonly code: string; readonly how: 'cleared' | 'logout' } | null>(null);
   const endWithCode = useCallback(
     (code: string, how: 'cleared' | 'logout'): void => {
       endSession.current = { code, how };
-      void navigate(
-        { pathname: location.pathname, search: `?code=${formatUserCode(code)}` },
-        { replace: true, flushSync: true },
-      );
+      void navigate({ pathname: location.pathname, search: `?code=${formatUserCode(code)}` }, { replace: true });
     },
     [location.pathname, navigate],
   );

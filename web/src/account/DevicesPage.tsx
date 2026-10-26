@@ -1,5 +1,6 @@
 import { queryOptions, useMutation, useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { useEffect, useId, useRef, useState, type ReactNode, type SyntheticEvent } from 'react';
+import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
 import { useApp } from '../app/context';
@@ -150,6 +151,10 @@ function LinkedDevices() {
   const heading = useRef<HTMLHeadingElement>(null);
   const list = devices.data?.devices ?? [];
 
+  /**
+   * A removed row leaves at once; the server's list follows. Focus was in the row (on its Remove, which the closed
+   * dialog handed it back to, or in its rename field), so the heading takes it.
+   */
   const gone = (id: string): void => {
     queryClient.setQueryData<DevicesResponse>(queryKeys.meDevices, (old) =>
       old ? { ...old, devices: old.devices.filter((d) => d.id !== id) } : old,
@@ -170,7 +175,7 @@ function LinkedDevices() {
     <Section heading={t('account.devices.linked.heading')} headingRef={heading}>
       <ListState query={devices}>
         {list.length === 0 ? (
-          <p className={styles.empty}>{t('account.devices.linked.empty')}</p>
+          <p className={styles.empty}>{t('link.devices.empty')}</p>
         ) : (
           <ul className={styles.list}>
             {list.map((device) => (
@@ -498,7 +503,11 @@ function RemoveDevice({ device, nameId, onGone }: { device: DeviceInfo; nameId: 
     },
     onSuccess: () => {
       ui.getState().announce(t('link.devices.removed', { name: device.name }));
-      setOpen(false);
+      // The dialog closes first: while it is modal the rest of the page is inert, so the heading could not take
+      // focus, and closing it afterwards would hand focus back to this row's Remove, which is about to go.
+      flushSync(() => {
+        setOpen(false);
+      });
       onGone();
     },
   });

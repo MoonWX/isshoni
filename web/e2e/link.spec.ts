@@ -5,14 +5,16 @@
 //   verificationUriComplete, sees the code, renames the app and links it; Node's poll gets 200 with an isa_ token;
 //   a Node WebSocket whose hello carries the token gets welcome; the Devices page lists the app, and Remove closes
 //   Node's socket with 4401.
-// - Signed out: /link?code=… goes to /login?next=…, and logging in comes back to the confirm card.
+// - Signed out: /link?code=… goes to /login?next=…, and logging in comes back to the confirm card. So does a session
+//   that ends under the card: Link's 401 puts the code back into the address bar, and the login's next= has it.
 // - The network notes: `different` (both IPv4) and `unknown` (the app over IPv6, the browser over IPv4) each need
 //   the "I started this myself" tick before Link; `same` has none (the first case).
 //
 // Addresses. The e2e server trusts X-Forwarded-For from a loopback peer (fixtures.ts, fromNewAddress), so the app's
 // requests and the browser's each say where they come from: the lookup's `network` compares the two (02 §5.3), and
 // each flow's /device/code spends the device-code-ip budget (10, then 1 per 6 min) of an address of its own. The
-// addresses here are from 198.18.0.0/15 and 2001:db8:18::/48, which fixtures.ts and the other specs don't use.
+// addresses here are from 198.18.0.0/16 and 2001:db8:18::/48, which fixtures.ts and the other specs don't use
+// (a11y.spec has 198.19.0.0/16 and 2001:db8:19::/48).
 import type { BrowserContext, Page } from '@playwright/test';
 
 import { expect, test, type E2EServer } from './fixtures.ts';
@@ -26,7 +28,7 @@ const SOCKET_TIMEOUT_MS = 10_000;
 
 let addresses = 0;
 
-/** An IPv4 address no other call of this worker returned (198.18.0.0/15, RFC 2544). */
+/** An IPv4 address no other call of this worker returned (198.18.0.0/16, half of RFC 2544's 198.18.0.0/15). */
 function newIPv4(): string {
   const n = ++addresses;
   return `198.18.${String(Math.floor(n / 250))}.${String((n % 250) + 1)}`;
@@ -254,6 +256,8 @@ test('start, approve with a new name: Node’s poll gets an isa_ token, its WebS
     await expect(dialog).toContainText('E2E PC will be signed out and has to be linked again.');
     await dialog.getByRole('button', { name: 'Remove' }).click();
     await expect(row).toHaveCount(0);
+    // The row's Remove had focus; with the dialog closed first, the list's heading takes it (not <body>).
+    await expect(page.getByRole('heading', { name: 'Linked devices' })).toBeFocused();
 
     const code = await Promise.race([
       socket.closed,
@@ -302,6 +306,37 @@ test('signed out: /link?code=… goes to /login?next=…, and logging in comes b
   } finally {
     await context.close();
   }
+});
+
+test('the session ends under the confirm card: Link goes to /login?next=… with the code, and logging in comes back', async ({
+  server,
+  page,
+}) => {
+  const account = await server.createUser();
+  await server.signIn(page.context(), account);
+  // One address for the app and the browser (`network: same`, so Link needs no tick); the login spends its budget.
+  const ip = newIPv4();
+  await browseFrom(page.context(), ip);
+  const flow = await startFlow(server, ip);
+
+  await page.goto(flow.verificationUriComplete);
+  await confirmCard(page);
+  await expect(page).toHaveURL(`${server.url}/link`);
+  // The session goes while the card shows (as when another browser signs this one out): Link's decide gets 401.
+  await page.context().clearCookies();
+  await page.getByRole('button', { name: 'Link', exact: true }).click();
+  await expect(page.getByRole('heading', { level: 1, name: /^Log in/ })).toBeVisible();
+  // The address bar and the router agree: the login's next= carries the code back.
+  await expect(page).toHaveURL(`${server.url}/login?next=${encodeURIComponent(`/link?code=${flow.userCode}`)}`);
+
+  await page.getByLabel('Username').fill(account.username);
+  await page.getByLabel('Password', { exact: true }).fill(account.password);
+  await page.getByRole('button', { name: 'Log in' }).click();
+  await confirmCard(page);
+  await expect(page.getByText(flow.userCode, { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(`${server.url}/link`);
+  // Nothing was decided: the app is still waiting.
+  expect(errorCode(await poll(server, flow, ip))).toBe('authorization_pending');
 });
 
 for (const variant of [

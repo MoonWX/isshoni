@@ -60,6 +60,7 @@
       "body": "Try again in {{minutes}} min."
     },
     "devices": {
+      "empty": "Nothing is linked yet. When you link the isshoni app to this account, it shows up here.",
       "thisApp": "This app",
       "linkedOn": "Linked {{date}}",
       "lastSeen": "Last seen {{when}} from {{ip}}",

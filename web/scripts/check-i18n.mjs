@@ -55,9 +55,12 @@
 //    A src tree without lazy namespaces (test fixtures) has nothing to check.
 // 6. (M2 WA63, docs/m2/03-desktop-app.md §18.1) Every desktop bridge error code (platform/desktop/codes.gen.ts, which
 //    `task gen` makes from internal/desktop/bridge/codes) has a desktop.errors.<code> message: the SPA shows a bridge
-//    error by its code, so these keys are never t('…') literals (BRIDGE_ERRORS). The update.* codes are exempt: their
-//    texts are the update screens' desktop.update.error.<code> (README WA82, which drops the exemption); the prefix
-//    is the file's own UpdatePrefix constant. The codes are read from the generated `Code` union like rule 2's, so a
+//    error by its code, so these keys are never t('…') literals (BRIDGE_ERRORS). The update.* codes are exempt for
+//    now (the prefix is the file's own UpdatePrefix constant): their texts are the update screens'
+//    desktop.update.error.<code>, which WA82 writes (README §3 item 42). Dropping the exemption here would demand
+//    desktop.errors.update.* keys nobody writes, so then this rule maps an update.* code to
+//    desktop.update.error.<code> instead; README's WA82 row names only codes.node.test.ts, so the write-back after
+//    group 7 adds this file to its Touches. The codes are read from the generated `Code` union like rule 2's, so a
 //    code added in Go and regenerated fails the check until desktop.en.json has its text, and rule 4 counts every
 //    required message as used. A src tree without the file (test fixtures) skips the rule with a note.
 //    web/src/platform/desktop/codes.node.test.ts checks the same in test:web, with 03 §10.5's reason texts.
