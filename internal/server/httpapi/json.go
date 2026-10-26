@@ -49,7 +49,9 @@ func writeJSONBytes(w http.ResponseWriter, status int, b []byte) {
 	h.Set("Content-Type", jsonContentType)
 	h.Set("Content-Length", strconv.Itoa(len(b)))
 	w.WriteHeader(status)
-	_, _ = w.Write(b) // a failed write means the client is gone; there is no one left to tell
+	// A failed write means the client is gone; there is no one left to tell. G705: b is always encoding/json's output
+	// (HTML-escaped) sent as application/json with nosniff and a deny-all CSP, so a browser never renders it as HTML.
+	_, _ = w.Write(b) //nolint:gosec // G705: see above
 }
 
 func bodyAllowed(status int) bool {

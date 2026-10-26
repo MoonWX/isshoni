@@ -565,8 +565,13 @@ func TestAdminUserRoutes(t *testing.T) {
 		wantError(t, rec, http.StatusForbidden, api.CodeCSRFFailed)
 		wantError(t, f.call(http.MethodPost, path, `{"token":"x"}`, header("Content-Type", "text/plain")),
 			http.StatusUnsupportedMediaType, api.CodeUnsupportedMediaType)
-		wantError(t, f.call(http.MethodPost, path, `{"token":"x"}`, header("Authorization", "Bearer x")),
-			http.StatusUnauthorized, api.CodeUnauthenticated)
+		// A Public route ignores the Authorization header (M2 02 §6.4): the answer is the one without it.
+		plain := f.call(http.MethodPost, path, `{"token":"x"}`)
+		if rec := f.call(http.MethodPost, path, `{"token":"x"}`, header("Authorization", "Bearer x")); rec.Code != plain.Code ||
+			rec.Body.String() != plain.Body.String() {
+			t.Errorf("POST %s with Authorization: %d %q, want %d %q as without it", path, rec.Code, rec.Body, plain.Code,
+				plain.Body)
+		}
 		for _, body := range []string{``, `{"token":`, `[]`, `{} {}`} {
 			wantError(t, f.call(http.MethodPost, path, body), http.StatusBadRequest, api.CodeBadRequest)
 		}

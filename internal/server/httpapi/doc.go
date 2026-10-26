@@ -17,15 +17,19 @@
 // No access log: only 5xx responses log one line (route pattern, status, request ID), and a panic or an internal
 // error logs its cause instead. URLs, queries and bodies are never logged.
 //
-// The API part (api.go, deps.go, info.go, auth.go, me.go, account.go, rooms.go, invites.go, push.go, admin_users.go,
-// admin_rooms.go, admin_settings.go, admin_audit.go, accounts.go; 03 §12):
-//   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1): body limit (16 KiB for auth and
-//     device endpoints, 64 KiB elsewhere) → no-store on every response → route lookup (JSON 404 not_found, 405
-//     method_not_allowed with Allow; a matched route reports its own pattern to the RouteObserver) → any
-//     Authorization header is 401 unauthenticated (no bearer tokens in M1, 03 §7.5) → CSRF (auth.Service.CSRF,
-//     03 §7.5) → authenticate (User and Admin routes) → MaybeRotate → access check → handler. API.Handle registers
-//     other docs' routes behind the same chain, with an Access level (Public, User, Admin); PrincipalFrom gives a
-//     handler its caller.
+// The API part (api.go, cors.go, deps.go, info.go, auth.go, me.go, account.go, device.go, rooms.go, invites.go,
+// push.go, admin_users.go, admin_rooms.go, admin_settings.go, admin_audit.go, accounts.go; 03 §12, M2 02 §6.4, §7):
+//   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1, M2 02 §6.4): CORS for the desktop
+//     app's origins (Deps.DesktopOrigins: preflights answered, cached 600 s, the Cookie header dropped, never
+//     Access-Control-Allow-Credentials) → body limit (16 KiB for auth and device endpoints, 64 KiB elsewhere) →
+//     no-store on every response → route lookup (JSON 404 not_found, 405 method_not_allowed with Allow; a matched
+//     route reports its own pattern to the RouteObserver) → credentials: a Public route reads none; on any other
+//     route an Authorization header takes the bearer path (no cookie, no cross-origin check, the Content-Type rule,
+//     auth.Service.Authenticate: 401 invalid_token with WWW-Authenticate; an Admin or UserSession route then 403
+//     forbidden {credential: session}), its absence the cookie path: CSRF (auth.Service.CSRF, 03 §7.5) →
+//     authenticate → MaybeRotate → access check (Admin: an admin; UserDevice: 403 forbidden {credential: device}) →
+//     handler. API.Handle registers other docs' routes behind the same chain, with an Access level (Public, User,
+//     Admin, UserSession, UserDevice); PrincipalFrom gives a handler its caller, a web session or a device.
 //   - The interfaces the wiring implements (04 §6.6): Signal (01's hub), Push (04's push service) and InfoSource
 //     (04's build information), each declared in full; nil Signal and Info have built-in defaults, nil Push means
 //     push is off.
@@ -58,10 +62,17 @@
 //   - Self-service (README S58; 03 §7.7, §12.4.3; account.go): GET /api/v1/me/sessions (this browser first and
 //     marked current) and DELETE /api/v1/me/sessions/{id}, POST /api/v1/me/sessions/revoke-others,
 //     POST /api/v1/auth/logout-everywhere, POST /api/v1/me/password (the session's cookie is replaced by a new
-//     token), POST /api/v1/me/delete, and GET /api/v1/me/devices and DELETE /api/v1/me/devices/{id} (no device
-//     exists before M2). auth.Service owns each change, with the revocation row of 03 §7.7 that goes with it; the
-//     handlers set or clear the cookie, as the response's only Set-Cookie, and notify {UserID}: devices, or
-//     {Admins}: admin.users after an account was deleted.
+//     token), POST /api/v1/me/delete, and GET /api/v1/me/devices and DELETE /api/v1/me/devices/{id}. auth.Service
+//     owns each change, with the revocation row of 03 §7.7 that goes with it; the handlers set or clear the cookie,
+//     as the response's only Set-Cookie (never for a device), and notify {UserID}: devices, or {Admins}: admin.users
+//     after an account was deleted. The account changes are UserSession routes (M2 02 §6.4); a device's bearer
+//     reaches the rest, and GET /api/v1/me answers it with its device in place of the session.
+//   - Devices (README WA47; M2 02 §5, §6.2, §7, §14; device.go): the device flow, POST /api/v1/device/code (Public),
+//     /device/lookup and /device/decide (UserSession), both grants of POST /api/v1/device/token (Public), the
+//     password fallback POST /api/v1/device/password (Public), the app's sign-out POST /api/v1/device/revoke
+//     (UserDevice) and the rename PATCH /api/v1/me/devices/{id} (User). auth.Service owns every rule, throttle,
+//     audit row, connection close and alert; the handlers notify {UserID}: devices after a link, a rename, a revoke
+//     and a refresh token's reuse (auth.RefreshReusedError).
 //   - Admin users and password resets (README S64; 03 §7.10–7.11, §12.4.8; admin_users.go, auth.go):
 //     GET /api/v1/admin/users (every account, with ?status= for one status and online from Signal.OnlineUserIDs),
 //     PATCH /api/v1/admin/users/{id} (rename, role, status), DELETE /api/v1/admin/users/{id},

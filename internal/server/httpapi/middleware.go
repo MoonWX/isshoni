@@ -93,9 +93,11 @@ func (rt *Router) recoverPanics(next http.Handler) http.Handler {
 				panic(http.ErrAbortHandler) // part of the response is out: break the connection instead
 			default:
 				// Nothing was sent: drop what the handler prepared for its own answer (WriteError drops the
-				// validators and the encoding) and answer 500.
+				// validators and the encoding) and answer 500. The CORS step's headers go too: a recovered 500
+				// is unreadable to the desktop SPA, which retries as for 421 and the shutdown 503 (M2 02 §6.4).
 				h := w.Header()
-				for _, k := range []string{"Set-Cookie", "Content-Range", "Content-Disposition", "Location"} {
+				for _, k := range []string{"Set-Cookie", "Content-Range", "Content-Disposition", "Location",
+					"Access-Control-Allow-Origin", "Access-Control-Expose-Headers"} {
 					h.Del(k)
 				}
 				setBaseHeaders(h)

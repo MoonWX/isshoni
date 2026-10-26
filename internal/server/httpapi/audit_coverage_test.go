@@ -23,10 +23,10 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// The audit coverage test of 03 §15 (README S70): every action of 03 §10 that M1 can trigger is produced by a real
-// request (or by the CLI path, the janitor or a key rotation), shows up in GET /api/v1/admin/audit with the actor and
-// target kinds of §10's table and, for a request, with the IP that ClientIP gave. The actions §10 marks "later" are
-// listed with the reason they have no code yet, and nothing fakes them.
+// The audit coverage test of 03 §15 (README S70): every action of 03 §10 and M2 02 §8 that the server can trigger is
+// produced by a real request (or by the CLI path, the janitor or a key rotation), shows up in GET /api/v1/admin/audit
+// with the actor and target kinds of the tables and, for a request, with the IP that ClientIP gave. The actions a
+// table marks "later" are listed with the reason they have no code yet, and nothing fakes them.
 
 // auditAction is a row of the action table of 03 §10.
 type auditAction struct {
@@ -39,29 +39,33 @@ type auditAction struct {
 	// names the account only if it exists, and reject all has none.
 	targets []string
 	sec     bool // a security event (§10's Sec column); settings.changed only when registrationMode changed
-	// later is why M1 has no code that writes the action (§10 marks it later); "" for the actions M1 writes.
+	// systemIP marks an action whose system rows carry the IP of the request behind them (M2 02 §8:
+	// device.refresh_reused names the presenter's address); every other system or CLI row has none.
+	systemIP bool
+	// later is why the merged tree has no code that writes the action (the table marks it later); "" for the actions
+	// it writes.
 	later string
-	// inAuth marks a later action that auth already writes although no route reaches it yet (M2 README WA30);
-	// WA47 produces it in TestAuditCoverage and drops later and inAuth.
-	inAuth bool
 }
 
 // Actor kinds of the table.
 var (
-	byUser      = []store.ActorKind{store.ActorUser}
-	byUserOrCLI = []store.ActorKind{store.ActorUser, store.ActorCLI}
-	byAnonymous = []store.ActorKind{store.ActorAnonymous}
-	byCLI       = []store.ActorKind{store.ActorCLI}
-	bySystem    = []store.ActorKind{store.ActorSystem}
+	byUser            = []store.ActorKind{store.ActorUser}
+	byUserOrCLI       = []store.ActorKind{store.ActorUser, store.ActorCLI}
+	byUserOrSystem    = []store.ActorKind{store.ActorUser, store.ActorSystem}
+	byAnonymous       = []store.ActorKind{store.ActorAnonymous}
+	byAnonymousOrUser = []store.ActorKind{store.ActorAnonymous, store.ActorUser}
+	byCLI             = []store.ActorKind{store.ActorCLI}
+	bySystem          = []store.ActorKind{store.ActorSystem}
 )
 
-// auditActions is the table of 03 §10, in its order.
+// auditActions is the table of 03 §10, in its order, with the device rows of M2 02 §8.
 var auditActions = []auditAction{
 	{action: "setup.token_issued", actors: byCLI, targets: []string{""}},
 	{action: "setup.completed", actors: byUser, targets: []string{"user"}, sec: true},
 	{action: "auth.login", actors: byUser, targets: []string{"session"}},
 	{action: "auth.login_failed", actors: byAnonymous, targets: []string{"user", ""}},
-	{action: "auth.throttled", actors: byAnonymous, targets: []string{""}, sec: true},
+	// M2 02 §8: the device-lookup bucket's row is the user's.
+	{action: "auth.throttled", actors: byAnonymousOrUser, targets: []string{""}, sec: true},
 	{action: "auth.logout", actors: byUser, targets: []string{"session"}},
 	{action: "auth.logout_everywhere", actors: byUser, targets: []string{"user"}},
 	{action: "auth.password_changed", actors: byUser, targets: []string{"user"}},
@@ -88,21 +92,15 @@ var auditActions = []auditAction{
 	{action: "room.deleted", actors: byUser, targets: []string{"room"}},
 	{action: "settings.changed", actors: byUser, targets: []string{"settings"}, sec: true},
 	{action: "secrets.rotated", actors: bySystem, targets: []string{""}, sec: true},
-	{action: "device.approved", targets: []string{"device"}, inAuth: true,
-		later: "M2 02 §5.3: auth writes it (WA30); TestAuditCoverage produces it from WA47"},
-	{action: "device.denied", targets: []string{"device"}, inAuth: true,
-		later: "M2 02 §5.3: auth writes it (WA30); TestAuditCoverage produces it from WA47"},
-	{action: "device.linked", targets: []string{"device"}, sec: true, inAuth: true,
-		later: "M2 02 §5.4, §14: auth writes it (WA30); TestAuditCoverage produces it from WA47"},
-	// §10 marks it later, but S58's DELETE /api/v1/me/devices/{id} writes it for any device row. No M1 path links
-	// a device, so TestAuditCoverage inserts one row, as M2's linking would, and revokes it over REST.
-	{action: "device.revoked", actors: byUser, targets: []string{"device"}},
-	{action: "device.renamed", targets: []string{"device"}, inAuth: true,
-		later: "M2 02 §7.2: auth writes it (WA39); TestAuditCoverage produces it from WA47"},
-	{action: "device.refresh_reused", targets: []string{"device"}, sec: true, inAuth: true,
-		later: "M2 02 §6.2: auth writes it (WA39); TestAuditCoverage produces it from WA47"},
-	{action: "device.expired", targets: []string{"device"},
-		later: "M2 02 §8: the janitor's devices rule (WA19); TestAuditCoverage produces it from WA47"},
+	// M2 02 §8 (README WA47 produces each of them over REST, or with the janitor).
+	{action: "device.approved", actors: byUser, targets: []string{"device"}},
+	{action: "device.denied", actors: byUser, targets: []string{"device"}},
+	{action: "device.linked", actors: byUser, targets: []string{"device"}, sec: true},
+	// The owner on the Devices page or in the app, or the system when the device cap evicts one.
+	{action: "device.revoked", actors: byUserOrSystem, targets: []string{"device"}},
+	{action: "device.renamed", actors: byUser, targets: []string{"device"}},
+	{action: "device.refresh_reused", actors: bySystem, targets: []string{"device"}, sec: true, systemIP: true},
+	{action: "device.expired", actors: bySystem, targets: []string{"device"}},
 }
 
 // auditActionOf returns the table row of an action.
@@ -211,10 +209,11 @@ func (f *authFixture) auditPages(c *http.Cookie, limit int) []api.AuditEntry {
 	return nil
 }
 
-// TestAuditCoverage is 03 §15's audit case: every action of 03 §10 that M1 can trigger is produced at least once,
-// each row has the actor and target kinds of §10, a request's row has the IP from ClientIP and the CLI's and the
-// server's own rows have none, GET /api/v1/admin/audit pages through all of them, and the dashboard's security events
-// are exactly the rows of §10's Sec column.
+// TestAuditCoverage is 03 §15's audit case, with M2 02 §8's device rows: every action of the tables that the server
+// can trigger is produced at least once, each row has the actor and target kinds of the tables, a request's row has
+// the IP from ClientIP and the CLI's and the server's own rows have none (but device.refresh_reused, which names the
+// presenter's), GET /api/v1/admin/audit pages through all of them, and the dashboard's security events are exactly
+// the rows of the Sec column.
 func TestAuditCoverage(t *testing.T) {
 	f := newAuthFixtureDeps(t, func(d *Deps) { d.ClientIP = behindProxy },
 		func(o *auth.Options) { o.ClientIP = behindProxy })
@@ -247,7 +246,7 @@ func TestAuditCoverage(t *testing.T) {
 	expectBy("setup.token_issued", store.ActorCLI)
 	rec := f.call(http.MethodPost, "/api/v1/auth/setup/complete", jsonBody(t, api.SetupCompleteRequest{
 		Token: token, Username: "Alex", Password: testPassword}), from(ip(1)))
-	decodeBody[api.UserResponse](t, rec, http.StatusCreated)
+	alex := decodeBody[api.UserResponse](t, rec, http.StatusCreated).User
 	admin := f.sessionCookie(rec, thirtyDays)
 	expect("setup.completed", ip(1))
 
@@ -331,9 +330,26 @@ func TestAuditCoverage(t *testing.T) {
 	wantNoContent(t, f.call(http.MethodDelete, "/api/v1/me/sessions/"+string(f.sessionID(other)), "",
 		with(samCookie), from(ip(22))))
 	expect("session.revoked", ip(22))
-	f.linkDevice(sam.ID, "d1d1d1d1d1d1") // what M2's device flow would have done
+	f.linkDevice(sam.ID, "d1d1d1d1d1d1") // a device row as a link leaves one
 	wantNoContent(t, f.call(http.MethodDelete, "/api/v1/me/devices/d1d1d1d1d1d1", "", with(samCookie), from(ip(23))))
-	expect("device.revoked", ip(23))
+	expectShaped("device.revoked", ip(23), "device map[via:devices_page]")
+
+	// Sam links the app through the device flow (M2 02 §5) while 20 devices are linked already, so the link evicts
+	// the least recently seen (§6.7: device.revoked by the system, without an IP); a second code is denied.
+	for i := range 20 {
+		f.linkDevice(sam.ID, fmt.Sprintf("c%011d", i))
+	}
+	code := f.startedLink("Sam-PC", ip(40))
+	decodeBody[api.DeviceLookup](t, f.lookupCode(samCookie, code.UserCode, from(ip(41))), http.StatusOK)
+	wantNoContent(t, f.decideCode(samCookie, code.UserCode, true, from(ip(41))))
+	expect("device.approved", ip(41))
+	decodeBody[api.DeviceTokenResponse](t, f.pollCode(code.DeviceCode, ip(42)), http.StatusOK)
+	expectShaped("device.linked", ip(42), "device map[clientKind:desktop os:windows via:device_flow]")
+	wants = append(wants, want{action: "device.revoked", actor: store.ActorSystem, shape: "device map[via:cap]"})
+	denied := f.startedLink("Sam-PC", ip(40))
+	wantNoContent(t, f.decideCode(samCookie, denied.UserCode, false, from(ip(43))))
+	expect("device.denied", ip(43))
+	wantError(t, f.pollCode(denied.DeviceCode, ip(42)), http.StatusBadRequest, api.CodeAccessDenied)
 	wantNoContent(t, f.call(http.MethodPost, "/api/v1/auth/logout-everywhere", `{}`, with(samCookie), from(ip(24))))
 	expect("auth.logout_everywhere", ip(24))
 	last := f.sessionCookie(f.login("Samuel", "another passphrase", ip(25)), thirtyDays)
@@ -393,6 +409,38 @@ func TestAuditCoverage(t *testing.T) {
 	wantNoContent(t, f.call(http.MethodDelete, "/api/v1/admin/rooms/"+room.ID, "", with(admin), from(ip(32))))
 	expect("room.deleted", ip(32))
 
+	// The admin links two apps with the password fallback (M2 02 §14). The first is renamed from the app, rotates its
+	// refresh token twice, and then its first refresh token comes back from another address: reuse revokes it (§6.2;
+	// a system row with the presenter's IP). The second signs itself out (§7.2).
+	passLink := func(addr string) api.DeviceTokenResponse {
+		t.Helper()
+		return decodeBody[api.DeviceTokenResponse](t, f.passwordLink("Alex", testPassword, "Alex-PC", addr), http.StatusOK)
+	}
+	first := passLink(ip(44))
+	expectShaped("device.linked", ip(44), "device map[clientKind:desktop os:windows via:password]")
+	ok(f.call(http.MethodPatch, "/api/v1/me/devices/"+first.Device.ID, `{"name":"Gaming PC"}`,
+		withBearer(first.AccessToken), from(ip(45))), http.StatusOK)
+	expect("device.renamed", ip(45))
+	child := decodeBody[api.DeviceTokenResponse](t, f.refresh(first.RefreshToken, "", ip(46)), http.StatusOK)
+	decodeBody[api.DeviceTokenResponse](t, f.refresh(child.RefreshToken, "", ip(46)), http.StatusOK)
+	if e := wantError(t, f.refresh(first.RefreshToken, "", ip(47)), http.StatusBadRequest, api.CodeInvalidGrant); e.Params[api.ParamReason] != api.InvalidGrantReused {
+		t.Fatalf("the replayed refresh token: params %v", e.Params)
+	}
+	wants = append(wants, want{action: "device.refresh_reused", actor: store.ActorSystem, ip: proxiedText(ip(47))})
+	signOut := passLink(ip(48))
+	expectShaped("device.linked", ip(48), "device map[clientKind:desktop os:windows via:password]")
+	wantNoContent(t, f.call(http.MethodPost, "/api/v1/device/revoke", `{}`, withBearer(signOut.AccessToken), goClient,
+		from(ip(49))))
+	expectShaped("device.revoked", ip(49), "device map[via:app]")
+	// Wrong user codes on the approval page, until the device-lookup bucket is empty (M2 02 §5.5): the user's row.
+	for range 10 {
+		wantError(t, f.lookupCode(admin, "BCDF-GHJK", from(ip(50))), http.StatusNotFound, api.CodeDeviceCodeInvalid)
+	}
+	wantError(t, f.lookupCode(admin, "BCDF-GHJK", from(ip(50))), http.StatusTooManyRequests, api.CodeRateLimited)
+	expectShaped("auth.throttled", ip(50), "none map[scope:device_lookup]")
+	// A device without a live refresh token, as one left 90 days without a refresh, for the janitor below (§6.7).
+	f.linkDevice(alex.ID, "e1e1e1e1e1e1")
+
 	// The dashboard's security events (03 §12.4.8) are §10's Sec rows, newest first, all of them so far.
 	wantSecurity := func(when string) {
 		t.Helper()
@@ -417,10 +465,13 @@ func TestAuditCoverage(t *testing.T) {
 	}
 	wantSecurity("after the requests")
 
-	// The janitor, two weeks later: Max's sign-up expires.
+	// The janitor, two weeks later: Max's sign-up expires, and so does the device without a live refresh token.
 	f.clk.advance(14*24*time.Hour + time.Millisecond)
-	f.runJanitor(f.svc, func() bool { return len(f.auditOf("user.signup_expired")) > 0 })
+	f.runJanitor(f.svc, func() bool {
+		return len(f.auditOf("user.signup_expired")) > 0 && len(f.auditOf("device.expired")) > 0
+	})
 	expectBy("user.signup_expired", store.ActorSystem)
+	expectBy("device.expired", store.ActorSystem)
 
 	// A restart with a new invite key (`isshoni admin rotate-secrets`, 04 §5.3): auth.New finds the change.
 	o := testAuthOptions(f.clk)
@@ -473,7 +524,8 @@ func TestAuditCoverage(t *testing.T) {
 		if e.Action == "auth.login_failed" && strings.Contains(fmt.Sprint(e), "Nobody") {
 			t.Errorf("row %d %s holds the name tried for an unknown account: %+v", e.ID, e.Action, e)
 		}
-		fromRequest := e.Actor.Kind == string(store.ActorUser) || e.Actor.Kind == string(store.ActorAnonymous)
+		fromRequest := e.Actor.Kind == string(store.ActorUser) || e.Actor.Kind == string(store.ActorAnonymous) ||
+			e.Actor.Kind == string(store.ActorSystem) && a.systemIP
 		if fromRequest != (e.IP != "") || e.IP != "" && !strings.HasPrefix(e.IP, "2001:db8:") {
 			t.Errorf("row %d %s by %s has the IP %q; want the one ClientIP gave for a request, none otherwise",
 				e.ID, e.Action, e.Actor.Kind, e.IP)
@@ -495,7 +547,7 @@ func TestAuditCoverage(t *testing.T) {
 		case a.later != "":
 			t.Logf("03 §10 %s: no code yet (%s); not produced", a.action, a.later)
 		case !produced:
-			t.Errorf("03 §10 %s: M1 writes it, but the scenario does not produce it", a.action)
+			t.Errorf("03 §10 %s: the merged tree writes it, but the scenario does not produce it", a.action)
 		}
 		for _, kind := range a.actors {
 			if !slices.ContainsFunc(rows[a.action], func(e api.AuditEntry) bool { return e.Actor.Kind == string(kind) }) {
@@ -576,9 +628,6 @@ func TestAuditActionsInSource(t *testing.T) {
 			continue
 		}
 		for _, dir := range []string{".", "../auth"} {
-			if dir == "../auth" && a.inAuth {
-				continue
-			}
 			if where := writers[dir][a.action]; len(where) > 0 {
 				t.Errorf("%s names %s, which the table marks later (%s): produce it in TestAuditCoverage", where[0],
 					a.action, a.later)
