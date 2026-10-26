@@ -15,7 +15,7 @@ export class Info {
     "arch": string;
 
     /**
-     * C2's connection id; "" while it isn't ready (WA58)
+     * C2's connection id; "" while it isn't ready
      */
     "publisherConnectionId": string;
     "wizardDone": boolean;

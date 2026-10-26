@@ -19,7 +19,8 @@ type Site struct {
 	// Dev is true only in off mode with a loopback listen.http and a public_url that is empty or on a loopback host
 	// (localhost, 127.0.0.1, [::1]): then the Host check accepts any localhost Host header.
 	Dev bool
-	// ExtraOrigins are further allowed browser origins: later (M2) the Wails asset origins, added in code, not config.
+	// ExtraOrigins are further allowed browser origins: the desktop app's Wails asset origins
+	// (protocol.DesktopOrigins), which the server's wiring sets in code (M2 02 §6.3), never from config.
 	ExtraOrigins []string
 }
 

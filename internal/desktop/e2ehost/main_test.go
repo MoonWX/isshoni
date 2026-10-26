@@ -120,9 +120,21 @@ func TestHostCalls(t *testing.T) {
 		w.Body.String() != "null" {
 		t.Fatalf("AccessToken without a server: %d %s", w.Code, w.Body)
 	}
-	if w := call(t, h, "Share", "Pick"); w.Code != http.StatusUnprocessableEntity ||
-		!strings.Contains(w.Body.String(), `"code":"not_implemented"`) {
+	// Share runs WA58's controller over the fake engine: a pick, then the back-out that releases it.
+	w = call(t, h, "Share", "Pick")
+	var picked struct {
+		PickID string `json:"pickId"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &picked) != nil || picked.PickID == "" {
 		t.Fatalf("Share.Pick: %d %s", w.Code, w.Body)
+	}
+	if w := call(t, h, "Share", "Release", picked.PickID); w.Code != http.StatusOK {
+		t.Fatalf("Share.Release: %d %s", w.Code, w.Body)
+	}
+	// A bridge method still unimplemented answers 422 not_implemented (README WA71).
+	if w := call(t, h, "Auth", "SwitchServer", "http://127.0.0.1:1"); w.Code != http.StatusUnprocessableEntity ||
+		!strings.Contains(w.Body.String(), `"code":"not_implemented"`) {
+		t.Fatalf("Auth.SwitchServer: %d %s", w.Code, w.Body)
 	}
 	if w := call(t, h, "Audio", "FriendsHear"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"seq"`) {
 		t.Fatalf("Audio.FriendsHear over 05's service: %d %s", w.Code, w.Body)

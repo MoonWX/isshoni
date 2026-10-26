@@ -29,8 +29,8 @@ type Options struct {
 	// token goes nowhere but into hello.auth.
 	//
 	// An unauthenticated answer stops the client like every error in scope session. The "refresh once and retry"
-	// of 01 §3.2 is then the app's: it dials again, as a new connection. The M1 server answers every bearer hello
-	// with unauthenticated.
+	// of 01 §3.2 is then the app's: it dials again, as a new connection. An M1 (0.1.x) server answers every bearer
+	// hello with unauthenticated.
 	Token func(ctx context.Context) (protocol.Secret, error)
 	// Client, Role, Caps and Features go into every hello (01 §8.2). A resume keeps the connection's client info,
 	// role and features and takes the caps anew (01 §10.3). Caps are therefore the client's first ones only: once
