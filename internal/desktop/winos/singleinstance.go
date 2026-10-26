@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -31,6 +32,78 @@ const (
 
 // ErrNotFirst is Serve's error in a process that isn't the first instance.
 var ErrNotFirst = errors.New("winos: not the first instance")
+
+// errStopped: Close ran while the pipe's server waited.
+var errStopped = errors.New("winos: stopped")
+
+// pipeServer is the OS's side of Serve's goroutine: instances of the pipe's name (singleinstance_windows.go). The loop
+// around it, serveLoop, is portable, so its order is tested on every OS (singleinstance_test.go).
+type pipeServer interface {
+	// create makes an instance of the pipe that a client may connect to at once, before accept is called. The first
+	// one is made with nobody else holding the name. It returns errStopped when Close ended its retries.
+	create(first bool) (pipeInstance, error)
+	// stopped reports whether Close ran.
+	stopped() bool
+}
+
+// pipeInstance is one instance of the pipe.
+type pipeInstance interface {
+	// accept waits for this instance's client (one that connected before the call counts, even one that wrote and
+	// closed its end since) and returns all it wrote until it closed its end. It returns errStopped on Close.
+	accept() ([]byte, error)
+	// close disconnects the instance's client, if any, and closes the instance.
+	close()
+}
+
+// serveLoop is Serve's goroutine: it delivers each second launch's command line to onArgs, one at a time, until Close.
+// The next instance is created before the served one is closed, so the name is never free for another account to
+// create while this process serves, and a launch that comes while onArgs runs connects to that instance and is served
+// once onArgs returns.
+func serveLoop(p pipeServer, onArgs func(args []string), log *slog.Logger) {
+	// The first instance of the pipe must be ours (nobody squats the name).
+	inst, err := p.create(true)
+	if err != nil {
+		if !errors.Is(err, errStopped) {
+			log.Warn("winos: the single-instance pipe can't be created; second launches can't reach this one",
+				"err", err)
+		}
+		return
+	}
+	for {
+		if p.stopped() { // Close ran while onArgs handled the last command line
+			inst.close()
+			return
+		}
+		data, err := inst.accept()
+		quit := errors.Is(err, errStopped)
+		var next pipeInstance
+		var nextErr error
+		if !quit {
+			next, nextErr = p.create(false)
+		}
+		inst.close()
+		if quit {
+			return
+		}
+		var args []string
+		if err == nil {
+			args, err = decodeArgs(data)
+		}
+		if err != nil {
+			log.Info("winos: a second launch's message was dropped", "err", err)
+		} else {
+			onArgs(args)
+		}
+		if nextErr != nil {
+			if !errors.Is(nextErr, errStopped) {
+				log.Warn("winos: the single-instance pipe can't be created; second launches can't reach this one",
+					"err", nextErr)
+			}
+			return
+		}
+		inst = next
+	}
+}
 
 // forwardMessage is what a second instance sends.
 type forwardMessage struct {
