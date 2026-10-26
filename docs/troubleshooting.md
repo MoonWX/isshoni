@@ -231,6 +231,106 @@ isshoni runs in a container. Check that `compose.yaml` publishes the media ports
 outside, `7882:7882/udp` and `7882:7882/tcp`, and open them in your provider's firewall. Published ports bypass ufw,
 so ufw rules neither help nor block them ([Docker](/install/docker#host)).
 
+<!-- The desktop app links to #desktop-linking from its "Can't reach the server" texts (docs/m2/03-desktop-app.md
+§8.1, §9): never rename or remove that anchor. The section's first paragraph goes once the Windows app is released
+(06 R14, which turns /download into the Windows page). -->
+
+## Linking the app {#desktop-linking}
+
+The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 and links only to a server that
+runs 0.2 or later ([Desktop apps](/download)). This section describes linking as it will work.
+
+The desktop app signs in to your server once, when you link it: it shows a code and opens your server's page in your
+browser, where you approve it while signed in. "Sign in with username and password instead" in the app links it
+without a browser. These are the usual problems.
+
+### "Can't reach the server", but the browser can {#desktop-linking-proxy}
+
+The server opens in your browser, and maybe in the app's own window, but the app says it can't reach the server, or
+can't connect when you share. Most often the network needs a proxy: an office or school network, or security or
+filtering software that sets one. Your browser and the app's window use the proxy set in Windows; the app's own
+connection to the server, which links it and starts your shares, doesn't read that setting yet. Until it does, give
+it the proxy yourself:
+
+1. Find the proxy's address in **Settings → Network & internet → Proxy**, under "Manual proxy setup" (for example
+   `proxy.example.com:8080`). If the proxy is set up automatically instead ("Automatically detect settings" or "Use
+   setup script"), ask whoever runs the network for its address.
+2. Set it as `HTTPS_PROXY` for your Windows user, in PowerShell:
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('HTTPS_PROXY', 'http://proxy.example.com:8080', 'User')
+   ```
+
+   or under **Edit environment variables for your account** (search for it in Start): New, name `HTTPS_PROXY`, value
+   `http://proxy.example.com:8080`.
+3. Quit isshoni from its tray icon and start it again: a program reads the setting when it starts.
+
+If the proxy asks for a sign-in of its own (office proxies often use your Windows account), the app can't use it yet:
+ask whoever runs the network to let `isshoni.exe`, or your server's address, through without one.
+
+Other programs that read `HTTPS_PROXY`, such as some command-line tools, use it too; delete the variable once you
+no longer need it. If the browser works without any proxy, look at your firewall or security software instead: one
+that lets only known programs connect may block `isshoni.exe`, so allow it there. The proxy carries only the app's
+connection to the server; video goes its own way to the server's media port. If the app links but no video gets
+through, run the connection test in your browser ([Connection test results](#connection-test)).
+
+### The code expired, or the browser doesn't take it {#desktop-linking-code}
+
+- A code works for 10 minutes. When the app says "The code expired", click **Get a new code** and approve the new one.
+- Approve in a browser where you're signed in to the same server. If it asks you to log in first, do: it comes back
+  to the approval page. Check that the code on the page is the one in the app.
+- "This code is wrong, was already used or has expired": start again in the app, which shows a new code. A code has
+  letters only, no digits and no vowels (so no O or I), and the dash is optional.
+- After too many wrong codes the page asks you to wait a few minutes.
+- If you clicked **Don't link**, the app says linking was declined: click **Try again**.
+- The page asks you to tick "I started this myself" when the app and the browser reach the server from different
+  networks (for example, the PC uses a VPN or mobile data) or the server can't tell. If you started linking on your
+  own PC, tick it. **If someone sent you the link, don't approve it**: they would get an app signed in as you.
+- After you click **Link**, the app goes on by itself within a few seconds.
+
+### The app was signed out {#desktop-linking-signed-out}
+
+The app asks you to link it again when the server no longer accepts its sign-in:
+
+- **"This PC was signed out"**: it was removed on your account's Devices page, or not used for 90 days; or you
+  changed your password or used "Log out everywhere"; or an admin created a reset link for you or signed you out
+  everywhere; or the server's admin restored an older backup or replaced the server's keys; or a 21st app was linked
+  to your account, which removes the app seen least recently (an account has at most 20). Click **Link again**.
+- **"Someone else used this PC's sign-in"**: the server saw the app's sign-in used twice, which happens when it was
+  copied, so it removed the app. Rarely, the app causes it itself, when it was closed by a crash or a power cut right
+  after the server renewed its sign-in. Link again, then check your Devices page for apps you don't recognize. If
+  you suspect a copy, check this PC for unwanted software first: any program running as you can read the app's
+  sign-in ([Linked apps](/security#linked-apps)).
+- **"Your account is disabled"**: ask your admin.
+
+### Wrong username or password {#desktop-linking-password}
+
+"Sign in with username and password instead" takes the username and password of your server's login page, with the
+same limits:
+
+- "Wrong username or password": check both. The username is the one you log in with in the browser.
+- After several wrong tries the app asks you to wait; try again after that time.
+- "An admin hasn't approved your account yet": the server approves new accounts by hand; wait for an admin.
+- Forgot your password? isshoni sends no email: ask your admin for a reset link, open it in your browser, choose a
+  new password, then sign in to the app with it.
+
+The app never saves your password: it is needed only to link, and the app then keeps the sign-in the server gives
+it.
+
+### Windows Credential Manager {#desktop-linking-credential-manager}
+
+The app keeps its sign-in for each server in Windows Credential Manager: **Control Panel → Credential Manager →
+Windows Credentials**, under "Generic Credentials", named `isshoni:v1:` and the server's address (for example
+`isshoni:v1:https://watch.example.com`). It is stored for this PC only.
+
+- **"Couldn't save the sign-in to Windows Credential Manager"**: the app works until you quit it, and then has to be
+  linked again. Windows didn't let it store the entry, for example because of a policy on a PC that an organization
+  manages. Signing out of Windows and back in, or a restart, helps when it was a passing problem.
+- Deleting the entry signs the app out on this PC only: the server still lists the app on your Devices page until
+  you remove it there, or until 90 days pass. **Sign out** in the app does both.
+- Uninstalling isshoni signs it out of every server it can reach, and deletes its entries either way.
+- A new PC, or a Windows profile copied to one, doesn't bring the sign-in along: link the app there again.
+
 ## Other problems {#other}
 
 ### The certificate is not issued {#certificate-not-issued}

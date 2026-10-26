@@ -101,3 +101,71 @@ Each archive also comes with an SPDX SBOM (`*.sbom.json`) that lists what it con
 image carries `THIRD_PARTY_NOTICES` with the licenses of everything isshoni bundles.
 
 See also the [code signing policy](/code-signing).
+
+<!-- The section's first paragraph goes once the Windows app is released (06 R14, which turns /download into the
+Windows page). -->
+
+## Linked apps {#linked-apps}
+
+The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 ([Desktop apps](/download)).
+This section describes how they will sign in.
+
+The desktop apps never keep your password or a browser cookie. You link an app to your server once, and the server gives
+that app a sign-in of its own. This is that sign-in's threat model: what it is, where it is kept, what someone who
+copies it can do, and how it ends.
+
+### Linking {#linked-apps-linking}
+
+- An app is approved only in a browser that is signed in to the server, on the server's own page (`/link`). A linked
+  app can never approve another one.
+- That page shows the code to compare with the one in the app, which app and version asks, the computer's name, and
+  when and from which IP address the request came. When the request came from another network than the browser, or
+  the server can't tell, the page warns and asks you to tick "I started this myself". A code works for 10 minutes.
+  **Never approve a code that someone sent you**: whoever started it would get an app signed in as you.
+- Instead of a browser, the app can sign in with your username and password. That form has exactly the login page's
+  limits, so it is no faster way to guess a password, and the password is sent once and never stored.
+- Every new app shows on your account's Devices page, and on the admins' dashboard as a security event.
+
+### The sign-in and where it is kept {#linked-apps-tokens}
+
+- The app holds a **refresh token**, which it trades for a new one every time it uses it, and **access tokens** that
+  work for 15 minutes. The server keeps only keyed hashes of them (HMAC-SHA-256), so a copy of its database or of a
+  backup holds no usable token.
+- An app stays linked while it uses its refresh token at least once in 90 days; it does so when it starts and at
+  least once a day while it runs. An app left unused for 90 days is removed.
+- On Windows the refresh token is kept in **Windows Credential Manager**, one entry per server, stored for this PC
+  only, so it doesn't follow a roaming profile to other PCs. Access tokens stay in memory, and the app's window only
+  ever gets an access token, never the refresh token.
+- **Any program that runs as the same Windows user can read that entry**, just as it can read your browser's
+  cookies: Windows protects it from the PC's other users (DPAPI, tied to your Windows sign-in), not from your own
+  programs. Malware running as you can take the app's sign-in, as it can take your browser's.
+
+### What a copied sign-in can do {#linked-apps-scope}
+
+- It acts as you on that server, as the app does: it can watch, share, change your settings, sign your browsers out,
+  and create or revoke invites if you're allowed to.
+- It can't change your password, delete your account, approve another app, subscribe to notifications, or use any
+  admin page or admin API: those need a browser session. That holds for an admin's PC too, so a stolen desktop
+  sign-in never becomes control over the server's users, settings or audit log. (An admin's app can create and revoke
+  invites, as any member allowed to invite can.)
+- The server accepts requests from the app's window (`http://wails.localhost`) only with an access token, never with
+  cookies. Every app built with the same framework has that origin, so the origin proves nothing; the token does.
+
+### How a copy is caught {#linked-apps-reuse}
+
+- Each refresh token works once. When the app and a copy both use the same one, the server sees a used token come
+  back: it removes that app at once, so the copy stops working too, records a security event and alerts the admins
+  who turned on admin alerts. The app says that someone else used its sign-in and asks to be linked again. The app's
+  own retries of a refresh whose answer got lost don't count as a second use.
+- A copy is caught once both have used it: at the latest when the app next refreshes. Until then a copy that was used
+  first keeps working, so remove an app you don't trust right away (below).
+
+### Ending a sign-in {#linked-apps-revoke}
+
+- Your account's Devices page, in the browser, lists every linked app with its name, version, and when and from which
+  IP address it was last seen. Remove signs that app out at once and closes its connections; "Sign out" in the app
+  does the same for that app.
+- Changing your password or "Log out everywhere" removes all your apps, and so do an admin's "Create reset link",
+  "Sign out everywhere" and "Disable".
+- An account has at most 20 linked apps; linking a 21st removes the one seen least recently.
+- `isshoni admin rotate-secrets` signs out every app, as it does every browser.
