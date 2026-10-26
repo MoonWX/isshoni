@@ -1016,8 +1016,8 @@ jobs:
 
       - name: Install busybox (test:sh runs the install.sh unit tests under it)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends busybox
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends busybox
 
       - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
         run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
@@ -1249,8 +1249,8 @@ jobs:
       - name: Install rpm (release:assets lists the rpm packages and their dependencies with it)
         run: |
           if ! command -v rpm > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends rpm
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends rpm
           fi
           rpm --version
 
@@ -1315,8 +1315,8 @@ jobs:
       - name: Install rpm (release:snapshot's asset check lists the rpm packages with it)
         run: |
           if ! command -v rpm > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends rpm
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends rpm
           fi
 
       - name: Build the releases 0.0.1-ci.1 and 0.0.1-ci.2
@@ -1676,8 +1676,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! command -v clang-format-18 > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends clang-format-18
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq --no-install-recommends clang-format-18
           fi
           task lint:native CLANG_FORMAT=clang-format-18
 
