@@ -159,7 +159,9 @@ const maxLoggedOrigin = 128
 //  3. Authenticator.AuthenticateRequest: success makes the socket cookie-authenticated; ErrNoCredentials and
 //     ErrInvalid make it pre-auth; any other error gets 503 with Retry-After: 2.
 //  4. Pre-auth only: at most Limits.PreAuthPerIPPerMinute upgrades per client IP key per minute (429 with
-//     Retry-After) and Limits.MaxPreAuthConns pre-auth sockets at once (503 with Retry-After: 2).
+//     Retry-After) and Limits.MaxPreAuthConns pre-auth sockets at once (503 with Retry-After: 2). A socket whose
+//     hello then authenticates with a bearer token gives its token back (authenticated, M2 02 §6.3 item 4), so the
+//     per-IP limit counts the sockets that never authenticate.
 //  5. Cookie only: the user has fewer than Limits.MaxConnectionsPerUser connections and handshaking sockets, else
 //     the socket is accepted and gets error{too_many_connections, scope connection} and 4429, unless its hello
 //     resumes one of the user's connections. A resume needs no slot (the connection has its own), and the resume
@@ -363,14 +365,19 @@ func (h *Hub) releaseSlotLocked(userID string) {
 	}
 }
 
-// authenticated marks a pre-auth socket as authenticated by bearer at hello: it stops counting against the pre-auth
-// limit.
+// authenticated marks a pre-auth socket as authenticated by bearer at hello: it stops counting against the
+// server-wide pre-auth limit, and the token it took from its IP key's bucket at the upgrade goes back (M2 02 §6.3
+// item 4). The per-IP bucket thus counts only the sockets that never authenticate: the desktop apps of ten friends
+// behind one NAT, two bearer sockets each, all reconnect after a server restart, as cookie upgrades (which take no
+// token) do. Only a socket that took a token gives one back, and only once: s.preAuth is set exactly when ServeHTTP
+// took it, and cleared here.
 func (h *Hub) authenticated(s *socket) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s.preAuth {
 		h.preAuth--
 		s.preAuth = false
+		h.preAuthIP.refund(ipKey(s.ip), time.Now())
 	}
 }
 
