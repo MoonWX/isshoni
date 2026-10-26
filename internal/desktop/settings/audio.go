@@ -37,24 +37,38 @@ func (a *AudioStore[T]) AudioSettings() T {
 	return v
 }
 
-// SaveAudioSettings writes v as the section, keeping the section's keys that v doesn't have.
+// SaveAudioSettings writes v as the section, keeping the section's keys that v doesn't have. A section that would
+// have more than maxObjectKeys keys is a *FieldError for audio, and the saved one stays.
 func (a *AudioStore[T]) SaveAudioSettings(v T) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	var next map[string]json.RawMessage
-	if err := json.Unmarshal(data, &next); err != nil || next == nil {
+	next, ok := members(data)
+	if !ok {
 		return fieldError("audio")
 	}
-	var old map[string]json.RawMessage
-	_ = json.Unmarshal(a.s.AudioSection(), &old)
+	old, _ := members(a.s.AudioSection())
+	if len(old) > maxObjectKeys || len(next) > maxObjectKeys {
+		return fieldError("audio")
+	}
 	merged := make(map[string]json.RawMessage, len(old)+len(next))
 	maps.Copy(merged, old)
 	maps.Copy(merged, next)
+	if len(merged) > maxObjectKeys {
+		return fieldError("audio")
+	}
 	out, err := json.Marshal(merged)
 	if err != nil {
 		return err
 	}
 	return a.s.SetAudioSection(out)
+}
+
+// members returns the members of the JSON object data; ok is false when data is anything else (null included).
+func members(data []byte) (m map[string]json.RawMessage, ok bool) {
+	if err := json.Unmarshal(data, &m); err != nil || m == nil {
+		return nil, false
+	}
+	return m, true
 }

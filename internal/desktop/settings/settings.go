@@ -52,6 +52,16 @@ const CurrentSchema = 1
 // DefaultDebounce is how long a change waits before it is written (03 §20).
 const DefaultDebounce = 500 * time.Millisecond
 
+// maxObjectKeys bounds the members of every JSON object in settings.json (03 §14.2, §20): four times its largest
+// object, 05's appRules with at most 256 entries (05 §14.1); serverPrefs has one entry per server, at most 20 (02),
+// and pill.positions one per monitor. A file with a larger object anywhere is not a settings file: it counts as one
+// that doesn't parse. Update and SetAudioSection refuse a value with one, and a write that would make one fails, so
+// the store never writes a file it would set aside. It is also the bound of what a merge allocates.
+const maxObjectKeys = 1024
+
+// errTooManyKeys is the error of a JSON object with more than maxObjectKeys members.
+var errTooManyKeys = fmt.Errorf("settings: a JSON object with more than %d keys", maxObjectKeys)
+
 // The values of the enumerated settings.
 const (
 	PillAuto   = "auto"   // "Only when Windows shows no border" (the default)
@@ -352,7 +362,8 @@ func (s *Store) badName() string {
 	return name
 }
 
-// parse reads a JSON object; numbers stay json.Number, so unknown fields are written back exactly.
+// parse reads a JSON object; numbers stay json.Number, so unknown fields are written back exactly. An object with
+// more than maxObjectKeys members, at any depth, is errTooManyKeys.
 func parse(data []byte) (map[string]any, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -366,7 +377,32 @@ func parse(data []byte) (map[string]any, error) {
 	if dec.More() {
 		return nil, errors.New("settings: data after the JSON object")
 	}
+	if !fits(raw) {
+		return nil, errTooManyKeys
+	}
 	return raw, nil
+}
+
+// fits reports whether every object in v, a decoded JSON value, has at most maxObjectKeys members.
+func fits(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		if len(x) > maxObjectKeys {
+			return false
+		}
+		for _, e := range x {
+			if !fits(e) {
+				return false
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if !fits(e) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // decode turns the raw object into Settings on top of the defaults and repairs values outside their ranges.
@@ -445,6 +481,12 @@ func repair(s *Settings) bool {
 // is not checked: a hotkey this build can't parse is kept as it was loaded (a newer build's key, or a hand edit;
 // see Hotkeys), and it must not make every later change of another setting fail.
 func validate(prev, next *Settings) error {
+	switch {
+	case len(next.ServerPrefs) > maxObjectKeys:
+		return fieldError("serverPrefs")
+	case len(next.Pill.Positions) > maxObjectKeys:
+		return fieldError("pill.positions")
+	}
 	for origin, p := range next.ServerPrefs {
 		if old, ok := prev.ServerPrefs[origin]; ok && old == p {
 			continue
@@ -498,9 +540,14 @@ func (e *FieldError) Unwrap() error { return ErrInvalid }
 
 func fieldError(field string) error { return &FieldError{Field: field} }
 
+// isObject reports whether m is a JSON object whose objects have at most maxObjectKeys members each.
 func isObject(m json.RawMessage) bool {
-	var v map[string]json.RawMessage
-	return json.Unmarshal(m, &v) == nil && v != nil
+	var v any
+	if json.Unmarshal(m, &v) != nil {
+		return false
+	}
+	o, ok := v.(map[string]any)
+	return ok && fits(o)
 }
 
 // hasUpdateCheck reports whether the file had updates.check.
@@ -633,7 +680,10 @@ func encode(raw map[string]any, cur Settings) (map[string]any, []byte, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	merged := mergeKnown(raw, known, "")
+	merged, err := mergeKnown(raw, known, "")
+	if err != nil {
+		return nil, nil, err
+	}
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return nil, nil, err
@@ -643,8 +693,13 @@ func encode(raw map[string]any, cur Settings) (map[string]any, []byte, error) {
 
 // mergeKnown returns base with every key of known set to known's value; objects present in both are merged the same
 // way, except the replaced ones, which known replaces. path is the object's place in the file ("" for the file,
-// "serverPrefs[]" for an entry of a keyed object); a keyed object keeps only known's keys.
-func mergeKnown(base, known map[string]any, path string) map[string]any {
+// "serverPrefs[]" for an entry of a keyed object); a keyed object keeps only known's keys. An object of base or known
+// with more than maxObjectKeys members, or a merged one that would have more, is errTooManyKeys: parse refused such a
+// file, and the store must not write one.
+func mergeKnown(base, known map[string]any, path string) (map[string]any, error) {
+	if len(base) > maxObjectKeys || len(known) > maxObjectKeys {
+		return nil, errTooManyKeys
+	}
 	out := make(map[string]any, len(base)+len(known))
 	if !keyed[path] {
 		maps.Copy(out, base)
@@ -662,12 +717,19 @@ func mergeKnown(base, known map[string]any, path string) map[string]any {
 		bo, bok := base[k].(map[string]any)
 		ko, kok := v.(map[string]any)
 		if bok && kok && !replaced[p] {
-			out[k] = mergeKnown(bo, ko, p)
+			m, err := mergeKnown(bo, ko, p)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = m
 			continue
 		}
 		out[k] = v
 	}
-	return out
+	if len(out) > maxObjectKeys {
+		return nil, errTooManyKeys
+	}
+	return out, nil
 }
 
 // WizardDone reports settings.wizardDone (06's update.Options.WizardDone).

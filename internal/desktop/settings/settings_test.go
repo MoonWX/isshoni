@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -770,5 +771,175 @@ func TestAudioStore(t *testing.T) {
 	}
 	if v := NewAudioStore[audioSettings](s3, nil).AudioSettings(); v.KeepOutMicUsers {
 		t.Error("nil defaults should be the zero value")
+	}
+}
+
+// object returns a JSON object with n members "k0": 0, "k1": 1, ….
+func object(n int) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i := range n {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"k` + strconv.Itoa(i) + `":` + strconv.Itoa(i))
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// TestObjectKeyBound: a JSON object of up to maxObjectKeys members anywhere in settings.json is read and written back;
+// a file with a larger one counts as one that doesn't parse (set aside, the last good copy used).
+func TestObjectKeyBound(t *testing.T) {
+	t.Run("at the bound", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, FileName), `{"schema": 1, "later": {"deep": `+object(maxObjectKeys)+`}}`)
+		s := open(t, Options{Dir: dir})
+		if err := s.Update(func(v *Settings) { v.CloseToTray = true }); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		m := readJSON(t, filepath.Join(dir, FileName))
+		if deep, _ := m["later"].(map[string]any)["deep"].(map[string]any); len(deep) != maxObjectKeys ||
+			m["closeToTray"] != true {
+			t.Errorf("later.deep has %d keys; closeToTray = %v", len(deep), m["closeToTray"])
+		}
+	})
+	t.Run("past it", func(t *testing.T) {
+		dir := t.TempDir()
+		big := `{"schema": 1, "later": {"deep": ` + object(maxObjectKeys+1) + `}}`
+		writeFile(t, filepath.Join(dir, FileName), big)
+		writeFile(t, filepath.Join(dir, bakName), `{"schema": 1, "closeToTray": true}`)
+		s := open(t, Options{Dir: dir})
+		if !s.Get().CloseToTray {
+			t.Error("the last good copy wasn't used")
+		}
+		if data, err := os.ReadFile(filepath.Join(dir, badName+"20261022T123045Z")); err != nil || string(data) != big {
+			t.Errorf("the file wasn't set aside: %d bytes, %v", len(data), err)
+		}
+		if _, ok := readJSON(t, filepath.Join(dir, FileName))["later"]; ok {
+			t.Error("the object past the bound was written back")
+		}
+	})
+	t.Run("a last good copy past it", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, FileName), `not json`)
+		writeFile(t, filepath.Join(dir, bakName), `{"schema": 1, "closeToTray": true, "x": `+object(maxObjectKeys+1)+`}`)
+		if g := open(t, Options{Dir: dir}).Get(); !reflect.DeepEqual(g, Defaults()) {
+			t.Errorf("not the defaults: %+v", g)
+		}
+	})
+}
+
+// TestObjectKeyBoundOnChanges: Update and SetAudioSection refuse a value with an object past maxObjectKeys, so the
+// store never writes a file it would set aside.
+func TestObjectKeyBoundOnChanges(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, Options{Dir: dir})
+	prefs := func(n int) map[string]ServerPrefs {
+		m := make(map[string]ServerPrefs, n)
+		for i := range n {
+			m["https://s"+strconv.Itoa(i)+".example.com"] = ServerPrefs{Preset: protocol.PresetGame}
+		}
+		return m
+	}
+	if err := s.Update(func(v *Settings) { v.ServerPrefs = prefs(maxObjectKeys) }); err != nil {
+		t.Fatalf("serverPrefs at the bound: %v", err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(open(t, Options{Dir: dir}).Get().ServerPrefs); n != maxObjectKeys {
+		t.Errorf("read back %d serverPrefs", n)
+	}
+	before := s.Get()
+	positions := make(map[string]Point, maxObjectKeys+1)
+	for i := range maxObjectKeys + 1 {
+		positions[`\\.\DISPLAY`+strconv.Itoa(i)] = Point{X: i}
+	}
+	for field, fn := range map[string]func(*Settings){
+		"serverPrefs":    func(v *Settings) { v.ServerPrefs = prefs(maxObjectKeys + 1) },
+		"pill.positions": func(v *Settings) { v.Pill.Positions = positions },
+		"audio":          func(v *Settings) { v.Audio = json.RawMessage(`{"appRules": ` + object(maxObjectKeys+1) + `}`) },
+	} {
+		err := s.Update(fn)
+		var fe *FieldError
+		if !errors.As(err, &fe) || fe.Field != field || !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: %v", field, err)
+		}
+	}
+	if !reflect.DeepEqual(s.Get(), before) {
+		t.Error("a refused Update changed the settings")
+	}
+	if err := s.SetAudioSection(json.RawMessage(`{"appRules": ` + object(maxObjectKeys+1) + `}`)); !errors.Is(err,
+		ErrInvalid) {
+		t.Errorf("SetAudioSection past the bound: %v", err)
+	}
+	if err := s.SetAudioSection(json.RawMessage(`{"appRules": ` + object(maxObjectKeys) + `}`)); err != nil {
+		t.Errorf("SetAudioSection at the bound: %v", err)
+	}
+}
+
+// TestSaveAudioSettingsBound: SaveAudioSettings refuses a section that would have more than maxObjectKeys keys (the
+// saved section's keys that T doesn't have, and T's), and keeps the saved one.
+func TestSaveAudioSettingsBound(t *testing.T) {
+	s := open(t, Options{Dir: t.TempDir()})
+	st := NewAudioStore(s, audioDefaults)
+	// audioSettings has 4 keys, none of them k<n>.
+	if err := s.SetAudioSection(json.RawMessage(object(maxObjectKeys - 3))); err != nil {
+		t.Fatal(err)
+	}
+	saved := s.AudioSection()
+	err := st.SaveAudioSettings(audioDefaults())
+	var fe *FieldError
+	if !errors.As(err, &fe) || fe.Field != "audio" {
+		t.Errorf("SaveAudioSettings past the bound: %v", err)
+	}
+	if !bytes.Equal(s.AudioSection(), saved) {
+		t.Error("a refused SaveAudioSettings changed the section")
+	}
+	if err := s.SetAudioSection(json.RawMessage(object(maxObjectKeys - 4))); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAudioSettings(audioDefaults()); err != nil {
+		t.Errorf("SaveAudioSettings at the bound: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(s.AudioSection(), &m); err != nil || len(m) != maxObjectKeys {
+		t.Errorf("the section has %d keys, %v", len(m), err)
+	}
+}
+
+func TestMergeKnownBound(t *testing.T) {
+	keys := func(n int) map[string]any {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(object(n)), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	for _, c := range []struct {
+		name        string
+		base, known map[string]any
+		path        string
+		ok          bool
+	}{
+		{"base at the bound", keys(maxObjectKeys), map[string]any{"k0": "x"}, "", true},
+		{"base past it", keys(maxObjectKeys + 1), map[string]any{}, "", false},
+		{"known past it", map[string]any{}, keys(maxObjectKeys + 1), "", false},
+		{"merged past it", keys(maxObjectKeys), map[string]any{"new": true}, "", false},
+		{"nested past it", map[string]any{"o": keys(maxObjectKeys)}, map[string]any{"o": map[string]any{"new": 1}}, "",
+			false},
+		{"keyed: only known's keys", keys(maxObjectKeys), keys(1), "serverPrefs", true},
+	} {
+		out, err := mergeKnown(c.base, c.known, c.path)
+		switch {
+		case c.ok && (err != nil || len(out) == 0):
+			t.Errorf("%s: %d keys, %v", c.name, len(out), err)
+		case !c.ok && !errors.Is(err, errTooManyKeys):
+			t.Errorf("%s: %d keys, %v", c.name, len(out), err)
+		}
 	}
 }

@@ -170,13 +170,39 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		a.wg.Go(func() {
 			if err := p.r.Run(a.ctx); err != nil && a.ctx.Err() == nil {
-				a.log.Error("app: a part stopped", "part", p.name, "err", err)
+				a.log.Error("app: a part stopped", "part", p.name, errAttr(err))
 			}
 		})
 	}
 	<-a.ctx.Done()
 	a.wg.Wait()
 	return nil
+}
+
+// errAttr is the log attribute of an error that one of the app's parts returned (Session, AudioService, Updater).
+// Log files are what users attach to public issues (03 §17), and a part is an interface whose errors the app can't
+// vouch for: one may wrap a server's answer, a request's headers, a path with the user's name or the engine's detail
+// (05 §16 keeps that out of 05's own lines). So the attribute names the error's kind, never its text: a media error's
+// op, code and reason (never its detail), a context error's text, and "error" for anything else, as 05's errAttr
+// does.
+func errAttr(err error) slog.Attr {
+	var me *media.Error
+	switch {
+	case errors.As(err, &me):
+		s := string(me.Code)
+		if me.Op != "" {
+			s = me.Op + ": " + s
+		}
+		if me.Reason != "" {
+			s += " (" + me.Reason + ")"
+		}
+		return slog.String("err", s)
+	case errors.Is(err, context.Canceled):
+		return slog.String("err", context.Canceled.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return slog.String("err", context.DeadlineExceeded.Error())
+	}
+	return slog.String("err", "error")
 }
 
 // Probe returns the engine's start-time probe, waiting for it at most 2 s (03 §6.1); media.ErrUnsupportedOS's kind
@@ -219,7 +245,7 @@ func (a *App) Quit(stopShare bool) {
 	a.quitOnce.Do(func() {
 		if a.d.Audio != nil {
 			if err := a.d.Audio.Close(); err != nil {
-				a.log.Warn("app: the audio service didn't close cleanly", "err", err)
+				a.log.Warn("app: the audio service didn't close cleanly", errAttr(err))
 			}
 		}
 		if err := a.d.Settings.Flush(); err != nil {

@@ -255,6 +255,12 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	return l.w.Write(p)
 }
 
+func (l *lockedWriter) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.String()
+}
+
 func link(t *testing.T, raw string) deeplink.Link {
 	t.Helper()
 	l, err := deeplink.Parse(raw)
@@ -765,5 +771,76 @@ func TestRunEndsWithCtxAndProbeWithoutEngine(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// failingPart is a part whose Run fails at once with err.
+type failingPart struct{ err error }
+
+func (f failingPart) Run(context.Context) error { return f.err }
+func (f failingPart) Close() error              { return f.err }
+
+// TestPartErrorsLoggedByKind: the line for a part that stopped, and Quit's line for an audio service that didn't
+// close cleanly, name the error's kind, never its text (03 §17).
+func TestPartErrorsLoggedByKind(t *testing.T) {
+	e := newEnv(t, nil, nil)
+	logs := &lockedWriter{w: &bytes.Buffer{}}
+	e.app.log = slog.New(slog.NewTextHandler(logs, nil)).With("component", "app")
+	secret := errors.New("GET https://a.example.com/api/v1/device/token: Authorization: Bearer isa_" +
+		strings.Repeat("A", 43))
+	e.app.d.Session = failingPart{err: secret}
+	e.app.d.Audio = failingPart{err: fmt.Errorf("audio: unwatch: %w", &media.Error{Code: media.CodeAudioUnavailable,
+		Op: "unwatch_audio", Reason: "blocked", Detail: `C:\Users\alex\AppData\Local\discord.exe`})}
+	done := make(chan error, 1)
+	go func() { done <- e.app.Run(context.Background()) }()
+	// The session's line comes as soon as its Run has returned; the audio service runs too, and fails the same way.
+	for deadline := time.Now().Add(5 * time.Second); strings.Count(logs.String(), "a part stopped") < 2; time.Sleep(
+		5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no part stopped:\n%s", logs.String())
+		}
+	}
+	e.app.Quit(false)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(QuitTimeout):
+		t.Fatal("Run didn't return after Quit")
+	}
+	out := logs.String()
+	for _, want := range []string{
+		`msg="app: a part stopped" component=app part=session err=error`,
+		`msg="app: a part stopped" component=app part=audio err="unwatch_audio: audio_unavailable (blocked)"`,
+		`msg="app: the audio service didn't close cleanly" component=app err="unwatch_audio: audio_unavailable (blocked)"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %s in:\n%s", want, out)
+		}
+	}
+	for _, never := range []string{"isa_", "Bearer", "Authorization", "a.example.com", "alex", "discord"} {
+		if strings.Contains(out, never) {
+			t.Errorf("%q logged:\n%s", never, out)
+		}
+	}
+}
+
+func TestErrAttr(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{&media.Error{Code: media.CodeDependency, Op: "probe", Reason: "abi", Detail: "isshoni_media.dll 3.1"},
+			"probe: dependency (abi)"},
+		{fmt.Errorf("session: %w", &media.Error{Code: media.CodeTimeout}), "timeout"},
+		{fmt.Errorf("session: %w", context.Canceled), "context canceled"},
+		{fmt.Errorf("session: %w", context.DeadlineExceeded), "context deadline exceeded"},
+		{errors.New(`Cookie: isshoni_session=s3cr3t`), "error"},
+		{fmt.Errorf(`open C:\Users\alex\settings.json: %w`, os.ErrPermission), "error"},
+	} {
+		if a := errAttr(c.err); a.Key != "err" || a.Value.String() != c.want {
+			t.Errorf("errAttr(%q) = %s=%q, want err=%q", c.err, a.Key, a.Value.String(), c.want)
+		}
 	}
 }

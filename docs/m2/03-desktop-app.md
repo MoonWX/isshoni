@@ -1910,6 +1910,10 @@ temporary profile therefore needs only `%LOCALAPPDATA%` (and a test credential p
 - **Reads**: unknown fields are kept and written back (a newer app's settings survive a downgrade); a file that doesn't
   parse is renamed `settings.json.bad-<UTC timestamp>` and `settings.json.bak` is tried; if both fail, defaults.
   Credentials are never touched by a settings problem (as 02 §11.6 does for `servers.json`).
+- **Size**: no JSON object anywhere in the file has more than 1024 keys (four times the largest one, 05's `appRules`
+  with at most 256; `serverPrefs` has at most 20). A file with a larger object counts as one that doesn't parse;
+  `Update` and `SetAudioSection` refuse a value with one (`FieldError`), and a write that would make one fails, so the
+  app never writes a file it would set aside.
 - **Migrations** are forward-only, one function per schema step, run at load; a file with a newer `schema` than the app
   knows is read best-effort and not migrated.
 - `SettingsView` (to the SPA) is everything above except `audio` (05's own view through `Audio.*`), plus
@@ -2153,6 +2157,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | End of session | share stopped within 2 s |
 | WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni" |
 | Settings write debounce | 500 ms |
+| `settings.json` objects | ≤ 1024 keys each (§14.2) |
 | Logs | 5 MiB × 5 files |
 | SPA → Go log | ≤ 10 lines/s, ≤ 1 KiB each |
 | Bridge calls | `Probe` 10 s, `Link` 15 s, `Start` 20 s, `AccessToken` 15 s, `Updates.Check` 45 s, other I/O 10 s |
