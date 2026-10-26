@@ -1722,14 +1722,14 @@ so 3 s without inbound traffic is a real outage); `LoggerFactory = logx.NewPionL
   - A republish whose `room.join` or `share.start` is refused tries `rate_limited` again after `retryAfterMs` (1 s
     when absent) and a retryable `internal` once (M1 01 §12.1); other codes end the share.
   - A republish replaces the share's `ShareParams` (id, codec, encodings). As built (WA46, `hints.go`): the new
-    encodings and Opus target go to ratectl, whose actions apply (every layer active until the server says
-    otherwise); the room's codec policy goes first in the new Publisher's offers (the params' codec as an engine
-    profile when the encoder lists it, so a share republished into a room whose policy is High doesn't stay in CB
-    from an old hint, while a rebuild on the same server keeps the hinted profile); the views of the old id that
-    `room.state` gave are forgotten; and a paused share owes `share.update{paused: true}` for the new id, which goes
-    at once (§11.8): the server's new share doesn't have the bit. The preset needs no update, since the republish's
-    `share.start` carries it. A share republished while paused can't go live on the server until it is resumed
-    (§10.3, §11.8).
+    encodings and Opus target go to ratectl, whose actions apply (every layer active until the server says otherwise);
+    the room's codec policy goes first in the new Publisher's offers, chosen as at the start (§11.4: the params' codec
+    as an engine profile when the encoder lists it, else that encoder's first profile), so a share republished into a
+    room whose policy is High doesn't stay in CB from an old hint, while a rebuild on the same server keeps the hinted
+    profile; the views of the old id that `room.state` gave are forgotten; and a paused share owes
+    `share.update{paused: true}` for the new id, which goes at once (§11.8): the server's new share doesn't have the
+    bit. The preset needs no update, since the republish's `share.start` carries it. A share republished while paused
+    can't go live on the server until it is resumed (§10.3, §11.8).
 - **Not resumed** (server restart, grace over, or the new connection after a forced token refresh): drop the pub PC
   without a message, `gen` back to 1; `room.join{the share's room}`; `share.start{replaces: oldShareId, ref: new}`; a
   new Publisher at `gen` 1; the engine session continues and the pump asks for keyframes. The share keeps its local

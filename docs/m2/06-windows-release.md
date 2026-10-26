@@ -1491,14 +1491,14 @@ The channel `ci` (§8.2) is the unexported `channelCI`: no app setting names it.
 
 ### 8.10 Error codes
 
-`network`, `rate_limited`, `bad_signature`, `bad_manifest`, `manifest_unsupported`, `manifest_expired`,
-`wrong_channel`, `no_artifact`, `download_failed`, `size_mismatch`, `hash_mismatch`, `disk`, `install_failed`,
-`not_installed`; for `disabled`: `no_keys`, `not_release`. Stable, snake_case, never renamed (M1 README §4). 03 maps
-them to `desktop.update.error.<code>` in `web/src/i18n/lazy/desktop.en.json` (singular `error`, as 03 §6.4 and the
-code spell it; README §3 item 42). 03 adds these codes to `internal/desktop/bridge/codes` as `update.<code>`, plus
-`update.not_ready` (WA48); their texts come with the update screens (WA82), and until then neither `check:i18n` nor
-`codes.node.test.ts` asks for them (03 §18.1: the test exempts the `update.*` codes, and `check:i18n` doesn't read
-`codes.gen.ts` yet).
+`network`, `rate_limited`, `bad_signature`, `bad_manifest`, `manifest_unsupported`, `manifest_expired`, `wrong_channel`,
+`no_artifact`, `download_failed`, `size_mismatch`, `hash_mismatch`, `disk`, `install_failed`, `not_installed`; for
+`disabled`: `no_keys`, `not_release`. Stable, snake_case, never renamed (M1 README §4). 03 maps them to
+`desktop.update.error.<code>` in `web/src/i18n/lazy/desktop.en.json` (singular `error`, as 03 §6.4 and the code spell
+it; README §3 item 42). 03 adds these codes to `internal/desktop/bridge/codes` as `update.<code>`, plus
+`update.not_ready` (WA48); their texts come with the update screens (WA82), and until then nothing asks for them (03
+§18.1: `codes.node.test.ts`, where the codes' text rule lives, exempts the `update.*` codes until WA82 drops the
+exemption, and `check:i18n` doesn't read `codes.gen.ts`).
 
 ### 8.11 Test hooks (`updatetest` build tag)
 

@@ -635,18 +635,18 @@ over `*app.App`, registered in `main.go` with `application.NewService`. Argument
 TypeScript types come from the bindings generator (`web/src/platform/desktop/bindings/`, committed, drift-checked
 like tygo's output).
 
-As built (WA48): `bridge.New(bridge.Deps{…})` builds the seven services, and `shell.go`'s `registerServices`
-registers each with `application.NewService` between `application.New` and `Run` (`main.go` calls it once the app
-exists); a service missing there gets no binding. Argument and result types use plain strings for the enum-like values
-(05's `FriendsHear` and `AppRule` go out as they are); the generated TypeScript types them as strings, so
-`WailsBridge` checks its arguments against the generated signatures and casts results to `bridge.ts`'s unions (§7.4).
-`main.go` passes `update.PolicyDisabled` as `Deps.PolicyOff` (§14.2's `updates.policyOff`). Methods whose slice hasn't
-landed answer `not_implemented` (README §4): `Auth.Unlink`, `AddServer`, `SwitchServer` and `RemoveServer` until
-WA71 (they need the app's reload and share stop), `Share`'s calls until WA58, `Settings.Update`, `Hotkeys`,
+As built (WA48): `bridge.New(bridge.Deps{…})` builds the seven services, and `shell.go`'s `registerServices` registers
+each with `application.NewService` between `application.New` and `Run` (`main.go` calls it once the app exists); a
+service missing there gets no binding. Argument and result types use plain strings for the enum-like values (05's
+`FriendsHear` and `AppRule` go out as they are); the generated TypeScript types them as strings, so `WailsBridge` checks
+its arguments against the generated signatures and casts results to `bridge.ts`'s unions (§7.4). `main.go` passes
+`update.PolicyDisabled` as `Deps.PolicyOff` (§14.2's `updates.policyOff`). Methods whose slice hasn't landed answer
+`not_implemented` (README §4): `Auth.Unlink`, `AddServer`, `SwitchServer` and `RemoveServer` until WA71 (they need the
+app's reload and share stop), `Share.Pick`, `Start`, `StopOther`, `SetPaused`, `SetPreset` and `SetAudioEnabled` until
+WA58 (`Current` and `Stats` answer null and `Stop` and `Release` do nothing until then), `Settings.Update`, `Hotkeys`,
 `TestHotkey` and `Updates.*` until WA84; `Audio.*` work over 05's service once `main.go` passes it as `Deps.Audio`
-(WA77). `Share.Capabilities` already answers from the probe: each usable encoder
-kind once, in 04's order (the probe lists a kind once per adapter), with `reason` the media code when `canShare` is
-false.
+(WA77). `Share.Capabilities` already answers from the probe: each usable encoder kind once, in 04's order (the probe
+lists a kind once per adapter), with `reason` the media code when `canShare` is false.
 
 | Service.Method | In → out | Errors | Notes |
 |---|---|---|---|
@@ -2192,17 +2192,18 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 - The texts of `RequireBrowser`'s "Opened in your browser" screen and the Offline screen's "Switch server" are in the
   entry chunk, where the lazy `desktop` namespace isn't loaded, so they are four `common.*` keys in `en.json`
   (`back`, `openedInBrowser.title`, `openedInBrowser.body`, `screens.offline.switchServer`; WA42).
-- Error codes of §6.4 map to `desktop.errors.<code>` (the wire codes they pass through keep M1's `errors.<code>`).
-  The codes are constants of a small stdlib-only package, `internal/desktop/bridge/codes`, which `tygo.yaml` exports
-  to `web/src/platform/desktop/codes.gen.ts`; `check:i18n`'s error-code rule reads that file like `types.gen.ts`, so a
-  new code without a text fails the check (`engine.internal`, `engine.invalid` and `engine.busy` each have a key; the
-  last two point to the same text). The reason texts of §10.5 are keys `desktop.errors.engine.reason.<reason>`
-  (`selfWindow`, `driverTooOld`, `noMediaFoundation`, `blockedByPolicy`, `deviceRemoved` for §10.5's `device_removed`
-  row (WA48), and `reinstall` for `missing`, `version` and `abi`; `pick_expired` has none, it reopens the picker
-  silently). As built (WA48): `check-i18n.mjs` doesn't read `codes.gen.ts` yet (`web/scripts/` was outside WA48's
-  paths); `web/src/platform/desktop/codes.node.test.ts` enforces the same rule in `test:web`, every code but the
-  `update.*` ones needing its `desktop.errors.<code>` text. The `update.*` codes' texts are
-  `desktop.update.error.<code>` (§6.4), which WA82 writes with the update screens.
+- Error codes of §6.4 map to `desktop.errors.<code>` (the wire codes they pass through keep M1's `errors.<code>`). The
+  codes are constants of a small stdlib-only package, `internal/desktop/bridge/codes`, which `tygo.yaml` exports to
+  `web/src/platform/desktop/codes.gen.ts`; a test reads that file, so a new code without a text fails `test:web`
+  (`engine.internal`, `engine.invalid` and `engine.busy` each have a key; the last two point to the same text). The
+  reason texts of §10.5 are keys `desktop.errors.engine.reason.<reason>` (`selfWindow`, `driverTooOld`,
+  `noMediaFoundation`, `blockedByPolicy`, `deviceRemoved` for §10.5's `device_removed` row (WA48), and `reinstall` for
+  `missing`, `version` and `abi`; `pick_expired` has none, it reopens the picker silently). As built (WA48): the rule
+  lives in `web/src/platform/desktop/codes.node.test.ts`, which `test:web` runs, not in `check-i18n.mjs`, which doesn't
+  read `codes.gen.ts` (no M2 slice lists `web/scripts/`); every code but the `update.*` ones needs its
+  `desktop.errors.<code>` text. The `update.*` codes' texts are `desktop.update.error.<code>` (§6.4), which WA82 writes
+  with the update screens; it drops the test's `update.*` exemption, so from then on every update code needs its text
+  too (README WA82's row).
 
 ### 18.2 Accessibility
 
