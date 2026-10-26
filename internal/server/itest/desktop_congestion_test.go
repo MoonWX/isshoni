@@ -229,7 +229,7 @@ func TestDesktopReinitCongestion(t *testing.T) {
 	}
 	logs := run.app.logs.String()
 	viewers := []*sfutest.Viewer{run.viewer, preview}
-	seen := map[string]int{}
+	seen, unsure := map[string]int{}, map[string]int{}
 	for rid, calls := range changes {
 		prev, prevAt := initial[rid], time.Time{}
 		for i, c := range calls {
@@ -260,6 +260,7 @@ func TestDesktopReinitCongestion(t *testing.T) {
 					rid, reinitKeyBefore, reinitKeyAfter, c.Bps)
 			case sightUnsure:
 				t.Logf("  the viewers' keyframes of %s at this change may be the GOP's or a keyframe request's", rid)
+				unsure[rid]++
 			case sightReinit:
 				seen[rid]++
 			}
@@ -270,7 +271,10 @@ func TestDesktopReinitCongestion(t *testing.T) {
 		t.Errorf("the viewers saw the new encoder's keyframe at %d of the full layer's %d changes, want 2 at least",
 			seen["f"], len(changes["f"]))
 	}
-	if len(changes["q"]) > 0 && seen["q"] == 0 {
+	// The preview's keyframes are often the GOP's or a keyframe request's as well (carol joins q, the 4 s GOP): a
+	// change whose keyframe can't be told apart from those doesn't count against it (a missing keyframe already
+	// failed above, sightNoKey); one that came and is certainly the new encoder's is wanted only when none was unsure.
+	if len(changes["q"]) > 0 && seen["q"] == 0 && unsure["q"] == 0 {
 		t.Errorf("the viewers saw the new encoder's keyframe at none of the preview's %d changes, want 1 at least",
 			len(changes["q"]))
 	}
