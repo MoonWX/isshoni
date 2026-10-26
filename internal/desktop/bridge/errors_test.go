@@ -81,7 +81,14 @@ func TestMapError(t *testing.T) {
 		{"offline", fmt.Errorf("%w: dial", deviceauth.ErrOffline), codes.CodeServerUnreachable, nil},
 		{"network", deviceauth.ErrNetwork, codes.CodeServerUnreachable, nil},
 		{"bad response", deviceauth.ErrBadResponse, codes.CodeServerUnreachable, nil},
-		{"deadline", context.DeadlineExceeded, codes.CodeServerUnreachable, nil},
+		// A method's own deadline (Audio.SoundCheck's bound) is no server's fault.
+		{"deadline", fmt.Errorf("sound check: %w", context.DeadlineExceeded), codes.CodeInternal,
+			map[string]any{"reason": "timeout"}},
+		// Auth's deadlines bound server calls: rows named "Auth: …" go through Auth.authError.
+		{"Auth: deadline", fmt.Errorf("refresh: %w", context.DeadlineExceeded), codes.CodeServerUnreachable, nil},
+		{"Auth: deadline under a probe code", &servers.Error{Code: servers.CodeTLSUntrusted,
+			Err: context.DeadlineExceeded}, codes.CodeTLSUntrusted, nil},
+		{"Auth: offline", deviceauth.ErrOffline, codes.CodeServerUnreachable, nil},
 		{"cancelled", context.Canceled, codes.CodeInternal, map[string]any{"reason": "cancelled"}},
 		{"incompatible", deviceauth.ErrIncompatible, codes.CodeIncompatibleServer, nil},
 		{"too many servers", deviceauth.ErrTooManyServers, codes.CodeTooManyServers, nil},
@@ -119,7 +126,12 @@ func TestMapError(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			got := mapError(c.err, testLog(&buf))
+			var got error
+			if strings.HasPrefix(c.name, "Auth: ") {
+				got = (&Auth{log: testLog(&buf)}).authError(c.err, nil)
+			} else {
+				got = mapError(c.err, testLog(&buf))
+			}
 			if c.err == nil {
 				if got != nil {
 					t.Fatalf("mapError(nil) = %v", got)

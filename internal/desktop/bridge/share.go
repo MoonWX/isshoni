@@ -146,8 +146,11 @@ func (s *Share) Capabilities(ctx context.Context) ShareCaps {
 	if p.Audio.Backend != "" {
 		caps.AudioBackend = p.Audio.Backend
 	}
+	// The probe can list a kind once per adapter (EncoderInfo.Adapter): each usable kind once, in 04's order.
+	seen := map[string]bool{}
 	for _, e := range p.Encoders {
-		if e.Tested && e.Status == "" {
+		if e.Tested && e.Status == "" && !seen[e.Name] {
+			seen[e.Name] = true
 			caps.Encoders = append(caps.Encoders, e.Name)
 		}
 	}

@@ -7,8 +7,11 @@
 // The app has to open its WebView2's remote debugging port for the spec. At beta.34 Wails overwrites
 // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS in every build (03 §5.4), so the e2e build takes the port from its own
 // e2e-only variable ISSHONI_E2E_CDP_PORT and appends --remote-debugging-port to WindowsOptions.AdditionalBrowserArgs
-// (README WA72, cmd/isshoni-desktop/flavor_e2e.go). ISSHONI_CDP_ENDPOINT=http://127.0.0.1:<port> attaches to an app
-// that is already running instead of starting one. CI runs it in windows-desktop from WA72 on.
+// (README WA72, cmd/isshoni-desktop/flavor_e2e.go). The same file takes the data folder from ISSHONI_E2E_DATA_DIR in
+// place of %LOCALAPPDATA% and opens Credential Manager under a test prefix (03 §22.4 B), so a run never touches the
+// owner's servers, settings, WebView2 profile or isshoni:v1: entries; the spec refuses an app that ignored the folder.
+// ISSHONI_CDP_ENDPOINT=http://127.0.0.1:<port> attaches to an app that is already running instead of starting one. CI
+// runs it in windows-desktop from WA72 on.
 import { defineConfig } from '@playwright/test';
 
 export default defineConfig({

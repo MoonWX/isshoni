@@ -32,6 +32,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/update"
 	"github.com/MoonWX/isshoni/internal/version"
 	"github.com/MoonWX/isshoni/web"
 )
@@ -239,7 +240,8 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 	theApp.Store(a)
 	// The bound services (03 §6.2), registered before Wails runs.
 	svcs, err := registerServices(shell, bridge.Deps{App: a, Servers: bridge.ServersOf(srv), ProbeApp: appInfo(),
-		AllowInsecureLoopback: insecureLoopback(), Settings: st, Log: slog.Default()})
+		AllowInsecureLoopback: insecureLoopback(), Settings: st, PolicyOff: update.PolicyDisabled,
+		Log: slog.Default()})
 	if err != nil {
 		log.Error("desktop: the bound services can't start", "err", err)
 		return exitFailed

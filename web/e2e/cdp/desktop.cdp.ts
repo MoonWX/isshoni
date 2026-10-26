@@ -6,9 +6,15 @@
 // W16, W21 in the webview, a device-flow link, a fake share watched in Chrome, close-to-tray while live, Quit.
 //
 // Environment (web/e2e/cdp/playwright.config.ts): ISSHONI_DESKTOP_EXE (the e2e build), or ISSHONI_CDP_ENDPOINT to
-// attach to a running app. Windows only. The app is started with --relaunched (so it stays this process's child), a
-// temporary %LOCALAPPDATA% whose settings.json keeps the app in the tray when its window closes (03 §11.6's
-// closeToTray, so W7 needs no live share), and ISSHONI_E2E_CDP_PORT (README WA72's e2e-only port).
+// attach to a running app. Windows only. The app is started with --relaunched (so it stays this process's child),
+// ISSHONI_E2E_CDP_PORT (README WA72's e2e-only port) and ISSHONI_E2E_DATA_DIR: a temporary folder that stands in for
+// %LOCALAPPDATA% (03 §22.4 B), whose isshoni\settings.json keeps the app in the tray when its window closes (03
+// §11.6's closeToTray, so W7 needs no live share). Setting LOCALAPPDATA would not do: the app reads its data folder
+// from the shell's known folder, never from the environment (cmd/isshoni-desktop/platform_windows.go), so the e2e
+// build takes it from its own e2e-only variable (README WA72, flavor_e2e.go), as it takes the port. Once the endpoint
+// answers, the fixture checks that the app wrote into that folder (its log file or its WebView2 profile) and fails
+// before any test runs otherwise: an e2e build that ignored it would be using the owner's real servers, settings and
+// WebView2 profile.
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import net from 'node:net';
@@ -26,6 +32,8 @@ const EXE_ENV = 'ISSHONI_DESKTOP_EXE';
 const ENDPOINT_ENV = 'ISSHONI_CDP_ENDPOINT';
 /** The e2e build's own variable for its WebView2 debugging port (README WA72). */
 const PORT_ENV = 'ISSHONI_E2E_CDP_PORT';
+/** The e2e build's own variable for the folder that replaces %LOCALAPPDATA% (README WA72). */
+const DATA_DIR_ENV = 'ISSHONI_E2E_DATA_DIR';
 /** WebView2's first start (a new user data folder) takes a few seconds. */
 const START_TIMEOUT_MS = 60_000;
 
@@ -53,6 +61,26 @@ function freePort(): Promise<number> {
       });
     });
   });
+}
+
+/**
+ * Throws unless the app started under dataDir: its log file (03 §17) or its WebView2 user data folder exists in
+ * <dataDir>\isshoni. Both are created before the window opens, so by the time the endpoint answers one is there.
+ */
+async function assertUsedDataDir(dataDir: string): Promise<void> {
+  const root = path.join(dataDir, 'isshoni');
+  for (const p of [path.join(root, 'logs', 'isshoni.log'), path.join(root, 'WebView2')]) {
+    try {
+      await fsp.access(p);
+      return;
+    } catch {
+      // try the next one
+    }
+  }
+  throw new Error(
+    `the e2e build ignored its data folder: nothing under ${root} after its WebView2 opened. Does it read ` +
+      `${DATA_DIR_ENV} (README WA72, flavor_e2e.go)? It is using the real %LOCALAPPDATA%\\isshoni instead.`,
+  );
 }
 
 /** Waits until the debugging endpoint answers /json/version. */
@@ -99,12 +127,13 @@ const test = base.extend<{ app: RealApp }>({
         JSON.stringify({ schema: 1, closeToTray: true, wizardDone: true }),
       );
       child = spawn(path.resolve(exe), ['--relaunched'], {
-        env: { ...process.env, LOCALAPPDATA: dataDir, [PORT_ENV]: String(port) },
+        env: { ...process.env, [DATA_DIR_ENV]: dataDir, [PORT_ENV]: String(port) },
         stdio: 'ignore',
       });
     }
     try {
       await waitForEndpoint(endpoint, child);
+      if (dataDir !== null) await assertUsedDataDir(dataDir);
       const browser = await chromium.connectOverCDP(endpoint);
       const pages = (): Page[] => browser.contexts().flatMap((c) => c.pages());
       await expect
@@ -128,9 +157,15 @@ test.skip(process.platform !== 'win32' && !process.env[ENDPOINT_ENV], 'the real 
 
 test('W1, W2: the page is at the asset origin, in a secure context', async ({ app }) => {
   const [origin, secure] = await app.page.evaluate(() => [location.origin, isSecureContext] as const);
-  row('W1', `location.origin = ${origin}`);
+  // W1's second half, "this value is in protocol.DesktopOrigins()", needs no webview: internal/protocol's
+  // TestDesktopOrigins asserts DesktopOrigins()[0] == DesktopAssetOriginWindows. The skeleton has no server whose CORS
+  // could show it end to end (README DK13's run links a server from this webview).
+  row(
+    'W1',
+    `location.origin = ${origin}; DesktopOrigins membership: checked by internal/protocol's unit test ` +
+      `(TestDesktopOrigins)`,
+  );
   row('W2', `isSecureContext = ${String(secure)}`);
-  // protocol.DesktopOrigins()[0] is DesktopAssetOriginWindows by definition (internal/protocol/desktop.go).
   expect(origin).toBe(DesktopAssetOriginWindows);
   expect(secure).toBe(true);
 });

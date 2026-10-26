@@ -323,6 +323,13 @@ func TestShareCapabilities(t *testing.T) {
 		`"audioBackend":"process-loopback"}` {
 		t.Fatalf("caps %s", b)
 	}
+	// Two GPUs: one mf-hw entry per adapter, listed once, in the probe's order.
+	core.probe.Encoders = []media.EncoderInfo{{Name: "mf-hw", Adapter: 0, HW: true, Tested: true},
+		{Name: "mf-hw", Adapter: 1, HW: true, Tested: true}, {Name: "mf-sw", Adapter: -1, Tested: true}}
+	if c := s.Share.Capabilities(context.Background()); !c.CanShare ||
+		!slices.Equal(c.Encoders, []string{"mf-hw", "mf-sw"}) {
+		t.Fatalf("two adapters: %+v", c)
+	}
 	core.probe.Encoders = nil
 	if c := s.Share.Capabilities(context.Background()); c.CanShare || c.Reason != "no_encoder" {
 		t.Fatalf("no encoder: %+v", c)

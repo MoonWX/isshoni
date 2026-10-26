@@ -819,8 +819,12 @@ export interface DesktopState {
   excludedWindows: number;
   autostart: boolean;
   osPages: string[];
-  /** Each access token handed to the page: the origin asked for, the active origin, the first 8 bytes of its SHA-256. */
-  tokens: { origin: string; activeOrigin: string; sha256: string }[];
+  /**
+   * Each access token handed to the page: the origin asked for, the active origin when Auth.AccessToken was called
+   * (the one that decides whose token it is, 03 §5.8), the active origin when it returned, and the first 8 bytes of
+   * its SHA-256.
+   */
+  tokens: { origin: string; activeOrigin: string; activeAtReturn: string; sha256: string }[];
   /** The runtime requests that passed the Guard and reached the stub /wails/runtime: W21's object and method ids. */
   runtimeCalls: { object: number; method: number }[];
   tray: unknown;

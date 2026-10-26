@@ -314,13 +314,17 @@ func (s *Auth) activeFor(origin string) Manager {
 }
 
 // authError maps an error of 02's manager or the probe; incompatible_server gets the manager's compat check as its
-// params when m is known.
+// params when m is known. Every deadline here bounds a call to the server (Probe, Link, LinkWithPassword, Recheck,
+// AccessToken), so one that ran out is server_unreachable, where mapError's default is internal.
 func (s *Auth) authError(err error, m Manager) error {
 	if err == nil {
 		return nil
 	}
 	if errors.Is(err, deviceauth.ErrIncompatible) && m != nil {
 		return newError(codes.CodeIncompatibleServer, compatParams(m.State().Compat))
+	}
+	if isTimeout(err) {
+		return newError(codes.CodeServerUnreachable, nil)
 	}
 	return mapError(err, s.log)
 }

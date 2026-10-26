@@ -43,8 +43,13 @@ type callRequest struct {
 type dispatcher struct {
 	services map[string]reflect.Value // "App" → *bridge.App
 	log      *slog.Logger
-	// observe sees every successful call's arguments and result (the harness records the tokens handed out).
-	observe func(service, method string, args []json.RawMessage, result any)
+	// before runs just before each bound method is invoked; what it returns reaches observe as pre. The harness reads
+	// the active server there, at the call's start, because that is the server a token is handed out for (03 §5.8:
+	// Auth.AccessToken reads the active manager once, so a switch during the call doesn't change whose token it is).
+	before func(service, method string) any
+	// observe sees every successful call's arguments and result (the harness records the tokens handed out), and
+	// before's value for that call (nil without before).
+	observe func(service, method string, args []json.RawMessage, pre, result any)
 }
 
 var ctxType = reflect.TypeFor[context.Context]()
@@ -101,6 +106,10 @@ func (d *dispatcher) call(ctx context.Context, req callRequest) (result any, err
 			result, err = nil, transportError("panic")
 		}
 	}()
+	var pre any
+	if d.before != nil {
+		pre = d.before(req.Service, req.Method)
+	}
 	out := m.Call(in)
 	for _, o := range out {
 		if o.Type() == errType {
@@ -112,7 +121,7 @@ func (d *dispatcher) call(ctx context.Context, req callRequest) (result any, err
 		result = o.Interface()
 	}
 	if d.observe != nil {
-		d.observe(req.Service, req.Method, req.Args, result)
+		d.observe(req.Service, req.Method, req.Args, pre, result)
 	}
 	return result, nil
 }

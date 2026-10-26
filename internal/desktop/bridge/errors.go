@@ -91,6 +91,10 @@ func compatParams(c compat.Check) map[string]any {
 // mapError turns any Go error a service got into an *Error (03 §6.4); nil stays nil. log gets one WARN line for an
 // error that no rule knows (it becomes internal), with the cause's text: the packages below never put a token, a
 // password, a name or a path into an error's text.
+//
+// A deadline that ran out is internal with params.reason "timeout": a method's own bound (Audio.SoundCheck's 10 s, a
+// local file) is no server's fault. Only Auth, whose deadlines bound calls to a server, maps it to server_unreachable
+// (Auth.authError).
 func mapError(err error, log *slog.Logger) error {
 	if err == nil {
 		return nil
@@ -102,8 +106,18 @@ func mapError(err error, log *slog.Logger) error {
 	if e := knownError(err); e != nil {
 		return e
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return newError(codes.CodeInternal, map[string]any{"reason": "timeout"})
+	}
 	log.Warn("bridge: an unexpected error", "err", err)
 	return &Error{Code: codes.CodeInternal, cause: err}
+}
+
+// isTimeout reports an error that only a deadline explains: context.DeadlineExceeded that no bridge error and no rule
+// of knownError claims first (a server's own code wrapped around it keeps that code).
+func isTimeout(err error) bool {
+	var be *Error
+	return errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &be) && knownError(err) == nil
 }
 
 // knownError is mapError's table; nil for an error it doesn't know.
@@ -150,7 +164,7 @@ func knownError(err error) *Error {
 		// The page cancelled the call (W11): nobody reads the answer.
 		return newError(codes.CodeInternal, map[string]any{"reason": "cancelled"})
 	case errors.Is(err, deviceauth.ErrOffline), errors.Is(err, deviceauth.ErrNetwork),
-		errors.Is(err, deviceauth.ErrBadResponse), errors.Is(err, context.DeadlineExceeded):
+		errors.Is(err, deviceauth.ErrBadResponse):
 		return newError(codes.CodeServerUnreachable, nil)
 	case errors.Is(err, deviceauth.ErrIncompatible):
 		return newError(codes.CodeIncompatibleServer, compatParams(compat.Check{}))

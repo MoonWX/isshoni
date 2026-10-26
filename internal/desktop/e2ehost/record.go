@@ -48,11 +48,15 @@ type hostState struct {
 	Tray            any                `json:"tray"`         // the tray's view; null until the tray (README WA68)
 }
 
-// tokenRecord is one access token handed to the page.
+// tokenRecord is one access token handed to the page. ActiveOrigin is read when Auth.AccessToken was called, the
+// moment that decides whose token it is (03 §5.8): a call that starts while A is active rightly returns A's token even
+// when B becomes active before it returns, so "no token for A while B was active" (03 §22.4 A's desktop-link.spec)
+// asserts on activeOrigin; activeAtReturn is there for the failure message.
 type tokenRecord struct {
-	Origin       string `json:"origin"`       // the origin the page asked for
-	ActiveOrigin string `json:"activeOrigin"` // the active server's origin at that moment
-	SHA256       string `json:"sha256"`       // the first 8 bytes of the token's SHA-256, hex
+	Origin         string `json:"origin"`         // the origin the page asked for
+	ActiveOrigin   string `json:"activeOrigin"`   // the active server's origin when the call started
+	ActiveAtReturn string `json:"activeAtReturn"` // the active server's origin when it returned
+	SHA256         string `json:"sha256"`         // the first 8 bytes of the token's SHA-256, hex
 }
 
 // runtimeCall is one request that reached the stub runtime handler: the object and method ids of 03 §3.2 W21.

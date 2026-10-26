@@ -293,7 +293,19 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 		return fail(fmt.Errorf("the web app (web/dist) is unusable; run task build:web first: %w", err))
 	}
 	d := newDispatcher(svcs, log.With("component", "e2ehost"))
-	d.observe = func(service, method string, args []json.RawMessage, result any) {
+	activeOrigin := func() string {
+		if m := srv.Active(); m != nil {
+			return m.State().Origin
+		}
+		return ""
+	}
+	d.before = func(service, method string) any {
+		if service != "Auth" || method != "AccessToken" {
+			return nil
+		}
+		return activeOrigin()
+	}
+	d.observe = func(service, method string, args []json.RawMessage, pre, result any) {
 		if service != "Auth" || method != "AccessToken" {
 			return
 		}
@@ -305,13 +317,11 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 		if len(args) > 0 {
 			_ = json.Unmarshal(args[0], &asked)
 		}
-		active := ""
-		if m := srv.Active(); m != nil {
-			active = m.State().Origin
-		}
+		atCall, _ := pre.(string)
+		atReturn := activeOrigin()
 		sum := sha256.Sum256([]byte(tok.Token.Reveal()))
 		rec.update(func(s *hostState) {
-			s.Tokens = append(s.Tokens, tokenRecord{Origin: asked, ActiveOrigin: active,
+			s.Tokens = append(s.Tokens, tokenRecord{Origin: asked, ActiveOrigin: atCall, ActiveAtReturn: atReturn,
 				SHA256: hex.EncodeToString(sum[:8])})
 		})
 	}

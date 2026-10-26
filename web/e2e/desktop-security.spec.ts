@@ -215,6 +215,10 @@ interface LinkableServer {
   close(): Promise<void>;
 }
 
+// TODO(README WA56, group 6): once WA56 wires protocol.DesktopOrigins() into the server's CORS and the e2e server
+// lists deviceFlow, the group-6 integration checks that the '/link …' test's "server" annotation reads "e2e server"
+// (03 §22.4 A runs against the unmodified e2e server of fixtures.ts), then deletes startStandIn, token() and the
+// stand-in branch here, leaving the e2e server the only path.
 /**
  * The worker's e2e server when it accepts the desktop origin and has the device routes, else the stand-in below
  * (see the file's comment).
