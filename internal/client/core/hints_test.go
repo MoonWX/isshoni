@@ -253,8 +253,10 @@ func checkSpacing(t *testing.T, sess *fake.Session, n int, want string, calls ..
 	}
 }
 
-// TestRateTickClock: ratectl and the engine see one clock (share.go's actor), so no change of a layer reaches the
-// engine sooner than ratectl's interval after the one before it (fake.Call.At). Times are from the ramp's first step,
+// TestRateTickClock: ratectl and the engine see one clock (share.go's actor), so the core issues no change of a layer
+// to the engine sooner than ratectl's interval after the one before it (fake.Call.At, less the hold of the call this
+// test makes the engine take 0.4 s for: ratectl dates a change when it decides it, not when an engine call that slow
+// returns). Times are from the ramp's first step,
 // which comes on a Tick, so the next Ticks fall due about every TickEvery from there:
 //
 //   - at 2.25 s a congestion hint lowers f at once (the step is 2 s old), and a second one wants f lower again, which
@@ -265,8 +267,8 @@ func checkSpacing(t *testing.T, sess *fake.Session, n int, want string, calls ..
 //
 // With the timer's value (when the Tick was due) as ratectl's now, ratectl dates the change 1.15 s before the engine
 // has it, and the next one reached the engine 0.85–1.35 s after it. With the clock read but on a ticker's fixed
-// schedule, the next Tick after the guard's 2 s came 1.85 s after the engine call. The timer re-armed after the Tick's
-// engine calls puts it 2 s after them.
+// schedule, the next Tick after the guard's 2 s came 1.85 s after the engine call. With the actor's clock and the
+// timer re-armed after the Tick's engine calls, the next change is issued 2 s or more after the last one was.
 //
 // The second hint's change must be dated between the Ticks (2.1–2.4 s), and the busy call must start before the Tick
 // due at 4.5 s. When the test runs late for either, the run is tried again (three runs at most); the spacing is
@@ -304,7 +306,8 @@ func rateClockRun(t *testing.T) bool {
 	congestionCap(fs, 2_000_000)
 	first := fCall(t, sess, n, cap2MF)
 	congestionCap(fs, 1_000_000)
-	slow.holdNext("f", 400*time.Millisecond)
+	const hold = 400 * time.Millisecond
+	slow.holdNext("f", hold)
 	time.Sleep(time.Until(at(4250 * time.Millisecond)))
 	busyUntil := at(5250 * time.Millisecond)
 	if err := sh.call(ctxFor(t), func() error {
@@ -316,8 +319,12 @@ func rateClockRun(t *testing.T) bool {
 	second := fCall(t, sess, n, cap1MF)
 	congestionCap(fs, 500_000)
 	third := fCall(t, sess, n, cap500kF)
+	// The spacing is ratectl's, from when the core issued each call: ratectl dates a change when it decides it, and
+	// the held call reaches the fake (fake.Call.At) hold later (a native engine call returns in microseconds).
+	issued := second
+	issued.At = second.At.Add(-hold)
 	checkSpacing(t, sess, n, fmt.Sprintf("bitrate f %d, bitrate f %d, bitrate f %d, bitrate f %d", rampStepF,
-		cap2MF, cap1MF, cap500kF), step, first, second, third)
+		cap2MF, cap1MF, cap500kF), step, first, issued, third)
 	if err := sh.Stop(ctxFor(t)); err != nil {
 		t.Fatal(err)
 	}
