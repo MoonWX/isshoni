@@ -1713,7 +1713,8 @@ jobs:
     # dll-check -ffmpeg checks its DLLs against the lock's names and SHA-256s. Uploads
     # windows-native, kept 1 day: release\ (the shipped DLL and PDB, the FFmpeg DLLs and PDBs
     # next to them, the FFmpeg and vcpkg license files, the bootstrapper, native-manifest.json)
-    # and ci\ (the test-hooks DLL with the FFmpeg DLLs next to it, never staged); and
+    # and ci\ (the test-hooks DLL with the FFmpeg DLLs next to it, never staged; the Go DLL
+    # tests run against it, so it is assembled before them); and
     # isshoni-native-tools, kept 7 days: the `task native:dist` zip for the owner's PC plus that
     # ci\ folder (for `isshoni-enginetest avsync -dll ci`, 06 §5.1).
     needs: changes
@@ -1931,34 +1932,6 @@ jobs:
           "sha256=$sha" >> $env:GITHUB_OUTPUT
           "signer=$subject" >> $env:GITHUB_OUTPUT
 
-      - name: gcc for cgo (MinGW-w64, for the race detector)
-        run: |
-          if (Get-Command gcc -ErrorAction SilentlyContinue) {
-            gcc --version | Select-Object -First 1
-            exit 0
-          }
-          foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
-            if (Test-Path (Join-Path $dir 'gcc.exe')) {
-              $dir >> $env:GITHUB_PATH
-              & (Join-Path $dir 'gcc.exe') --version | Select-Object -First 1
-              exit 0
-            }
-          }
-          "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
-          choco install mingw --no-progress -y
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
-
-      - name: go test -race ./internal/media/... with the engine DLL (win-x64-ci)
-        # The DLL-dependent Go tests (04 §18.2); they skip without ISSHONI_TEST_ENGINE_DLL, so they
-        # run here and nowhere else until windows-desktop exists (README WA72).
-        env:
-          CGO_ENABLED: '1'
-          ISSHONI_TEST_ENGINE_DLL: ${{ github.workspace }}\native\build\win-x64-ci\windows\isshoni-media.dll
-        run: |
-          go test -race -count=1 -timeout 10m ./internal/media/...
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: The windows-native artifact
         env:
           VERSION: ${{ env.ISSHONI_VERSION }}
@@ -2063,6 +2036,36 @@ jobs:
           path: ${{ runner.temp }}/windows-native/
           retention-days: 1
           if-no-files-found: error
+
+      - name: gcc for cgo (MinGW-w64, for the race detector)
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            gcc --version | Select-Object -First 1
+            exit 0
+          }
+          foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
+            if (Test-Path (Join-Path $dir 'gcc.exe')) {
+              $dir >> $env:GITHUB_PATH
+              & (Join-Path $dir 'gcc.exe') --version | Select-Object -First 1
+              exit 0
+            }
+          }
+          "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
+          choco install mingw --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
+
+      - name: go test -race ./internal/media/... with the engine DLL (win-x64-ci)
+        # The DLL-dependent Go tests (04 §18.2); they skip without ISSHONI_TEST_ENGINE_DLL, so they
+        # run here and nowhere else until windows-desktop exists (README WA72). They use the
+        # artifact's ci\ folder (06 §5.1): the win-x64-ci DLL with the lock-checked FFmpeg DLLs
+        # next to it, since the engine loads them from its own folder (04 §9.2).
+        env:
+          CGO_ENABLED: '1'
+          ISSHONI_TEST_ENGINE_DLL: ${{ runner.temp }}\windows-native\ci\isshoni-media.dll
+        run: |
+          go test -race -count=1 -timeout 10m ./internal/media/...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: task native:dist (isshoni-native-tools)
         env:

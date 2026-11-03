@@ -1274,15 +1274,22 @@ tasks:
       OUT: '{{.OUT | default ".deps/ffmpeg"}}'
       ZIP: '{{.ZIP | default ""}}'
       SOURCE: '{{.SOURCE | default "false"}}'
+    # The values reach the script through env, never as template text inside its quotes, so a path with a quote
+    # in it stays one argument (as native:dist does).
+    env:
+      FFMPEG_FETCH_OUT: '{{.OUT}}'
+      FFMPEG_FETCH_ZIP: '{{.ZIP}}'
+      FFMPEG_FETCH_SOURCE: '{{.SOURCE}}'
     cmds:
       - cmd: |
           set -eu
+          # The task runs in the repository root.
           abs() {
-            case $1 in /* | [A-Za-z]:*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' '{{.ROOT_DIR}}' "$1" ;; esac
+            case $1 in /* | [A-Za-z]:*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac
           }
-          set -- -out "$(abs '{{.OUT}}')"
-          if [ -n '{{.ZIP}}' ]; then set -- "$@" -zip "$(abs '{{.ZIP}}')"; fi
-          if [ '{{.SOURCE}}' = true ]; then set -- "$@" -source; fi
+          set -- -out "$(abs "$FFMPEG_FETCH_OUT")"
+          if [ -n "$FFMPEG_FETCH_ZIP" ]; then set -- "$@" -zip "$(abs "$FFMPEG_FETCH_ZIP")"; fi
+          if [ "$FFMPEG_FETCH_SOURCE" = true ]; then set -- "$@" -source; fi
           go -C tools run ./desktoppkg ffmpeg-fetch "$@"
           if [ -d .deps ] && ! [ -f .deps/.gitignore ]; then
             printf '%s\n' '# Fetched by the native and ffmpeg tasks (Taskfile.yml).' '*' >.deps/.gitignore
