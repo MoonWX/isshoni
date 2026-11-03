@@ -1219,7 +1219,7 @@ banner `viewer-muted` explains it.
   ],
   "warnings": [{"code": "multi_process_session", "app": "exe:foo.exe"}],
   "counters": {"streams": 7, "activations": 9, "activationFailures": 0, "underruns": 0, "trims": 0,
-    "overflows": 0, "discontinuities": 0, "mixerResyncs": 0, "fastpathExits": 0,
+    "tailFades": 0, "overflows": 0, "discontinuities": 0, "mixerResyncs": 0, "fastpathExits": 0,
     "fastpathLateCuts": 0, "silentReopens": 0, "deviceChanges": 0, "pidReuseBlocks": 0, "maxResamplePpm": 41,
     "audioCpuMsPerS": 6.2},
   "events": [{"tNs": 81234560000000, "code": "stream_running", "app": "exe:spotify.exe", "detail": ""}]
@@ -1241,7 +1241,7 @@ banner `viewer-muted` explains it.
 | `sessions[].created` | FILETIME as a decimal string (JSON numbers lose precision above 2^53) |
 | `sessions[].stream` | `none`, `activating`, `preroll`, `running`, `fading` |
 | `sessions[].note` | `""`; `covered` (captured by an ancestor's stream, §6.2 step 3); `no_handle` (an include target running without a held process handle, §5.7) |
-| `events[].code` | `session_created`, `session_expired`, `stream_opened`, `stream_running`, `stream_removed`, `stream_failed`, `activation_failed`, `fastpath_enter`, `fastpath_exit`, `fastpath_late_cut`, `default_device_changed`, `device_added`, `device_removed`, `no_device`, `audiosrv_restart`, `probe_ok`, `probe_failed`, `mixer_resync`, `underrun`, `trim`, `silent_reopen`, `rules_changed`, `muted`, `unmuted`, `mode_changed`, `reanchor` |
+| `events[].code` | `session_created`, `session_expired`, `stream_opened`, `stream_running`, `stream_removed`, `stream_failed`, `activation_failed`, `fastpath_enter`, `fastpath_exit`, `fastpath_late_cut`, `default_device_changed`, `device_added`, `device_removed`, `no_device`, `audiosrv_restart`, `probe_ok`, `probe_failed`, `mixer_resync`, `underrun`, `trim`, `tail_fade` (at most one per channel per second, §9.5), `silent_reopen`, `rules_changed`, `muted`, `unmuted`, `mode_changed`, `reanchor` |
 
 `counters` are the mixer's; packets dropped after the mixer are 04's (`im_get_stats` `audio.drops`). The tail fade
 (§9.5, README §3 item 53) adds the counter `tailFades` and the event code `tail_fade`, additive like any later field.
@@ -2108,7 +2108,7 @@ configuration has the fast path on (§18.10), INFO otherwise. S is the isshoni-s
 | 5 | `fast-path-late-voice` | as 4 (without S); at t = 3 s discord.exe starts and plays 440 at once (its `firstRenderNs` logged, §18.3) | 440 absent over [1.5, end], whose short-window rule covers every 50 ms window from Discord's `firstRenderNs` to the end (the leak this case exists for); 1000 present; `fastpath_exit` ≤ 15 ms after Discord's `session_created`; `fastpathLateCuts` = 0; **session lag** = `session_created` time − `firstRenderNs`, recorded, FAIL above 20 ms (the cut margin of §6.4) | yes (fast path) |
 | 6 | `helper-tree` | discord.exe (spawn) → voicehelper.exe (spawn) → audiohelper.exe plays 440 (a grandchild whose own name matches no rule: the ancestor walk must catch it); ms-teams.exe (spawn) → WebView2Runtime\msedgewebview2.exe plays 571 (another folder: the shared-runtime rule must catch it); game 1000 | 440, 571 absent; 1000 present | yes |
 | 7 | `late-helper` | discord.exe from the start (`spawn -at 4`, i.e. t = 3 s after the 1 s settle) → audiohelper.exe playing 440 at once (`firstRenderNs` logged) | 440 absent over [1.5, end], short windows included (in particular from the helper's `firstRenderNs`: the include set must never have captured it); 1000 present; no clicks | yes |
-| 8 | `late-app` | discord.exe idle (forces the include set); at t = 3 s game2 starts playing 683 for 3 s | 683 present in [3.5, 5.8]; measured onset (§18.6) ≤ 500 ms after its `session_created` (value recorded); no clicks in [1.5, end] (verifies the onset fade) | yes |
+| 8 | `late-app` | discord.exe idle (forces the include set); at t = 3 s game2 starts playing 683 for 3 s | 683 present in [3.5, 5.8]; measured onset (§18.6) ≤ 500 ms after its `session_created` (value recorded); no clicks in [1.5, end] (verifies the onset fade at game2's start and the tail fade at its stop, §9.5) | yes |
 | 9 | `steam-game` | mic flag on; `Steam\steam.exe` (`spawn -mic`) → `steamapps\common\TestGame\game.exe` 1000 (a subfolder of Steam's: only the launcher stop separates them) | 1000 present; Steam row `kept_out`/`mic`; game row heard | yes (mic) |
 | 10 | `isshoni-self` | harness plays 797 itself; harness's child `SelfWebView\msedgewebview2.exe` → its child `msedgewebview2.exe` plays S (1700); game 1000 | 797, S absent; 1000 present; rows `isshoni` | yes |
 | 11 | `viewer-browser` | `Service.SetViewerBrowser("c_test1", "edge", "windows", true)` as 03 calls it; `Microsoft\Edge\Application\msedge.exe` (spawn) → msedge.exe (`spawn -tone 440`, the "isshoni tab") → msedge.exe playing 797 ("other tab"); game 1000 | 440 and 797 absent (whole browser out, reason `viewer`); 1000 present | yes |
@@ -2331,10 +2331,11 @@ loopback with the banner, and the Win10 gate becomes "cases 1 and 19 pass and th
 told. **This applies now** (README §3 item 52): A0 ran on a CI runner and Windows 10 was not tested, and the owner
 decided on 2026-11-03 to take the gate. So on Win10 22H2, items 1 and 2 above become "cases 1 and 19 pass and the
 banner shows": the checks that need exclusion (the include-set and fast-path cases, R1, R2, R4 and R5's "Discord
-stays absent") don't apply to the endpoint engine. Items 3 and 4 stand on both.
+stays absent") don't apply to the endpoint engine. R2's "at least one" is then Win11, and R3 runs on Win11 only.
+Items 3 and 4 stand on both.
 
 **Release tiers** (plan "Verification"; 06 runs the checklist): every release: `run -gate` and R1 on Win11, report
-attached to the GitHub Release as `audiotest-win11.json`. Minor releases: the full gate on Win11 and Win10, R1–R6
+attached to the GitHub Release as `audiotest-win11.json`. Minor releases: the full gate on Win11 and, in the reduced form above, on Win10, R1–R6
 (R7 for an app whose row changed), `soak`, both reports attached.
 
 ## 19. Test plan
