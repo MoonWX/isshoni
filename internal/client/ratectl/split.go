@@ -66,15 +66,18 @@ func (c *Controller) target(l *layer) int {
 
 // capSplitFull returns the full layer's share of the cap's split (clamped to its engine range, without the ramp),
 // and false when there is no cap or no active full layer.
-func (c *Controller) capSplitFull() (int, bool) {
-	f := c.fullLayer()
-	if c.capBps <= 0 || f == nil || !f.active {
+func (c *Controller) capSplitFull() (int, bool) { return c.capSplit(c.fullLayer()) }
+
+// capSplit returns l's share of the cap's split over the active layers, clamped to its engine range and, for f,
+// without the ramp; false when there is no cap or l is nil or inactive.
+func (c *Controller) capSplit(l *layer) (int, bool) {
+	if c.capBps <= 0 || l == nil || !l.active {
 		return 0, false
 	}
 	set := c.activeWith(nil)
 	for i, share := range splitTotal(c.capBps, set) {
-		if set[i] == f {
-			lo, hi := f.bounds()
+		if set[i] == l {
+			lo, hi := l.bounds()
 			return clamp(share, lo, hi), true
 		}
 	}
