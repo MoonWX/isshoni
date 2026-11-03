@@ -1938,9 +1938,11 @@ type EndInfo struct {
 | `unlinked` | `Protocol` = the stop's code (`session_revoked`, `account_disabled`, `unauthenticated`) when there is one; "" for an `Auth` error's stop (`RelinkRequired`) |
 
 As built (WF4): `engineEnd` maps a live share's engine error and `startEnd` a failed start's `*media.Error` the same
-way (`source_gone` → `source-gone`, any other code → `error`), each with the error's `Reason` as `MediaReason`; an
-error that isn't a `*media.Error`, or one with an empty `Code`, is `error`/`internal` without a token, so
-`MediaReason` never comes without `Media`. It is the fixed detail token, never the error's `Detail` (logs only, §5.2);
+way (`source_gone` → `source-gone`, any other code → `error`), each with the error's `Reason` as `MediaReason`. In
+`engineEnd`, an error that isn't a `*media.Error`, or one with an empty `Code`, is `error` with `Media: internal` and
+no token. In `startEnd`, a `*protocol.Error` keeps its code in `Protocol`, a cancelled or timed-out context is `user`
+(`ByThisApp`), and any other error is `error` with `Protocol: internal` (and no `Media`). So `MediaReason` never
+comes without `Media`. It is the fixed detail token, never the error's `Detail` (logs only, §5.2);
 the "share ended" log line carries it as `media_reason`. 03's share controller passes it on as the media error's
 `Reason` (`endError`), which the bridge sends as `params.reason` (03 §10.1, §10.5).
 
