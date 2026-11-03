@@ -455,8 +455,9 @@ func TestRepoEnvNamesReserved(t *testing.T) {
 	for _, n := range slices.Sorted(maps.Keys(found)) {
 		if !known[n] && !accepted[n] {
 			t.Errorf("%s (in %s) is not a config key's env name or a reserved name, so the server warns about it: "+
-				"add it to reservedEnv and devEnvNames with what reads it (04 §4.2), or to repoNonEnvNames if it is "+
-				"not an env name", n, strings.Join(found[n], ", "))
+				"add it to reservedEnv in internal/server/config/keys.go and to devEnvNames with what reads it, or to "+
+				"repoNonEnvNames if it is not an env name; that edit belongs to the change that adds the name, even "+
+				"when internal/server/config is outside its Touches", n, strings.Join(found[n], ", "))
 		}
 	}
 }
