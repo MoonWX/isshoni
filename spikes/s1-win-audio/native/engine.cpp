@@ -999,6 +999,10 @@ struct Channel {
   size_t silent_frames = kOnsetSilenceFrames;
   size_t onset_pos = kOnsetRampFrames;  // >= kOnsetRampFrames: no ramp in progress
   std::atomic<uint64_t> underruns{0}, trims{0}, tail_fades{0};
+  // Mixer thread only: when "sound stopped: tail fade" was last logged. Apps
+  // that gate their sound to digital zero stop often; at most one such event
+  // per channel per second keeps them from pushing the rest out of the list.
+  int64_t tail_fade_event_ns = 0;
   std::atomic<bool> want_removal{false};
 };
 
@@ -1396,7 +1400,11 @@ class Engine {
           fade[i] = std::min(fade[i], static_cast<float>(t - i) / static_cast<float>(ramp));
         if (t >= ramp) {
           ++ch.tail_fades;
-          Event(ch.label, "sound stopped: tail fade");
+          const int64_t now = QpcNs();
+          if (ch.tail_fade_event_ns == 0 || now - ch.tail_fade_event_ns >= 1000000000) {
+            ch.tail_fade_event_ns = now;
+            Event(ch.label, "sound stopped: tail fade");
+          }
         }
       }
     }

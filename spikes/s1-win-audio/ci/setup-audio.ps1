@@ -300,7 +300,27 @@ foreach ($ep in $render) {
         "disabling $($ep.FriendlyName) failed: $($_.Exception.Message)"
     }
 }
-Start-Sleep -Seconds 2 # let the roles settle on the endpoint that is left
-foreach ($role in 0, 1, 2) { "default output, role ${role}: SWD\MMDEVAPI\$([S1Volume]::DefaultOutputId($role))" }
-"default output volume: $([math]::Round([S1Volume]::SetDefaultOutput(1.0) * 100))%, unmuted"
+# Let the roles settle on the endpoint that is left. A role whose endpoint was just disabled has no default
+# (E_NOTFOUND) until Windows reassigns it, so retry for up to 10 s, then log what is missing and go on.
+$deadline = (Get-Date).AddSeconds(10)
+for (;;) {
+    $lines = @()
+    $missing = $false
+    foreach ($role in 0, 1, 2) {
+        try {
+            $lines += "default output, role ${role}: SWD\MMDEVAPI\$([S1Volume]::DefaultOutputId($role))"
+        } catch {
+            $lines += "default output, role ${role}: none yet ($($_.Exception.Message))"
+            $missing = $true
+        }
+    }
+    try {
+        $lines += "default output volume: $([math]::Round([S1Volume]::SetDefaultOutput(1.0) * 100))%, unmuted"
+    } catch {
+        $lines += "setting the default output's volume failed: $($_.Exception.Message)"
+        $missing = $true
+    }
+    if (-not $missing -or (Get-Date) -gt $deadline) { $lines; break }
+    Start-Sleep -Milliseconds 500
+}
 

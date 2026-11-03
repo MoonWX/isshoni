@@ -115,7 +115,10 @@ func scenarios() []scenario {
 				{Exe: "game2.exe", Freq: fGame2, At: 3, Dur: 3}},
 			Duration: 9,
 			Checks: []check{present(fGame, "game"), absent(fVoice, "voice app started mid-share"),
-				{Freq: fGame2, From: 4.5, To: 5.8, Expect: "present", Why: "game started mid-share (picked up ≤1.5 s)"}},
+				{Freq: fGame2, From: 4.5, To: 5.8, Expect: "present", Why: "game started mid-share (picked up ≤1.5 s)"},
+				// game2 plays from >= 3 s for 3 s, so it is still sounding up to 6.0 s minus its own 20 ms fade-out.
+				// The tail fade smooths a tap that goes silent early, so the click detector no longer catches that.
+				{Freq: fGame2, From: 5.85, To: 5.97, Expect: "present", Why: "game2 still heard until it stops (not cut early)"}},
 			ClickWindow: [2]float64{1.5, 9}},
 		{Name: "late-start-endpoint", Info: true,
 			What: "control for late-start: same timeline through plain Windows loopback (no isshoni mixing); clicks here come from Windows/the test apps, not isshoni",
@@ -247,7 +250,20 @@ func cmdSelftest(e *engine, args []string) error {
 			controlClicks = r.ClicksAtS
 		}
 	}
-	if len(lateClicks) > 0 && len(controlClicks) > 0 {
+	controlHeard := false
+	for _, r := range reports {
+		if r.Name != "late-start-endpoint" {
+			continue
+		}
+		for _, c := range r.Checks {
+			if c.Freq == fGame && c.Expect == "present" && c.Pass {
+				controlHeard = true
+			}
+		}
+	}
+	if len(lateClicks) > 0 && !controlHeard {
+		fmt.Printf("\nnote: the late-start clicks %v can't be attributed: the plain Windows loopback control (late-start-endpoint) did not hear the game tone, or did not run.\n", lateClicks)
+	} else if len(lateClicks) > 0 && len(controlClicks) > 0 {
 		fmt.Printf("\nnote: the late-start clicks %v also appear through plain Windows loopback %v: they come from Windows or the test apps, not from isshoni's mixer.\n", lateClicks, controlClicks)
 	} else if len(lateClicks) > 0 {
 		fmt.Printf("\nnote: the late-start clicks %v do NOT appear through plain Windows loopback: they come from isshoni's capture/mixing (see click_details in the report).\n", lateClicks)
