@@ -10,10 +10,10 @@
 #   earlier runs) and s1.exe with Go. spikes/s1-win-audio/ci/setup-audio.ps1 starts the Windows Audio services, which
 #   Server ships off, and installs VB-CABLE, the virtual audio cable below, so the runner has an output (the default
 #   one, at 100% volume) and a microphone. Then `s1 probe`, the full `s1 selftest`, and the late-start re-run
-#   (`-only late-start,late-start-endpoint`: the onset fade of the spike README's Results). The self-test's verdicts
-#   are data: both exit codes and every scenario's result go to the job summary, and the job fails only when
-#   something before them breaks (the build, the driver's hash or install, no audio endpoint) or a run leaves no
-#   report. The fake apps start under explorer.exe when the runner's session has one, else under the step's shell
+#   (`-only late-start,late-start-endpoint`: the onset and tail fades of the spike README's Results). The
+#   self-test's verdicts are data: both exit codes and every scenario's result go to the job summary, and the job
+#   fails only when something before them breaks (the build, the driver's hash or install, no audio endpoint) or a
+#   run leaves no report. The fake apps start under explorer.exe when the runner's session has one, else under the step's shell
 #   (`selftest -launcher auto`).
 #
 # What a pass here proves: the code paths on Windows Server 2025 (build 26100) with a virtual endpoint, not a real
@@ -177,7 +177,7 @@ jobs:
           if ($code -notin 0, 1, 2) { throw "unexpected exit code $code" }
           exit 0
 
-      - name: s1 selftest (late-start re-run, onset fade)
+      - name: s1 selftest (late-start re-run, onset and tail fades)
         id: late
         timeout-minutes: 5
         env:
@@ -214,6 +214,11 @@ jobs:
           $md.Add('## S1 self-test on windows-2025 (VB-CABLE)')
           $md.Add('')
           $md.Add('Exit codes: 0 all passed, 1 something failed, 2 something was inconclusive. Verdicts are data; they do not fail the job.')
+          $md.Add('')
+          # Consecutive lines: one Markdown paragraph.
+          $md.Add('endpoint-baseline and late-start-endpoint are the plain-loopback control: they test the runner''s audio setup, not isshoni.')
+          $md.Add('If endpoint-baseline fails, the control heard nothing here (the first run got only zeros), and late-start-endpoint')
+          $md.Add('cannot show whether a click was already in what the output played (spike README, CI run).')
           foreach ($run in @(@{ Name = 'full'; Code = $env:FULL_CODE }, @{ Name = 'late-start'; Code = $env:LATE_CODE })) {
             $file = Join-Path $results "s1-report-$($run.Name).json"
             $md.Add('')

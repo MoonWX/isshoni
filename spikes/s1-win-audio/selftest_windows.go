@@ -608,9 +608,9 @@ func printScenario(r scenarioReport) {
 	var v statusView
 	if len(r.FinalStatus) > 0 && json.Unmarshal(r.FinalStatus, &v) == nil {
 		t := v.Totals
-		if t.Discontinuities+t.Overflows+t.Underruns+t.Trims+t.DroppedChunks+t.MixerResyncs > 0 {
-			fmt.Printf("    engine: discontinuities %d · overflows %d · underruns %d · trims %d · dropped %d · resyncs %d\n",
-				t.Discontinuities, t.Overflows, t.Underruns, t.Trims, t.DroppedChunks, t.MixerResyncs)
+		if t.Discontinuities+t.Overflows+t.Underruns+t.Trims+t.TailFades+t.DroppedChunks+t.MixerResyncs > 0 {
+			fmt.Printf("    engine: discontinuities %d · overflows %d · underruns %d · trims %d · tail fades %d · dropped %d · resyncs %d\n",
+				t.Discontinuities, t.Overflows, t.Underruns, t.Trims, t.TailFades, t.DroppedChunks, t.MixerResyncs)
 		}
 	}
 	for _, p := range r.Problems {

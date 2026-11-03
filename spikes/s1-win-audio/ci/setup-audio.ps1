@@ -7,14 +7,19 @@ The runner has no sound card, and Windows Server ships the audio services off. T
 only (never a PC):
 
 1. sets the Windows Audio services (AudioEndpointBuilder, Audiosrv) to Automatic and starts them;
-2. allows desktop apps to use the microphone and sets communications ducking to "Do nothing", the README's manual
-   steps, so the mic-user scenario can open VB-CABLE's capture side without lowering the other tones;
+2. allows desktop apps to use the microphone (the user's consent keys, and the machine policy, without which a capture
+   on a runner opens fine and delivers only zeros: wasapi-rs's CI notes it) and sets communications ducking to "Do
+   nothing", the README's manual steps, so the mic-user scenario can open VB-CABLE's capture side without lowering the
+   other tones;
 3. downloads VB-CABLE (VB-Audio Virtual Cable, www.vb-cable.com, donationware by Vincent Burel) from -Url, checks its
    SHA-256 against -Sha256 before unpacking (any mismatch stops here), and logs each catalog's signer;
 4. creates the root-enumerated device node the cable driver binds to and installs the driver with SetupAPI, as
    `devcon install` does but without a devcon binary: the Windows 10 package first (signed through Microsoft's
    hardware portal), the 2014 cross-signed Windows 7 package if that one does not start;
-5. waits for the cable's audio endpoints, and sets the default output's volume to 100% and unmutes it.
+5. waits for the cable's audio endpoints, and sets the default output's volume to 100% and unmutes it;
+6. leaves one output: VB-CABLE's Windows 10 package has two render endpoints, and endpoint loopback (the self-test's
+   plain-loopback control) hears only the console default, which need not be the one the fake apps play to. It
+   keeps the console default and disables the other outputs, then logs each role's default.
 
 VB-CABLE's licence allows using and sharing the package as is, not building it into another program's installer: it
 is downloaded at run time onto the runner, never committed and never shipped.
@@ -44,6 +49,9 @@ foreach ($key in "HKLM:\$consent", "HKCU:\$consent", "HKCU:\$consent\NonPackaged
     New-Item -Path $key -Force | Out-Null
     Set-ItemProperty -Path $key -Name Value -Value Allow -Type String
 }
+$privacy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
+New-Item -Path $privacy -Force | Out-Null
+Set-ItemProperty -Path $privacy -Name LetAppsAccessMicrophone -Value 1 -Type DWord # 1 = force allow
 New-Item -Path 'HKCU:\Software\Microsoft\Multimedia\Audio' -Force | Out-Null
 Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Multimedia\Audio' -Name UserDuckingPreference -Value 3 -Type DWord
 
@@ -216,6 +224,8 @@ interface IS1AudioEndpointVolume {
 [Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown), ComImport]
 interface IS1MMDevice {
     [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+    [PreserveSig] int OpenPropertyStore(int access, out IntPtr store);
+    [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
 }
 
 [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown), ComImport]
@@ -228,12 +238,23 @@ interface IS1MMDeviceEnumerator {
 class S1MMDeviceEnumerator { }
 
 public static class S1Volume {
-    // SetDefaultOutput sets the default render endpoint (eRender, eMultimedia) to level and unmutes it;
-    // returns the level read back.
+    // DefaultOutputId returns the ID of the default render endpoint for a role (0 console, 1 multimedia,
+    // 2 communications), e.g. "{0.0.0.00000000}.{guid}".
+    public static string DefaultOutputId(int role) {
+        var enumerator = (IS1MMDeviceEnumerator)new S1MMDeviceEnumerator();
+        IS1MMDevice device;
+        string id;
+        Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(0, role, out device));
+        Marshal.ThrowExceptionForHR(device.GetId(out id));
+        return id;
+    }
+
+    // SetDefaultOutput sets the default render endpoint (eRender, eConsole: the one the engine's endpoint loopback
+    // and `s1 probe` open) to level and unmutes it; returns the level read back.
     public static float SetDefaultOutput(float level) {
         var enumerator = (IS1MMDeviceEnumerator)new S1MMDeviceEnumerator();
         IS1MMDevice device;
-        Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(0, 1, out device));
+        Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(0, 0, out device));
         Guid iid = typeof(IS1AudioEndpointVolume).GUID;
         object o;
         Marshal.ThrowExceptionForHR(device.Activate(ref iid, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out o));
@@ -259,3 +280,27 @@ for (;;) {
         Start-Sleep -Milliseconds 500
     }
 }
+
+# 6. One output. The first CI run's plain-loopback control (endpoint-baseline, late-start-endpoint) got a full stream
+# of packets that were all zeros while process loopback, which taps each app before any endpoint, heard every tone.
+# VB-CABLE's Windows 10 package exposes two render endpoints (the "CABLE Input" speaker pin and the 16-channel
+# "CABLE In 16 Ch" line pin); PlaySound goes wherever the legacy wave mapper sends it, and endpoint loopback hears
+# only the console default. With one output left, apps, roles, volume and loopback must all use the same one. A
+# failure here is logged, not fatal: the self-test still runs and the control's result says whether it worked.
+$keep = 'SWD\MMDEVAPI\' + [S1Volume]::DefaultOutputId(0)
+$render = @(Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction SilentlyContinue |
+    Where-Object InstanceId -like 'SWD\MMDEVAPI\{0.0.0.00000000}.*')
+$render | Format-Table -AutoSize Status, FriendlyName, InstanceId | Out-String -Width 200
+foreach ($ep in $render) {
+    if ($ep.InstanceId -ieq $keep) { "keeping $($ep.FriendlyName) (the console default)"; continue }
+    try {
+        Disable-PnpDevice -InstanceId $ep.InstanceId -Confirm:$false
+        "disabled $($ep.FriendlyName)"
+    } catch {
+        "disabling $($ep.FriendlyName) failed: $($_.Exception.Message)"
+    }
+}
+Start-Sleep -Seconds 2 # let the roles settle on the endpoint that is left
+foreach ($role in 0, 1, 2) { "default output, role ${role}: SWD\MMDEVAPI\$([S1Volume]::DefaultOutputId($role))" }
+"default output volume: $([math]::Round([S1Volume]::SetDefaultOutput(1.0) * 100))%, unmuted"
+

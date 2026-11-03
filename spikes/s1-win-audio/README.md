@@ -28,7 +28,12 @@ The engine (`native/engine.cpp`, a C ABI DLL) instead keeps an **include set**:
 4. The **mixer** pulls 10 ms from each stream on a high-resolution timer:
    - each stream buffers 40 ms before it starts playing;
    - every start and stop is a 10 ms fade, including when a stream is about to run dry and when latency above 100 ms
-     is trimmed, so streams come and go without clicks.
+     is trimmed, so streams come and go without clicks;
+   - Windows cuts the edges of an app's own sound: it drops the start of an app that begins playing, and stops an app
+     that ends at a 10 ms packet boundary, cutting through its own fade-out. So sound that starts after ≥50 ms of
+     digital silence is ramped in over 5 ms (onset fade), and sound followed by ≥5 ms of digital silence is ramped out
+     over its last 5 ms (tail fade). The tail fade reads ahead in audio that is already buffered, so it adds no
+     latency.
    The output is 48 kHz stereo float, pulled by the host.
 5. `im_audio_status` returns **"what friends hear"**: live streams with levels, excluded apps with the reason, and
    warnings.
@@ -100,6 +105,15 @@ pull request that touches this folder or the workflow, and from "Run workflow" o
 - **Output:** both exit codes and each scenario's verdict go to the job summary. Verdicts never fail the job; only a
   setup error does (build, driver hash or install, no audio endpoint, no report). The artifact `s1-audio` holds
   `s1-report-full.json`, `s1-report-late-start.json` and every scenario's WAV.
+- **The plain-loopback control on the runner:** `endpoint-baseline` and `late-start-endpoint` record the default
+  output with plain Windows loopback. They test the runner's audio setup, not isshoni. In the first run
+  (2026-11-03) both were digital silence: Windows delivered every 10 ms packet, but all of them were zeros, while
+  process loopback heard every tone. So `endpoint-baseline` failed, and `late-start-endpoint` could not say whether a
+  click was already in what the output played. The likely cause is that the cable has two outputs and the apps did
+  not play to the one the control records. `ci/setup-audio.ps1` now keeps only the default output and disables the
+  other, and also sets the microphone privacy policy. Its log lists the outputs and each role's default. Until a run
+  shows `endpoint-baseline` passing, read a failure there as the runner's setup, not isshoni. The other scenarios
+  use process loopback, which taps each app before any output, so they are not affected.
 
 The run covers Windows Server 2025 (build 26100) with a virtual endpoint. It is not a real sound card, Windows 11
 client or Windows 10 22H2. Check the device name in a report before committing it to `results/`.
@@ -136,8 +150,9 @@ Raw reports: [`results/`](results/).
 
 | Machine | Build | Self-test | Real apps | Notes |
 |---|---|---|---|---|
-| Win 11 PC (run 1, 2026-09-29) | 26200 (25H2) | **7 PASS**, 1 INFO; include-set, exclude-one, helper-process, self, runtime-rule (no click), mic-user and endpoint-baseline pass. Excluded tones at −133 to −145 dB. app-boundary: *test fixture bug* (browser copy sat in a subfolder of the voice app, which the engine treats as the same app; fixed). late-start: clicks at 3.2 s / 6.13 s with **zero** engine underruns/trims/drops (re-run with the new plain-loopback control + event log) | **Discord desktop kept out, YouTube (Brave) heard** ✓ | Process loopback accepted plain float32 on the first try. Loopback levels are unaffected by master volume/mute (volume 19% and muted still gave −12 dB). Steam holds a mic session, so it's auto-excluded as a mic user (its own UI sounds only; games are separate apps) |
-| AWS VM (run 2, 2026-09-29, via RDP "Remote Audio") | Server 2025, 26100 | **9 PASS**, 1 INFO, mic-user SKIP (no mic in RDP). app-boundary **passes** after the fixture fix. late-start: 1 click at 4.05 s, **not** present in the plain-loopback control. Diagnosis from the WAV: the new app's stream was silent for 30 ms after "running", then its tone appeared at full level, because Windows drops the first ms of an app that starts playing after the loopback attaches (its 20 ms fade-in never arrived). **Fix: onset fade** (5 ms ramp when audio starts after ≥50 ms of digital silence), not yet re-verified on Windows | n/a | Same exclusion quality as Win11 (−138 to −145 dB) |
+| Win 11 PC (run 1, 2026-09-29) | 26200 (25H2) | **7 PASS**, 1 INFO; include-set, exclude-one, helper-process, self, runtime-rule (no click), mic-user and endpoint-baseline pass. Excluded tones at −133 to −145 dB. app-boundary: *test fixture bug* (browser copy sat in a subfolder of the voice app, which the engine treats as the same app; fixed). late-start: clicks at 3.19 s (game2 starts) / 6.11 s (game2 stops) with **zero** engine underruns/trims/drops. The plain-loopback control in the same report has no clicks: Windows' per-app tap cut the app's own fades, which the output itself played whole (onset fade, then the tail fade from the CI run) | **Discord desktop kept out, YouTube (Brave) heard** ✓ | Process loopback accepted plain float32 on the first try. Loopback levels are unaffected by master volume/mute (volume 19% and muted still gave −12 dB). Steam holds a mic session, so it's auto-excluded as a mic user (its own UI sounds only; games are separate apps) |
+| AWS VM (run 2, 2026-09-29, via RDP "Remote Audio") | Server 2025, 26100 | **9 PASS**, 1 INFO, mic-user SKIP (no mic in RDP). app-boundary **passes** after the fixture fix. late-start: 1 click at 4.05 s, **not** present in the plain-loopback control. Diagnosis from the WAV: the new app's stream was silent for 30 ms after "running", then its tone appeared at full level, because Windows drops the first ms of an app that starts playing after the loopback attaches (its 20 ms fade-in never arrived). **Fix: onset fade** (5 ms ramp when audio starts after ≥50 ms of digital silence), verified on the CI runner (no onset click) | n/a | Same exclusion quality as Win11 (−138 to −145 dB) |
+| GitHub windows-2025 runner (CI, 2026-11-03, VB-CABLE) | Server 2025, 26100 | **7 PASS**, 2 INFO, 2 FAIL. include-set, exclude-one, helper-process, app-boundary, self, runtime-rule and mic-user pass, excluded tones at −138 to −145 dB. endpoint-baseline: the plain-loopback control heard only zeros (CI run section above). late-start: no onset click, but one click at 6.13–6.14 s in both runs, where game2 stops. Diagnosis from the WAVs: game2 plays at full level, or partway into its own 20 ms fade-out, then drops to exact zero on a 10 ms boundary. Windows' per-app tap ended the app's sound early, and the engine passed the step through because the stream stayed running. The engine's own "fading out" comes 0.1–0.45 s later, on silence. **Fix: tail fade** (5 ms ramp out before ≥5 ms of digital silence, from audio already buffered, 0 ms latency), not yet re-verified on Windows | n/a | Not committed to `results/`: a virtual output on a CI runner |
 | Win 10 22H2 | | | | |
 
 ## Build on Windows
