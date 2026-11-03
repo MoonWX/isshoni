@@ -382,10 +382,14 @@ jobs:
           decide desktop-macos "$desktop" go.mod internal/client
           decide native-host "$native" Taskfile.yml .tool-versions native/CMakePresets.json native/vcpkg.json
           # isshoni-media.dll (M2 06 §5.1) on any change to the app, its engine or its packaging: the
-          # native code, the MSVC environment and its pins, and tools/desktoppkg (dll-check).
-          decide windows-native "$desktop" go.mod native/CMakePresets.json native/vcpkg.json \
+          # native code, the MSVC environment and its pins, and tools/desktoppkg (dll-check). From
+          # README WA24 it also needs the FFmpeg lock and runs `task native:dist`, so the Taskfile
+          # is one of its inputs too (the native filter adds only Taskfile.yml to desktop's paths).
+          windows_native_when=$desktop
+          if [ "$native" = true ]; then windows_native_when=true; fi
+          decide windows-native "$windows_native_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
-            deploy/windows/dll-imports.txt tools/desktoppkg
+            deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions
 
           task_version=''
           if [ -e .tool-versions ]; then
@@ -1702,10 +1706,16 @@ jobs:
     # (build); tools/desktoppkg dll-check on the release DLL only (exports, static: and delay:
     # imports, VERSIONINFO); the WebView2 bootstrapper's signature; and the Go tests that need
     # the engine DLL (ISSHONI_TEST_ENGINE_DLL), here until windows-desktop takes them over
-    # (README WA72). Uploads windows-native, kept 1 day: release\ (the shipped DLL and PDB, the
-    # vcpkg copyright files of the release tree, the bootstrapper, native-manifest.json) and ci\
-    # (the test-hooks DLL, never staged). FFmpeg joins with README WA24: the locked zip as
-    # IM_FFMPEG_ROOT, its staleness and hash checks, dll-check -ffmpeg and isshoni-native-tools.
+    # (README WA72). FFmpeg (README WA24, 06 §4.1, §5.1): the job fails first when
+    # native/ffmpeg/lock.json is stale (a pins.json, build.sh or ffcheck.c change without a new
+    # publish), then fetches the locked zip from its deps release (SHA-256 against the lock,
+    # unpacked and checked by tools/desktoppkg ffmpeg-fetch) as both presets' IM_FFMPEG_ROOT, and
+    # dll-check -ffmpeg checks its DLLs against the lock's names and SHA-256s. Uploads
+    # windows-native, kept 1 day: release\ (the shipped DLL and PDB, the FFmpeg DLLs and PDBs
+    # next to them, the FFmpeg and vcpkg license files, the bootstrapper, native-manifest.json)
+    # and ci\ (the test-hooks DLL with the FFmpeg DLLs next to it, never staged); and
+    # isshoni-native-tools, kept 7 days: the `task native:dist` zip for the owner's PC plus that
+    # ci\ folder (for `isshoni-enginetest avsync -dll ci`, 06 §5.1).
     needs: changes
     if: needs.changes.outputs.run-windows-native == 'true'
     runs-on: windows-2025
@@ -1743,6 +1753,36 @@ jobs:
             ${{ steps.goenv.outputs.gocache }}
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: The FFmpeg lock is current
+        # M2 06 §4.1: inputsSha256 over pins.json, build.sh and ffcheck.c must equal lock.json's,
+        # so a pin or build change can't merge without its published build.
+        run: |
+          go -C tools run ./desktoppkg ffmpeg-inputs -check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: FFmpeg from the lock
+        id: ffmpeg
+        run: |
+          # M2 06 §5.1: the locked zip from its deps release (not cached: a short download, checked
+          # each time), its SHA-256 against lock.json, unpacked to $RUNNER_TEMP\ffmpeg and checked
+          # (both DLLs with the lock's names and SHA-256s, ffmpeg-config.json's LGPL checks).
+          $out = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          $root = [string](go -C tools run ./desktoppkg ffmpeg-fetch -out $out | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $root = $root.Trim()
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'include/libavcodec/avcodec.h'))) {
+            throw "ffmpeg-fetch printed '$root', which has no include/libavcodec/avcodec.h"
+          }
+          $lock = Get-Content -Raw -LiteralPath native/ffmpeg/lock.json | ConvertFrom-Json
+          "IM_FFMPEG_ROOT=$root ($($lock.tag))"
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "bin=$(Join-Path $root 'bin')" >> $env:GITHUB_OUTPUT
 
       - name: MSVC environment
         id: msvc
@@ -1802,8 +1842,9 @@ jobs:
           CMAKE: ${{ steps.tools.outputs.cmake }}
           CTEST: ${{ steps.tools.outputs.ctest }}
           NINJA: ${{ steps.tools.outputs.ninja }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
         run: |
-          & $env:CMAKE --preset win-x64-ci "-DCMAKE_MAKE_PROGRAM=$env:NINJA"
+          & $env:CMAKE --preset win-x64-ci "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_FFMPEG_ROOT=$env:FFMPEG_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:CMAKE --build --preset win-x64-ci
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1830,6 +1871,7 @@ jobs:
           CMAKE: ${{ steps.tools.outputs.cmake }}
           NINJA: ${{ steps.tools.outputs.ninja }}
           VERSION: ${{ env.ISSHONI_VERSION }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
         run: |
           # The four-part version of M2 06 §5.3 for CI's 0.0.0-ci.<run>: 0.0.0.<run mod 65000> (the rule
           # tools/desktoppkg winver implements from README WA67 on).
@@ -1837,7 +1879,7 @@ jobs:
           $winver = '{0}.{1}.{2}.{3}' -f $Matches[1], $Matches[2], $Matches[3], ([int64]$Matches[4] % 65000)
           $commit = [string](git rev-parse --short=7 HEAD)
           & $env:CMAKE --preset win-x64-release "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_VERSION=$env:VERSION" `
-            "-DIM_WINVER=$winver" "-DIM_COMMIT=$($commit.Trim())"
+            "-DIM_WINVER=$winver" "-DIM_COMMIT=$($commit.Trim())" "-DIM_FFMPEG_ROOT=$env:FFMPEG_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:CMAKE --build --preset win-x64-release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1850,13 +1892,16 @@ jobs:
           dumpbin /nologo /loadconfig $dll | Select-String -Pattern 'Dependent Load' -SimpleMatch
           exit 0
 
-      - name: dll-check (the release DLL)
+      - name: dll-check (the release DLL and the FFmpeg DLLs)
         env:
           VERSION: ${{ env.ISSHONI_VERSION }}
           WINVER: ${{ steps.release.outputs.winver }}
+          FFMPEG_BIN: ${{ steps.ffmpeg.outputs.bin }}
         run: |
+          # -ffmpeg (README WA24): exactly the two DLLs lock.json names after its majors, with its
+          # SHA-256s, importing neither Media Foundation nor a C runtime DLL (06 §4.4, §5.1).
           $dll = Join-Path $env:GITHUB_WORKSPACE 'native/build/win-x64-release/windows/isshoni-media.dll'
-          go -C tools run ./desktoppkg dll-check -dll $dll -version $env:VERSION -winver $env:WINVER
+          go -C tools run ./desktoppkg dll-check -dll $dll -version $env:VERSION -winver $env:WINVER -ffmpeg $env:FFMPEG_BIN
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: The WebView2 bootstrapper (signature checked)
@@ -1925,8 +1970,11 @@ jobs:
           WEBVIEW2: ${{ steps.webview2.outputs.path }}
           WEBVIEW2_SHA256: ${{ steps.webview2.outputs.sha256 }}
           WEBVIEW2_SIGNER: ${{ steps.webview2.outputs.signer }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
         run: |
           # M2 06 §5.1: release\ is the win-x64-release output only; ci\ holds the test-hooks DLL.
+          # The FFmpeg DLLs (checked by dll-check -ffmpeg) sit next to isshoni-media.dll in both,
+          # since the engine loads them from its own folder (04 §9.2).
           $out = Join-Path $env:RUNNER_TEMP 'windows-native'
           $rel = Join-Path $out 'release'
           $ci = Join-Path $out 'ci'
@@ -1934,6 +1982,22 @@ jobs:
           $build = 'native/build/win-x64-release'
           Copy-Item -LiteralPath "$build/windows/isshoni-media.dll", "$build/windows/isshoni-media.pdb" -Destination $rel
           Copy-Item -LiteralPath 'native/build/win-x64-ci/windows/isshoni-media.dll' -Destination $ci
+          $lock = Get-Content -Raw -LiteralPath native/ffmpeg/lock.json | ConvertFrom-Json
+          $ffmpegDlls = [ordered]@{}
+          foreach ($name in @("avcodec-$($lock.avcodecMajor)", "avutil-$($lock.avutilMajor)")) {
+            $file = Join-Path $env:FFMPEG_ROOT "bin/$name.dll"
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            if ($sha -ne [string]$lock.dlls."$name.dll") { throw "$name.dll is not the one lock.json names" }
+            $ffmpegDlls["$name.dll"] = $sha
+            Copy-Item -LiteralPath $file -Destination $rel
+            Copy-Item -LiteralPath $file -Destination $ci
+            Copy-Item -LiteralPath (Join-Path $env:FFMPEG_ROOT "pdb/$name.pdb") -Destination $rel
+          }
+          # FFmpeg's license files (FFmpeg's own and those of the headers it was built with), beside
+          # the vcpkg ones below.
+          $licenses = Join-Path $rel 'licenses'
+          New-Item -ItemType Directory -Force -Path $licenses | Out-Null
+          Copy-Item -Path (Join-Path $env:FFMPEG_ROOT 'licenses/*') -Destination $licenses -Recurse
 
           # The vcpkg ports of the release tree (built without the tests feature, so no gtest): their
           # copyright files and their versions from vcpkg's status database.
@@ -1980,7 +2044,7 @@ jobs:
             version              = $env:VERSION
             winver               = $env:WINVER
             dll                  = [ordered]@{ name = 'isshoni-media.dll'; sha256 = $dllSha; abi = ($major * 65536 + $minor) }
-            ffmpeg               = $null # README WA24
+            ffmpeg               = [ordered]@{ tag = [string]$lock.tag; dlls = $ffmpegDlls }
             vcpkg                = [ordered]@{ baseline = $env:BASELINE; ports = $ports }
             msvcToolset          = $env:TOOLSET
             vsInstance           = $env:VS_VERSION
@@ -1998,6 +2062,28 @@ jobs:
           name: windows-native
           path: ${{ runner.temp }}/windows-native/
           retention-days: 1
+          if-no-files-found: error
+
+      - name: task native:dist (isshoni-native-tools)
+        env:
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+        run: |
+          # M2 06 §5.1, §17: the native:dist zip of the release DLL, the FFmpeg DLLs and the test
+          # tools for the owner's PC and the hwcheck suite, plus ci\ (the win-x64-ci DLL with the
+          # FFmpeg DLLs next to it) for the checks that need 04's luma tap
+          # (`isshoni-enginetest avsync -dll ci`). Never staged.
+          $out = Join-Path $env:RUNNER_TEMP 'isshoni-native-tools'
+          task native:dist "FFMPEG_ROOT=$env:FFMPEG_ROOT" "OUT=$(Join-Path $out 'isshoni-native-tools.zip')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'windows-native/ci') -Destination $out -Recurse
+          Get-ChildItem -LiteralPath $out -Recurse -File | ForEach-Object { $_.FullName.Substring($out.Length + 1) }
+
+      - name: Upload isshoni-native-tools
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isshoni-native-tools
+          path: ${{ runner.temp }}/isshoni-native-tools/
+          retention-days: 7
           if-no-files-found: error
 
   ci-ok:

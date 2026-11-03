@@ -1109,18 +1109,184 @@ tasks:
 
   native:dist:
     desc: >-
-      Zip the Windows test tools for the owner's PC - isshoni-enginetest.exe, g2g.exe, hwcheck.ps1, the release
-      isshoni-media.dll and the FFmpeg DLLs (docs/m2/06 §17)
+      Zip the Windows test tools for the owner's PC into dist-desktop/isshoni-native-tools.zip (OUT=<file>), flat -
+      GOOS=windows isshoni-enginetest.exe (once cmd/isshoni-enginetest exists), the release isshoni-media.dll
+      (DLL=<file>; default native/build/win-x64-release/) and the two FFmpeg DLLs of native/ffmpeg/lock.json, checked
+      against its SHA-256s (FFMPEG_ROOT=<dir>; default the ffmpeg:fetch output) (docs/m2/06 §5.1, §17)
+    # CI's windows-native uploads the zip as isshoni-native-tools (06 §5.1). README WA76 adds g2g.exe and
+    # native/windows/tools/hwcheck.ps1. The FFmpeg DLLs sit next to isshoni-media.dll because the engine loads them
+    # from its own folder (04 §9.2). Relative paths are relative to the repository root. On Windows the task runs in
+    # Windows PowerShell 5.1 (Compress-Archive: Windows has no zip), elsewhere in Task's shell with zip, so a zip for
+    # the owner's PC can also be made on the Mac from a downloaded windows-native artifact
+    # (DLL=<its release/isshoni-media.dll>) and task ffmpeg:fetch.
+    vars:
+      DLL: '{{.DLL | default "native/build/win-x64-release/windows/isshoni-media.dll"}}'
+      OUT: '{{.OUT | default "dist-desktop/isshoni-native-tools.zip"}}'
+      FFMPEG_ROOT: '{{.FFMPEG_ROOT | default ""}}'
+    env:
+      NATIVE_DIST_DLL: '{{.DLL}}'
+      NATIVE_DIST_OUT: '{{.OUT}}'
+      NATIVE_DIST_FFMPEG_ROOT: '{{.FFMPEG_ROOT}}'
+      NATIVE_DIST_VERSION: '{{.VERSION}}'
+      NATIVE_DIST_VERSION_PKG: '{{.VERSION_PKG}}'
+      # The NATIVE_DIST_* names exist only in this task's processes; they carry no ISSHONI_ prefix, so they are not
+      # names the server reads or warns about (internal/server/config's reserved list). Native programs run with
+      # ErrorActionPreference Continue and their exit codes decide, as in native:build.
+      NATIVE_DIST_PS1: |
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version 3.0
+        $root = (Get-Location).Path
+        function Get-RepoPath([string]$Path) {
+          if (-not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path $root $Path }
+          [IO.Path]::GetFullPath($Path)
+        }
+        function Invoke-Native([string]$What, [string]$Exe, [string[]]$Arguments) {
+          $ErrorActionPreference = 'Continue'
+          & $Exe @Arguments
+          if ($LASTEXITCODE -ne 0) { throw "native:dist: $What failed (exit code $LASTEXITCODE)" }
+        }
+
+        # Only a lock that describes the current native/ffmpeg inputs (06 section 4.1).
+        Invoke-Native 'desktoppkg ffmpeg-inputs -check' 'go' @('-C', 'tools', 'run', './desktoppkg', 'ffmpeg-inputs', '-check')
+        $lock = Get-Content -Raw -LiteralPath (Join-Path $root 'native\ffmpeg\lock.json') | ConvertFrom-Json
+        $ffmpeg = $env:NATIVE_DIST_FFMPEG_ROOT
+        if (-not $ffmpeg) { $ffmpeg = Join-Path '.deps\ffmpeg' (([string]$lock.tag -replace '^deps-', '') + '-win-x64') }
+        $ffmpeg = Get-RepoPath $ffmpeg
+        $dll = Get-RepoPath $env:NATIVE_DIST_DLL
+        if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+          throw "native:dist: $dll does not exist: run task native:build first, or pass DLL=<file>"
+        }
+
+        $stage = Join-Path $root 'dist-desktop\.build\native-tools'
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        Copy-Item -LiteralPath $dll -Destination (Join-Path $stage 'isshoni-media.dll')
+        foreach ($name in @("avcodec-$($lock.avcodecMajor).dll", "avutil-$($lock.avutilMajor).dll")) {
+          $file = Join-Path $ffmpeg "bin\$name"
+          if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw "native:dist: $file does not exist: run task ffmpeg:fetch first, or pass FFMPEG_ROOT=<dir>"
+          }
+          $want = [string]$lock.dlls.$name
+          $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+          if ($got -ne $want) { throw "native:dist: $file has SHA-256 $got, native/ffmpeg/lock.json has $want" }
+          Copy-Item -LiteralPath $file -Destination $stage
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $root 'cmd\isshoni-enginetest') -PathType Container) {
+          $commit = ([string](& git rev-parse HEAD)).Trim()
+          $pkg = $env:NATIVE_DIST_VERSION_PKG
+          $ldflags = "-s -w -X $pkg.version=$env:NATIVE_DIST_VERSION -X $pkg.commit=$commit"
+          $saved = @($env:GOOS, $env:GOARCH, $env:CGO_ENABLED)
+          $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
+          try {
+            Invoke-Native 'go build ./cmd/isshoni-enginetest' 'go' @('build', '-trimpath', '-ldflags', $ldflags,
+              '-o', (Join-Path $stage 'isshoni-enginetest.exe'), './cmd/isshoni-enginetest')
+          } finally {
+            $env:GOOS, $env:GOARCH, $env:CGO_ENABLED = $saved
+          }
+        } else {
+          Write-Host 'native:dist: note: cmd/isshoni-enginetest does not exist yet (README WA44 adds it), so the zip has no isshoni-enginetest.exe'
+        }
+
+        $out = Get-RepoPath $env:NATIVE_DIST_OUT
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
+        if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $out
+        Write-Host "native:dist: $out"
+        Get-ChildItem -LiteralPath $stage -File | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
     cmds:
-      - cmd: "echo 'native:dist: note: not implemented yet; README WA24 adds it (WA76 adds hwcheck.ps1 and g2g.exe). Nothing was built.'"
+      - cmd: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '& ([scriptblock]::Create($env:NATIVE_DIST_PS1))'
+        if: '{{if eq OS "windows"}}true{{else}}false{{end}}'
+      - cmd: |
+          set -eu
+          die() {
+            printf 'native:dist: %s\n' "$@" >&2
+            exit 1
+          }
+          abs() {
+            case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac
+          }
+          # Only a lock that describes the current native/ffmpeg inputs (06 §4.1).
+          go -C tools run ./desktoppkg ffmpeg-inputs -check >/dev/null
+          lock=native/ffmpeg/lock.json
+          # One "key": value line of lock.json (it is written one key per line, README WA07).
+          field() {
+            sed -n "s/^[[:space:]]*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}[[:space:]]*\$/\1/p" "$lock"
+          }
+          tag=$(field tag)
+          avcodec="avcodec-$(field avcodecMajor).dll"
+          avutil="avutil-$(field avutilMajor).dll"
+          case $tag/$avcodec/$avutil in
+          deps-ffmpeg-*/avcodec-[0-9]*.dll/avutil-[0-9]*.dll) ;;
+          *) die "could not read tag, avcodecMajor and avutilMajor from $lock" ;;
+          esac
+          ffmpeg=$(abs "${NATIVE_DIST_FFMPEG_ROOT:-.deps/ffmpeg/${tag#deps-}-win-x64}")
+          dll=$(abs "$NATIVE_DIST_DLL")
+          [ -f "$dll" ] || die "$dll does not exist: build it on Windows (task native:build), or pass DLL=<file>"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha() { sha256sum "$1" | cut -d' ' -f1; }
+          else
+            sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          fi
+          command -v zip >/dev/null 2>&1 || die 'zip is not installed'
+
+          stage=dist-desktop/.build/native-tools
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp "$dll" "$stage/isshoni-media.dll"
+          for name in "$avcodec" "$avutil"; do
+            file="$ffmpeg/bin/$name"
+            [ -f "$file" ] || die "$file does not exist: run task ffmpeg:fetch first, or pass FFMPEG_ROOT=<dir>"
+            want=$(field "$name")
+            got=$(sha "$file")
+            [ "$got" = "$want" ] || die "$file has SHA-256 $got, $lock has $want"
+            cp "$file" "$stage/"
+          done
+
+          if [ -d cmd/isshoni-enginetest ]; then
+            commit=$(git rev-parse HEAD)
+            pkg=$NATIVE_DIST_VERSION_PKG
+            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X $pkg.version=$NATIVE_DIST_VERSION -X $pkg.commit=$commit" \
+              -o "$stage/isshoni-enginetest.exe" ./cmd/isshoni-enginetest
+          else
+            echo 'native:dist: note: cmd/isshoni-enginetest does not exist yet (README WA44 adds it), so the zip has no isshoni-enginetest.exe'
+          fi
+
+          out=$(abs "$NATIVE_DIST_OUT")
+          mkdir -p "$(dirname "$out")"
+          rm -f "$out"
+          (cd "$stage" && zip -q -X "$out" ./*)
+          echo "native:dist: $out"
+          (cd "$stage" && ls -1 | sed 's/^/  /')
         silent: true
+        if: '{{if eq OS "windows"}}false{{else}}true{{end}}'
 
   ffmpeg:fetch:
     desc: >-
-      Download the locked FFmpeg build (native/ffmpeg/lock.json) from its deps release into .deps/ffmpeg/ and check
-      its SHA-256 (works on the Mac too)
+      Download the locked FFmpeg build (native/ffmpeg/lock.json) from its deps release into .deps/ffmpeg/ (OUT=<dir>),
+      check its SHA-256, unpack it and check the DLLs and LGPL config (ZIP=<file> takes a local copy of the zip
+      instead; SOURCE=true also fetches the source archive); fails when lock.json is stale (works on the Mac too)
+    # tools/desktoppkg ffmpeg-fetch does the work (docs/m2/06 §4.1, §4.5; README WA07) and prints the unpacked
+    # folder: the IM_FFMPEG_ROOT that task native:build finds in .deps/ffmpeg/. Relative paths are relative to the
+    # repository root.
+    vars:
+      OUT: '{{.OUT | default ".deps/ffmpeg"}}'
+      ZIP: '{{.ZIP | default ""}}'
+      SOURCE: '{{.SOURCE | default "false"}}'
     cmds:
-      - cmd: "echo 'ffmpeg:fetch: note: not implemented yet; README WA24 adds it (go -C tools run ./desktoppkg ffmpeg-fetch). Nothing was fetched.'"
+      - cmd: |
+          set -eu
+          abs() {
+            case $1 in /* | [A-Za-z]:*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' '{{.ROOT_DIR}}' "$1" ;; esac
+          }
+          set -- -out "$(abs '{{.OUT}}')"
+          if [ -n '{{.ZIP}}' ]; then set -- "$@" -zip "$(abs '{{.ZIP}}')"; fi
+          if [ '{{.SOURCE}}' = true ]; then set -- "$@" -source; fi
+          go -C tools run ./desktoppkg ffmpeg-fetch "$@"
+          if [ -d .deps ] && ! [ -f .deps/.gitignore ]; then
+            printf '%s\n' '# Fetched by the native and ffmpeg tasks (Taskfile.yml).' '*' >.deps/.gitignore
+          fi
         silent: true
 
   ffmpeg:build:
