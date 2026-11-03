@@ -1,0 +1,267 @@
+# S1 audio: spike S1's self-test (spikes/s1-win-audio) on a GitHub-hosted Windows Server 2025 runner with a virtual
+# audio driver, for README WA09 (docs/m2/README.md) in place of a run on the owner's PC.
+#
+#   pull request touching spikes/s1-win-audio/, this file ─┐
+#   or the MSVC setup (msvc-env.ps1, tools.json)            │
+#   Run workflow ───────────────────────────────────────────┴─► selftest ──► artifact s1-audio (reports, WAVs)
+#
+# - selftest (windows-2025, contents: read, no secrets): builds isshoni_audio.dll from the spike's CMakeLists.txt with
+#   MSVC (deploy/windows/msvc-env.ps1, Ninja; "Run workflow" can pick the image's MinGW instead, the toolchain of the
+#   earlier runs) and s1.exe with Go. spikes/s1-win-audio/ci/setup-audio.ps1 starts the Windows Audio services, which
+#   Server ships off, and installs VB-CABLE, the virtual audio cable below, so the runner has an output (the default
+#   one, at 100% volume) and a microphone. Then `s1 probe`, the full `s1 selftest`, and the late-start re-run
+#   (`-only late-start,late-start-endpoint`: the onset and tail fades of the spike README's Results). The
+#   self-test's verdicts are data: both exit codes and every scenario's result go to the job summary, and the job
+#   fails only when something before them breaks (the build, the driver's hash or install, no audio endpoint) or a
+#   run leaves no report. The fake apps start under explorer.exe when the runner's session has one, else under the step's shell
+#   (`selftest -launcher auto`).
+#
+# What a pass here proves: the code paths on Windows Server 2025 (build 26100) with a virtual endpoint, not a real
+# sound card, Windows 11 client or Windows 10 (WA09 says how far it counts).
+#
+# Departure from the usual downloads: VB-CABLE (VB-Audio Virtual Cable, www.vb-cable.com, donationware by Vincent
+# Burel) is a third-party driver downloaded at run time from the vendor's own host, the only place it is published.
+# Its licence allows using the package as is, not building it into another program's installer, so it is never
+# committed or shipped: it lives on the throwaway runner only. The URL names the version but the vendor could replace
+# the file, so the pinned SHA-256 below is checked before anything is unpacked, and a mismatch fails the run. The pin
+# is here, not in deploy/windows/tools.json, which is the product's (spikes/ is throwaway, dependabot.yml).
+#
+# GitHub offers "Run workflow" only for a workflow file on the default branch; until this file reaches main, a pull
+# request touching it runs it.
+#
+# Rules for every workflow (M1 06 §8.1): a read-only token by default, with jobs raising their own permissions;
+# third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
+# timeout-minutes on every job. No cache: one build per run.
+
+name: S1 audio
+
+on:
+  pull_request:
+    paths:
+      - spikes/s1-win-audio/**
+      - .github/workflows/s1-audio.yml
+      - deploy/windows/msvc-env.ps1
+      - deploy/windows/tools.json
+  workflow_dispatch:
+    inputs:
+      dll:
+        description: Toolchain for isshoni_audio.dll (mingw is the image's MinGW-w64, as the earlier runs used)
+        type: choice
+        options: [msvc, mingw]
+        default: msvc
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # VB-CABLE Driver Pack 45 (driver 3.3.1.7, 2024-10-07). A new pack is a new URL and hash, checked by hand first.
+  VBCABLE_URL: https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip
+  VBCABLE_SHA256: b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb
+
+jobs:
+  selftest:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DLL_TOOLCHAIN: ${{ inputs.dll || 'msvc' }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from the spike's go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: spikes/s1-win-audio/go.mod
+          cache: false
+
+      - name: MSVC environment
+        if: env.DLL_TOOLCHAIN == 'msvc'
+        id: msvc
+        run: ./deploy/windows/msvc-env.ps1
+
+      - name: Build isshoni_audio.dll and s1.exe
+        id: build
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 's1'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          if ($env:DLL_TOOLCHAIN -eq 'msvc') {
+            # Ninja, single-config: the DLL lands in the build folder itself. Static CRT (CMakeLists.txt).
+            $build = Join-Path $env:RUNNER_TEMP 's1-dll'
+            cmake -S spikes/s1-win-audio -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit code $LASTEXITCODE)" }
+            cmake --build $build
+            if ($LASTEXITCODE -ne 0) { throw "cmake build failed (exit code $LASTEXITCODE)" }
+            Copy-Item -LiteralPath (Join-Path $build 'isshoni_audio.dll') -Destination $out
+          } else {
+            # The flags of spikes/s1-win-audio/build/build-dll.sh.
+            $gxx = $null
+            foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
+              if (Test-Path -LiteralPath (Join-Path $dir 'g++.exe')) { $gxx = Join-Path $dir 'g++.exe'; $env:PATH = "$dir;$env:PATH"; break }
+            }
+            if (-not $gxx) { throw 'no MinGW-w64 g++ on the image' }
+            & $gxx --version | Select-Object -First 1
+            & $gxx -std=c++20 -O2 -Wall -Wextra -Wno-unknown-pragmas -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 `
+              -DUNICODE -D_UNICODE -shared -o (Join-Path $out 'isshoni_audio.dll') spikes/s1-win-audio/native/engine.cpp `
+              -static -static-libgcc -static-libstdc++ -lole32 -lwinmm
+            if ($LASTEXITCODE -ne 0) { throw "g++ failed (exit code $LASTEXITCODE)" }
+          }
+          $env:CGO_ENABLED = '0'
+          go -C spikes/s1-win-audio vet ./...
+          if ($LASTEXITCODE -ne 0) { throw "go vet failed (exit code $LASTEXITCODE)" }
+          go -C spikes/s1-win-audio test ./...
+          if ($LASTEXITCODE -ne 0) { throw "go test failed (exit code $LASTEXITCODE)" }
+          go -C spikes/s1-win-audio build -trimpath -o (Join-Path $out 's1.exe') .
+          if ($LASTEXITCODE -ne 0) { throw "go build failed (exit code $LASTEXITCODE)" }
+          Get-ChildItem -LiteralPath $out | Format-Table -AutoSize Name, Length | Out-String -Width 200
+          "dir=$out" >> $env:GITHUB_OUTPUT
+
+      - name: Session (does it have an explorer.exe?)
+        run: |
+          # The fake apps must not be children of s1 (they would count as "isshoni itself"). -launcher auto starts
+          # them under this session's explorer.exe, else under the step's pwsh.exe, which the engine also treats
+          # as a launcher.
+          $session = (Get-Process -Id $PID).SessionId
+          "this step's session: $session, user $env:USERNAME"
+          $explorer = @(Get-Process -Name explorer -ErrorAction SilentlyContinue)
+          if ($explorer.Count -eq 0) { 'no explorer.exe on the machine' }
+          $explorer | Format-Table -AutoSize Id, SessionId | Out-String -Width 200
+
+      - name: Audio (services, VB-CABLE, volume)
+        run: ./spikes/s1-win-audio/ci/setup-audio.ps1 -Url $env:VBCABLE_URL -Sha256 $env:VBCABLE_SHA256
+
+      - name: s1 probe
+        env:
+          S1: ${{ steps.build.outputs.dir }}
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $deadline = (Get-Date).AddSeconds(30)
+          for (;;) {
+            $line = & (Join-Path $env:S1 's1.exe') probe 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $line.Trim()
+            if ($code -eq 0 -and $line -notmatch 'output ""') { break }
+            if ((Get-Date) -gt $deadline) { throw "s1 probe found no output device (exit code $code)" }
+            Start-Sleep -Seconds 2
+          }
+
+      - name: s1 selftest (full)
+        id: full
+        timeout-minutes: 10
+        env:
+          S1: ${{ steps.build.outputs.dir }}
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          # -keep writes each scenario's WAV into a folder under TEMP; one TEMP per run keeps them apart.
+          $env:TMP = $env:TEMP = Join-Path $env:RUNNER_TEMP 's1-tmp\full'
+          New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+          $results = Join-Path $env:RUNNER_TEMP 's1-results'
+          New-Item -ItemType Directory -Force -Path $results | Out-Null
+          & (Join-Path $env:S1 's1.exe') selftest -keep -launcher auto
+          $code = $LASTEXITCODE
+          "code=$code" >> $env:GITHUB_OUTPUT
+          "s1 selftest exited with $code (0 all passed, 1 something failed, 2 something was inconclusive)"
+          $report = Join-Path $env:S1 's1-report.json'
+          if (-not (Test-Path -LiteralPath $report)) { throw 's1 selftest wrote no s1-report.json' }
+          Move-Item -LiteralPath $report -Destination (Join-Path $results 's1-report-full.json') -Force
+          if ($code -notin 0, 1, 2) { throw "unexpected exit code $code" }
+          exit 0
+
+      - name: s1 selftest (late-start re-run, onset and tail fades)
+        id: late
+        timeout-minutes: 5
+        env:
+          S1: ${{ steps.build.outputs.dir }}
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $env:TMP = $env:TEMP = Join-Path $env:RUNNER_TEMP 's1-tmp\late-start'
+          New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+          $results = Join-Path $env:RUNNER_TEMP 's1-results'
+          New-Item -ItemType Directory -Force -Path $results | Out-Null
+          $only = 'late-start', 'late-start-endpoint'
+          & (Join-Path $env:S1 's1.exe') selftest -keep -launcher auto -only ($only -join ',')
+          $code = $LASTEXITCODE
+          "code=$code" >> $env:GITHUB_OUTPUT
+          "s1 selftest exited with $code"
+          $report = Join-Path $env:S1 's1-report.json'
+          if (-not (Test-Path -LiteralPath $report)) { throw 's1 selftest wrote no s1-report.json' }
+          $dst = Join-Path $results 's1-report-late-start.json'
+          Move-Item -LiteralPath $report -Destination $dst -Force
+          # -only skips unknown names silently: both scenarios must be in the report.
+          $names = @((Get-Content -Raw -LiteralPath $dst | ConvertFrom-Json).scenarios.name)
+          foreach ($n in $only) { if ($n -notin $names) { throw "the report has no scenario $n (renamed?)" } }
+          if ($code -notin 0, 1, 2) { throw "unexpected exit code $code" }
+          exit 0
+
+      - name: Summary
+        if: always()
+        env:
+          FULL_CODE: ${{ steps.full.outputs.code }}
+          LATE_CODE: ${{ steps.late.outputs.code }}
+        run: |
+          $results = Join-Path $env:RUNNER_TEMP 's1-results'
+          $md = [Collections.Generic.List[string]]::new()
+          $md.Add('## S1 self-test on windows-2025 (VB-CABLE)')
+          $md.Add('')
+          $md.Add('Exit codes: 0 all passed, 1 something failed, 2 something was inconclusive. Verdicts are data; they do not fail the job.')
+          $md.Add('')
+          # Consecutive lines: one Markdown paragraph.
+          $md.Add('endpoint-baseline and late-start-endpoint are the plain-loopback control: they test the runner''s audio setup, not isshoni.')
+          $md.Add('If endpoint-baseline fails, the control heard nothing here (the first run got only zeros), and late-start-endpoint')
+          $md.Add('cannot show whether a click was already in what the output played (spike README, CI run).')
+          foreach ($run in @(@{ Name = 'full'; Code = $env:FULL_CODE }, @{ Name = 'late-start'; Code = $env:LATE_CODE })) {
+            $file = Join-Path $results "s1-report-$($run.Name).json"
+            $md.Add('')
+            $code = if ($run.Code) { $run.Code } else { 'did not run' }
+            $md.Add("### $($run.Name): exit code $code")
+            if (-not (Test-Path -LiteralPath $file)) { $md.Add('No report.'); continue }
+            $r = Get-Content -Raw -LiteralPath $file | ConvertFrom-Json
+            $p = $r.probe
+            $md.Add('')
+            $md.Add("Build $($p.os_build), per-app loopback $($p.process_loopback), format $($p.format), output ``$($p.device)``, fake apps under: $($r.launcher)")
+            $md.Add('')
+            $md.Add('| Scenario | Result | Clicks at (s) | Checks | Problems |')
+            $md.Add('|---|---|---|---|---|')
+            foreach ($s in $r.scenarios) {
+              $result = if ($s.result -eq 'ERROR') { 'INCONCLUSIVE' } else { $s.result }
+              $clicks = (@($s.clicks_at_s) | Where-Object { $null -ne $_ }) -join ', '
+              $checks = (@($s.checks) | Where-Object { $null -ne $_ } | ForEach-Object {
+                '{0} Hz {1}: {2:N1} dB{3}' -f $_.freq, $_.expect, $_.level_db, $(if ($_.pass -or $_.expect -eq 'info') { '' } else { ' ✗' })
+              }) -join '<br>'
+              $problems = (@($s.problems) | Where-Object { $null -ne $_ }) -join '<br>'
+              $md.Add("| $($s.name) | $result | $clicks | $checks | $($problems -replace '\|', '\|') |")
+            }
+          }
+          $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $md -join "`n"
+
+      - name: Upload the reports and WAVs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s1-audio
+          path: |
+            ${{ runner.temp }}/s1-results/*.json
+            ${{ runner.temp }}/s1-tmp/**/*.wav
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          Get-Service Audiosrv, AudioEndpointBuilder | Format-List Name, Status, StartType | Out-String -Width 200
+          Get-PnpDevice -Class AudioEndpoint, MEDIA -ErrorAction SilentlyContinue |
+            Format-List Status, Problem, FriendlyName, InstanceId | Out-String -Width 200
+          pnputil /enum-drivers /class MEDIA
+          $log = 'C:\Windows\INF\setupapi.dev.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 120 }

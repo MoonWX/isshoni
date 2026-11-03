@@ -62,6 +62,7 @@ constexpr size_t kTrimToFrames = 4 * kChunk;            // …fade out, drop bac
 constexpr size_t kTailRampFrames = 64;                  // backstop ramp if a chunk ends early
 constexpr size_t kOnsetSilenceFrames = kRate / 20;      // 50 ms of digital silence…
 constexpr size_t kOnsetRampFrames = kRate / 200;        // …then audio starts: ramp it in over 5 ms
+constexpr size_t kOffsetRampFrames = kRate / 200;       // audio stops into >= 5 ms of digital silence: ramp out over 5 ms
 constexpr size_t kRingFrames = kRate;                   // 1 s per stream
 constexpr int kMissingPollsBeforeRemoval = 3;           // session gone for 1.5 s (process alive) → drop stream
 constexpr int kPollMs = 500;
@@ -612,6 +613,19 @@ class LoopbackStream {
     return n;
   }
 
+  // Copies up to `frames` frames into dst without consuming them; zero-fills the rest. Returns frames copied.
+  size_t Peek(float *dst, size_t frames) {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t n = std::min(frames, size_);
+    for (size_t i = 0; i < n; ++i) {
+      size_t at = ((head_ + i) % kRingFrames) * 2;
+      dst[2 * i] = ring_[at];
+      dst[2 * i + 1] = ring_[at + 1];
+    }
+    std::fill(dst + 2 * n, dst + 2 * frames, 0.0f);
+    return n;
+  }
+
   size_t Buffered() {
     std::lock_guard<std::mutex> lk(mu_);
     return size_;
@@ -984,7 +998,11 @@ struct Channel {
   // level. Audio that starts after >= 50 ms of digital silence is ramped in.
   size_t silent_frames = kOnsetSilenceFrames;
   size_t onset_pos = kOnsetRampFrames;  // >= kOnsetRampFrames: no ramp in progress
-  std::atomic<uint64_t> underruns{0}, trims{0};
+  std::atomic<uint64_t> underruns{0}, trims{0}, tail_fades{0};
+  // Mixer thread only: when "sound stopped: tail fade" was last logged. Apps
+  // that gate their sound to digital zero stop often; at most one such event
+  // per channel per second keeps them from pushing the rest out of the list.
+  int64_t tail_fade_event_ns = 0;
   std::atomic<bool> want_removal{false};
 };
 
@@ -1243,6 +1261,7 @@ class Engine {
       reaped_overflows_ += ch->stream->overflows.load();
       reaped_underruns_ += ch->underruns.load();
       reaped_trims_ += ch->trims.load();
+      reaped_tail_fades_ += ch->tail_fades.load();
     }
     dead.clear();  // joins capture threads outside the lock
   }
@@ -1258,7 +1277,7 @@ class Engine {
       timeBeginPeriod(1);
       coarse = true;
     }
-    std::vector<float> mix(kChunk * 2), tmp(kChunk * 2);
+    std::vector<float> mix(kChunk * 2), tmp(kChunk * 2), ahead(kChunk * 2), fade(kChunk);
     int64_t next = QpcNs();
     while (!stop_) {
       next += 10'000'000;
@@ -1280,7 +1299,7 @@ class Engine {
         std::lock_guard<std::mutex> lk(ch_mu_);
         chans = channels_;
       }
-      for (auto &ch : chans) MixChannel(*ch, mix, tmp);
+      for (auto &ch : chans) MixChannel(*ch, mix, tmp, ahead, fade);
       chans.clear();  // never hold the last reference here: destruction belongs to the poller
       {
         std::lock_guard<std::mutex> lk(ch_mu_);
@@ -1318,7 +1337,8 @@ class Engine {
   // a full chunk that is still buffered (packets arrive in whole 10 ms blocks,
   // so waiting until the ring is empty would leave nothing to fade), and a
   // chunk that ends early anyway gets a short tail ramp.
-  void MixChannel(Channel &ch, std::vector<float> &mix, std::vector<float> &tmp) {
+  void MixChannel(Channel &ch, std::vector<float> &mix, std::vector<float> &tmp, std::vector<float> &ahead,
+                  std::vector<float> &fade) {
     LoopbackStream &s = *ch.stream;
     if ((ch.want_removal || s.Failed()) && ch.state != Channel::Fading) {
       ch.state = Channel::Fading;
@@ -1348,6 +1368,46 @@ class Engine {
       }
     }
     const size_t got = s.Pop(tmp.data(), kChunk);
+    // Tail fade, the onset fade's mirror image. When an app stops playing,
+    // Windows' process-loopback tap cuts its audio at a 10 ms packet boundary
+    // and then delivers digital silence: measured on Server 2025 (CI) and in
+    // the Win11 PC's late-start run, the app's own 20 ms fade-out arrived only
+    // in part or not at all, while plain endpoint loopback on the PC heard it
+    // whole. The stream stays Running, so nothing above fades it. Sound that
+    // is followed by >= 5 ms of digital silence gets its last 5 ms ramped out.
+    // The ramp needs the frames after the change, which are already in the
+    // ring (a Running stream holds >= kLowWaterFrames = 20 ms before this pop,
+    // so >= 10 ms remain to peek): latency cost 0 ms. A sound that really ends
+    // in a hard cut loses 5 ms of level at its very end, which is inaudible.
+    const size_t peeked = s.Peek(ahead.data(), kChunk);
+    std::fill(fade.begin(), fade.end(), 1.0f);
+    {
+      const size_t n = got + peeked, ramp = kOffsetRampFrames;
+      auto silent = [&](size_t k) {
+        const float *f = k < got ? &tmp[2 * k] : &ahead[2 * (k - got)];
+        return std::fabs(f[0]) < 1e-6f && std::fabs(f[1]) < 1e-6f;
+      };
+      // t: the first silent frame after sound. Its ramp [t - ramp, t) must
+      // reach into this chunk, and the ramp's worth of silence after t must be
+      // visible. A ramp that straddles two chunks is found in both ticks
+      // (counted in the first, where t >= ramp).
+      for (size_t t = 1; t < got + ramp && t + ramp <= n; ++t) {
+        if (!silent(t) || silent(t - 1)) continue;
+        size_t k = t + 1;
+        while (k < t + ramp && silent(k)) ++k;
+        if (k < t + ramp) continue;  // a gap shorter than 5 ms: not a stop
+        for (size_t i = t > ramp ? t - ramp : 0; i < std::min(t, got); ++i)
+          fade[i] = std::min(fade[i], static_cast<float>(t - i) / static_cast<float>(ramp));
+        if (t >= ramp) {
+          ++ch.tail_fades;
+          const int64_t now = QpcNs();
+          if (ch.tail_fade_event_ns == 0 || now - ch.tail_fade_event_ns >= 1000000000) {
+            ch.tail_fade_event_ns = now;
+            Event(ch.label, "sound stopped: tail fade");
+          }
+        }
+      }
+    }
     const float target = (ch.state == Channel::Fading || stop_after) ? 0.0f : 1.0f;
     const float step = 1.0f / kChunk;
     float peak = 0.0f, last_l = 0.0f, last_r = 0.0f;
@@ -1362,8 +1422,8 @@ class Engine {
       }
       float onset = 1.0f;
       if (ch.onset_pos < kOnsetRampFrames) onset = static_cast<float>(++ch.onset_pos) / static_cast<float>(kOnsetRampFrames);
-      last_l = in_l * ch.gain * onset;
-      last_r = in_r * ch.gain * onset;
+      last_l = in_l * ch.gain * onset * fade[i];
+      last_r = in_r * ch.gain * onset * fade[i];
       mix[2 * i] += last_l;
       mix[2 * i + 1] += last_r;
       peak = std::max({peak, std::fabs(last_l), std::fabs(last_r)});
@@ -1395,6 +1455,7 @@ class Engine {
   // ---- status JSON ("what friends hear")
   void PublishStatus(const Snapshot &snap) {
     uint64_t disc = reaped_discontinuities_, over = reaped_overflows_, under = reaped_underruns_, trims = reaped_trims_;
+    uint64_t tail_fades = reaped_tail_fades_;
     std::string j = "{\"mode\":";
     JsonStr(j, mode_ == IM_AUDIO_MODE_INCLUDE_SET ? "include-set"
                : mode_ == IM_AUDIO_MODE_EXCLUDE_ONE ? "exclude-one"
@@ -1411,6 +1472,7 @@ class Engine {
         over += s.overflows.load();
         under += ch->underruns.load();
         trims += ch->trims.load();
+        tail_fades += ch->tail_fades.load();
         j += "{\"label\":";
         JsonStr(j, ch->label);
         j += ",\"kind\":";
@@ -1426,6 +1488,7 @@ class Engine {
              ",\"silent_packets\":" + std::to_string(s.silent_packets.load()) +
              ",\"discontinuities\":" + std::to_string(s.discontinuities.load()) +
              ",\"underruns\":" + std::to_string(ch->underruns.load()) + ",\"trims\":" + std::to_string(ch->trims.load()) +
+             ",\"tail_fades\":" + std::to_string(ch->tail_fades.load()) +
              ",\"overflows\":" + std::to_string(s.overflows.load()) + ",\"error\":";
         JsonStr(j, s.Failed() ? s.FailReason() : "");
         j += '}';
@@ -1433,6 +1496,7 @@ class Engine {
     }
     j += "],\"totals\":{\"discontinuities\":" + std::to_string(disc) + ",\"overflows\":" + std::to_string(over) +
          ",\"underruns\":" + std::to_string(under) + ",\"trims\":" + std::to_string(trims) +
+         ",\"tail_fades\":" + std::to_string(tail_fades) +
          ",\"dropped_chunks\":" + std::to_string(dropped_chunks_.load()) +
          ",\"mixer_resyncs\":" + std::to_string(mixer_resyncs_.load()) + "},\"sessions\":";
     AppendSessions(j, snap);
@@ -1507,6 +1571,7 @@ class Engine {
   std::vector<std::shared_ptr<Channel>> channels_;
   std::vector<std::shared_ptr<Channel>> graveyard_;
   uint64_t reaped_discontinuities_ = 0, reaped_overflows_ = 0, reaped_underruns_ = 0, reaped_trims_ = 0;  // poller
+  uint64_t reaped_tail_fades_ = 0;                                                                       // poller
 
   std::mutex out_mu_;
   std::condition_variable out_cv_;

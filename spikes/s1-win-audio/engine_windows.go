@@ -207,6 +207,7 @@ type statusView struct {
 		Overflows       int `json:"overflows"`
 		Underruns       int `json:"underruns"`
 		Trims           int `json:"trims"`
+		TailFades       int `json:"tail_fades"`
 		DroppedChunks   int `json:"dropped_chunks"`
 		MixerResyncs    int `json:"mixer_resyncs"`
 	} `json:"totals"`

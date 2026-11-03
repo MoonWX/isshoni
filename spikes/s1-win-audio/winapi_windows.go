@@ -104,13 +104,24 @@ func openMic() (func(), error) {
 	}, nil
 }
 
-// startUnderExplorer launches exe as a child of the user's explorer.exe (like
-// an app started from the Start menu). Falls back to a normal child process.
+// launcher picks the parent of the fake apps (selftest -launcher):
+//   - "explorer" (default): the user's explorer.exe in s1's session, like an app
+//     started from the Start menu;
+//   - "parent": s1's own parent process (the shell that started s1, such as
+//     pwsh.exe on a CI runner with no desktop), so the fake apps are siblings of
+//     s1, not descendants; the shell is a launcher where the engine's app walk
+//     stops, so they are classified as under Explorer;
+//   - "auto": explorer, else parent.
+var launcher = "explorer"
+
+// startUnderExplorer launches exe as a child of the launcher process (see
+// launcher; explorer.exe by default). Falls back to a normal child process,
+// reported as reparented=false.
 func startUnderExplorer(exe string, args ...string) (*os.Process, bool, error) {
 	cmd := exec.Command(exe, args...)
 	attr := &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	reparented := false
-	if h, err := openExplorer(); err == nil {
+	if h, _, err := openLauncher(); err == nil {
 		defer windows.CloseHandle(h)
 		attr.ParentProcess = syscall.Handle(h)
 		reparented = true
@@ -130,26 +141,78 @@ func startUnderExplorer(exe string, args ...string) (*os.Process, bool, error) {
 	return cmd.Process, reparented, nil
 }
 
-func openExplorer() (windows.Handle, error) {
-	var mySession uint32
-	windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &mySession)
+// openLauncher opens the process the fake apps start under, and describes it.
+func openLauncher() (windows.Handle, string, error) {
+	switch launcher {
+	case "explorer":
+		return openExplorer()
+	case "parent":
+		return openOwnParent()
+	case "auto":
+		if h, desc, err := openExplorer(); err == nil {
+			return h, desc, nil
+		}
+		return openOwnParent()
+	}
+	return 0, "", fmt.Errorf("unknown launcher %q (explorer, parent or auto)", launcher)
+}
+
+// launcherAccess: PROCESS_CREATE_PROCESS to be the parent; PROCESS_DUP_HANDLE
+// because Go duplicates the child's stdio handles into the new parent.
+const launcherAccess = windows.PROCESS_CREATE_PROCESS | windows.PROCESS_DUP_HANDLE | windows.PROCESS_QUERY_LIMITED_INFORMATION
+
+// processes lists every process: PID → (parent PID, exe name).
+func processes() (map[uint32]windows.ProcessEntry32, error) {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer windows.CloseHandle(snap)
+	out := map[uint32]windows.ProcessEntry32{}
 	var pe windows.ProcessEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
 	for err = windows.Process32First(snap, &pe); err == nil; err = windows.Process32Next(snap, &pe) {
+		out[pe.ProcessID] = pe
+	}
+	return out, nil
+}
+
+func openExplorer() (windows.Handle, string, error) {
+	var mySession uint32
+	windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &mySession)
+	procs, err := processes()
+	if err != nil {
+		return 0, "", err
+	}
+	for pid, pe := range procs {
 		if !strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), "explorer.exe") {
 			continue
 		}
 		var s uint32
-		if windows.ProcessIdToSessionId(pe.ProcessID, &s) != nil || s != mySession {
+		if windows.ProcessIdToSessionId(pid, &s) != nil || s != mySession {
 			continue
 		}
-		// PROCESS_DUP_HANDLE: Go duplicates the child's stdio handles into the new parent.
-		return windows.OpenProcess(windows.PROCESS_CREATE_PROCESS|windows.PROCESS_DUP_HANDLE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pe.ProcessID)
+		h, err := windows.OpenProcess(launcherAccess, false, pid)
+		return h, fmt.Sprintf("explorer.exe (session %d)", mySession), err
 	}
-	return 0, fmt.Errorf("explorer.exe not found in session %d", mySession)
+	return 0, "", fmt.Errorf("explorer.exe not found in session %d", mySession)
+}
+
+// openOwnParent opens the process that started s1 (selftest -launcher parent).
+func openOwnParent() (windows.Handle, string, error) {
+	procs, err := processes()
+	if err != nil {
+		return 0, "", err
+	}
+	me, ok := procs[windows.GetCurrentProcessId()]
+	if !ok {
+		return 0, "", fmt.Errorf("s1 is not in the process list")
+	}
+	parent, ok := procs[me.ParentProcessID]
+	if !ok {
+		return 0, "", fmt.Errorf("s1's parent process %d has exited", me.ParentProcessID)
+	}
+	name := windows.UTF16ToString(parent.ExeFile[:])
+	h, err := windows.OpenProcess(launcherAccess, false, me.ParentProcessID)
+	return h, "s1's parent " + name, err
 }

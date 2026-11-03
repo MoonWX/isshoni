@@ -10,7 +10,8 @@ import (
 
 const usage = `s1 — isshoni spike S1 (Windows audio exclusion)
 
-  s1 selftest [-keep]            run all scenarios, print pass/fail, write s1-report.json
+  s1 selftest [-keep] [-only a,b] [-launcher explorer|parent|auto]
+                                 run the scenarios, print pass/fail, write s1-report.json
   s1 probe                       does this Windows build support per-app loopback?
   s1 apps [-exclude a.exe,…]     list apps playing audio and how they would be classified
   s1 record -d 20 -o out.wav     capture what friends would hear (default voice-app list + mic detection)
