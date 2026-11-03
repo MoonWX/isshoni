@@ -731,7 +731,7 @@ the pinned Wails drops an event whose data type isn't exactly the registered one
 
 | Event | Payload | When | Pull |
 |---|---|---|---|
-| `share.state` | `ShareView` (below) | every change, coalesced to ≤ 10 per second | `Share.Current()` |
+| `share.state` | `ShareView` (below), or `null` when there is no share (`Share.Current()` is `null`: before any, or a pick in progress was settled without one; TS `ShareView \| null`, WA65) | every change, coalesced to ≤ 10 per second | `Share.Current()` |
 | `share.stats` | `ShareStatsSample` | every 2 s while live | `Share.Stats()` |
 | `share.notice` | `{code, params}`: `encoder_fallback {encoder}` | 01's `EventNotice` (§10.5) | — (transient) |
 | `audio.report` | `FriendsHear` (05 §14.5) | on change, ≤ 4 per second | `Audio.FriendsHear()` |
@@ -770,8 +770,8 @@ fields; named apart from `core.ShareSnapshot` on purpose):
   `Upload.ApproxHeight`, `{kind: 'cpu-limited'}` from `Overloaded`, else `null` (§10.3).
 - `encoder`, `hw`, `layers`, `server`: the Details disclosure (§10.3): `layers` from `LayerSnapshot {RID, Width,
   Height, FPS, TargetBps/1000, SentBps/1000, CaptureToSend}`; `server` = `{layers: ShareSnapshot.Server}` (an object
-  around 01's `ServerLayerStats[]`, as built by WA58: WA48's DTO types it `map[string]any`, TS `Record<string,
-  unknown>`) while `Share.WatchServerStats` is on, else `null`.
+  around 01's `ServerLayerStats[]`, as built by WA58: WA48's DTO types it `map[string]any`; WA65 typed the TS side
+  `{layers: ServerLayerStats[]} | null`) while `Share.WatchServerStats` is on, else `null`.
 - `endReason`: `user | hotkey | tray | source-gone | elsewhere | server | server-unreachable | unlinked | system | error`.
 - `error`: `{code, params}` per §6.4.
 
@@ -838,7 +838,7 @@ export interface PickedSource {
   kind: ShareKind;
   audioScope: 'window' | 'tab' | 'system' | 'none';   // native: 'system' (everything but the exclusions) or 'none'
   warning: 'screen-with-system-audio' | 'no-audio' | null; // native: null (voice apps are kept out)
-  preview: MediaStream;                                // WA65: MediaStream | null (null for a native pick)
+  preview: MediaStream | null;                         // null for a native pick (WA65)
   /** M2, native: the picker's name for the source; shown on this PC only, never sent. */
   label?: string;
   /** M2, native: one-time sheets to show before going live, in order (§10.2). */
@@ -850,12 +850,24 @@ export type LocalEndReason =
   | 'user' | 'browser-stopped' | 'server' | 'server-unreachable' | 'error'
   | 'source-gone' | 'system' | 'unlinked';            // M2, native
 
+export interface ActiveShare {
+  // … M1 members …
+  /** M2, native: the room the share publishes in (ShareView.roomId), which the room runtime follows (§9). */
+  readonly roomId?: string;
+}
+
 export interface SharingProvider {
   readonly mode: 'in-page' | 'native';
-  pick(opts: { preset: Preset }): Promise<PickedSource | null>;
+  /** withAudio (native): the desktop ShareSheet's Share sound switch, carried as audioScope; default true. The
+   *  browser ignores it. */
+  pick(opts: { preset: Preset; withAudio?: boolean }): Promise<PickedSource | null>;
   start(src: PickedSource, opts: { preset: Preset; withAudio: boolean }, ctx: ShareContext): Promise<ActiveShare>;
   /** M2, native: the share the app publishes now (e.g. after the page reloaded), or null. */
   current?(): ActiveShare | null;
+  /** M2, native: resolves once current() and localConnectionIds() say what the app knows. */
+  ready?(): Promise<void>;
+  /** M2, native: fn runs whenever current() or localConnectionIds() may answer differently; returns its off. */
+  onChange?(fn: () => void): () => void;
   /** M2: connections whose shares are this page's local shares beyond the page's own (desktop: C2). */
   localConnectionIds?(): string[];
   /** M2, native: share.stop for another connection's share of this user (the desktop SPA's role is viewer). */
@@ -886,8 +898,12 @@ export type SignalStopAction = 'redial' | 'relink' | 'version' | 'wait' | 'none'
 **As built by WA32** (where the code departs from the block above as first written): `Platform.desktop` is optional,
 not required, because a required member would break the M1 test platforms in `web/src/test/platform.ts`, `rooms/`,
 `viewer/` and `account/`; `BrowserPlatform` sets it to `null` explicitly and callers read `platform.desktop ?? null`.
-`PickedSource.preview` stays `MediaStream` until WA65's `DesktopSharing`, which makes it `MediaStream | null` together
-with its readers in `share/` (`BrowserSharing`, `BrowserShare`, `shareStore`; README WA65's row). `DesktopFeatures` has
+`PickedSource.preview` stayed `MediaStream` until WA65's `DesktopSharing`, which made it `MediaStream | null` together
+with its readers in `share/` (`BrowserSharing` and `BrowserShare` take only captured picks; `shareStore`). **As built
+by WA65** (group 7): `SharingProvider.pick` takes an optional `withAudio`, because §10.2's `audioScope` depends on the
+sheet's Share sound switch (the browser ignores it); `SharingProvider.ready()` and `onChange(fn)` and
+`ActiveShare.roomId` let the room runtime follow a share the page didn't start (§9: the provider's chunk and Go's
+answers can come after the room's snapshot, and a quiet room sends no other). `DesktopFeatures` has
 three members beyond the first draft, `sessionEnded`, `helloRefused` and `signalStopped`, which bind the page's
 `serverOrigin` (02 §11.8) and keep §7.3's C1-stop rules inside `platform/`, where they are tested; the room runtime
 calls `signalStopped` (WA42, in `web/src/rooms/`).
@@ -947,7 +963,7 @@ Boot (05 §4) in the desktop:
 | `apiFetch(path, init)` | 02 §11.8, with the origin bound: get `Auth.AccessToken(serverOrigin, false)`; on `null`, send the request **without** `Authorization` (Public routes such as `/info` work; others get the server's 401 `unauthenticated`, which clears `['me']`, 05 §6.2); with a token, `fetch(new URL(path, serverOrigin), {...init, headers + Authorization: Bearer <token>, credentials: 'omit', mode: 'cors', referrerPolicy: 'no-referrer'})`; on 401 `invalid_token` or `unauthenticated`: `Auth.AccessToken(serverOrigin, true)` and one retry; a second 401 goes to the SPA, and so does the first one when the forced call fails (offline, `server_unreachable`), so the SPA's 401 rule runs either way. `serverOrigin` is always `bridge.js`'s, so a token is only ever requested for the server the request goes to (§5.8) |
 | `signaling()` | `{url: wss://<host>/ws, auth: ({forceRefresh}) => …}`: `Auth.AccessToken(serverOrigin, forceRefresh)`; the result as `{scheme: 'bearer', token}` (`undefined` when `null`, so a hello to a server that isn't active carries no token) |
 | `createPeerConnection` | `new RTCPeerConnection(config)` |
-| `sharing` | a `DesktopSharing` over `bridge` (§10); non-null on Windows and in dev/e2e builds (fake engine). It comes from `DesktopPlatformOptions.sharing`, a factory WA65 plugs `DesktopSharing` into; until then `sharing` is `null` |
+| `sharing` | a `DesktopSharing` over `bridge` (§10); non-null on Windows and in dev/e2e builds (fake engine). `DesktopPlatformOptions.sharing` overrides it (tests); the default (WA65) is `lazySharing(bridge)`, a small stub in the entry chunk that loads `DesktopSharing` at once with a dynamic `import()` in a chunk of its own (it writes `share/`'s store, which may not be in the initial chunks, and the 4 KB entry budget had about 350 B left; `size.node.test` expects 4 dynamic imports). Every call waits for the load; `current()` and `localConnectionIds()` answer `null` and `[]` until it is there, `ready()` resolves once they say what the app knows, and `onChange` listeners hear every change from the load on |
 | `notifications` | `support()` → `'unsupported'` (no Web Push in WebView2; the push card never shows) |
 | `pwa` | `null` |
 | `requestWakeLock()` | the Screen Wake Lock API when present, else `null` (Go keeps the display awake while sharing, §11.6) |
@@ -1109,7 +1125,12 @@ reader of `platform.role` but the hello in `rooms/connection.ts`, and three Shar
 and the `SharePanel`) and `rooms/RoomStage.tsx` (`EmptyRoom`). In the browser the two agree; in the desktop they
 differ once WA65 plugs in `DesktopSharing`, whose engine can report `canShare` false (`unsupported_os`,
 `no_encoder`), so WA65 switches them to `capabilities().canShare`, read asynchronously as `viewer/useControls.ts`
-does (README WA65's row).
+does (README WA65's row). As built (WA65): `rooms/hooks.ts`' `useShareAvailability(platform)` answers `{canShare,
+reason?}`, `null` until the platform has answered (and for a platform without a sharing provider); in the desktop a
+refusal brings `Share.Capabilities()`'s `reason` (a media code). `RoomStage`'s empty state shows
+`NativeShareUnavailable` (the reason's text) in place of [Share your screen], and `RoomPage`'s header keeps Share
+disabled (`NativeShareDisabled`) with the same text as its description and tooltip, so a room that already has
+shares says why too (§10.5).
 
 ---
 
@@ -1327,7 +1348,16 @@ in settings (per install) records that the sound and voice steps were seen once.
 - **The SPA reloads, the share stays.** C1 may drop (page reload, WebView2 crash) while C2 keeps sharing. At boot the
   runtime asks `platform.sharing.current()`: a live share makes its room the desired room, and after the first
   `room.state` the runtime calls **`RoomSession.adoptShare(share)`** (new, `rooms/RoomSession.ts`): it sets
-  `session.share` and wires its events exactly as `startShare` does.
+  `session.share` and wires its events exactly as `startShare` does. As built (WA65, `rooms/runtime.ts`'
+  `followPlatformShare`): while the session holds no share, the runtime checks `platform.sharing.current()` when the
+  provider is `ready()`, on its `onChange`, on every `room.state` and when the desired room changes. A share whose
+  `roomId` isn't the desired room sends the UI there with `RoomSession.followShareRoom(roomId)` (the room store's
+  `redirect` with code `share`, as for the server's redirects; the route's join follows), once per share and never
+  for a share this page held (started, adopted, or stopped by a confirmed switch); one in the desired room is adopted
+  once a `room.state` of that room lists it. `adoptShare` and `followShareRoom` refuse (false) while the session has
+  a share or one is starting, outside a room, and for an ended share or the desired room itself. A native share's end
+  is C2's to report: when C1 sees it end, `RoomSession` doesn't detach it but asks it to refresh its view
+  (`serverEnded`, which pulls `Share.Current()`), and the share's own `ended` detaches it (§10.2).
 - Watcher counts for the tray and the pill come from `core.ShareSnapshot.Watchers`; the names in the panel from C1's
   `room.state`, as in M1.
 - C2 that isn't ready for 10 s when `Share.Start` runs → `publisher_offline` ("Can't reach the server", plus the
@@ -1431,24 +1461,35 @@ hotkeys, pill, keep-awake and tray.
 | any other `server` | `server` (e.g. `media_timeout`) |
 | `server-unreachable` | `server-unreachable` (01's 30 s hold ran out) |
 | `unlinked` | state `ended`, `endReason: unlinked`; the session adapter calls `Manager.SessionEnded` when `StopError.Code` is `session_revoked` or `account_disabled` (§9); the relink page follows `auth.state` (§8.3) |
-| `error` | state `failed`, `error.code` = `engine.<media code>` with `params.reason` = `EndInfo.MediaReason` when `EndInfo` names a media code (README §3 item 43: until WF4 adds the field, `params.reason` is empty, so §10.5's `device_removed` row can't show for a live share), else the protocol code |
+| `error` | state `failed`, `error.code` = `engine.<media code>` with `params.reason` = `EndInfo.MediaReason` when `EndInfo` names a media code, else the protocol code. As built (WF4, README §3 item 43): `mapping.go`'s `endError` returns `*media.Error{Code: Media, Reason: MediaReason, Op: "share"}`, which the bridge sends as `engine.<code>` with `params.reason`, so §10.5's reason rows apply to a live share's end too (`TestShareViewJSON` has the `device_removed` case, group 7's integration) |
 
 ### 10.2 The SPA flow
 
-`DesktopSharing` (`platform/desktop/DesktopSharing.ts`) is a `SharingProvider` with `mode: 'native'`:
-- `pick()` → `bridge.share.pick()` → a `PickedSource {kind, audioScope: withAudio ? 'system' : 'none', warning: null,
-  preview: null, label, confirm, release}`; no transient-activation rule applies, but M1's ShareButton still calls it
-  first in the click handler, which is fine. The SPA counts on the same 300 s hold as Go (§10.1, README §3 item 45;
+`DesktopSharing` (`platform/desktop/DesktopSharing.ts`, in a chunk of its own behind `lazySharing`, §7.3) is a
+`SharingProvider` with `mode: 'native'`:
+- `pick({preset, withAudio})` → `bridge.share.pick()` → a `PickedSource {kind, audioScope: withAudio === false ?
+  'none' : 'system', warning: null, preview: null, label, confirm, release}` (`withAudio` is the sheet's Share sound
+  switch, §7.1); no transient-activation rule applies, but the host button still calls it first in the click handler,
+  which is fine. The SPA counts on the same 300 s hold as Go (§10.1, README §3 item 45;
   `bridge.ts`'s `Picked` said 120 s until WA65): a `start` after it gets `pick_expired`, which reopens the picker
   (§10.5).
 - `start(src, opts, ctx)` → `bridge.share.start({pickId, roomId: ctx.roomId, preset, withAudio})` → a
   `DesktopShare`. `ctx.signal` is unused (C2 publishes).
-- `current()`, `localConnectionIds()` (`[publisherConnectionId]`), `stopOther(roomId, shareId)` per §7.1.
+- `current()`, `localConnectionIds()` (`[publisherConnectionId]`), `stopOther(roomId, shareId)`, `ready()` and
+  `onChange(fn)` per §7.1; `onChange` fires when a share is made or ends and when C2's connection id changes, so the
+  room runtime adopts and the viewer resyncs without waiting for another `room.state` (§9, §10.4).
 
 `DesktopShare` implements `ActiveShare` and 05 §11.1's `ShareRecovery`: it mirrors `share.state` (its `shareId`
-changes when C2 re-publishes with `replaces`, and it emits `state` then); `resync` and `republish` resolve at once
-(C2 recovers on its own); `serverEnded` only updates the UI, since C2 reports the authoritative end; `stop()` calls
-`Share.Stop()`; `stats()` returns `share.stats`' last sample. Its `hint` event comes straight from `ShareView.hint`:
+changes when C2 re-publishes with `replaces`, and it emits `state` then; `roomId` is the view's); `resync` and
+`republish` resolve at once (C2 recovers on its own); `serverEnded` only asks Go for its view again
+(`Share.Current()`), since C2 reports the authoritative end, and its own `ended` detaches it (§9); `stop()` calls
+`Share.Stop()`; `stats()` returns `share.stats`' last sample. It drives the page's share store: a native share's
+`params` there stay `null` (`publishing` takes `params: ShareParams | null`), since C2 holds them. Ends that weren't
+the user's (WA65): a closed shared window ends with a panel message (`engine.source_gone`), and so does a share whose
+30 s hold ran out (`server_unreachable` with `{ended: 'server-unreachable'}`, "Your share stopped: isshoni couldn't
+reach the server for 30 seconds…" with [Share again], not the server probe's text); a stop from another device is
+the store's "stopped elsewhere" notice; the server's end, `unlinked` (the relink page follows) and `system` (Go's
+toast says why) go back to idle without a message. Its `hint` event comes straight from `ShareView.hint`:
 native shares use no `HintDetector` (01 already applies the web's 6 s on / 10 s off rule in ratectl, and native
 shares keep their resolution, 01 D11, so M1's height-based detector would never fire).
 
@@ -1463,11 +1504,22 @@ the host `ShareButton` from `PickedSource.confirm`, in order:
    the "Optimize for" picker · the line "Pause: {pauseCombo} · Stop: {stopCombo}, also from the tray icon" with the
    registered combinations (`desktop.share.first.hotkeys`; omitted for a hotkey that isn't registered) · **Go live** ·
    Cancel. Shown before live, because it is the moment the user learns what
-   leaves the PC.
+   leaves the PC. As built (WA65): the label, the "Optimize for" picker and Go live; "Friends will hear", the volume
+   note and `Audio.Watch` come with WA77, the hotkey line with WA80 (README's WA65 row).
 2. **DND tip** (`'dnd'`, the first share of `kind: 'screen'`, `tips.dndShown`): "Sharing your whole screen? Turn on
    Do not disturb so notifications don't show up for friends. Allow isshoni in priority notifications, so its
    warnings still reach you." · **Open Do not disturb settings**
    (`App.OpenOSSettings('dnd')`) · **Share now**.
+
+As built (WA65): M1's `ShareButton` and `SharePanel` are unchanged; in native mode `RoomPage` and `RoomStage` render
+`share/native/`'s `NativeShareButton` (the host button) and `NativeSharePanel` through `rooms/lazyNative.ts`.
+`shareStore` gains `confirming: 'first-share' | 'dnd' | 'screen-audio' | null` (the step the flow waits for, in that
+order: a native pick's `confirm` list, then a browser pick's whole-screen warning), `confirm(withAudio?)` (each call
+moves to the next step and starts the share after the last; only the whole-screen warning takes `withAudio`, the
+native sheets keep what was picked), `setPreset(preset)` while picking or confirming (the first-share sheet's picker)
+and `PickedInfo.label`. A pick-again failure that stays on screen (a second `pick_expired` in one Share click) says why
+("That pick timed out…", `shareFailureText`) with [Pick again]; a pick that fails after the panel's [Share again] is
+said as a toast, since the panel goes with it.
 
 The **desktop ShareSheet** (opened by the Share button; `Audio.Watch(true)` while open) replaces the browser's tip
 with: the "Optimize for" picker (Auto, Game, Movie, Text, one line each, as 05 §13.5), a **Share sound** checkbox (on)
@@ -1476,8 +1528,9 @@ out · [Details]" from `Audio.FriendsHear()`; before a share 05 lists playing ap
 **Share** (→ picker). While the picker is open the sheet shows "Choose what to share in the Windows picker…". "You're
 already sharing from another tab or device" (05 §13.1) counts the app's own C2 share as local, through
 `findShareElsewhere(shares, {userId, connectionIds: [c1, ...localConnectionIds()]})` (`share/elsewhere.ts` takes a
-list now); its **Stop it** calls `platform.sharing.stopOther(roomId, shareId)`. No `beforeunload` is registered for
-native shares (it is `BrowserShare`'s).
+list now: `own: {userId, connectionIds}`); its **Stop it** calls `platform.sharing.stopOther(roomId, shareId)`. No
+`beforeunload` is registered for native shares (it is `BrowserShare`'s). As built (WA65): the sheet's "What friends
+hear" summary and the volume note come with WA77.
 
 ### 10.3 The share panel in the desktop
 
@@ -1528,6 +1581,12 @@ M1's `SharePanel` (05 §13.7) with native extras from `share/native/` (lazy, loa
   `cpu-limited` → M1's CPU text).
 - **Encoder notice**: on `share.notice` `encoder_fallback`, the panel shows "Switched to <encoder>" for 5 s.
 
+As built (WA65): `NativeSharePanel` takes M1's panel's place in native mode (§10.2), a view of the page's
+`shareStore` for the flow and of `DesktopShare`'s `ShareView` for the rest: the bar (Stop, the paused bar with
+Resume, reconnecting, unreachable with [Test connection], the minimized line, the hint, "Switched to <encoder>"), the
+expander's Optimize for, Share sound, watchers and Details, and a failed share's text and action. What friends hear,
+the banners and the mic prompt card come with WA77, Pause and the hotkeys' tooltips with WA80.
+
 On the Mac and in the e2e harness the same `audio.Service` runs on 05's fake engine audio (`ISSHONI_FAKE_AUDIO`
 scenarios, 05 §13.3), so every row rule, prompt and banner above is exercised without Windows.
 
@@ -1536,10 +1595,18 @@ scenarios, 05 §13.3), so every row rule, prompt and banner above is exercised w
 The native share is "own" (same user) but comes from C2, not from the page. With `localConnectionIds()`,
 `syncRoom` marks it `local` (05 §12.2); a local share without a preview stream (the desktop has none) is:
 - subscribed with **video `low` at most and audio `off` always** (`viewer/layerPolicy.ts`, a new rule for local shares
-  without `localPreviews`), so its tile and the stage show the preview layer (360p15, about 0.3 Mbps) labeled
+  without `localPreview`), so its tile and the stage show the preview layer (360p15, about 0.3 Mbps) labeled
   "Preview: what friends see";
 - never focused automatically and never audible (M1's rules for own shares);
 - not counted as watching (the server counts participants other than the owner, 01 §4.1).
+
+As built (WA65): `ViewerSelf` gains `localConnectionIds` and `ViewerShare` gains `localPreview` (local and published
+by this page's own connection: it shows the page's preview stream and is never subscribed); a share of another local
+connection is `local` without `localPreview`, and `subscriptions.ts` passes such shares to `layerPolicy.ts` as
+`LayerInputs.localShares` (rule 7: the same rules as remote shares, but `low` at most and audio always `off`).
+`rooms/connectViewer.ts` gives the viewer `platform.sharing.localConnectionIds()` and syncs the snapshot again
+whenever the session's local share changes and on the provider's `onChange`, since those ids can become known after
+the snapshot that lists the share. The tile's text is `viewer.tile.lowPreview` in `en.json`.
 
 While the app shares in 05's `endpoint` engine, every other share in its viewer is muted too (§12.1).
 
@@ -1547,7 +1614,13 @@ While the app shares in 05's `endpoint` engine, every other share in its viewer 
 
 Keyed on 01's `media.ErrorCode` (bridge code `engine.<code>`) and then on `media.Error.Reason` (`params.reason`,
 04 §5.7's detail tokens). A reason row wins over its code's row; `EncoderInfo.Status`/`Reason` from the probe
-(01 §5) feed the same rows when Share is disabled at probe time.
+(01 §5) feed the same rows when Share is disabled at probe time. As built (WA65, `share/native/engineErrors.ts`): an
+unknown reason shows its code's text and an unknown engine code `engine.internal`'s. **Not built yet** (WA65-R8):
+`ShareCaps` (Go, `internal/desktop/bridge`) lists only the usable encoders' names and puts only the media code in
+`reason`, so the probe-time `driver_too_old` quiet note (Settings and Details) and the probe-time
+`no_media_foundation` and `blocked_by_policy` texts can't be told; when Share is disabled, `NativeShareUnavailable`
+and the header's disabled Share show the media code's text (`unsupported_os`, `no_encoder`, …). They need `ShareCaps`
+to carry each encoder's status and reason, a hand-over that no slice lists yet (README's WA65 row).
 
 **By reason** (the code in brackets is what 01 and 04 return after README §3 item 17: `IM_ERR_DEPENDENCY` →
 `dependency`, `IM_ERR_NO_ENCODER` → `no_encoder`, a self pick → `invalid`/`self_window`):
@@ -1560,7 +1633,7 @@ Keyed on 01's `media.ErrorCode` (bridge code `engine.<code>`) and then on `media
 | `no_media_foundation` (`dependency`; MF encoder status) | probe | "This edition of Windows (N or KN) needs Microsoft's Media Feature Pack for video" with a link to `/troubleshooting#desktop-media-feature-pack`; when no encoder works, Share is disabled with this text instead of `no_encoder`'s |
 | `blocked_by_policy` (`dependency`) | probe, start | "Windows (Smart App Control or your organization's policy) blocked part of isshoni's video engine." with a link to `/troubleshooting#desktop-smart-app-control`; when 04 offers it, [Enable Cisco OpenH264…] (Cisco signs its binary, 04 §17) |
 | `missing`, `version`, `abi` (`dependency`) | open, probe, start | "Part of isshoni is missing or damaged. Reinstall isshoni from your server's Download page." [Open download page] (`serverOrigin + '/download'`); sharing off, viewing works |
-| `device_removed` (`encoder_lost` from `Next`: the GPU was removed or reset, 04 §5.7, §9.8) | live | the share ends with code `encoder_lost`: state `failed`, toast and panel "Your graphics driver restarted, so the share stopped." [Share again], which starts a new pick (`Share.Pick()`; the engine's next session uses a new device). The reason reaches the view through 01's `EndInfo.MediaReason` (README §3 item 43, WF4); WA58's `endError` had only `EndInfo.Media`, so until WF4 this row showed as `encoder_lost`'s |
+| `device_removed` (`encoder_lost` from `Next`: the GPU was removed or reset, 04 §5.7, §9.8) | live | the share ends with code `encoder_lost`: state `failed`, toast and panel "Your graphics driver restarted, so the share stopped." [Share again], which starts a new pick (`Share.Pick()`; the engine's next session uses a new device). The reason reaches the view through 01's `EndInfo.MediaReason` and the controller's `endError` (README §3 item 43, WF4, §10.1); before WF4, WA58's `endError` had only `EndInfo.Media`, and this row showed as `encoder_lost`'s |
 
 **By code** (when no reason row applies):
 
@@ -2237,11 +2310,17 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   reason texts of §10.5 are keys `desktop.errors.engine.reason.<reason>` (`selfWindow`, `driverTooOld`,
   `noMediaFoundation`, `blockedByPolicy`, `deviceRemoved` for §10.5's `device_removed` row (WA48), and `reinstall` for
   `missing`, `version` and `abi`; `pick_expired` has none, it reopens the picker silently). As built (WA48): the rule
-  lives in `web/src/platform/desktop/codes.node.test.ts`, which `test:web` runs, not in `check-i18n.mjs`, which doesn't
-  read `codes.gen.ts` (no M2 slice lists `web/scripts/`); every code but the `update.*` ones needs its
-  `desktop.errors.<code>` text. The `update.*` codes' texts are `desktop.update.error.<code>` (§6.4), which WA82 writes
-  with the update screens; it drops the test's `update.*` exemption, so from then on every update code needs its text
-  too (README WA82's row).
+  lives in `web/src/platform/desktop/codes.node.test.ts`, which `test:web` runs (WA48 had no `web/scripts/` in its
+  paths); every code but the `update.*` ones needs its `desktop.errors.<code>` text. The `update.*` codes' texts are
+  `desktop.update.error.<code>` (§6.4), which WA82 writes with the update screens; it drops the test's `update.*`
+  exemption, so from then on every update code needs its text too (README WA82's row). Since group 7,
+  `check-i18n.mjs` checks it too: WA63 added **rule 6** (the hand-over of group 5's WA48), which reads the generated
+  `Code` union of `codes.gen.ts` and requires a `desktop.errors.<code>` message for every code (counted as used by
+  rule 4), with the same `update.*` exemption (the file's `UpdatePrefix` constant) and a note instead when the src
+  tree has no `codes.gen.ts`; it prints its count on a line of its own before the summary. `codes.node.test.ts` keeps
+  checking the same in `test:web`, with the reason texts. When WA82 ends the exemption, rule 6 maps an `update.*` code
+  to `desktop.update.error.<code>` instead of dropping the exemption (which would demand `desktop.errors.update.*`
+  keys nobody writes), so WA82 lists `check-i18n.mjs` too.
 
 ### 18.2 Accessibility
 
@@ -2413,13 +2492,14 @@ there.
   is `playing`, gone when one plays; the minimized line while `ShareView.minimized`; paused bar; the "Resume
   sharing?" bar after a long lock (Resume calls `setPaused(false)`); the unreachable bar's Test connection URL; the
   Details disclosure (Ctrl+Shift+D, `watchServerStats` on open and off on close, no names, the `driver_too_old`
-  note); "Switched to <encoder>" for 5 s.
+  note, which waits for `ShareCaps`' encoder statuses, §10.5); "Switched to <encoder>" for 5 s.
 - Engine errors (§10.5), one case per row: `pick_expired` (from `start` and the controller's own code) reopens the
   picker with no text; `self_window` reopens it with "Pick something other than isshoni"; `driver_too_old`,
   `no_media_foundation`, `blocked_by_policy` and `missing`/`version`/`abi` show their texts and links (each arriving as
   `dependency`, README §3 item 17); `device_removed` shows its stop notice and [Share again] starts a new pick; a probe
-  with NVENC `driver_too_old` and a working fallback shows only the quiet note; an unknown reason falls back to its
-  code's text; `permission_denied`, `source_gone`, `unsupported_os`, `no_encoder` and `internal` as their rows.
+  with NVENC `driver_too_old` and a working fallback shows only the quiet note (not built yet, §10.5); an unknown
+  reason falls back to its code's text; `permission_denied`, `source_gone`, `unsupported_os`, `no_encoder` and
+  `internal` as their rows; a share whose 30 s hold ran out says so with [Share again] (WA65).
 - Browser entries (§12.3): with `client.os` `windows` the ShareSheet and the whole-screen warning link to
   `/download?room=<roomId>` (plain `/download` for an id that fails the room-id rule); with `macos`, `linux`,
   `android` and `ios` they show "Desktop app: Windows now, Mac soon" and no link.
@@ -2490,22 +2570,20 @@ Once it listens it prints one JSON line `{addr, origin, log}`. `/__e2e/system` a
 `display-change`. Each token record in `/__e2e/state` has `origin` (asked for), `activeOrigin` (the active server
 when `Auth.AccessToken` was called, the moment that decides whose token it is, §5.8, which `desktop-link.spec`'s
 "no token for A while B was active" asserts on), `activeAtReturn` (for the failure message) and the hash prefix; the
-recording `Shell.Reload` only counts reloads (a spec reloads the page itself). Until the e2e server answers CORS for
-the desktop origins (WA56 wired `httpapi.Deps.DesktopOrigins` in group 6; WA47's default is none),
-`desktop-security.spec`'s `/link` and storage case uses a small loopback stand-in server with the e2e server's own
-`/info` plus `deviceFlow`, `/device/password`, `/device/token` and `/device/revoke`; the spec switches to the worker's
-e2e server by itself once that one answers desktop CORS and lists `deviceFlow`, and the stand-in branch goes with WA65
-(README WA65's row). In CI (group 5's integration) the `build` job, which has `web/dist`, builds the harness
-(`CGO_ENABLED=0 go build -trimpath -o bin/e2ehost ./internal/desktop/e2ehost`) and uploads it as `e2ehost-linux-amd64`;
-the `e2e` job downloads it and sets `DESKTOP_E2E_BIN` (06 §10.1).
+recording `Shell.Reload` only counts reloads (a spec reloads the page itself). `desktop-security.spec`'s `/link` and
+storage case links the app to the worker's unmodified e2e server with a password (`POST /api/v1/device/password`,
+02 §14), which answers the desktop origin with 02's CORS since WA56 wired `protocol.DesktopOrigins()`; the loopback
+stand-in server it used until then is gone (WA65). In CI (group 5's integration) the `build` job, which has
+`web/dist`, builds the harness (`CGO_ENABLED=0 go build -trimpath -o bin/e2ehost ./internal/desktop/e2ehost`) and
+uploads it as `e2ehost-linux-amd64`; the `e2e` job downloads it and sets `DESKTOP_E2E_BIN` (06 §10.1).
 
 | Spec | Asserts |
 |---|---|
 | `desktop-link.spec` | wizard: server address → confirm → device code, QR code and short URL shown → a second browser context signed in on the server approves at `/link` → sound step (05's fake: `captured`) → voice step (`voiceApps` from the scenario) → the room; a denied code shows "declined"; the password path: "Sign in with username and password instead", a wrong password shows the error and clears the field, the right one links; an unknown server delivered as `--server` shows "Add server {host}?" and the harness records no request to it before Add, and after Add (same host) the link step follows with no confirm step. **Second server, no token crosses**: with the page in a room on server A (C1 open) and a second e2e server B from `fixtures.ts` (its own port and data dir), the harness started with `-reload-delay=2s`: add B through `--server`, Add; during the delay the spec creates a room on A (A's `invalidate` makes the page refetch `['rooms']` from A) and closes C1 through Playwright's `page.routeWebSocket` (C1 reconnects and resumes), so the page's refetch and C1's resume hello reach A while B is active; then B's link step renders on B's `bridge.js` and is approved. Asserted: no request to A (`page.on('request')`, the `Authorization` header) and no `hello` to A (`page.on('websocket')`, `framesent`) carries a token whose hash `/__e2e/state` lists for B; the harness lists no token handed out for origin A while B was active; the window reloaded exactly once, at `/desktop/setup?link=1` |
-| `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off |
+| `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off. As built (WA65): Share → sheet → fake pick → first-share sheet ("Friends will see: Fake window") → Go live; the log check also covers the `normal` scenario's apps; the viewer, the own tile ("Preview: what friends see") and the panel's Stop; a second share needs no first-share sheet. The tray step is a note until the harness has the tray (WA68; WA80 then asserts "Live, 1 watching", adjusting the expected names if WA68 names them differently); Pause, the late joiner, the hotkeys and the mic prompt step (WA77's card) come with WA80, which extends the spec (README's WA80 row) |
 | `desktop-share.spec` (audio alert case) | with `ISSHONI_FAKE_AUDIO=degrade-live`: Share → live; 5 s later the fake degrades to `endpoint`; the harness's debug endpoint shows `tray.Render` with `tray-warn`, the first menu line "Friends hear voice apps" and, with a scripted prompt, "1 question waiting"; `PillState` with `VoiceAppsHeard` and `Questions` 1; exactly one recorded `desktop.native.toast.voiceAppsHeard` toast; a second degrade within 60 s records none |
 | `desktop-handoff.spec` | a web tab of the same user watches Lounge; the desktop page joins Lounge → the tab shows "Now watching in the isshoni app" and its subscriptions are all off; "Watch here instead" resumes and the tab's `playback.state {playing: true}` reaches the app (`/__e2e/state` shows 05's viewer rule input); closing the tab sets it to `playing: false`; a phone-emulated tab (role `viewer`) keeps playing |
-| `desktop-reload.spec` | reload the desktop page while sharing → the share continues for viewers and the page adopts it (panel back, live) |
+| `desktop-reload.spec` | reload the desktop page while sharing → the share continues for viewers and the page adopts it (panel back, live). As built (WA65): the adopted panel passes axe in both color schemes, the own tile is local at the low layer again, and its Stop ends the share |
 | `desktop-security.spec` | the HTML response carries the CSP; `/sw.js` 404; an external link click records an `OpenURL` and the page stays; no `isa_` in `localStorage`; `/wails/runtime` with a foreign Origin 403 (assets handler mounted the same way); same-origin runtime requests from the page for `Browser.OpenURL('ms-settings:display')`, `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403 and reach no handler, while a bound-method `Call` reaches the stub; `/link` opens the browser |
 | `desktop-relink.spec` | revoke the device from the web Devices page → C1 and C2 closed → `Auth.SessionEnded` → the desktop shows `/desktop/relink` with the `signed_out` text; Link again works |
 | `desktop-system.spec` | with `-lock-resume=2s -lock-stop=6s`: lock pauses and keep-awake goes off; unlock within 2 s resumes and keep-awake is on again; unlock after 3 s stays paused with "Resume sharing?" in the panel, the pill state, the tray menu and a recorded toast, and Resume makes it live; left locked for 6 s it stops with `endReason: system` and the toast "Sharing stopped while your PC was locked"; suspend stops with `endReason: system` and a recorded toast |
@@ -2583,7 +2661,7 @@ shows the encoder and the full layer's bitrate, and its windows stay out of the 
 | `Engine.Pick(ctx, media.PickRequest{OwnerWindow: <main HWND>})`; `ErrCancelled` → null; the app applies `WDA_EXCLUDEFROMCAPTURE` to its own windows (04 doesn't) | §10.1, §11.5 | 04, 01 |
 | `ShareView` fields used by the shell: `border` (from `Source.OSBorder`, then `ShareSnapshot.NoOSIndicator`), `label` (the controller's, from `Source.Name`; `ShareRequest.Label` always `""`), `kind`, `watching` (`len(Watchers)`) | §6.3, §10.1 | 01 and 04 add `NoOSIndicator` and `OSBorder` |
 | Bound services and events (§6.2, §6.3), bridge error codes (§6.4) in `internal/desktop/bridge/codes` → `web/src/platform/desktop/codes.gen.ts` (a new `tygo.yaml` entry) | §6, §18.1 | SPA; M3; M4's `RelayBridge` mirrors `NativeBridge` |
-| TS: `Platform.desktop` (optional, §7.1), `DesktopFeatures` (with `sessionEnded`, `helloRefused`, `signalStopped`), `HelloAuthProvider`, `PickedSource.preview \| null` (with WA65), `label`, `confirm`, `SharingProvider.current/localConnectionIds/stopOther(roomId, shareId)`, `LocalEndReason` additions, `NativeBridge`, `ShareView`, `RoomSession.adoptShare`, `SignalClientOptions.auth`; `RoomPage`'s `?conntest=1` | §7 | 05-web (browser parts unchanged), M3, M4 |
+| TS: `Platform.desktop` (optional, §7.1), `DesktopFeatures` (with `sessionEnded`, `helloRefused`, `signalStopped`), `HelloAuthProvider`, `PickedSource.preview \| null` (with WA65), `label`, `confirm`, `SharingProvider.pick({preset, withAudio?})`, `SharingProvider.current/localConnectionIds/stopOther(roomId, shareId)/ready/onChange`, `ActiveShare.roomId`, `LocalEndReason` additions, `NativeBridge`, `ShareView`, `RoomSession.adoptShare` and `followShareRoom`, `findShareElsewhere` with `connectionIds`, `SignalClientOptions.auth`; `RoomPage`'s `?conntest=1` | §7, §9, §10.2 | 05-web (browser parts unchanged), M3, M4 |
 | `web.DesktopCatalog()`, namespace `desktop`, Go keys `desktop.native.*` (incl. the mic-prompt toasts); 05's texts as `desktop.audio.*` | §18.1 | 05 (texts) |
 | Viewer tile state `paused` for `ShareStatus paused`; no freeze detection while paused | §11.3 | 01-client-core (server status) |
 | Project-site anchors the app links: `/download#windows-updates` (install_failed, manifest_expired), `/troubleshooting#desktop-webview2` (WebView2 message box), `#desktop-gpu-driver`, `#desktop-media-feature-pack` and `#desktop-smart-app-control` (§10.5's reason rows), `#desktop-linking` (§8.1's and §9's "See why", 02 DA12's section), `/privacy#desktop` and `/code-signing` (About) | §5.4, §8.1, §9, §10.5, §14.4, §16.2 | 06 (`TestDocsAnchors`) |
