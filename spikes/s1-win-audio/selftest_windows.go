@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // The self-test models the real situation with fake apps: a "game" plays a
@@ -145,7 +147,7 @@ type scenarioReport struct {
 	Checks      []checkResult   `json:"checks"`
 	ClicksAtS   []float64       `json:"clicks_at_s"`
 	Clicks      []clickDetail   `json:"click_details,omitempty"`
-	Reparented  bool            `json:"tone_apps_under_explorer"`
+	Reparented  bool            `json:"tone_apps_under_explorer"` // under the launcher (key kept for the committed reports)
 	LostMs      int             `json:"audio_lost_ms,omitempty"`
 	Foreign     []string        `json:"other_apps_heard,omitempty"`
 	Problems    []string        `json:"problems,omitempty"`
@@ -169,7 +171,16 @@ func cmdSelftest(e *engine, args []string) error {
 	fs := flag.NewFlagSet("selftest", flag.ExitOnError)
 	keep := fs.Bool("keep", false, "keep the recorded WAVs")
 	only := fs.String("only", "", "run only these scenarios (comma-separated)")
+	fs.StringVar(&launcher, "launcher", "explorer",
+		"start the fake apps under: explorer (explorer.exe in this session), parent (s1's own parent, e.g. the shell; for a CI runner with no desktop) or auto (explorer, else parent)")
 	fs.Parse(args)
+	launchedUnder := "none (fake apps start as children of s1)"
+	if h, desc, err := openLauncher(); err == nil {
+		windows.CloseHandle(h)
+		launchedUnder = desc
+	} else if launcher != "explorer" && launcher != "parent" && launcher != "auto" {
+		return err
+	}
 
 	probe, err := e.Probe()
 	if err != nil {
@@ -184,6 +195,7 @@ func cmdSelftest(e *engine, args []string) error {
 	if probe.MasterMuted || (probe.MasterVolume >= 0 && probe.MasterVolume < 0.3) {
 		fmt.Println("  ⚠ Windows volume is muted or below 30% — raise it (turn the speakers down instead) for reliable levels.")
 	}
+	fmt.Println("Fake apps start under:", launchedUnder)
 	fmt.Println("You will hear test beeps for about 2 minutes. Please close/pause other apps that play sound.")
 	work, err := os.MkdirTemp("", "isshoni-s1-")
 	if err != nil {
@@ -241,7 +253,7 @@ func cmdSelftest(e *engine, args []string) error {
 		fmt.Printf("\nnote: the late-start clicks %v do NOT appear through plain Windows loopback: they come from isshoni's capture/mixing (see click_details in the report).\n", lateClicks)
 	}
 
-	report := map[string]any{"probe": probe, "scenarios": reports, "time": time.Now().Format(time.RFC3339)}
+	report := map[string]any{"probe": probe, "launcher": launchedUnder, "scenarios": reports, "time": time.Now().Format(time.RFC3339)}
 	b, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		b = []byte(fmt.Sprintf(`{"error": %q}`, err.Error()))
@@ -526,7 +538,7 @@ func runScenario(e *engine, sc scenario, self, work string, keep bool, r *scenar
 		r.problem("other apps were playing and were captured (%s); close them and re-run with -only %s", strings.Join(r.Foreign, ", "), sc.Name)
 	case !r.Reparented:
 		r.Result = "ERROR"
-		r.problem("test apps could not be started under explorer.exe, so they count as part of s1 ('isshoni itself')")
+		r.problem("test apps could not be started under the launcher process (explorer.exe, or s1's parent with -launcher parent), so they count as part of s1 ('isshoni itself')")
 	case inconclusive && r.Result != "FAIL":
 		r.Result = "ERROR"
 	}

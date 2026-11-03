@@ -81,6 +81,29 @@ PASS.
 4. Do steps 2–3 on **Windows 11** and on **Windows 10 22H2** (dual boot).
 5. Send back both `s1-report.json` files, plus one line per real-app test ("heard YouTube, no Discord ✓" etc.).
 
+## CI run (windows-2025 with a virtual audio driver)
+
+`.github/workflows/s1-audio.yml` runs the self-test without a PC, for README WA09 (`docs/m2/README.md`). It runs on a
+pull request that touches this folder or the workflow, and from "Run workflow" once the file is on main.
+- **Build:** it builds the DLL with MSVC (`deploy/windows/msvc-env.ps1`, then CMake with Ninja). "Run workflow" can
+  pick the image's MinGW instead. It builds `s1.exe` with Go.
+- **Audio:** `ci/setup-audio.ps1` starts the Windows Audio services, which are off on Server. It installs
+  [VB-CABLE](https://vb-audio.com/Cable/) (donationware) from a pinned URL and checks its SHA-256 before unpacking.
+  The driver is downloaded only onto the throwaway runner and is never committed. The cable gives the runner a
+  default output, set to 100%, and a microphone, so `mic-user` runs too. The script also sets the microphone
+  access and the "Do nothing" ducking setting from step 2 above.
+- **Runs:** it runs `s1 probe`, then the full `s1 selftest -keep -launcher auto`, then
+  `-only late-start,late-start-endpoint` to re-check the onset fade (Results below).
+- **Launcher:** `-launcher auto` starts the fake apps under the session's `explorer.exe`. If the session has none,
+  it uses s1's own parent, the step's `pwsh.exe`, which the engine also treats as a launcher. The report's
+  `launcher` field says which one was used. On a PC the default stays `-launcher explorer`.
+- **Output:** both exit codes and each scenario's verdict go to the job summary. Verdicts never fail the job; only a
+  setup error does (build, driver hash or install, no audio endpoint, no report). The artifact `s1-audio` holds
+  `s1-report-full.json`, `s1-report-late-start.json` and every scenario's WAV.
+
+The run covers Windows Server 2025 (build 26100) with a virtual endpoint. It is not a real sound card, Windows 11
+client or Windows 10 22H2. Check the device name in a report before committing it to `results/`.
+
 ## Pass criteria (plan S1)
 
 | Scenario | Pass means |
