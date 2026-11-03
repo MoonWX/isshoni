@@ -150,6 +150,26 @@ describe('DownloadPage', () => {
     expect(within(step(1)).getByRole('link', { name: 'Download for Windows' })).toBe(installer);
   });
 
+  it('opens step 3 after a middle click on the installer, which downloads it without a click', async () => {
+    await renderPage();
+    const installer = within(step(1)).getByRole('link', { name: 'Download for Windows' });
+    // A right-button auxclick isn't a download.
+    fireEvent(installer, new MouseEvent('auxclick', { button: 2, bubbles: true }));
+    expect(within(step(3)).getByRole('button', { name: 'Open isshoni' })).toBeDisabled();
+    fireEvent(installer, new MouseEvent('auxclick', { button: 1, bubbles: true }));
+    expect(await within(step(3)).findByRole('link', { name: 'Open isshoni' })).toHaveAttribute(
+      'href',
+      'isshoni://watch.example.com/',
+    );
+  });
+
+  it('opens step 3 after the context menu on the installer ("Save link as…")', async () => {
+    await renderPage();
+    expect(within(step(3)).getByRole('button', { name: 'Open isshoni' })).toBeDisabled();
+    fireEvent.contextMenu(within(step(1)).getByRole('link', { name: 'Download for Windows' }));
+    expect(await within(step(3)).findByRole('link', { name: 'Open isshoni' })).toBeInTheDocument();
+  });
+
   it('shows the three warning lines in the order the friend meets them, with their project-site anchors', async () => {
     await renderPage();
     const lines = within(step(2)).getAllByRole('listitem');

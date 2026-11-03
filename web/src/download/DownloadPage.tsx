@@ -26,13 +26,17 @@ interface ExternalLinkProps {
   icon?: ReactNode;
   /** Runs on every click, before the platform's own handling. */
   onClick?: () => void;
+  /** Runs on a click of another button (auxclick: the middle button opens or saves the link without a click). */
+  onAuxClick?: (e: MouseEvent<HTMLAnchorElement>) => void;
+  /** Runs when the link's context menu opens (where "Save link as…" lives). */
+  onContextMenu?: () => void;
 }
 
 /**
  * A link that leaves the SPA: a new tab, without opener or referrer (05 §20). Outside a browser tab (the desktop
  * app; RequireBrowser keeps it from rendering this page, 03 §7.5) the platform opens it in the system browser.
  */
-function ExternalLink({ href, children, className, icon, onClick }: ExternalLinkProps) {
+function ExternalLink({ href, children, className, icon, onClick, onAuxClick, onContextMenu }: ExternalLinkProps) {
   const platform = usePlatform();
   const click = (e: MouseEvent<HTMLAnchorElement>): void => {
     onClick?.();
@@ -41,7 +45,15 @@ function ExternalLink({ href, children, className, icon, onClick }: ExternalLink
     platform.openExternal(href);
   };
   return (
-    <a href={href} target="_blank" rel="noopener noreferrer" className={className ?? styles.external} onClick={click}>
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={className ?? styles.external}
+      onClick={click}
+      onAuxClick={onAuxClick}
+      onContextMenu={onContextMenu}
+    >
       {icon !== undefined && <span aria-hidden="true">{icon}</span>}
       <span>{children}</span>
       {icon === undefined && <ExternalLinkIcon aria-hidden="true" />}
@@ -191,6 +203,13 @@ function WindowsSection({ links }: { links: DesktopLinks }) {
               className={buttonClass({ variant: 'primary' })}
               icon={<Download className={styles.buttonIcon} />}
               onClick={() => {
+                setDownloaded(true);
+              }}
+              // A middle click and "Save link as…" download it too, without a click: step 3 follows them as well.
+              onAuxClick={(e) => {
+                if (e.button === 1) setDownloaded(true);
+              }}
+              onContextMenu={() => {
                 setDownloaded(true);
               }}
             >
