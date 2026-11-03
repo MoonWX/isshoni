@@ -1,8 +1,9 @@
 # S1 audio: spike S1's self-test (spikes/s1-win-audio) on a GitHub-hosted Windows Server 2025 runner with a virtual
 # audio driver, for README WA09 (docs/m2/README.md) in place of a run on the owner's PC.
 #
-#   pull request touching spikes/s1-win-audio/ or this file ─┐
-#   Run workflow ────────────────────────────────────────────┴─► selftest ──► artifact s1-audio (reports, WAVs)
+#   pull request touching spikes/s1-win-audio/, this file ─┐
+#   or the MSVC setup (msvc-env.ps1, tools.json)            │
+#   Run workflow ───────────────────────────────────────────┴─► selftest ──► artifact s1-audio (reports, WAVs)
 #
 # - selftest (windows-2025, contents: read, no secrets): builds isshoni_audio.dll from the spike's CMakeLists.txt with
 #   MSVC (deploy/windows/msvc-env.ps1, Ninja; "Run workflow" can pick the image's MinGW instead, the toolchain of the
@@ -39,6 +40,8 @@ on:
     paths:
       - spikes/s1-win-audio/**
       - .github/workflows/s1-audio.yml
+      - deploy/windows/msvc-env.ps1
+      - deploy/windows/tools.json
   workflow_dispatch:
     inputs:
       dll:

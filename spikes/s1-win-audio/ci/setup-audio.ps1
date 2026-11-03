@@ -141,12 +141,15 @@ function Wait-Cable([int] $Seconds) {
 
 function Install-Package([string] $Inf, [string] $Cat) {
     $sig = Get-AuthenticodeSignature -LiteralPath $Cat
-    "${Cat}: signature $($sig.Status), signer '$($sig.SignerCertificate.Subject)', issuer '$($sig.SignerCertificate.Issuer)'"
-    if ($sig.SignerCertificate) {
-        # Trusting the signer up front rules out a "trust this publisher?" prompt nobody can answer.
-        $cer = Join-Path $env:RUNNER_TEMP ([IO.Path]::GetFileNameWithoutExtension($Cat) + '.cer')
-        Export-Certificate -Cert $sig.SignerCertificate -FilePath $cer | Out-Null
-        Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+    $signer = $sig.SignerCertificate # $null for an unsigned or unreadable catalog
+    $who = if ($signer) { "signer '$($signer.Subject)', issuer '$($signer.Issuer)'" } else { 'no signer' }
+    "${Cat}: signature $($sig.Status), $who"
+    if ($signer) {
+        # Trusting the signer up front rules out a "trust this publisher?" prompt nobody can answer. X509Store, not
+        # the PKI module's Import-Certificate, which PowerShell 7 may load through the Windows PowerShell compat layer.
+        $store = [Security.Cryptography.X509Certificates.X509Store]::new('TrustedPublisher', 'LocalMachine')
+        $store.Open('ReadWrite')
+        try { $store.Add($signer) } finally { $store.Close() }
     }
     try {
         $reboot = [S1DevInstall]::InstallDriver($Inf, $HardwareId)
@@ -158,7 +161,7 @@ function Install-Package([string] $Inf, [string] $Cat) {
 
 $win10 = Join-Path $dir 'vbMmeCable64_win10.inf'
 $win7 = Join-Path $dir 'vbMmeCable64_win7.inf'
-if ((Get-CableDevice).Count -eq 0) {
+if (@(Get-CableDevice).Count -eq 0) { # @(): a function's empty result is $null, and strict mode throws on $null.Count
     [S1DevInstall]::CreateRootDevice($win10, $HardwareId)
     'created the root device node'
 }
