@@ -128,9 +128,54 @@
     },
     "download": {
       "title": "Desktop app",
-      "coming": "The isshoni desktop app is coming (Windows first). It keeps Discord and other voice apps out of what friends hear.",
-      "untilThen": "Until then, share from Chrome or Edge: pick a Window and keep Share audio on.",
-      "site": "Project site"
+      "lead": "The isshoni app shares a window with only its own sound, so Discord and other voice apps stay out of what friends hear.",
+      "windows": {
+        "heading": "Windows",
+        "devBuild": "This server is a development build ({{version}}); the app comes from the latest release.",
+        "latestRelease": "Latest release",
+        "download": {
+          "title": "Download",
+          "button": "Download for Windows",
+          "version": "Version {{version}}, the same as this server.",
+          "releaseNotes": "Release notes"
+        },
+        "run": {
+          "title": "Run it",
+          "browserWarning": "Your browser may say the file isn't commonly downloaded: choose Keep (Edge: … → Keep → Show more → Keep anyway).",
+          "smartScreen": "Windows may warn that the app is unrecognized: choose More info → Run anyway.",
+          "smartAppControl": "If Windows says Smart App Control blocked it, this version can't run on your PC yet: share from Chrome or Edge instead.",
+          "aboutWarning": "Why the warning?",
+          "aboutSmartAppControl": "About Smart App Control"
+        },
+        "open": {
+          "title": "Open isshoni",
+          "button": "Open isshoni",
+          "afterInstall": "after the install",
+          "fromStartMenu": "Start isshoni from the Start menu and add this server."
+        },
+        "requirements": {
+          "heading": "Requirements",
+          "os": "Windows 10 22H2 or later, 64-bit",
+          "gpu": "A current GPU driver (NVIDIA 531.61 or newer for NVIDIA encoding)",
+          "mediaFeaturePack": "Windows N editions: install the Media Feature Pack"
+        },
+        "powerShell": {
+          "heading": "Or install with PowerShell",
+          "lead": "No warning, and the app opens set up for this server; you approve it once in this browser.",
+          "copiedSpoken": "Command copied.",
+          "copyManually": "Your browser didn't allow copying. The command is selected: press Ctrl+C.",
+          "about": "What the command does"
+        }
+      },
+      "macos": {
+        "heading": "macOS",
+        "coming": "Coming (M3)."
+      },
+      "linux": {
+        "heading": "Linux",
+        "coming": "Coming (M4)."
+      },
+      "site": "All downloads on the project site"
     }
   }
 }

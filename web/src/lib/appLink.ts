@@ -11,11 +11,17 @@
 // The link never carries a query or a fragment: nothing but the server and the room travels to the app. The app
 // reads it with deeplink.Parse, which is the authority; the host rules here only keep this side from building a link
 // that Parse would refuse. The browser's URL parser does the IDNA mapping (UTS #46, as Go's idna.Lookup does), and
-// this file adds what Go's canonicalHost has on top of it: the STD3 rules (letters, digits and "-" in each label,
-// no "%" or "\"), the hyphen rules (also inside an xn-- label, which it decodes), labels of 1–63 bytes and names
-// of at most 253, and netip's spelling of an IPv4-mapped IPv6 address. One rule is left to Parse: RFC 5893's bidi
-// rule for a name with a right-to-left label (Arabic or Hebrew letters, Arabic-Indic digits), which needs Unicode's
-// bidi classes; for such a name this side may build a link that the app then refuses as invalid.
+// this file adds what Go's canonicalHost has on top of it, since browsers differ in what their parser checks: the
+// STD3 rules (letters, digits and "-" in each label, no "%" or "\"), the hyphen rules (also inside an xn-- label,
+// which it decodes, and which must be the parser's own spelling of its Unicode form), labels of 1–63 bytes and names
+// of at most 253, no label that starts with a combining mark, RFC 5893's bidi rule for a name with a right-to-left
+// label, and netip's spelling of an IPv4-mapped IPv6 address. Where this side can't tell what Go decides without
+// Unicode tables it refuses: a label with a zero-width joiner or non-joiner (Go allows one in a few contexts, by
+// joining type), and a symbol, punctuation or a modifier letter in a name with a right-to-left label (bidiGroup). So
+// a link is never one Parse refuses, and for a few rare names there is no link although Parse would take one.
+//
+// Go's tables are Unicode 17's with the toolchain go.mod pins (go1.27: x/net/idna's tables17.0.0.go; go1.26 builds
+// use Unicode 15's, which still refuse "≠"). A browser with older Unicode data refuses what it doesn't know.
 
 /** The URL scheme the app registers (06-windows-release §2.3). */
 export const APP_LINK_SCHEME = 'isshoni';
@@ -28,7 +34,7 @@ const MAX_BYTES = 2048;
 
 /** A space, a control character or a bidi control anywhere in the address (deeplink's checkChars). */
 // eslint-disable-next-line no-control-regex -- refusing control characters is the point
-const BAD_CHARS = /[\s\u0000-\u001f\u007f-\u009f؜‎‏‪-‮⁦-⁩]/u;
+const BAD_CHARS = /[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 /** A port as written: 1–65535 without a leading zero. */
 const PORT = /^[1-9]\d{0,4}$/;
@@ -44,12 +50,6 @@ const MAX_HOST_BYTES = 253;
  * maxLabelBytes). The URL parser has lower-cased it.
  */
 const LDH_LABEL = /^[a-z0-9-]{1,63}$/;
-
-/**
- * Characters UTS #46 lists as disallowed_STD3_valid: ≠, ≮ and ≯ (also as "=", "<" or ">" with U+0338, which
- * normalization composes). Go's STD3 rules refuse them; the URL parser, without those rules, keeps them.
- */
-const STD3_DISALLOWED_VALID = /[\u2260\u226e\u226f]/u;
 
 /** An IPv6 literal without its brackets, as NormalizeOrigin reads one: hex digits, dots and two or more ":". */
 function bareIPv6(s: string): boolean {
@@ -159,18 +159,103 @@ function hyphensAllowed(label: string): boolean {
 }
 
 /**
+ * What RFC 5893's bidi rule tells apart of a character's Bidi_Class (x/text's bidirule): L; R and AL ("rtl"); AN; EN;
+ * ES, CS, ET, ON and BN ("neutral"); NSM. "unknown" is a character outside the right-to-left blocks whose class this
+ * side can't tell without Unicode's tables (a symbol, punctuation, a modifier letter, a number that isn't a digit):
+ * it is never R, AL or AN, and a name with a right-to-left label that has one gets no link.
+ */
+type BidiGroup = 'l' | 'rtl' | 'an' | 'en' | 'neutral' | 'nsm' | 'unknown';
+
+/**
+ * The blocks whose characters are right-to-left (R or AL) unless they are AN, EN, NSM or a neutral below: Hebrew to
+ * Arabic Extended-A, the Hebrew and Arabic presentation forms, the supplementary plane's right-to-left area (Cypriot
+ * to Elymaic, 10800–10FFF), Mende Kikakui, Adlam, the Siyaq numbers and the Arabic mathematical letters. No character
+ * outside them is R, AL or AN, of those a label may hold (Unicode 17's DerivedBidiClass and UTS #46's valid ones; a
+ * scratch comparison with x/text's tables over every such code point found no difference).
+ */
+const RTL_BLOCK =
+  /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufeff\u{10800}-\u{10fff}\u{1e800}-\u{1e8df}\u{1e900}-\u{1e95f}\u{1ec70}-\u{1ecbf}\u{1ed00}-\u{1ed4f}\u{1ee00}-\u{1eeff}]/u;
+
+/** The punctuation and symbols of those blocks that are neutrals (ES, CS, ET, ON); the others there are R or AL. */
+const RTL_BLOCK_NEUTRAL =
+  /[\u0606\u0607\u0609\u060a\u060c\u060e\u060f\u066a\u06de\u06e9\u07f6-\u07f9\ufbc3-\ufbd2\ufd3e-\ufd4f\ufd90\ufd91\ufdc8-\ufdcf\ufdfd-\ufdff\u{1091f}\u{10b39}-\u{10b3f}\u{10d6e}\u{10ed0}-\u{10ed8}\u{1eef0}\u{1eef1}]/u;
+
+/** Arabic numbers (AN) that a label may hold: Arabic-Indic digits and separators, Hanifi Rohingya, Garay, Rumi. */
+const ARABIC_NUMBER = /[\u0660-\u0669\u066b\u066c\u{10d30}-\u{10d39}\u{10d40}-\u{10d49}\u{10e60}-\u{10e7e}]/u;
+
+/** European numbers (EN) that a label may hold: ASCII digits, Extended Arabic-Indic digits, Coptic epact numbers. */
+const EUROPEAN_NUMBER = /[0-9\u06f0-\u06f9\u{102e1}-\u{102fb}]/u;
+
+/** Nonspacing and enclosing marks (NSM), but for the five that are L (Kannada, Zanabazar Square, Bhaiksuki). */
+const NONSPACING_MARK = /[\p{Mn}\p{Me}]/u;
+const MARK_THAT_IS_L = /[\u0cbf\u0cc6\u{11a07}\u{11a08}\u{11c3f}]/u;
+
+/** A character's BidiGroup. */
+function bidiGroup(c: string): BidiGroup {
+  if (/[a-z]/.test(c)) return 'l';
+  if (c === '-') return 'neutral';
+  if (EUROPEAN_NUMBER.test(c)) return 'en';
+  if (ARABIC_NUMBER.test(c)) return 'an';
+  if (NONSPACING_MARK.test(c)) return MARK_THAT_IS_L.test(c) ? 'l' : 'nsm';
+  if (RTL_BLOCK.test(c)) return RTL_BLOCK_NEUTRAL.test(c) ? 'neutral' : 'rtl';
+  // Elsewhere, punctuation, symbols, modifier letters and numbers that aren't digits are L or a neutral (। and ⠁
+  // are L, ʹ and ⓫ ON), each by its own row of Unicode's tables.
+  if (/[\p{P}\p{S}\p{Lm}\p{Nl}\p{No}]/u.test(c)) return 'unknown';
+  return /[\p{L}\p{Mc}\p{Nd}]/u.test(c) ? 'l' : 'unknown';
+}
+
+/** Whether a label's characters make its name one with a right-to-left label (Go's isBidi: R, AL or AN). */
+function rightToLeft(groups: readonly BidiGroup[]): boolean {
+  return groups.some((g) => g === 'rtl' || g === 'an');
+}
+
+/**
+ * RFC 5893 §2 on one label of a name that has a right-to-left label, as x/text's bidirule.ValidString checks it:
+ * the first character is L (an LTR label) or R/AL (an RTL label); an LTR label holds no R, AL or AN and ends, before
+ * any marks, with L or EN; an RTL label holds no L and ends with R, AL, EN or AN; no label holds both EN and AN.
+ */
+function bidiRuleHolds(groups: readonly BidiGroup[]): boolean {
+  if (groups.includes('unknown') || (groups.includes('en') && groups.includes('an'))) return false;
+  let last: BidiGroup | undefined;
+  for (const g of groups) if (g !== 'nsm') last = g;
+  if (groups[0] === 'l') return !groups.some((g) => g === 'rtl' || g === 'an') && (last === 'l' || last === 'en');
+  if (groups[0] === 'rtl') return !groups.includes('l') && (last === 'rtl' || last === 'en' || last === 'an');
+  return false;
+}
+
+/** The label's ASCII (xn--) form as this browser's URL parser writes it, or null when the parser refuses it. */
+function parserSpelling(unicodeLabel: string): string | null {
+  try {
+    return new URL(`https://${unicodeLabel}/`).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether a host name in its ASCII form (from the URL parser) passes canonicalHost's checks on top of the IDNA
- * mapping: at most 253 bytes; each label 1–63 letters, digits and "-"; the hyphen rules on each label, an xn-- one
- * decoded (it must decode, to something that isn't plain ASCII). The bidi rule is left to Parse (see the top).
+ * mapping: at most 253 bytes; each label 1–63 letters, digits and "-"; an xn-- label decodes, to something that isn't
+ * plain ASCII, is in NFC and is the parser's own spelling of what it decodes to (Go's "its own ToASCII"); the hyphen
+ * rules on each label in Unicode; no label starts with a combining mark (UTS #46 V6) or holds a zero-width joiner or
+ * non-joiner (see the top); and in a name with a right-to-left label (an R, AL or AN character) every label passes
+ * the bidi rule.
  */
 function validHostName(hostname: string): boolean {
   if (hostname.length > MAX_HOST_BYTES) return false;
-  return hostname.split('.').every((label) => {
+  const labels: string[] = [];
+  for (const label of hostname.split('.')) {
     if (!LDH_LABEL.test(label)) return false;
-    if (!label.startsWith('xn--')) return hyphensAllowed(label);
-    const unicode = decodePunycode(label.slice(4));
-    return unicode !== null && !/^\p{ASCII}*$/u.test(unicode) && hyphensAllowed(unicode);
-  });
+    const unicode = label.startsWith('xn--') ? decodePunycode(label.slice(4)) : label;
+    if (unicode === null || !hyphensAllowed(unicode)) return false;
+    if (unicode !== label) {
+      if (/^\p{ASCII}*$/u.test(unicode) || unicode.normalize('NFC') !== unicode) return false;
+      if (parserSpelling(unicode) !== label) return false;
+      if (/^\p{M}/u.test(unicode) || /[\u200c\u200d]/u.test(unicode)) return false;
+    }
+    labels.push(unicode);
+  }
+  const groups = labels.map((label) => Array.from(label, bidiGroup));
+  return !groups.some(rightToLeft) || groups.every(bidiRuleHolds);
 }
 
 /**
@@ -219,7 +304,6 @@ function linkAuthority(origin: string): string | null {
   }
   if (port !== '' && (!PORT.test(port) || Number(port) > 65535)) return null;
   if (rawHost.endsWith('.') || rawHost.endsWith('.]')) return null;
-  if (STD3_DISALLOWED_VALID.test(rawHost.normalize('NFKC'))) return null;
 
   let url: URL;
   try {
