@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // The self-test models the real situation with fake apps: a "game" plays a
@@ -113,7 +115,10 @@ func scenarios() []scenario {
 				{Exe: "game2.exe", Freq: fGame2, At: 3, Dur: 3}},
 			Duration: 9,
 			Checks: []check{present(fGame, "game"), absent(fVoice, "voice app started mid-share"),
-				{Freq: fGame2, From: 4.5, To: 5.8, Expect: "present", Why: "game started mid-share (picked up ≤1.5 s)"}},
+				{Freq: fGame2, From: 4.5, To: 5.8, Expect: "present", Why: "game started mid-share (picked up ≤1.5 s)"},
+				// game2 plays from >= 3 s for 3 s, so it is still sounding up to 6.0 s minus its own 20 ms fade-out.
+				// The tail fade smooths a tap that goes silent early, so the click detector no longer catches that.
+				{Freq: fGame2, From: 5.85, To: 5.97, Expect: "present", Why: "game2 still heard until it stops (not cut early)"}},
 			ClickWindow: [2]float64{1.5, 9}},
 		{Name: "late-start-endpoint", Info: true,
 			What: "control for late-start: same timeline through plain Windows loopback (no isshoni mixing); clicks here come from Windows/the test apps, not isshoni",
@@ -145,7 +150,7 @@ type scenarioReport struct {
 	Checks      []checkResult   `json:"checks"`
 	ClicksAtS   []float64       `json:"clicks_at_s"`
 	Clicks      []clickDetail   `json:"click_details,omitempty"`
-	Reparented  bool            `json:"tone_apps_under_explorer"`
+	Reparented  bool            `json:"tone_apps_under_explorer"` // under the launcher (key kept for the committed reports)
 	LostMs      int             `json:"audio_lost_ms,omitempty"`
 	Foreign     []string        `json:"other_apps_heard,omitempty"`
 	Problems    []string        `json:"problems,omitempty"`
@@ -169,7 +174,16 @@ func cmdSelftest(e *engine, args []string) error {
 	fs := flag.NewFlagSet("selftest", flag.ExitOnError)
 	keep := fs.Bool("keep", false, "keep the recorded WAVs")
 	only := fs.String("only", "", "run only these scenarios (comma-separated)")
+	fs.StringVar(&launcher, "launcher", "explorer",
+		"start the fake apps under: explorer (explorer.exe in this session), parent (s1's own parent, e.g. the shell; for a CI runner with no desktop) or auto (explorer, else parent)")
 	fs.Parse(args)
+	launchedUnder := "none (fake apps start as children of s1)"
+	if h, desc, err := openLauncher(); err == nil {
+		windows.CloseHandle(h)
+		launchedUnder = desc
+	} else if launcher != "explorer" && launcher != "parent" && launcher != "auto" {
+		return err
+	}
 
 	probe, err := e.Probe()
 	if err != nil {
@@ -184,6 +198,7 @@ func cmdSelftest(e *engine, args []string) error {
 	if probe.MasterMuted || (probe.MasterVolume >= 0 && probe.MasterVolume < 0.3) {
 		fmt.Println("  ⚠ Windows volume is muted or below 30% — raise it (turn the speakers down instead) for reliable levels.")
 	}
+	fmt.Println("Fake apps start under:", launchedUnder)
 	fmt.Println("You will hear test beeps for about 2 minutes. Please close/pause other apps that play sound.")
 	work, err := os.MkdirTemp("", "isshoni-s1-")
 	if err != nil {
@@ -235,13 +250,26 @@ func cmdSelftest(e *engine, args []string) error {
 			controlClicks = r.ClicksAtS
 		}
 	}
-	if len(lateClicks) > 0 && len(controlClicks) > 0 {
+	controlHeard := false
+	for _, r := range reports {
+		if r.Name != "late-start-endpoint" {
+			continue
+		}
+		for _, c := range r.Checks {
+			if c.Freq == fGame && c.Expect == "present" && c.Pass {
+				controlHeard = true
+			}
+		}
+	}
+	if len(lateClicks) > 0 && !controlHeard {
+		fmt.Printf("\nnote: the late-start clicks %v can't be attributed: the plain Windows loopback control (late-start-endpoint) did not hear the game tone, or did not run.\n", lateClicks)
+	} else if len(lateClicks) > 0 && len(controlClicks) > 0 {
 		fmt.Printf("\nnote: the late-start clicks %v also appear through plain Windows loopback %v: they come from Windows or the test apps, not from isshoni's mixer.\n", lateClicks, controlClicks)
 	} else if len(lateClicks) > 0 {
 		fmt.Printf("\nnote: the late-start clicks %v do NOT appear through plain Windows loopback: they come from isshoni's capture/mixing (see click_details in the report).\n", lateClicks)
 	}
 
-	report := map[string]any{"probe": probe, "scenarios": reports, "time": time.Now().Format(time.RFC3339)}
+	report := map[string]any{"probe": probe, "launcher": launchedUnder, "scenarios": reports, "time": time.Now().Format(time.RFC3339)}
 	b, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		b = []byte(fmt.Sprintf(`{"error": %q}`, err.Error()))
@@ -526,7 +554,7 @@ func runScenario(e *engine, sc scenario, self, work string, keep bool, r *scenar
 		r.problem("other apps were playing and were captured (%s); close them and re-run with -only %s", strings.Join(r.Foreign, ", "), sc.Name)
 	case !r.Reparented:
 		r.Result = "ERROR"
-		r.problem("test apps could not be started under explorer.exe, so they count as part of s1 ('isshoni itself')")
+		r.problem("test apps could not be started under the launcher process (explorer.exe, or s1's parent with -launcher parent), so they count as part of s1 ('isshoni itself')")
 	case inconclusive && r.Result != "FAIL":
 		r.Result = "ERROR"
 	}
@@ -596,9 +624,9 @@ func printScenario(r scenarioReport) {
 	var v statusView
 	if len(r.FinalStatus) > 0 && json.Unmarshal(r.FinalStatus, &v) == nil {
 		t := v.Totals
-		if t.Discontinuities+t.Overflows+t.Underruns+t.Trims+t.DroppedChunks+t.MixerResyncs > 0 {
-			fmt.Printf("    engine: discontinuities %d · overflows %d · underruns %d · trims %d · dropped %d · resyncs %d\n",
-				t.Discontinuities, t.Overflows, t.Underruns, t.Trims, t.DroppedChunks, t.MixerResyncs)
+		if t.Discontinuities+t.Overflows+t.Underruns+t.Trims+t.TailFades+t.DroppedChunks+t.MixerResyncs > 0 {
+			fmt.Printf("    engine: discontinuities %d · overflows %d · underruns %d · trims %d · tail fades %d · dropped %d · resyncs %d\n",
+				t.Discontinuities, t.Overflows, t.Underruns, t.Trims, t.TailFades, t.DroppedChunks, t.MixerResyncs)
 		}
 	}
 	for _, p := range r.Problems {
