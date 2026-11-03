@@ -1,8 +1,16 @@
 package config
 
 import (
+	"bytes"
+	"errors"
+	"io/fs"
+	"maps"
 	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -262,8 +270,22 @@ func TestReservedNames(t *testing.T) {
 		"ISSHONI_DEV_SERVER", "ISSHONI_LOADTEST_PASSWORD",
 	}
 	want = append(want, desktopEnvNames[2:]...) // M2 06 §7.3 after M1's; its first two names are M1's already
-	if got := ReservedEnvNames(); !slices.Equal(got, want) {
+	for _, d := range devEnvNames {
+		want = append(want, d.name) // then WF7's
+	}
+	got := ReservedEnvNames()
+	if !slices.Equal(got, want) {
 		t.Errorf("ReservedEnvNames = %v, want 04 §4.2's list %v", got, want)
+	}
+	seen := map[string]bool{}
+	for _, n := range got {
+		if seen[n] {
+			t.Errorf("%s is listed twice", n)
+		}
+		seen[n] = true
+		if !strings.HasPrefix(n, "ISSHONI_") || strings.ToUpper(n) != n {
+			t.Errorf("%s is not an upper-case ISSHONI_* name", n)
+		}
 	}
 }
 
@@ -289,4 +311,196 @@ func TestDesktopEnvNamesNotWarned(t *testing.T) {
 	if ws := mustLoad(t, "", env).Warnings(); len(ws) != 0 {
 		t.Errorf("warnings:%s\nwant none", problemList(ws))
 	}
+}
+
+// devEnvNames are the ISSHONI_* names that M2's desktop dev and e2e builds, tasks and tests read and that 06 §7.3
+// doesn't list (WF7), in ReservedEnvNames' order, each with where the repository reads it. They were found by
+// grepping every tracked file outside docs/ for ISSHONI_ names; header guards, window globals (__ISSHONI_…__) and the
+// deliberately unknown names of tests are not env names. The M0 spikes' signing variables are not listed.
+// TestRepoEnvNamesReserved repeats that grep on every run, so a name that a later change starts to read lands here.
+var devEnvNames = []struct{ name, readBy string }{
+	{"ISSHONI_DESKTOP_DEV_URL", "cmd/isshoni-desktop/flavor_dev.go, set by task desktop:dev (M2 03 §5.3)"},
+	{"ISSHONI_FAKE_AUDIO", "cmd/isshoni-desktop/engine_fake.go, internal/desktop/e2ehost, web/e2e (M2 05 §13.3)"},
+	{"ISSHONI_E2E_CDP_PORT", "web/e2e/cdp, and cmd/isshoni-desktop/flavor_e2e.go from WA72 on (M2 03 §22.4)"},
+	{"ISSHONI_E2E_DATA_DIR", "web/e2e/cdp, and cmd/isshoni-desktop/flavor_e2e.go from WA72 on (M2 03 §22.4)"},
+	{"ISSHONI_DESKTOP_EXE", "web/e2e/cdp: the e2e build of isshoni.exe the CDP spec starts"},
+	{"ISSHONI_CDP_ENDPOINT", "web/e2e/cdp: a running app the CDP spec attaches to"},
+	{"ISSHONI_NATIVE_PRESETS", "Taskfile.yml native:build"},
+	{"ISSHONI_NATIVE_TEST", "Taskfile.yml native:build"},
+	{"ISSHONI_NATIVE_BUILD_PS1", "Taskfile.yml native:build"},
+	{"ISSHONI_FFMPEG_BUILD_PS1", "Taskfile.yml ffmpeg:build"},
+	{"ISSHONI_CHECKLIST_OUT", "cmd/isshoni-desktop/checklist_test.go (M2 03 §3.2)"},
+	{"ISSHONI_CHECKLIST_W19_PORT", "cmd/isshoni-desktop/checklist_test.go (M2 03 §3.2)"},
+	{"ISSHONI_CHECKLIST_W19_PIPE", "cmd/isshoni-desktop/checklist_test.go (M2 03 §3.2)"},
+	{"ISSHONI_DESKTOP_TEST_CHILD", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_DESKTOP_TEST_ID", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_DESKTOP_TEST_RUNNING", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_DESKTOP_TEST_OUT", "cmd/isshoni-desktop/main_windows_test.go"},
+	{"ISSHONI_WINOS_TEST_CHILD", "internal/desktop/winos/winos_windows_test.go"},
+	{"ISSHONI_WINOS_TEST_ID", "internal/desktop/winos/winos_windows_test.go"},
+	{"ISSHONI_WINOS_TEST_OUT", "internal/desktop/winos/winos_windows_test.go"},
+	{"ISSHONI_APPLOG_CRASH_CHILD", "internal/desktop/applog/applog_test.go"},
+	{"ISSHONI_MEDIATEST_MUTANT", "internal/media/mediatest/mutant_test.go"},
+}
+
+// The server never warns about the names M2's desktop dev and e2e builds, tasks and tests read (WF7, after README
+// WA66's note): running task desktop:dev, an e2e run or a native build in the shell the server runs in leaves the
+// server's log alone. The names are matched exactly, so an unlisted name of the same families still warns.
+func TestDevEnvNamesNotWarned(t *testing.T) {
+	env := make([]string, 0, len(devEnvNames))
+	for _, d := range devEnvNames {
+		if !slices.Contains(ReservedEnvNames(), d.name) {
+			t.Errorf("%s (read by %s) is not a reserved name", d.name, d.readBy)
+		}
+		env = append(env, d.name+"=1")
+	}
+	if ws := mustLoad(t, "", env).Warnings(); len(ws) != 0 {
+		t.Errorf("warnings:%s\nwant none", problemList(ws))
+	}
+
+	for _, n := range devUnknownNames {
+		env = append(env, n+"=1")
+	}
+	ws := mustLoad(t, "", env).Warnings()
+	var names []string
+	for _, w := range ws {
+		if w.Severity != SeverityWarning || w.Source.Kind != SourceEnv || w.Message != "is not a config key; it is ignored" {
+			t.Errorf("warning %+v, want an unknown env warning", w)
+		}
+		names = append(names, w.Source.Name)
+	}
+	if !slices.Equal(names, devUnknownNames) {
+		t.Errorf("warned about %v, want %v", names, devUnknownNames)
+	}
+}
+
+// devUnknownNames are unlisted names of devEnvNames' families, which TestDevEnvNamesNotWarned expects a warning for.
+var devUnknownNames = []string{
+	"ISSHONI_E2E_NOT_A_NAME", "ISSHONI_NATIVE_NOT_A_NAME", "ISSHONI_FAKE_AUDIOS", "ISSHONI_DESKTOP_DEV",
+}
+
+// repoNonEnvNames are the ISSHONI_* names in the repository that are not env names or are unknown on purpose, with
+// where they are; TestRepoEnvNamesReserved accepts them, and devUnknownNames.
+var repoNonEnvNames = map[string]string{
+	"ISSHONI_MEDIA_H":                             "native/include/isshoni_media.h's include guard",
+	"ISSHONI_UPDATE_TEST":                         "internal/update's update_test: a string release builds lack",
+	"ISSHONI_TEST_PADDING":                        "tools/desktoppkg's ffmpeg_test: the filler of a long header",
+	"ISSHONI_TEST_PADDING_VALUE_OF_A_LONG_HEADER": "tools/desktoppkg's ffmpeg_test: the filler of a long header",
+	"ISSHONI_TLS_MOD":                             "a misspelled key that config tests expect a warning for",
+	"ISSHONI_TOTALLY_UNKNOWN":                     "load_test's unknown name",
+	"ISSHONI_EMPTY_UNKNOWN":                       "load_test's unknown name",
+	"ISSHONI_SOMETHING_ELSE":                      "deploy/test/install_unit.sh's unknown name",
+}
+
+// envNameRE matches an ISSHONI_* name as a whole word. A window global (__ISSHONI_…__) has a word character on each
+// side, and a family written as ISSHONI_E2E_* or a prefix as "ISSHONI_" ends in an underscore, so neither matches.
+var envNameRE = regexp.MustCompile(`\bISSHONI_[A-Z0-9_]*[A-Z0-9]\b`)
+
+// Every ISSHONI_* name in a tracked file outside docs/ and spikes/ is a key's env name, a reserved name, an env-only
+// switch or one of repoNonEnvNames (WF7's review). The reserved list matches names exactly (04 §4.2), so it holds
+// only while each new variable that a task, test or build reads is added to it by hand; this test fails on one that
+// isn't, where otherwise the only sign would be the server's unknown-env warning in the shell that runs both. It
+// scans git's list of tracked files, so build output, node_modules, agent worktrees and other ignored files never
+// count; outside a git checkout of the repository (a module-cache build, a source archive) it is skipped.
+func TestRepoEnvNamesReserved(t *testing.T) {
+	root := repoRoot(t)
+	known := map[string]bool{}
+	for _, k := range Keys() {
+		known[k.EnvName()] = true
+	}
+	for _, n := range slices.Concat(ReservedEnvNames(), envOnly) {
+		known[n] = true
+	}
+	accepted := map[string]bool{}
+	for n := range repoNonEnvNames {
+		accepted[n] = true
+	}
+	for _, n := range devUnknownNames {
+		accepted[n] = true
+	}
+	for n := range accepted {
+		if known[n] {
+			t.Errorf("%s is a key's env name, a reserved name or an env-only switch, so it is not a non-env name", n)
+		}
+	}
+
+	found := map[string][]string{} // name → the files it is in
+	files := trackedFiles(t, root)
+	for _, f := range files {
+		if strings.HasPrefix(f, "docs/") || strings.HasPrefix(f, "spikes/") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(f)))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // deleted in the working tree
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.IndexByte(b[:min(len(b), 8000)], 0) >= 0 {
+			continue // binary, by git's own test
+		}
+		for _, m := range envNameRE.FindAll(b, -1) {
+			if n := string(m); !slices.Contains(found[n], f) {
+				found[n] = append(found[n], f)
+			}
+		}
+	}
+	// keys.go holds every reserved and env-only name, so a scan that misses one of them read nothing.
+	for _, n := range slices.Concat(ReservedEnvNames(), envOnly) {
+		if found[n] == nil {
+			t.Fatalf("the scan of %d tracked files found no %s, which keys.go holds: it is broken", len(files), n)
+		}
+	}
+	for _, n := range slices.Sorted(maps.Keys(found)) {
+		if !known[n] && !accepted[n] {
+			t.Errorf("%s (in %s) is not a config key's env name or a reserved name, so the server warns about it: "+
+				"add it to reservedEnv in internal/server/config/keys.go and to devEnvNames with what reads it, or to "+
+				"repoNonEnvNames if it is not an env name; that edit belongs to the change that adds the name, even "+
+				"when internal/server/config is outside its Touches", n, strings.Join(found[n], ", "))
+		}
+	}
+}
+
+// repoRoot is the root of the repository this package is in: the closest directory above it that holds go.mod and
+// Taskfile.yml. Without one (the package was built from the module cache) the test is skipped.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, errMod := os.Stat(filepath.Join(dir, "go.mod"))
+		_, errTask := os.Stat(filepath.Join(dir, "Taskfile.yml"))
+		if errMod == nil && errTask == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Skip("not in a checkout of the repository: no directory above holds go.mod and Taskfile.yml")
+		}
+		dir = parent
+	}
+}
+
+// trackedFiles lists the files git tracks under root, slash-separated and relative to it. A root that is not a git
+// work tree (a source archive), or a machine without git, skips the test; a git that fails in a work tree fails it.
+func trackedFiles(t *testing.T, root string) []string {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		t.Skipf("%s is not a git work tree: %v", filepath.Base(root), err)
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("no git: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), "git", "ls-files", "-z")
+	cmd.Dir = root
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git ls-files: %v\n%s", err, stderr.Bytes())
+	}
+	return strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
 }

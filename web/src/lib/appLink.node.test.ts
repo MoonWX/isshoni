@@ -86,6 +86,16 @@ describe('appLinkFor', () => {
     ['a name of 253 bytes', `https://${HOST_253}`, `isshoni://${HOST_253}/`],
     // x/net/idna reads the hyphen rule by bytes: here the "--" is in the fifth and sixth (é has two).
     ['an IDN label with "--" after its fourth byte', 'https://aé--c.example', 'isshoni://xn--a--c-bpa.example/'],
+    // UTS #46 since Unicode 16 (go1.27's x/net/idna tables) keeps ≠, also when normalization composes it.
+    ['a not-equal sign', 'https://≠.example', 'isshoni://xn--1ch.example/'],
+    ['an equals sign with a combining long solidus', 'https://=\u0338.example', 'isshoni://xn--1ch.example/'],
+    // Names with a right-to-left label that pass RFC 5893's bidi rule, as Go's Build takes them.
+    ['a Hebrew name', 'https://שלום.example', 'isshoni://xn--9dbne9b.example/'],
+    ['a Hebrew name in its ASCII form', 'https://xn--9dbne9b.example', 'isshoni://xn--9dbne9b.example/'],
+    ['an RTL label that ends with a digit', 'https://א1.example', 'isshoni://xn--1-zhc.example/'],
+    ['an Arabic letter and an Arabic-Indic digit', 'https://ب١.example', 'isshoni://xn--ngb8i.example/'],
+    ['a hyphen inside an RTL label', 'https://א-ב.example', 'isshoni://xn----zhce.example/'],
+    ['a gershayim inside an RTL label', 'https://א״ב.example', 'isshoni://xn--4dbc8h.example/'],
   ])('canonicalizes %s', (_name, origin, link) => {
     expect(appLinkFor(origin)).toBe(link);
   });
@@ -122,8 +132,6 @@ describe('appLinkFor', () => {
     ['an asterisk', 'https://a*b.example'],
     ['a dollar sign', 'https://a$b.example'],
     ['an apostrophe', "https://a'b.example"],
-    ['a not-equal sign', 'https://≠.example'],
-    ['an equals sign with a combining long solidus', 'https://=\u0338.example'],
     // The hyphen rules.
     ['a label that starts with "-"', 'https://-foo.example'],
     ['a label that ends with "-"', 'https://foo-.example'],
@@ -141,6 +149,22 @@ describe('appLinkFor', () => {
     // What the URL parser would rewrite: the friend would see one host and the app get another.
     ['a percent escape in the host', 'https://exa%41mple.com'],
     ['a backslash in the host', 'https://a\\b.example'],
+    // RFC 5893's bidi rule, in every label of a name with a right-to-left label (R, AL or AN).
+    ['a label that starts with Arabic-Indic digits', 'https://١٢.example'],
+    ['the ASCII form of a label that starts with an Arabic-Indic digit', 'https://xn--9hb.example'],
+    ['a Hebrew letter in an LTR label', 'https://aא.example'],
+    ['an Arabic-Indic digit in an LTR label', 'https://a١.example'],
+    ['an RTL label that starts with a digit', 'https://1א.example'],
+    ['a label that starts with a digit beside an RTL label', 'https://1.א'],
+    ['an LTR label that ends with neither a letter nor a digit, beside an RTL label', 'https://א.1a'],
+    ['European and Arabic-Indic digits in one RTL label', 'https://ب۱١.example'],
+    // What this side can't classify without Unicode's tables refuses a name with a right-to-left label.
+    ['a symbol beside an RTL label', 'https://א.☃'],
+    // Labels in Unicode.
+    ['a label that starts with a combining mark', 'https://\u1ac1.example'],
+    ['an xn-- label that is not in NFC', 'https://xn--u-ccb.example'],
+    ['a zero-width non-joiner, even after a virama, where Go takes it', 'https://क्\u200cष.example'],
+    ['a zero-width joiner, also after a virama, where Go takes it', 'https://क्\u200dष.example'],
   ])('has no link for %s', (_name, origin) => {
     expect(appLinkFor(origin, 'lounge')).toBe('');
   });

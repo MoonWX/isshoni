@@ -103,9 +103,13 @@ func (k Key) clone() Key {
 
 // ReservedEnvNames are the ISSHONI_* names that are not config keys and that the server ignores without a warning:
 // install.sh's, the release tooling's and the dev tasks' variables, plus ISSHONI_CONFIG (read as the config path).
-// The list matches 06's, with M2 06 §7.3's names after M1's; a new non-key ISSHONI_* name must be added to both
-// (04 §4.2). The env-only switches ISSHONI_IN_CONTAINER and ISSHONI_ALLOW_EPHEMERAL_DATA are read by the server and
-// are not warned about either.
+// The list is M1's (04 §4.2), then M2 06 §7.3's, then the names that M2's desktop dev and e2e builds, tasks and
+// tests read (WF7), which no spec lists: keys_test.go's devEnvNames documents them with their readers, so that one of
+// them left in the shell that runs the server doesn't make it warn. A new non-key ISSHONI_* name that the repository
+// reads must be added here (and to devEnvNames, or to the spec that defines it); TestRepoEnvNamesReserved fails on one
+// that this list lacks. Names are matched exactly, never by prefix, so any other ISSHONI_* name that is not a
+// key still warns. The env-only switches ISSHONI_IN_CONTAINER and ISSHONI_ALLOW_EPHEMERAL_DATA are read by the
+// server and are not warned about either.
 func ReservedEnvNames() []string { return slices.Clone(reservedEnv) }
 
 var reservedEnv = []string{
@@ -134,6 +138,34 @@ var reservedEnv = []string{
 	// and the release notes (M2 06 §11.7).
 	"ISSHONI_DESKTOP_MIN_VERSION",
 	"ISSHONI_FFMPEG_VERSION",
+	// M2's desktop dev and e2e builds, tasks and tests (WF7): the dev build's Vite origin (M2 03 §5.3) and the fake
+	// engine's audio scenario in the dev and e2e builds and the e2e harness (M2 05 §13.3),
+	"ISSHONI_DESKTOP_DEV_URL",
+	"ISSHONI_FAKE_AUDIO",
+	// the e2e build's CDP port and data folder, and the CDP spec's app and endpoint (M2 03 §22.4),
+	"ISSHONI_E2E_CDP_PORT",
+	"ISSHONI_E2E_DATA_DIR",
+	"ISSHONI_DESKTOP_EXE",
+	"ISSHONI_CDP_ENDPOINT",
+	// the scripts and arguments that native:build and ffmpeg:build pass to Windows PowerShell (M2 06 §4.3, §5.1),
+	"ISSHONI_NATIVE_PRESETS",
+	"ISSHONI_NATIVE_TEST",
+	"ISSHONI_NATIVE_BUILD_PS1",
+	"ISSHONI_FFMPEG_BUILD_PS1",
+	// the Wails checklist test's output file and W19 row (M2 03 §3.2),
+	"ISSHONI_CHECKLIST_OUT",
+	"ISSHONI_CHECKLIST_W19_PORT",
+	"ISSHONI_CHECKLIST_W19_PIPE",
+	// and the switches that test binaries set for the child processes they start.
+	"ISSHONI_DESKTOP_TEST_CHILD",
+	"ISSHONI_DESKTOP_TEST_ID",
+	"ISSHONI_DESKTOP_TEST_RUNNING",
+	"ISSHONI_DESKTOP_TEST_OUT",
+	"ISSHONI_WINOS_TEST_CHILD",
+	"ISSHONI_WINOS_TEST_ID",
+	"ISSHONI_WINOS_TEST_OUT",
+	"ISSHONI_APPLOG_CRASH_CHILD",
+	"ISSHONI_MEDIATEST_MUTANT",
 }
 
 // envOnly are the env-only switches of §4.3: read directly, never warned about.

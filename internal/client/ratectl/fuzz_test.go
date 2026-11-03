@@ -16,10 +16,11 @@ import (
 //     is off, paused only when it is on, and gets OpBitrate only while it is on);
 //   - Tick and Hint keep the guards, and so does Params for every layer whose ceiling it didn't change: a layer's
 //     OpBitrate comes at least MinInterval (live) or ReinitMinInterval (re-init) after its last change, and is at
-//     least MinChange or ReinitMinChange of the applied value, except a live layer's step up to its ceiling or a
-//     live full layer's ramp step, and a step down of a layer applied above its ceiling. The model tells a ramp step
-//     without the Controller's ramp: one under MinChange ends at a ceiling or a cap's split (§9.2, computed here)
-//     that some call since the full layer's last change saw;
+//     least MinChange or ReinitMinChange of the applied value, except a layer's step up to exactly its ceiling or a
+//     live full layer's ramp step, a step down of a layer applied above its ceiling, and a re-init layer's step down
+//     to exactly its share of the cap from above it (README WF6). The model tells a ramp step without the
+//     Controller's ramp: one under MinChange ends at a ceiling or a cap's split (§9.2, computed here) that some call
+//     since the full layer's last change saw;
 //   - Reinit is set exactly for layers whose encoder re-initializes;
 //   - State reports what the Actions told the engine, every Wanted is within range, and an upload hint names one of
 //     the six heights.
@@ -138,19 +139,28 @@ func (m *fuzzModel) has(layer string) bool { _, ok := m.on[layer]; return ok }
 // guardAll says that a call keeps the guards for every layer.
 func guardAll(string) bool { return true }
 
-// capSplitF is §9.2's split of st.Cap for the full layer over the active layers, clamped to its engine range, and
-// false without a cap or an active full layer. It is written from the spec, apart from the Controller's code.
-func capSplitF(st State) (int, bool) {
-	if st.Cap <= 0 || !st.Active["f"] {
+// capSplitOf is §9.2's split of st.Cap for layer (f or q) over the active layers, clamped to its engine range, and
+// false without a cap or with the layer inactive. It is written from the spec, apart from the Controller's code.
+func capSplitOf(st State, layer string) (int, bool) {
+	if st.Cap <= 0 || !st.Active[layer] {
 		return 0, false
 	}
-	t, fCeil := st.Cap, st.Ceiling["f"]
-	f := max(FloorF, min(fCeil, t))
-	if qCeil, ok := st.Ceiling["q"]; ok && st.Active["q"] {
-		q := min(qCeil, max(FloorQ, int(math.Round(QShare*float64(t)))))
-		f = max(FloorF, min(fCeil, t-q))
+	t := st.Cap
+	fCeil, hasF := st.Ceiling["f"]
+	qCeil, hasQ := st.Ceiling["q"]
+	both := hasF && hasQ && st.Active["f"] && st.Active["q"]
+	q := min(qCeil, max(FloorQ, int(math.Round(QShare*float64(t)))))
+	if layer == "f" {
+		f := max(FloorF, min(fCeil, t))
+		if both {
+			f = max(FloorF, min(fCeil, t-q))
+		}
+		return min(max(f, MinBitrateF), MaxBitrateF), true
 	}
-	return min(max(f, MinBitrateF), MaxBitrateF), true
+	if !both {
+		q = max(FloorQ, min(qCeil, t))
+	}
+	return min(max(q, MinBitrateLayer), MaxBitrateLayer), true
 }
 
 // seeTops records the full layer's ceiling and cap split in st.
@@ -158,7 +168,7 @@ func (m *fuzzModel) seeTops(st State) {
 	if c, ok := st.Ceiling["f"]; ok {
 		m.fTops[c] = true
 	}
-	if s, ok := capSplitF(st); ok {
+	if s, ok := capSplitOf(st, "f"); ok {
 		m.fTops[s] = true
 	}
 }
@@ -264,11 +274,16 @@ func (m *fuzzModel) checkGuards(call string, now float64, a Action, st State) {
 	}
 	prev := m.applied[a.Layer]
 	ceiling := st.Ceiling[a.Layer]
+	share, capped := capSplitOf(st, a.Layer)
 	switch {
-	case live && a.Bps > prev && (a.Bps == ceiling || (a.Layer == protocol.RIDHigh && m.fTops[a.Bps])):
-		return // the step up to the ceiling, or a ramp step clamped at a ceiling or a cap's split
+	case a.Bps > prev && a.Bps == ceiling:
+		return // the step up to the ceiling, whatever the encoder
+	case live && a.Bps > prev && a.Layer == protocol.RIDHigh && m.fTops[a.Bps]:
+		return // a live full layer's ramp step clamped at a ceiling or a cap's split
 	case a.Bps < prev && prev > ceiling:
 		return // down toward the admin's cap
+	case !live && capped && a.Bps == share && prev > share:
+		return // a re-init layer down to its share of the cap (README WF6)
 	}
 	diff := int64(a.Bps) - int64(prev)
 	if diff < 0 {
@@ -281,13 +296,17 @@ func (m *fuzzModel) checkGuards(call string, now float64, a Action, st State) {
 }
 
 // TestFuzzModelSeesTheRamp makes sure the fuzz model's guard check accepts the spec's own sequences: the ramp, a
-// backoff and its recovery (a failing model would make the fuzz target useless).
+// backoff and its recovery, and a re-init encoder's moves that the ceiling or a cap forces (a failing model would make
+// the fuzz target useless).
 func TestFuzzModelSeesTheRamp(t *testing.T) {
-	newModel := func(c *Controller) *fuzzModel {
-		m := newFuzzModel(t, c, map[string]bool{"f": true, "q": true})
+	newModelOf := func(c *Controller, live map[string]bool) *fuzzModel {
+		m := newFuzzModel(t, c, live)
 		m.on["f"], m.on["q"] = true, true
 		m.check("Initial", 0, c.Initial(), nil, true)
 		return m
+	}
+	newModel := func(c *Controller) *fuzzModel {
+		return newModelOf(c, map[string]bool{"f": true, "q": true})
 	}
 	c := newController(bothLive, autoParams)
 	m := newModel(c)
@@ -332,4 +351,33 @@ func TestFuzzModelSeesTheRamp(t *testing.T) {
 	if want := []int{6_000_000, 6_700_000}; !slices.Equal(steps, want) {
 		t.Errorf("f's steps %v, want %v", steps, want)
 	}
+
+	// Both layers re-init (README WF6): a cap 16 % below f (q keeps its ceiling), one 20 % below q, a rise of q to
+	// its ceiling (25 %) with a cap that lets f rise by more than 30 %, and f's last step up to its ceiling (14.3 %)
+	// once the cap is lifted.
+	allReinit := map[string]bool{"f": false, "q": false}
+	c = newController(allReinit, autoParams)
+	m = newModelOf(c, allReinit)
+	c.Live(at(0))
+	hints := map[float64]int64{12: 7_000_000, 21: 800_000, 31: 7_300_000, 41: 0}
+	var got []event
+	for s := 0.5; s <= 60; s += 0.5 {
+		if cp, ok := hints[s]; ok {
+			acts := c.Hint(congestion(cp), at(s))
+			m.check("Hint", s, acts, guardAll, false)
+			got = append(got, events(s, acts)...)
+		}
+		acts := c.Tick(at(s))
+		m.check("Tick", s, acts, guardAll, false)
+		got = append(got, events(s, acts)...)
+	}
+	checkEvents(t, "re-init moves", got, []event{
+		{10, reinitBitrate("f", 8_000_000)},
+		{20, reinitBitrate("f", 6_700_000)},
+		{21, reinitBitrate("q", 240_000)},
+		{30, reinitBitrate("f", 560_000)},
+		{31, reinitBitrate("q", 300_000)},
+		{40, reinitBitrate("f", 7_000_000)},
+		{50, reinitBitrate("f", 8_000_000)},
+	})
 }
