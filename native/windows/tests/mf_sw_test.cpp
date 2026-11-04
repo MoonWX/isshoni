@@ -3,7 +3,11 @@
 // device (WARP on the GPU-less runner), converted, read back into system memory and encoded, for about 4 s per case.
 //
 // It runs when Media Foundation works on the machine (MFStartup, IM_OS_MEDIA_FOUNDATION) and the H.264 encoder MFT is
-// registered; otherwise it is skipped with the reason logged. The FFmpeg folder is ffmpeg_load_test's
+// registered; otherwise it is skipped with the reason logged. On Windows Server, where Microsoft's H.264 encoder MFT
+// is not supported ("Minimum supported server: None supported") yet can enumerate and open, a probe failure is skipped
+// too, but only when FFmpeg's log shows the MFT itself refused (h264_mf's error with the MFT's HRESULT), which the skip
+// prints; any other failure (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows
+// must pass in full. A failed probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's
 // (ISSHONI_TEST_FFMPEG_DIR; required in CI).
 //
 // It asserts, for a High and a Constrained Baseline session forced to IM_ENC_MF_SW:
@@ -24,6 +28,7 @@
 
 #include <mfapi.h>
 #include <mftransform.h>
+#include <versionhelpers.h>
 
 #include <algorithm>
 #include <chrono>
@@ -34,6 +39,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "encode/selector.h"
@@ -96,6 +102,59 @@ bool H264EncoderMftRegistered() {
   return SUCCEEDED(hr) && count > 0;
 }
 
+// The engine's "encode" and "ffmpeg" log lines since the last drain: the probe's own lines and h264_mf's errors,
+// which end in the MFT's HRESULT ("failed processing input: <hr>").
+std::string EncodeLog() {
+  std::vector<char> buf(64 * 1024);
+  std::string out;
+  for (;;) {
+    const int32_t n = im_read_logs(buf.data(), static_cast<int32_t>(buf.size()));
+    if (n <= 0) {
+      break;
+    }
+    std::string_view all(buf.data(), static_cast<std::size_t>(n));
+    while (!all.empty()) {
+      const std::size_t eol = all.find('\n');
+      const std::string_view line = all.substr(0, eol);
+      if (line.find("\"component\":\"ffmpeg\"") != std::string_view::npos ||
+          line.find("\"component\":\"encode\"") != std::string_view::npos) {
+        out.append(line);
+        out.push_back('\n');
+      }
+      if (eol == std::string_view::npos) {
+        break;
+      }
+      all.remove_prefix(eol + 1);
+    }
+  }
+  return out;
+}
+
+// The first "ffmpeg" line of encode_log showing that the encoder MFT itself refused (h264_mf's messages that end in the
+// MFT's HRESULT), or "" when there is none (then the failure may be ours: no AU, or no SPS/PPS/IDR in it).
+std::string MftRefusal(const std::string &encode_log) {
+  static constexpr std::string_view kMarkers[] = {"failed processing input",  "failed processing output",
+                                                  "could not start stream",   "failed draining",
+                                                  "could not set input type", "could not set output type"};
+  std::string_view rest(encode_log);
+  while (!rest.empty()) {
+    const std::size_t eol = rest.find('\n');
+    const std::string_view line = rest.substr(0, eol);
+    if (line.find("\"component\":\"ffmpeg\"") != std::string_view::npos) {
+      for (const std::string_view m : kMarkers) {
+        if (line.find(m) != std::string_view::npos) {
+          return std::string(line);
+        }
+      }
+    }
+    if (eol == std::string_view::npos) {
+      break;
+    }
+    rest.remove_prefix(eol + 1);
+  }
+  return {};
+}
+
 struct Packet {
   uint32_t flags = 0;
   uint32_t profile = 0;
@@ -132,6 +191,8 @@ protected:
     ASSERT_EQ(im_init(&p), IM_OK) << LastError();
     initialized_ = true;
 
+    (void)EncodeLog(); // im_init's records out of the ring (512 records; a full ring drops new ones): the probe's fit
+
     im_caps caps{};
     caps.struct_size = sizeof caps;
     ASSERT_EQ(im_probe(IM_PROBE_FULL, &caps), IM_OK) << LastError();
@@ -146,11 +207,27 @@ protected:
       }
     }
     ASSERT_NE(mf, nullptr) << "the probe always lists MF software";
-    if (mf->status != IM_OK && !H264EncoderMftRegistered()) {
-      std::printf("mf_sw_test: skipped: no H.264 encoder MFT is registered (probe reason '%s')\n", mf->reason);
-      GTEST_SKIP() << "Media Foundation has no H.264 encoder MFT here";
+    std::string why;
+    if (mf->status != IM_OK) {
+      why = EncodeLog();
+      std::printf("mf_sw_test: MF software's probe failed (status %d, '%s'); the engine's encode log:\n%s", mf->status,
+                  mf->reason, why.c_str());
+      EXPECT_EQ(mf->flags & IM_ENCF_AVAILABLE, 0u) << "a failed probe entry is not available";
+      if (!H264EncoderMftRegistered()) {
+        std::printf("mf_sw_test: skipped: no H.264 encoder MFT is registered (probe reason '%s')\n", mf->reason);
+        GTEST_SKIP() << "Media Foundation has no H.264 encoder MFT here";
+      }
+      // Microsoft's H.264 encoder MFT: "Minimum supported server: None supported". On Windows Server (GitHub's
+      // windows-2025 runner) it can enumerate and open, then refuse to encode. Skipped only when FFmpeg's log shows
+      // the MFT itself refused, with its HRESULT; anything else (no AU, no SPS/PPS/IDR) still fails below.
+      if (const std::string refusal = MftRefusal(why); IsWindowsServer() && !refusal.empty()) {
+        std::printf("mf_sw_test: skipped: Windows Server; the H.264 encoder MFT refused: %s\n", refusal.c_str());
+        GTEST_SKIP() << "Microsoft's H.264 encoder MFT is not supported on Windows Server and refused here: "
+                     << refusal;
+      }
     }
-    ASSERT_EQ(mf->status, IM_OK) << "MF software failed its probe: " << mf->reason;
+    ASSERT_EQ(mf->status, IM_OK) << "MF software failed its probe: " << mf->reason << "; the engine's encode log:\n"
+                                 << why;
     EXPECT_NE(mf->flags & IM_ENCF_AVAILABLE, 0u);
     EXPECT_EQ(mf->flags & IM_ENCF_ZERO_COPY, 0u) << "MF software reads back (04 §9.1)";
     EXPECT_EQ(mf->flags & IM_ENCF_LIVE_BITRATE, 0u) << "MF software re-inits for a bitrate change (04 §9.5)";

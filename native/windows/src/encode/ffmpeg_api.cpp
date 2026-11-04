@@ -406,6 +406,9 @@ void LogCapture::Append(std::string_view line) noexcept {
   } catch (...) {
     // A capture that runs out of memory just stops collecting.
   }
+  if (previous_ != nullptr) {
+    previous_->Append(line); // the enclosing capture collects it too
+  }
 }
 
 bool LogCapture::Contains(std::string_view needle) const noexcept {

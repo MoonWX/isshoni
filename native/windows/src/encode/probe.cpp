@@ -496,13 +496,17 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
   }
   const AuFacts first = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
   if (!ok || !first.sps || !first.pps || !first.idr) {
-    log::Info("encode", "probe: test encode failed",
-              {{"encoder", name},
-               {"ok", ok},
-               {"aus", run.aus().size()},
-               {"sps", first.sps},
-               {"pps", first.pps},
-               {"idr", first.idr}});
+    log::Info(
+        "encode", "probe: test encode failed",
+        {{"encoder", name},
+         {"ok", ok},
+         {"aus", run.aus().size()},
+         {"sps", first.sps},
+         {"pps", first.pps},
+         {"idr", first.idr},
+         // The failed call (cut at the ring's 63 bytes); FFmpeg's own "ffmpeg" error line just before it carries
+         // the encoder's reason (h264_mf: the MFT's HRESULT). "" when every frame went in but no good AU came out.
+         {"detail", abi::LastErrorText()}});
     abi::ClearLastError();
     enc.reset();
     SetStatus(info, IM_ERR_NO_ENCODER, abi::token::kTestEncodeFailed);
