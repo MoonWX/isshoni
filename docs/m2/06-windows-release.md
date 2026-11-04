@@ -1061,6 +1061,12 @@ name that is neither a key, reserved nor env-only. So **a slice that starts read
 only inside one task's own processes takes another prefix instead, as `native:dist`'s `NATIVE_DIST_*` and
 `ffmpeg:fetch`'s `FFMPEG_FETCH_*` do (§17; README WA24).
 
+Group 10's integration added the two names WA44 started to read, so the list ends with them:
+`ISSHONI_ENGINETEST_TEST_CHILD` (the child switch of `cmd/isshoni-enginetest`'s process-default test, beside the other
+test-child names) and `ISSHONI_TEST_FFMPEG_DIR` (the FFmpeg folder of the native encoder tests `ffmpeg_load_test` and
+`mf_sw_test`, which `windows-native` sets to the locked zip's `bin`; 04 §9.10, §18.2). M1 04 §4.2's documented list
+matches `reservedEnv` again since WB9 (group 11).
+
 ### 7.4 Server: `GET /install-desktop.ps1`
 
 M1 reserved the path (M1 04 §9.2). M2 adds:
