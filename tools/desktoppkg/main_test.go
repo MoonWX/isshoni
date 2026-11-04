@@ -60,20 +60,6 @@ func TestUsageListsEveryCommand(t *testing.T) {
 	}
 }
 
-// TestNotImplemented: the commands of later slices fail with exit 1 and name their slice.
-func TestNotImplemented(t *testing.T) {
-	root := t.TempDir()
-	for cmd, slice := range map[string]string{
-		"winver": "WA67", "stage": "WA67", "nsis": "WA67", "check": "WA67",
-	} {
-		code, _, stderr := runCmd(t, "-root", root, cmd)
-		want := "desktoppkg " + cmd + ": not implemented yet (slice " + slice + ")"
-		if code != 1 || !strings.Contains(stderr, want) {
-			t.Errorf("%s: exit %d, stderr %q; want exit 1 and %q", cmd, code, stderr, want)
-		}
-	}
-}
-
 // TestFindRoot: without -root the repository root is the nearest directory whose go.mod is the main module, so
 // `go -C tools run ./desktoppkg` works from tools/.
 func TestFindRoot(t *testing.T) {

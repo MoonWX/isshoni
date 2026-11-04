@@ -16,16 +16,20 @@
 //	dll-check -dll FILE -version V -winver W [-ffmpeg DIR] [-load-config]
 //	                                the checks of isshoni-media.dll (exports, imports, VERSIONINFO, load config) and
 //	                                of the FFmpeg DLLs, from the PE images themselves (06 §5.1)
-//	winver <semver>                 the four-part Windows version of a SemVer (06 §5.3; slice WA67)
-//	stage [-release]                copy the install tree into dist-desktop/stage/ (06 §6.2; slices WA67, WA78)
-//	nsis                            the defines passed to makensis (06 §6.2; slice WA67)
-//	check                           the stage and installer source rules (06 §6.10, §9.3; slice WA67)
+//	winver <semver>                 the four-part Windows version of a SemVer (06 §5.3)
+//	stage [-release] -version V -native DIR -notices FILE [-exe FILE] [-out DIR] [-mtime T]
+//	                                copy the install tree of 06 §2.2 into dist-desktop/stage/ and write its
+//	                                install-files.txt; on Windows also --self-check the staged isshoni.exe (06 §6.2)
+//	nsis -version V -webview2 FILE [-stage DIR] [-out FILE] [-prebuilt-uninstaller FILE] [-makensis BIN] [-print]
+//	nsis -uninstaller-generator -version V [-out FILE] [-makensis BIN]
+//	                                run makensis -WX on deploy/windows/nsis/ with the defines of 06 §6.2 (§6.9)
+//	check [-stage DIR] [-installer FILE] [-exe FILE -version V]
+//	                                the NSIS strings rule (06 §6.10), the stage's binaries (§9.3), the installer's
+//	                                size budget and 06 §5.2 step 3 on isshoni.exe
 //	manifest -version V -installer FILE [-date T] [-out FILE] [-releases URL]
 //	                                write the update manifest isshoni-desktop-update.json from the installer, the
 //	                                version and deploy/desktop/min-version, deploy/keys/update_revoked (06 §8.2);
 //	                                -releases only for the updater e2e's ci manifests (06 §8.11)
-//
-// A command whose slice has not landed yet fails with "not implemented yet".
 //
 // Exit status: 0 on success, 1 when a command fails, 2 on a usage error.
 package main
@@ -52,9 +56,6 @@ const modulePath = "github.com/MoonWX/isshoni"
 // errUsage marks an error that is the caller's mistake; run prints the usage and exits 2.
 var errUsage = errors.New("usage error")
 
-// errNotImplemented is returned by the commands whose slices have not landed yet.
-var errNotImplemented = errors.New("not implemented yet")
-
 // env is what a command runs with.
 type env struct {
 	root   string // repository root
@@ -77,10 +78,10 @@ var commands = []command{
 	{"ffmpeg-inputs", "[-check]", runFFmpegInputs},
 	{"ffmpeg-fetch", "[-out DIR] [-zip FILE] [-source] [-base URL]", runFFmpegFetch},
 	{"dll-check", "-dll FILE -version V -winver W [-ffmpeg DIR] [-load-config]", runDLLCheck},
-	{"winver", "<semver> (slice WA67)", runWinver},
-	{"stage", "[-release] (slices WA67, WA78)", runStage},
-	{"nsis", "(slice WA67)", runNSIS},
-	{"check", "(slice WA67)", runCheck},
+	{"winver", "<semver>", runWinver},
+	{"stage", "[-release] -version V -native DIR -notices FILE [-exe FILE] [-out DIR] [-mtime T]", runStage},
+	{"nsis", "-version V -webview2 FILE [-stage DIR] [-out FILE] [-prebuilt-uninstaller FILE] [-uninstaller-generator] [-makensis BIN] [-print]", runNSIS},
+	{"check", "[-stage DIR] [-installer FILE] [-exe FILE -version V]", runCheck},
 	{"manifest", "-version V -installer FILE [-date T] [-out FILE] [-releases URL]", runManifest},
 }
 
@@ -188,9 +189,4 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// notImplemented is the error of a command whose slice has not landed yet.
-func notImplemented(slice string) error {
-	return fmt.Errorf("%w (slice %s)", errNotImplemented, slice)
 }

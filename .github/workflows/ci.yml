@@ -82,6 +82,7 @@ jobs:
       run-desktop-macos: ${{ steps.plan.outputs.run-desktop-macos }}
       run-native-host: ${{ steps.plan.outputs.run-native-host }}
       run-windows-native: ${{ steps.plan.outputs.run-windows-native }}
+      run-windows-desktop: ${{ steps.plan.outputs.run-windows-desktop }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
     steps:
@@ -158,8 +159,9 @@ jobs:
               - 'tools/relserve/**'
               - 'tools/notices/**'
             # The Windows app (M2 06 §10.1): everything the app, its engine, its installer or
-            # its packaging reads, the SPA it bundles included. windows-go, desktop-macos and
-            # windows-native run on it; windows-desktop joins when it lands (README WA72).
+            # its packaging reads, the SPA it bundles included. windows-go, desktop-macos,
+            # windows-native and windows-desktop run on it (README WA67 adds the installer smoke, one
+            # of windows-desktop's own inputs).
             desktop:
               - 'cmd/isshoni-desktop/**'
               - 'cmd/isshoni-enginetest/**'
@@ -169,6 +171,7 @@ jobs:
               - 'internal/desktop/**'
               - 'native/**'
               - 'deploy/windows/**'
+              - 'deploy/test/windows/smoke.ps1'
               - 'deploy/install-desktop.ps1'
               - 'deploy/embed.go'
               - 'deploy/notices/native-windows.json'
@@ -391,6 +394,13 @@ jobs:
           decide windows-native "$windows_native_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
             deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions
+          # The installer (M2 06 §6, §10.1; README WA67): windows-native's inputs (it needs that job's DLLs), the
+          # web job's web/dist, the NSIS scripts, the smoke and the app.
+          decide windows-desktop "$desktop" go.mod native/CMakePresets.json native/vcpkg.json \
+            native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
+            deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions \
+            web/package.json web/package-lock.json deploy/windows/nsis/installer.nsi deploy/test/windows/smoke.ps1 \
+            cmd/isshoni-desktop
 
           task_version=''
           if [ -e .tool-versions ]; then
@@ -2096,6 +2106,174 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  windows-desktop:
+    # The Windows app's packaging and installer (M2 06 §10.1, R4; README WA67 writes this first part, WA72 completes
+    # the job): isshoni.exe (task desktop:exe:windows, with 06 §5.2 step 3's checks), NSIS from the pinned portable
+    # zip of deploy/windows/tools.json (SHA-256 checked, cached by it), the prebuilt uninstaller (06 §6.9), the stage
+    # (-release: the windows-native artifact's release\ folder only, --self-check ok with testHooks false) and the
+    # installer (task desktop:package:windows: makensis -WX, the strings rule, the stage's binaries, the size
+    # budget), two more installers for the smoke's upgrade and downgrade cases, then deploy/test/windows/smoke.ps1
+    # -Mode ci (06 §16). README WA72 adds the DLL-dependent Go tests, the CDP spec, Pester under Windows PowerShell
+    # 5.1, the server-rendered ps1 test and the isshoni-desktop-windows-pr artifact; WA78 the notices gate.
+    needs: [changes, web, windows-native]
+    if: needs.changes.outputs.run-windows-desktop == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Find Go's module and build caches
+        id: goenv
+        run: |
+          "modcache=$(go env GOMODCACHE)" >> $env:GITHUB_OUTPUT
+          "gocache=$(go env GOCACHE)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.goenv.outputs.modcache }}
+            ${{ steps.goenv.outputs.gocache }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', 'tools/wails3/go.mod', 'tools/wails3/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: Download web/dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Download windows-native
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-native
+          path: ${{ runner.temp }}/windows-native
+
+      - name: The NSIS pin
+        id: nsis-pin
+        run: |
+          $pin = (Get-Content -Raw -LiteralPath deploy/windows/tools.json | ConvertFrom-Json).nsis
+          if ($pin.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'deploy/windows/tools.json has no nsis.sha256' }
+          "version=$($pin.version)" >> $env:GITHUB_OUTPUT
+          "url=$($pin.url)" >> $env:GITHUB_OUTPUT
+          "sha256=$($pin.sha256)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache the NSIS zip
+        # M2 06 §10.2: keyed by its SHA-256, which the next step checks on a hit too.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nsis-zip
+          key: nsis-zip-${{ steps.nsis-pin.outputs.sha256 }}
+
+      - name: NSIS (makensis from the pinned portable zip)
+        id: nsis
+        env:
+          NSIS_VERSION: ${{ steps.nsis-pin.outputs.version }}
+          NSIS_URL: ${{ steps.nsis-pin.outputs.url }}
+          NSIS_SHA256: ${{ steps.nsis-pin.outputs.sha256 }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'nsis-zip'
+          $zip = Join-Path $dir "nsis-$env:NSIS_VERSION.zip"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          if (-not (Test-Path -LiteralPath $zip)) {
+            $ProgressPreference = 'SilentlyContinue'
+            for ($try = 1; ; $try++) {
+              try {
+                Invoke-WebRequest -UseBasicParsing -Uri $env:NSIS_URL -OutFile $zip -UserAgent 'Wget'
+                break
+              } catch {
+                if ($try -ge 3) { throw }
+                "download failed ($($_.Exception.Message)); trying again"
+                Start-Sleep -Seconds (5 * $try)
+              }
+            }
+          }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($sha -ne $env:NSIS_SHA256) {
+            Remove-Item -LiteralPath $zip -Force
+            throw "nsis-$env:NSIS_VERSION.zip has the SHA-256 $sha, not deploy/windows/tools.json's $env:NSIS_SHA256"
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'nsis'
+          Expand-Archive -LiteralPath $zip -DestinationPath $out -Force
+          $makensis = Join-Path $out "nsis-$env:NSIS_VERSION\makensis.exe"
+          if (-not (Test-Path -LiteralPath $makensis)) { throw "the NSIS zip has no nsis-$env:NSIS_VERSION\makensis.exe" }
+          & $makensis -VERSION
+          ''
+          "makensis=$makensis" >> $env:GITHUB_OUTPUT
+
+      - name: isshoni.exe, the stage and the installer (task desktop:package:windows)
+        id: package
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          MAKENSIS: ${{ steps.nsis.outputs.makensis }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # M2 06 §5.2 (the exe and its step 3 checks), §6.2 (stage -release: on Windows it runs the staged
+          # isshoni.exe --self-check and requires ok and testHooks false), §6.9 (the prebuilt uninstaller), §6.10
+          # and §9.3 (desktoppkg check).
+          task desktop:package:windows "VERSION=$env:VERSION" "NATIVE_DIR=$env:NATIVE" "MAKENSIS=$env:MAKENSIS" `
+            RELEASE=true PREBUILT_UNINSTALLER=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist-desktop/isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "no $setup" }
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+
+      - name: The smoke's older and newer installers
+        id: smoke-builds
+        env:
+          MAKENSIS: ${{ steps.nsis.outputs.makensis }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # 06 §16: an older build whose install-files.txt lists an extra (fake) avcodec-00.dll, for the stale-file
+          # case, and a newer one, for the downgrade cases. Both pack the same stage otherwise, with the same
+          # prebuilt uninstaller. 0.0.0-smoke's last identifier is no number, so its winver is 0.0.0.0, never above
+          # CI's 0.0.0.<run_number mod 65000> (desktoppkg winver, 06 §5.3); 0.0.1-smoke.1 has 0.0.1.1, above it.
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
+          $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/.build/uninst/uninstall.exe'
+          $webview2 = Join-Path $env:NATIVE 'MicrosoftEdgeWebview2Setup.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-builds'
+          $old = Join-Path $out 'stage-old'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -LiteralPath $stage -Destination $old -Recurse
+          [IO.File]::WriteAllText((Join-Path $old 'avcodec-00.dll'), "fake avcodec-00.dll for the smoke`r`n")
+          [IO.File]::AppendAllText((Join-Path $old 'install-files.txt'), "avcodec-00.dll`r`n")
+          foreach ($b in @(@('0.0.0-smoke', $old, 'old.exe'), @('0.0.1-smoke.1', $stage, 'newer.exe'))) {
+            go -C tools run ./desktoppkg nsis -version $b[0] -stage $b[1] -out (Join-Path $out $b[2]) `
+              -webview2 $webview2 -prebuilt-uninstaller $uninstaller -makensis $env:MAKENSIS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          "old=$(Join-Path $out 'old.exe')" >> $env:GITHUB_OUTPUT
+          "newer=$(Join-Path $out 'newer.exe')" >> $env:GITHUB_OUTPUT
+
+      - name: smoke.ps1 -Mode ci
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          SETUP: ${{ steps.package.outputs.setup }}
+          OLD_SETUP: ${{ steps.smoke-builds.outputs.old }}
+          NEWER_SETUP: ${{ steps.smoke-builds.outputs.newer }}
+        run: |
+          ./deploy/test/windows/smoke.ps1 -Mode ci -Setup $env:SETUP -Version $env:VERSION -OldSetup $env:OLD_SETUP `
+            -NewerSetup $env:NEWER_SETUP -Stage (Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage')
+
   ci-ok:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
@@ -2121,6 +2299,7 @@ jobs:
         desktop-macos,
         native-host,
         windows-native,
+        windows-desktop,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
