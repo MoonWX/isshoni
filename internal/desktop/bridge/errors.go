@@ -163,6 +163,8 @@ func knownError(err error) *Error {
 		return newError(codes.CodeBusy, nil)
 	case errors.Is(err, app.ErrNotImplemented):
 		return newError(codes.CodeNotImplemented, nil)
+	case errors.Is(err, app.ErrIO):
+		return newError(codes.CodeIOError, nil)
 
 	case errors.Is(err, context.Canceled):
 		// The page cancelled the call (W11): nobody reads the answer.

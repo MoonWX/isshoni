@@ -344,7 +344,17 @@ IM_API im_status IM_CALL im_audio_set_muted(uint32_t muted) {
     ClearLastError();
     IM_CHECK(im::api::CheckBool("im_audio_set_muted", "muted", muted));
     IM_CHECK(im::engine::RequireInit("im_audio_set_muted"));
-    return im::audio_bridge::Engine().SetMuted(muted != 0);
+    // Two halves (04 §8.5, §10.3): the test tone's own user mute, whose sound 05's AudioEngine never sees, and 05's
+    // mix bus. IM_OK when either took it, also after IM_INIT_NO_AUDIO, where the AudioEngine answers
+    // IM_ERR_BAD_STATE but a test-tone session runs; otherwise the AudioEngine's answer and detail.
+    const im_status tone = im::session::SetToneMuted(muted != 0);
+    ClearLastError();
+    const im_status st = im::audio_bridge::Engine().SetMuted(muted != 0);
+    if (st != IM_OK && tone == IM_OK) {
+      ClearLastError();
+      return IM_OK;
+    }
+    return st;
   });
 }
 

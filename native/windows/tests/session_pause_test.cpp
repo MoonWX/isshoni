@@ -342,7 +342,7 @@ TEST_F(Engine, ResumeKeepsTheUserMuteOfTheTone) {
   const im_session s = Start(ToneConfig());
   ASSERT_NE(s, 0u);
   std::vector<Pkt> pkts = Pull(s, milliseconds(300));
-  ASSERT_EQ(im::session::SetToneMuted(true), IM_OK) << LastError();
+  ASSERT_EQ(im_audio_set_muted(1), IM_OK) << LastError();
   const int64_t muted_at = EngineNow();
   Append(pkts, Pull(s, milliseconds(200)));
   ASSERT_EQ(im_set_paused(s, 1), IM_OK) << LastError();
@@ -350,7 +350,7 @@ TEST_F(Engine, ResumeKeepsTheUserMuteOfTheTone) {
   ASSERT_EQ(im_set_paused(s, 0), IM_OK) << LastError();
   const int64_t resumed_at = EngineNow();
   Append(pkts, Pull(s, milliseconds(300)));
-  ASSERT_EQ(im::session::SetToneMuted(false), IM_OK) << LastError();
+  ASSERT_EQ(im_audio_set_muted(0), IM_OK) << LastError();
   const int64_t unmuted_at = EngineNow();
   Append(pkts, Pull(s, milliseconds(300)));
   ASSERT_EQ(im_stop(s), IM_OK);

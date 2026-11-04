@@ -247,6 +247,8 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 		I18n:             cat,
 		Log:              log,
 		InsecureLoopback: true,
+		LockResume:       o.lockResume,
+		LockStop:         o.lockStop,
 	})
 	if err != nil {
 		return fail(err)

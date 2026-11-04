@@ -1056,7 +1056,9 @@ TEST(Exports, FailedAudioInitDoesNotFailInit) {
   ASSERT_GT(n, 0) << LastError();
   const std::string out(logs.data(), static_cast<std::size_t>(n));
   EXPECT_NE(out.find("\"msg\":\"audio init failed\""), std::string::npos) << out;
-  EXPECT_NE(out.find("the audio watcher can't start"), std::string::npos) << out;
+  // Only the detail's token: 05's text may name an app (04 §5.6, session.h's DetailToken).
+  EXPECT_NE(out.find("\"token\":\"test\""), std::string::npos) << out;
+  EXPECT_EQ(out.find("the audio watcher can't start"), std::string::npos) << out;
 
   // Video calls keep working: im_probe reaches its area (the skeleton's stub answers whatever it answers).
   im_caps caps = Sized<im_caps>(sizeof(im_caps));

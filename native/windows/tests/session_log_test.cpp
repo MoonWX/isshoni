@@ -9,7 +9,8 @@
 // - a top-level window of the test with a distinctive title, handed to im_protect_window;
 // - the exclusion rules of im_start (an executable, its app id and its display name), which a fake AudioEngine
 //   (audio_bridge::SetEngineForTest, 04 §18.2) refuses with a detail that repeats them, as 05's text may;
-// - a Mixer whose Start fails with a detail that names another app's executable.
+// - a Mixer whose Start fails with a detail that names another app's executable, and an AudioEngine::Init that fails
+//   with such a detail (engine.cpp's "audio init failed" record).
 // The session logs only the token of such a detail (session.h's DetailToken), so the check also finds the
 // tokens the fake used ("set_rules", "missing") and the records that carry them.
 #include <gtest/gtest.h>
@@ -111,13 +112,21 @@ public:
     return *a;
   }
 
-  void Configure(bool refuse_rules, MixerKind mixer) {
+  void Configure(bool refuse_rules, MixerKind mixer, bool refuse_init = false) {
     std::lock_guard<std::mutex> lock(mu_);
     refuse_rules_ = refuse_rules;
     mixer_ = mixer;
+    refuse_init_ = refuse_init;
   }
 
-  im_status Init(uint32_t) override { return IM_OK; }
+  // Init refuses, when asked to, with a detail that names another app's executable, as 05's text may.
+  im_status Init(uint32_t) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!refuse_init_) {
+      return IM_OK;
+    }
+    return im::abi::Failf(IM_ERR_INTERNAL, im::abi::token::kMissing, "%s holds the audio endpoint", kVoiceExe);
+  }
   void Shutdown() override {}
   uint32_t ProbeFlags() override { return 0; }
   int32_t ListAppsJson(uint32_t, char *buf, int32_t cap) override { return im::abi::CopyOut("{}", buf, cap); }
@@ -156,6 +165,7 @@ private:
   FakeAudio() = default;
   std::mutex mu_;
   bool refuse_rules_ = false;
+  bool refuse_init_ = false;
   MixerKind mixer_ = MixerKind::kNone;
 };
 
@@ -363,6 +373,29 @@ TEST_P(SessionLog, NoRecordNamesAWindowOrAnApp) {
   // The failures were logged, with their tokens only (warn level: recorded at info and at debug).
   EXPECT_TRUE(rules_token) << "no \"audio rules not applied\" record with its token";
   EXPECT_TRUE(mixer_token) << "no \"audio mixer did not start\" record with its token";
+}
+
+// engine.cpp's "audio init failed" record (im_init succeeds without audio, 05 §4.3) logs the detail's token only.
+TEST_P(SessionLog, AFailedAudioInitLogsOnlyItsToken) {
+  Collect();
+  im_shutdown();
+  FakeAudio::Instance().Configure(false, FakeAudio::MixerKind::kNone, true);
+  im_init_params p{};
+  p.struct_size = sizeof p;
+  p.abi_version = IM_ABI_VERSION;
+  p.log_level = GetParam();
+  ASSERT_EQ(im_init(&p), IM_OK) << LastError();
+  FakeAudio::Instance().Configure(false, FakeAudio::MixerKind::kNone);
+  Collect();
+  bool init_token = false;
+  for (const std::string &line : lines_) {
+    const std::string l = Lower(line);
+    EXPECT_EQ(l.find("wa52secretvoice"), std::string::npos) << "a record names the voice app: " << line;
+    EXPECT_EQ(l.find(".exe"), std::string::npos) << "a record names an executable: " << line;
+    init_token = init_token || (l.find("audio init failed") != std::string::npos &&
+                                l.find("\"token\":\"missing\"") != std::string::npos);
+  }
+  EXPECT_TRUE(init_token) << "no \"audio init failed\" record with its token";
 }
 
 INSTANTIATE_TEST_SUITE_P(Levels, SessionLog, ::testing::Values(IM_LOG_INFO, IM_LOG_DEBUG),

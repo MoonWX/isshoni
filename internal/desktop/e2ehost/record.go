@@ -8,6 +8,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/hotkey"
+	"github.com/MoonWX/isshoni/internal/desktop/tray"
 )
 
 // recorder is the harness's recording Shell and OSHooks (03 §22.4 A): every call the app makes of the window, the
@@ -113,7 +114,15 @@ func (r *recorder) update(fn func(s *hostState)) {
 
 // ---- app.Shell ----
 
-var _ app.Shell = (*recorder)(nil)
+var (
+	_ app.Shell     = (*recorder)(nil)
+	_ app.TrayShell = (*recorder)(nil)
+)
+
+// SetTray records the tray's view for /__e2e/state (README WA68).
+func (r *recorder) SetTray(v tray.View) {
+	r.update(func(s *hostState) { s.Tray = v })
+}
 
 func (r *recorder) ShowWindow(bool) {
 	r.update(func(s *hostState) { s.WindowVisible = true; s.ShowWindowCalls++ })
