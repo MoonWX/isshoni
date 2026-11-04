@@ -371,11 +371,19 @@ AuFacts Inspect(std::span<const uint8_t> au) noexcept {
 // One test session of an encoder: the frames it encoded and the AUs it produced, in order.
 class TestRun {
 public:
-  explicit TestRun(FfmpegEncoder &enc) noexcept : enc_(enc) {}
+  // paced: each frame after the first goes in no sooner than one frame interval (1/kTestFps) after the one before,
+  // as a session sends them (encpolicy::TestEncodePlan).
+  TestRun(FfmpegEncoder &enc, bool paced) noexcept : enc_(enc), paced_(paced) {}
 
   // Encodes one mid-gray frame; appends the AU when the encoder produced one. False on an error (detail set).
   bool Frame(bool idr, bool *produced) noexcept {
     *produced = false;
+    if (paced_ && index_ > 0) {
+      const int64_t due = last_send_ns_ + 1'000'000'000LL / kTestFps;
+      for (int64_t now = NowNs(); now < due; now = NowNs()) {
+        Sleep(static_cast<DWORD>((due - now + 999'999) / 1'000'000));
+      }
+    }
     gpu::Nv12Target t;
     if (enc_.NextTarget(&t) != IM_OK || enc_.FillGray(t) != IM_OK) {
       return false;
@@ -387,6 +395,7 @@ public:
     in.index = index_++;
     ts_ += 1'000'000'000LL / kTestFps;
     session::EncodedAu au;
+    last_send_ns_ = NowNs();
     if (enc_.Encode(in, &au) != IM_OK) {
       return false;
     }
@@ -401,10 +410,15 @@ public:
     return true;
   }
 
+  // End of stream: appends every AU the encoder still held. False on an error (detail set).
+  bool Drain() noexcept { return enc_.Drain(&aus_) == IM_OK; }
+
   const std::vector<std::vector<uint8_t>> &aus() const noexcept { return aus_; }
 
 private:
   FfmpegEncoder &enc_;
+  bool paced_ = false;
+  int64_t last_send_ns_ = 0;
   int64_t ts_ = 0;
   uint32_t index_ = 0;
   std::vector<std::vector<uint8_t>> aus_;
@@ -416,9 +430,6 @@ struct TestSize {
   uint32_t height;
 };
 constexpr TestSize kTestSizes[] = {{kTestWidth, kTestHeight}, {kTestFallbackWidth, kTestFallbackHeight}};
-
-// The most frames an encoder may hold back before its first AU (some MF and QSV configurations hold one).
-constexpr int kMaxDelayFrames = 3;
 
 session::EncoderParams TestParams(uint32_t kind, uint32_t profile, const TestSize &size, gpu::Device *device) noexcept {
   session::EncoderParams p;
@@ -501,24 +512,50 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
   }
   info.flags |= profile == IM_PROFILE_HIGH ? IM_ENCF_HIGH : IM_ENCF_CB;
 
-  // The IDR, allowing the encoder a few frames of delay before its first AU.
-  TestRun run(*enc);
+  // The IDR, allowing the encoder a few frames of delay before its first AU (encpolicy::TestEncodePlan: MF software's
+  // frames are paced, and when they bring no AU a drain shows what the MFT still held; it never passes the probe).
+  const encpolicy::TestEncodePlan plan = encpolicy::TestEncodePlanFor(info.kind);
+  TestRun run(*enc, plan.paced);
   bool produced = false;
   bool ok = run.Frame(true, &produced);
   int delay = 0;
-  while (ok && !produced && delay < kMaxDelayFrames) {
+  while (ok && !produced && delay < plan.max_delay_frames) {
     ++delay;
     ok = run.Frame(false, &produced);
   }
-  const AuFacts first = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
-  if (!ok || !first.sps || !first.pps || !first.idr) {
-    log::Info("encode", "probe: test encode failed",
+  const std::size_t budget_aus = run.aus().size(); // what the frame budget brought, before any drain
+  if (ok && !produced && plan.drain) {
+    // Diagnosis only: an encoder whose first AU needs more than the frame budget, or comes out only at end of
+    // stream, would hold back that many frames in a session, which never drains. The log tells "nothing at all"
+    // from "the AU was there, too late"; the probe fails either way.
+    const bool drain_ok = run.Drain();
+    const AuFacts drained = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
+    log::Info("encode", "probe: first AU only on drain",
               {{"encoder", name},
-               {"ok", ok},
+               {"frames", delay + 1},
+               {"ok", drain_ok},
                {"aus", run.aus().size()},
-               {"sps", first.sps},
-               {"pps", first.pps},
-               {"idr", first.idr}});
+               {"sps", drained.sps},
+               {"pps", drained.pps},
+               {"idr", drained.idr},
+               {"detail", abi::LastErrorText()}});
+    abi::ClearLastError();
+  }
+  const AuFacts first = budget_aus == 0 ? AuFacts{} : Inspect(run.aus().front());
+  if (!ok || !first.sps || !first.pps || !first.idr) {
+    // At most log::kMaxAttrs (8) attributes, or the ring leaves the last ones out.
+    log::Info(
+        "encode", "probe: test encode failed",
+        {{"encoder", name},
+         {"ok", ok},
+         {"frames", delay + 1},
+         {"aus", budget_aus},
+         {"sps", first.sps},
+         {"pps", first.pps},
+         {"idr", first.idr},
+         // The failed call (cut at the ring's 63 bytes); FFmpeg's own "ffmpeg" error line just before it carries
+         // the encoder's reason (h264_mf: the MFT's HRESULT). "" when every frame went in but no good AU came out.
+         {"detail", abi::LastErrorText()}});
     abi::ClearLastError();
     enc.reset();
     SetStatus(info, IM_ERR_NO_ENCODER, abi::token::kTestEncodeFailed);
@@ -551,6 +588,7 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
     }
   }
   enc.reset();
+  // Diagnostics only; for MF software it includes the pacing between frames.
   info.test_encode_us = static_cast<uint32_t>(std::clamp<int64_t>((NowNs() - t0) / 1000, 0, UINT32_MAX));
 
   // The other profile, by a trial open (04 §9.10: "High and CB from trial opens"), at the size that opened.

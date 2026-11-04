@@ -79,6 +79,11 @@ public:
 
   bool zero_copy() const noexcept { return zero_copy_; }
 
+  // For the probe (04 §9.10; encpolicy::TestEncodePlan.drain): end of stream (avcodec_send_frame(NULL)), then every
+  // packet the encoder still held, each appended to aus as one AU, until AVERROR_EOF. The encoder takes no frame
+  // after it.
+  im_status Drain(std::vector<std::vector<uint8_t>> *aus) noexcept;
+
   // 04 §9.2's pts → capture-time table: the capture time (EncodeInput.ts_ns) of the frame the last Encode's AU came
   // from, found by the first packet's pts among the last kPtsRing frames sent; 0 when that Encode produced no AU.
   // An encoder with frames of delay emits an AU for an earlier frame than the one just sent: Encode also returns this

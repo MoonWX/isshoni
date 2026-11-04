@@ -404,6 +404,37 @@ im_status FfmpegEncoder::OpenCodec(OpenFacts *facts) noexcept {
   return IM_OK;
 }
 
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+int ffmpeg::OpenEncoderWithoutDeviceForTest(uint32_t kind, std::string *error) noexcept {
+  error->clear();
+  const ffmpeg::Api *api = ffmpeg::Loaded();
+  const AVCodec *codec = FindCodec(api, kind);
+  if (codec == nullptr) {
+    *error = api == nullptr ? "FFmpeg is not loaded" : "the FFmpeg build has no such encoder";
+    return AVERROR_ENCODER_NOT_FOUND;
+  }
+  AVCodecContext *ctx = api->avcodec_alloc_context3(codec);
+  if (ctx == nullptr) {
+    *error = "out of memory";
+    return AVERROR(ENOMEM);
+  }
+  ctx->width = 1920;
+  ctx->height = 1080;
+  ctx->time_base = AVRational{1, 1000000}; // avcodec_open2 refuses an encoder without one
+  ctx->framerate = AVRational{60, 1};
+  ctx->pix_fmt = AV_PIX_FMT_NV12; // in all three encoders' pixel-format lists
+  ctx->bit_rate = 8'000'000;
+  ctx->max_b_frames = 0;
+  ctx->thread_count = 1;
+  const int r = api->avcodec_open2(ctx, codec, nullptr);
+  if (r < 0) {
+    *error = api->ErrorText(r);
+  }
+  api->avcodec_free_context(&ctx);
+  return r;
+}
+#endif
+
 im_status FfmpegEncoder::EncodeFail(int err, const char *what) noexcept {
   if (device_ != nullptr && device_->Removed()) {
     return abi::Failf(IM_ERR_ENCODER_LOST, abi::token::kDeviceRemoved, "encode: %s: the device was removed", what);
@@ -542,6 +573,12 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
   }
   last_pts_ = pts;
   frame->pts = pts;
+  if (params_.kind == IM_ENC_MF_HW || params_.kind == IM_ENC_MF_SW) {
+    // One nominal frame interval in time_base (1/1e6): h264_mf passes it on as the sample's duration, which is 0
+    // otherwise. MF only: AMF would take it as the surface duration for rate control, and the real spacing can be
+    // wider.
+    frame->duration = static_cast<int64_t>(1'000'000 / params_.fps);
+  }
   pts_ring_[pts_next_] = PtsTs{pts, in.ts_ns};
   pts_next_ = (pts_next_ + 1) % kPtsRing;
   au_ts_ns_ = 0;
@@ -613,6 +650,37 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
   return IM_OK;
 }
 
+im_status FfmpegEncoder::Drain(std::vector<std::vector<uint8_t>> *aus) noexcept {
+  if (ctx_ == nullptr) {
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: the encoder is closed");
+  }
+  // h264_mf: the NULL frame sends MFT_MESSAGE_COMMAND_DRAIN, and from then on every receive calls ProcessOutput
+  // until the MFT says MF_E_TRANSFORM_NEED_MORE_INPUT (then AVERROR_EOF).
+  if (const int r = api_->avcodec_send_frame(ctx_, nullptr); r < 0 && r != AVERROR_EOF) {
+    return EncodeFail(r, "avcodec_send_frame(NULL)");
+  }
+  for (;;) {
+    const int r = api_->avcodec_receive_packet(ctx_, pkt_);
+    if (r == AVERROR_EOF) {
+      return IM_OK;
+    }
+    if (r == AVERROR(EAGAIN)) {
+      // Not EOF after a drain request: an encoder that won't finish draining (libavcodec says it can't happen).
+      return abi::Fail(IM_ERR_INTERNAL, {}, "encode: avcodec_receive_packet said EAGAIN while draining");
+    }
+    if (r < 0) {
+      return EncodeFail(r, "avcodec_receive_packet(drain)");
+    }
+    try {
+      aus->emplace_back(pkt_->data, pkt_->data + pkt_->size);
+    } catch (...) {
+      api_->av_packet_unref(pkt_);
+      return abi::Fail(IM_ERR_INTERNAL, {}, "encode: out of memory draining");
+    }
+    api_->av_packet_unref(pkt_);
+  }
+}
+
 im_status FfmpegEncoder::SetBitrate(uint32_t bps) noexcept {
   if (ctx_ == nullptr) {
     return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: the encoder is closed");
@@ -664,6 +732,17 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &, session::EncodedAu
 im_status FfmpegEncoder::SetBitrate(uint32_t) noexcept {
   return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: built without FFmpeg");
 }
+
+im_status FfmpegEncoder::Drain(std::vector<std::vector<uint8_t>> *) noexcept {
+  return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: built without FFmpeg");
+}
+
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+int ffmpeg::OpenEncoderWithoutDeviceForTest(uint32_t, std::string *error) noexcept {
+  *error = "built without FFmpeg";
+  return -1;
+}
+#endif
 
 #endif // IM_ENCODE_FFMPEG
 

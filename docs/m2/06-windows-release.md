@@ -255,7 +255,7 @@ by hand against FFmpeg's release key):
 
 ```json
 {
-  "revision": 1,
+  "revision": 2,
   "ffmpeg":          {"version": "9.0.2", "url": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz", "sha256": "<pin>"},
   "nvCodecHeaders":  {"tag": "n12.1.14.1", "url": "https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n12.1.14.1.tar.gz", "sha256": "<pin>"},
   "amfHeaders":      {"tag": "v1.5.3", "url": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.3/AMF-headers-v1.5.3.tar.gz", "sha256": "<pin>"},
@@ -263,9 +263,10 @@ by hand against FFmpeg's release key):
 }
 ```
 
-- `revision` starts at 1 and goes up whenever the build changes without a version change (a flag, the script), once
-  that revision has been published: `deps-ffmpeg-9.0.2-r1` had not been published when WF1 changed `build.sh`, so
-  `revision` stayed 1 (`inputsSha256` moved with the script, and the first publish writes the lock for it).
+- `revision` starts at 1 and goes up whenever the build changes without a version change (a flag, the script, a
+  patch), once that revision has been published: `deps-ffmpeg-9.0.2-r1` had not been published when WF1 changed
+  `build.sh`, so `revision` stayed 1 (`inputsSha256` moved with the script, and the first publish writes the lock for
+  it). r1 was published on 2026-11-03, so the libvpl patch below is revision 2 (`deps-ffmpeg-9.0.2-r2`).
 - Each entry stays on one line, as above: `build.sh` reads `pins.json` line by line (no JSON parser in MSYS2's bash),
   and `tools/desktoppkg`'s check of `pins.json` enforces it. `native/ffmpeg/.gitattributes` (`eol=lf`) and
   `tools/desktoppkg/testdata/.gitattributes` (`-text`) keep the bytes that `inputsSha256` hashes the same in every
@@ -274,10 +275,25 @@ by hand against FFmpeg's release key):
   newer); n13.x would raise the floor to the 570 series. 04 decides the floor; n12.1.14.1 is the default here. The
   exact driver numbers are checked against NVIDIA's SDK notes when the pin is set.
 - AMF headers and libvpl are MIT; nv-codec-headers are MIT (headers only, the driver library is loaded at run time).
-- **libvpl's dispatcher and the DLL search** (04 §13.3 layer 4, §17): if 04's marker test (`dll_search_test`'s
-  vendor-runtime and libvpl part, slice E7, README WA44) shows the dispatcher loading a runtime from the current
-  directory or `PATH`, this pin moves to a libvpl version or build option whose dispatcher doesn't, in a tool PR
-  (a new `revision`) before WA44 merges.
+- **libvpl's dispatcher and the DLL search** (04 §13.3 layer 4, §17): 04's marker test (`dll_search_test`'s
+  vendor-runtime and libvpl part in `ffmpeg_load_test`, slice E7, README WA44) showed r1's dispatcher (libvpl v2.17.0
+  unchanged) loading `libmfx64-gen.dll` and `libmfxhw64.dll` planted in a `PATH` entry. libvpl v2.17.0 has no build
+  option for its Windows search: `MFXLoad` takes runtimes from `ONEVPL_PRIORITY_PATH`,
+  the driver store, the executable's folder, every `PATH` entry, `ONEVPL_SEARCH_PATH`, the legacy driver store, the
+  dispatcher's registry keys and `%windir%\system32`/`syswow64`, and loads each one by full path, past the process's
+  DLL search settings. So the owner decided (2026-11-04) to patch it:
+  `native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch` removes the executable's folder, `PATH`,
+  `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` from that list on Windows and keeps the places Intel's drivers
+  install the runtimes (both driver stores, the registry keys, System32 and SysWOW64). The two variables go as well,
+  although the engine clears them (04 §13.3 layer 4): without them the dispatcher's search doesn't depend on the host
+  process (ffcheck, `isshoni-enginetest`, the test binaries) or on when it clears them. It guards against planted
+  files only: the kept search still reads `%windir%` and the HKCU dispatcher key. The patch's header gives the
+  details; `build.sh` applies it (§4.3 step 3). The libvpl pin stays v2.17.0: a pin bump has to carry the patch
+  forward (it must apply with no fuzz, or the build fails).
+- **Patches** are files under `native/ffmpeg/patches/`, unified diffs with a header saying why, applied to an
+  unpacked upstream source by `build.sh` (its `libvpl_patches`, in order; for now only libvpl has one). Each is an
+  input of `inputsSha256` and goes into the source archive (§4.5), and `tools/desktoppkg`'s tests fail when a file
+  there is not one of the inputs.
 
 `native/ffmpeg/lock.json` (outputs; written by the owner after a publishing run, §4.5):
 
@@ -285,7 +301,7 @@ by hand against FFmpeg's release key):
 {
   "revision": 1,
   "tag": "deps-ffmpeg-9.0.2-r1",
-  "inputsSha256": "<sha256 over pins.json, build.sh, ffcheck.c (§4.4)>",
+  "inputsSha256": "<sha256 over pins.json, build.sh, ffcheck.c and the patches (below)>",
   "assets": {
     "ffmpeg-9.0.2-r1-win-x64.zip": "<sha256>",
     "ffmpeg-9.0.2-r1-source.tar": "<sha256>"
@@ -302,13 +318,18 @@ by hand against FFmpeg's release key):
 
 `msvcToolset` is the `VCToolsVersion` folder; `msvcCompiler` and `msvcLinker` are the toolset build of §3 (WF1). The
 committed lock is `deps-ffmpeg-9.0.2-r1`'s, from the owner's publishing run of 2026-11-03 (§4.6, README §3 item 50).
+With the libvpl patch the inputs are revision 2's, so that lock is stale, and every consumer (`windows-native`'s
+"The FFmpeg lock is current" step first) fails by design until the owner publishes `deps-ffmpeg-9.0.2-r2` and commits
+the lock it prints.
 
 `avcodecMajor` and `avutilMajor` (integers; the numbers above are placeholders) are written by the publish run from
 `ffcheck`'s `avcodec_version() >> 16` and `avutil_version() >> 16` in `ffmpeg-config.json` (§4.4). 04's CMake reads
 them to compile in the runtime DLL names and the load-time version check (04 §9.2).
 
-`inputsSha256` is `sha256` of the three lines `"<sha256>  <path>\n"` for `native/ffmpeg/pins.json`,
-`native/ffmpeg/build.sh` and `native/ffmpeg/ffcheck.c`, in that order (`tools/desktoppkg ffmpeg-inputs` prints it).
+`inputsSha256` is `sha256` of the lines `"<sha256>  <path>\n"` for `native/ffmpeg/pins.json`,
+`native/ffmpeg/build.sh`, `native/ffmpeg/ffcheck.c` and then each patch in `build.sh`'s order (now
+`native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch`), in that order (`tools/desktoppkg ffmpeg-inputs` prints it;
+its `inputFiles` and `build.sh`'s `input_files` list the same files).
 Every consumer fails with "native/ffmpeg/lock.json is stale: run the FFmpeg workflow with publish and update the lock"
 when it differs from the current files, so a pin change can't merge without its build.
 
@@ -356,8 +377,8 @@ runners) inside the MSVC environment of §3, which `deploy/windows/msvc-env.ps1`
 workflow's step, on a PC `powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe
 native/ffmpeg/build.sh` from the repository root. `WORKDIR` defaults to the git-ignored `.deps/ffmpeg-build`. The
 script installs nothing and changes nothing outside `WORKDIR`: MSYS2's packages come from the workflow's
-`pacman -Sy --noconfirm --needed make pkgconf diffutils zip` (once by hand on a PC; their versions go into the build
-manifest). No third-party action. The same command rebuilds the DLLs from an unpacked source archive (§4.5).
+`pacman -Sy --noconfirm --needed make pkgconf diffutils zip patch` (once by hand on a PC; their versions go into the
+build manifest). No third-party action. The same command rebuilds the DLLs from an unpacked source archive (§4.5).
 
 1. **Preflight**: MSYS2's bash and the MSVC variables (`VCToolsInstallDir`, `VCToolsVersion`, `WindowsSDKVersion`)
    are required. MSVC's `Hostx64/x64` folder goes first on `PATH`, before `/usr/bin`, so MSYS2's coreutils `link.exe`
@@ -368,7 +389,9 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
    lock's and this build's toolset, compiler and linker.
 2. **Sources**: each `pins.json` tarball into `WORKDIR/src/`, downloaded with MSYS2's `curl` (3 retries) unless
    already there or in the source archive's `src/`, and checked against its SHA-256 either way.
-3. **libvpl**: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+3. **libvpl**: the patches of §4.1 (`libvpl-no-exe-dir-or-path.patch`), each with `patch -p1 --fuzz=0` after a
+   `--dry-run`; a patch that doesn't apply exactly (a hunk off, fuzz needed, already applied) fails the build. Then
+   `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DUSE_MSVC_STATIC_RUNTIME=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
    -DINSTALL_EXAMPLES=OFF`, build, install into `WORKDIR/prefix` (gives `vpl.lib` and `vpl.pc`). libvpl sets CMP0091
    inside `if(MSVC)` before `project()` defines `MSVC`, so without the policy default CMake ignores the runtime
@@ -383,9 +406,10 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
 6. **Checks** of §4.4, then the layout `ffmpeg-<ver>-r<rev>-win-x64/`: `bin/` (the two DLLs), `pdb/`, `lib/`
    (`avcodec.lib`, `avutil.lib` import libraries), `include/`, `licenses/{ffmpeg/COPYING.LGPLv2.1,ffmpeg/LICENSE.md,
    ffmpeg/README-LGPL.txt,libvpl/LICENSE,nv-codec-headers/LICENSE,amf/LICENSE.txt}`, `ffmpeg-config.json` (§4.4) and
-   `build-manifest.json` (every input's SHA-256, the toolset folder and the compiler and linker builds of §3, SDK and
-   MSYS2 package versions, the commit; `README-LGPL.txt` names the compiler build too). Neither
-   the AMF headers nor nv-codec-headers ship a license file, so `build.sh` writes `amf/LICENSE.txt` and
+   `build-manifest.json` (every input's SHA-256, the libvpl patches' under `inputs.libvpl.patches`, the toolset
+   folder and the compiler and linker builds of §3, SDK and MSYS2 package versions, the commit; `README-LGPL.txt`
+   names the compiler build too and says that libvpl's dispatcher is patched). Neither the AMF headers nor
+   nv-codec-headers ship a license file, so `build.sh` writes `amf/LICENSE.txt` and
    `nv-codec-headers/LICENSE` from the headers' own MIT notices: each distinct notice once, after the files that
    carry it.
 7. **Archives** in `WORKDIR/out/`: `ffmpeg-<ver>-r<rev>-win-x64.zip` (the layout folder at its top; names sorted, no
@@ -450,11 +474,12 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   prerelease) and the updater (§8.4) never see it. A ruleset makes `deps-*` tags undeletable and immutable (§14).
 - **The source archive** `ffmpeg-<ver>-r<rev>-source.tar` holds one top-level folder, `ffmpeg-<ver>-r<rev>-source/`,
   with: the four upstream tarballs exactly as downloaded (`src/`), `native/ffmpeg/{pins.json,build.sh,ffcheck.c,
-  README-LGPL.txt}`, `deploy/windows/{msvc-env.ps1,tools.json}` (so the archive alone rebuilds the DLLs, the relink
-  check of §9.1), `CONFIGURE.txt` (the configuration string `ffcheck` printed, the toolset folder with the compiler and
-  linker builds, the SDK, and how to build),
-  and `SHA256SUMS` of the tarballs. The zip likewise has one top-level folder, `ffmpeg-<ver>-r<rev>-win-x64/`. Every
-  isshoni release copies the source archive as `isshoni-desktop_<v>_ffmpeg-source.tar` (§11.1).
+  README-LGPL.txt}` and `native/ffmpeg/patches/` (the patches `build.sh` applies),
+  `deploy/windows/{msvc-env.ps1,tools.json}` (so the archive alone rebuilds the DLLs, the relink check of §9.1),
+  `CONFIGURE.txt` (the configuration string `ffcheck` printed, the toolset folder with the compiler and linker builds,
+  the SDK, and how to build), and `SHA256SUMS` of the tarballs. The zip likewise has one top-level folder,
+  `ffmpeg-<ver>-r<rev>-win-x64/`. Every isshoni release copies the source archive as
+  `isshoni-desktop_<v>_ffmpeg-source.tar` (§11.1).
 - **Consumers** (the `windows-native` job of both ci.yml and release.yml, `task ffmpeg:fetch`) download
   `https://github.com/MoonWX/isshoni/releases/download/<tag>/<asset>` and fail unless the SHA-256 matches
   `lock.json`; release.yml also runs `gh attestation verify <zip> --repo MoonWX/isshoni --signer-workflow

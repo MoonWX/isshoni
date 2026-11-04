@@ -130,7 +130,8 @@ struct Versions {
 Versions LoadedVersions();
 
 // Collects the FFmpeg log messages of the calling thread (any level FFmpeg reports at warning or above) while it
-// lives. One per thread at a time; nesting is not supported (the inner one wins).
+// lives. Captures nest: each one alive on the thread collects every message (an encoder open's own capture inside a
+// test's), and they must end in the reverse order they began (scoped objects).
 class LogCapture {
 public:
   LogCapture() noexcept;
@@ -155,6 +156,16 @@ private:
 // a renamed real DLL as "another major"); a major of 0 restores the build's. Only before the first successful Load.
 void SetExpectedVersionsForTest(uint32_t avutil_major, uint32_t avutil_minor, uint32_t avcodec_major,
                                 uint32_t avcodec_minor) noexcept;
+
+// ffmpeg_load_test (defined in ffmpeg_encoder.cpp, declared here because the tests build without FFmpeg's headers and
+// so must not include ffmpeg_encoder.h): avcodec_open2 of the kind's encoder at 1920x1080 NV12 in system memory, with
+// no hw_device_ctx or hw_frames_ctx, closed again at once. NVENC (nvcuda.dll, then nvEncodeAPI64.dll), AMF (amfrt64.dll
+// through an AV_HWDEVICE_TYPE_AMF device) and QSV (libvpl's MFXLoad and MFXEnumImplementations) load their runtime
+// inside avcodec_open2 before they need a device: NVENC and AMF through the same loaders as the engine's D3D11VA open,
+// QSV through the same libvpl dispatcher search (avcodec's copy in qsv.c rather than avutil's in hwcontext_qsv.c); this
+// reaches them on a device without video support, where the engine's open stops at av_hwdevice_ctx_init. FFmpeg must be
+// loaded. Returns the AVERROR (0 = it opened); *error is FFmpeg's text for it ("" when it opened).
+int OpenEncoderWithoutDeviceForTest(uint32_t kind, std::string *error) noexcept;
 #endif
 
 } // namespace im::encode::ffmpeg
