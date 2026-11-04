@@ -10,9 +10,14 @@
 // - MinimizeTracker: the supervisor polls IsIconic(window) every kMinimizePollNs for an identified window (§7.6) and
 //   sends SOURCE_MINIMIZED / SOURCE_RESTORED on each edge; WGC delivers no frames meanwhile, so viewers keep the last
 //   picture.
+// - SourceWatcher: both trackers as the supervisor runs them (README WF12): the newest content size the capture
+//   reported since the last pass, the settle deadline and the minimize poll's schedule; what the pass sends.
+// - ReinitForSize: whether a settled size changes a layer's output size (§7.7: only those layers re-init).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 #include "im/video/scale.h"
@@ -99,6 +104,69 @@ public:
 
 private:
   bool minimized_ = false;
+};
+
+// A size in one 64-bit word (width high, height low), for the atomics that carry a size between threads.
+constexpr uint64_t PackSize(video::Size s) noexcept { return (static_cast<uint64_t>(s.width) << 32) | s.height; }
+constexpr video::Size UnpackSize(uint64_t v) noexcept {
+  return video::Size{static_cast<uint32_t>(v >> 32), static_cast<uint32_t>(v & 0xFFFFFFFFu)};
+}
+
+// Whether a source of `settled` changes the output size of a layer with `bounds` whose encoder runs at `current`
+// (§7.7, §8.3): only then does the layer re-init (REINIT|KEYFRAME); otherwise the converter keeps fitting the content.
+inline bool ReinitForSize(video::Size settled, const video::LayerBounds &bounds, video::Size current) noexcept {
+  const video::OutputSize out = video::ComputeOutputSize(settled, bounds);
+  return out.size.width != 0 && out.size.height != 0 && !(out.size == current);
+}
+
+// The session supervisor's view of a running capture (§7.6, §7.7): one Poll per supervisor pass.
+class SourceWatcher {
+public:
+  static constexpr int64_t kNever = std::numeric_limits<int64_t>::max();
+
+  struct Step {
+    std::optional<video::Size> resized; // SOURCE_RESIZED {"width","height"} goes out now
+    std::optional<video::Size> settled; // the size the layers re-init for (ReinitForSize), stable for 1 s
+    MinimizeTracker::Change minimize = MinimizeTracker::Change::kNone; // SOURCE_MINIMIZED / SOURCE_RESTORED
+  };
+
+  // initial: the size the encoders were set up for (the pick's); watch_minimize: the capture has an identified window
+  // to poll (§7.6); now: the first poll is due at once.
+  SourceWatcher(video::Size initial, bool watch_minimize, int64_t now) noexcept
+      : resize_(initial), watch_minimize_(watch_minimize), next_poll_(now) {}
+
+  // One pass at now. reported: the newest content size the capture reported since the last pass (none: no change);
+  // iconic() is called only when a minimize poll is due (IsIconic on the window).
+  template <class Iconic> Step Poll(std::optional<video::Size> reported, int64_t now, Iconic &&iconic) {
+    Step s;
+    if (reported && resize_.Observe(*reported, now)) {
+      s.resized = *reported;
+    }
+    s.settled = resize_.Settle(now);
+    if (watch_minimize_ && now >= next_poll_) {
+      s.minimize = minimize_.Update(static_cast<bool>(iconic()));
+      next_poll_ = now + kMinimizePollNs;
+    }
+    return s;
+  }
+
+  // When Poll next has work of its own (a settle or a minimize poll); kNever when none.
+  int64_t NextDueNs() const noexcept {
+    int64_t at = watch_minimize_ ? next_poll_ : kNever;
+    if (const std::optional<int64_t> due = resize_.SettleDueNs()) {
+      at = std::min(at, *due);
+    }
+    return at;
+  }
+
+  bool minimized() const noexcept { return minimize_.minimized(); }
+  video::Size settled() const noexcept { return resize_.settled(); }
+
+private:
+  ResizeTracker resize_;
+  MinimizeTracker minimize_;
+  bool watch_minimize_ = false;
+  int64_t next_poll_ = 0;
 };
 
 } // namespace im::capture

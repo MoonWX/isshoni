@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "capture/picked_item.h"
+#include "capture/window_system_win.h"
 #include "capture/winrt_support.h"
 #include "gpu/device.h"
 #include "im/abi/status.h"
@@ -242,6 +243,8 @@ im_status WgcCapture::Start(const session::SourceSpec &source, gpu::FrameSlots &
     std::unique_ptr<WgcCapture> cap(new WgcCapture(impl));
     cap->borderless_ = borderless;
     cap->window_ = picked->identity.window;
+    cap->size_ =
+        video::Size{static_cast<uint32_t>(impl->pool_size.Width), static_cast<uint32_t>(impl->pool_size.Height)};
     log::Info("capture", "wgc started",
               {{"w", impl->pool_size.Width},
                {"h", impl->pool_size.Height},
@@ -276,6 +279,8 @@ im_status WgcCapture::Start(const session::SourceSpec &source, gpu::FrameSlots &
 WgcCapture::WgcCapture(std::shared_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 WgcCapture::~WgcCapture() { Stop(); }
+
+bool WgcCapture::minimized() const noexcept { return WindowMinimized(window_); }
 
 void WgcCapture::SetFps(uint32_t fps) noexcept {
   if (!impl_ || fps == 0) {

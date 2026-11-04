@@ -11,8 +11,6 @@ namespace {
 namespace meta = winrt::Windows::Foundation::Metadata;
 namespace access = winrt::Windows::Security::Authorization::AppCapabilityAccess;
 
-constexpr uint32_t kAccessWaitMs = 2000;
-
 unsigned long Hex(HRESULT hr) noexcept { return static_cast<unsigned long>(hr); }
 
 // BorderlessAllowed's answer: 0 not asked (or asked without an answer), 1 allowed, 2 denied for good.
@@ -82,9 +80,9 @@ AsyncWait::Result AsyncWait::Wait(uint32_t timeout_ms, HANDLE cancel) noexcept {
   }
 }
 
-bool BorderlessAllowed() noexcept {
+bool BorderlessAllowed(uint32_t wait_ms) noexcept {
   const int known = g_borderless.load(std::memory_order_acquire);
-  if (known != 0) {
+  if (known != 0 || wait_ms == 0) {
     return known == 1;
   }
   try {
@@ -95,9 +93,9 @@ bool BorderlessAllowed() noexcept {
     auto op = wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless);
     AsyncWait wait;
     wait.Attach(op);
-    if (wait.Wait(kAccessWaitMs, nullptr) != AsyncWait::Result::kCompleted) {
+    if (wait.Wait(wait_ms, nullptr) != AsyncWait::Result::kCompleted) {
       op.Cancel();
-      log::Info("capture", "borderless access: no answer", {{"wait_ms", kAccessWaitMs}});
+      log::Info("capture", "borderless access: no answer", {{"wait_ms", wait_ms}});
       return false;
     }
     if (op.Status() != winrt::Windows::Foundation::AsyncStatus::Completed) {

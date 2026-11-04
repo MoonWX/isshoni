@@ -7,6 +7,7 @@
 //   window_match.h       what a pick is: window identity, kind, self (§7.2 step 4, §7.6); plain C++, unit-tested
 //   window_system_win.h  the Win32 queries behind it
 //   picked_item.h        what a pick token holds (session::SourceSpec::item)
+//   capture_source.h     what a session sees of its capture, and which capture runs a source (README WF12)
 //   wgc_capture.h        WGC for one session into its frame slots (§7.3, §7.7, §7.8)
 //   source_watch.h       resize debounce and minimize edges for the session's supervisor (§7.6, §7.7)
 //   winrt_support.h      C++/WinRT, ApiInformation checks, borderless access, HRESULT mapping
@@ -38,10 +39,12 @@ void ReleaseSource(std::string_view id) noexcept;
 // im_shutdown: cancels an open pick, ends the picker thread and forgets every token.
 void Shutdown() noexcept;
 
-// The capture part of im_caps.os_flags, asked from Windows itself (for the probe, on the engine worker):
+// The capture part of im_caps.os_flags, asked from Windows itself (for the probe, on the engine worker, COM MTA):
 // IM_OS_WGC and IM_OS_WGC_PICKER (GraphicsCaptureSession::IsSupported()), IM_OS_WGC_CURSOR_TOGGLE,
 // IM_OS_WGC_MIN_INTERVAL and IM_OS_WGC_SECONDARY_WINDOWS (the properties are present), IM_OS_WGC_BORDERLESS
-// (IsBorderRequired present and GraphicsCaptureAccess allows borderless, §7.1).
-uint32_t OsFlags() noexcept;
+// (IsBorderRequired present and GraphicsCaptureAccess allows borderless, §7.1). borderless_wait_ms bounds the access
+// query (BorderlessAllowed); 0 asks nothing and uses the answer kept from an earlier query (a pick, a WGC start, a
+// full probe), as a quick probe must (< 100 ms).
+uint32_t OsFlags(uint32_t borderless_wait_ms) noexcept;
 
 } // namespace im::capture

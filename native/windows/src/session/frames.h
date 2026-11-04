@@ -12,6 +12,7 @@
 //   capture side   PublishPattern(frame k, capture time)   the supervisor's pattern timer: BeginWrite → TestPattern::
 //                                                          Render → Publish (or the time alone without a device)
 //                  slots()                                 README WA50's WGC callback and WA60's DD thread write here
+//                  PublishTime(capture time)               a capture without slots (test hooks, no device)
 //   video thread   Take()                                  the newest published frame (its capture time and the frames
 //                                                          skipped since the last Take, for the pacer); the reader's
 //                                                          slot keeps it as the last frame for refreshes and keyframes
@@ -74,6 +75,13 @@ public:
   im_status PublishPattern(const gpu::PatternFrame &f, int64_t capture_ts_ns) noexcept;
   // The slots a real capture writes (null without a device).
   gpu::FrameSlots *slots() noexcept { return slots_.get(); }
+  // A frame a capture without slots delivered at capture_ts_ns (the test hooks' fake capture in a session without a
+  // device, README WF12): its time only. No-op with a device (a capture there publishes into slots() itself).
+  void PublishTime(int64_t capture_ts_ns) noexcept {
+    if (device_ == nullptr) {
+      times_.Publish(capture_ts_ns);
+    }
+  }
 
   // ---- the video thread
   using Taken = TakenFrame;
