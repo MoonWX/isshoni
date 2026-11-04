@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -370,8 +371,8 @@ type Options struct {
 }
 
 // Engine is the Windows media engine, opened by Open: a media.Engine and 05's media.AudioController (audio.go), with
-// the Windows-only extras BuildInfo, Clock, SetOpenH264Path, ProtectWindow, SourceDetail and StartExtra, which 03
-// and the tools reach by type assertion (04 §12.2). It is safe for concurrent use. There is one per process: the
+// the Windows-only extras BuildInfo, Clock, SetOpenH264Path, ProtectWindow, SourceDetail, StartExtra and StartWith,
+// which 03 and the tools reach by type assertion (04 §12.2). It is safe for concurrent use. There is one per process: the
 // engine's state (im_init) is process-wide.
 type Engine struct {
 	c    caller
@@ -1067,21 +1068,67 @@ func (e *Engine) SourceDetail(id string) (SourceDetail, bool) {
 // Conformance check 9); the DLL's own limits (4 sessions, 1 with audio) are busy too. im_start takes up to 3 s and
 // can't be interrupted, so ctx is checked before it starts.
 func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
-	return e.start(ctx, "start", cfg, false)
+	return e.start(ctx, "start", cfg, false, nil)
+}
+
+// StartWith is Start with native-only options (WithGOP), for enginetest (the app never calls it): the same mapping
+// and the same one-session rule.
+func (e *Engine) StartWith(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error) {
+	return e.start(ctx, "start", cfg, false, opts)
 }
 
 // StartExtra is Start without the one-session check, for enginetest's sessions only (the app never calls it): up to
-// the DLL's 4 sessions, video only (audio is one per process), so a cfg with Audio is invalid (04 §12.2).
-func (e *Engine) StartExtra(ctx context.Context, cfg media.Config) (media.Session, error) {
+// the DLL's 4 sessions, video only (audio is one per process), so a cfg with Audio is invalid (04 §12.2). opts are
+// StartWith's.
+func (e *Engine) StartExtra(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error) {
 	const op = "start_extra"
 	if cfg.Audio != nil {
 		return nil, codeError(media.CodeInvalid, op, "", "StartExtra runs video-only sessions (Audio must be nil)")
 	}
-	return e.start(ctx, op, cfg, true)
+	return e.start(ctx, op, cfg, true, opts)
 }
 
-func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra bool) (media.Session, error) {
-	args, err := buildStart(op, cfg)
+// StartOption is a native-only setting of StartWith and StartExtra beyond media.Config, for enginetest. media.Config
+// itself has no GOP field (01 §5.1): the app's sessions always run the engine's defaults.
+type StartOption func(*startOptions)
+
+// startOptions is what the StartOption values of one start set.
+type startOptions struct {
+	gop map[string]time.Duration // by rid
+}
+
+// WithGOP sets the GOP of the layer whose RID is rid (im_layer_config.gop_ms, 04 §9.4): from 1 s to 10 s in whole
+// milliseconds (04 §6.4), or 0 for the engine's default (f 4 s, the others 2 s). A rid that isn't one of
+// Config.Layers, or a GOP outside the range, makes the start CodeInvalid without a DLL call. The last WithGOP of a
+// rid wins. enginetest's capture -bitrate-steps sets f's to 10 s (04 §14).
+func WithGOP(rid string, gop time.Duration) StartOption {
+	return func(o *startOptions) {
+		if o.gop == nil {
+			o.gop = map[string]time.Duration{}
+		}
+		o.gop[rid] = gop
+	}
+}
+
+// The GOP range of 04 §6.4 (im_layer_config.gop_ms; 0 is the engine's default).
+const (
+	minGOP = time.Second
+	maxGOP = 10 * time.Second
+)
+
+func collectOptions(opts []StartOption) startOptions {
+	var o startOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra bool,
+	opts []StartOption) (media.Session, error) {
+	args, err := buildStart(op, cfg, collectOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -1183,9 +1230,10 @@ func (a *startArgs) str(op, s string) (*byte, error) {
 // maxSourceID is im_source_info.id's size: an id fits with its NUL.
 const maxSourceID = 64
 
-// buildStart is media.Config → im_start_config (04 §12.2's table). Anything the engine would refuse that Go can tell
-// is CodeInvalid without a DLL call.
-func buildStart(op string, cfg media.Config) (*startArgs, error) {
+// buildStart is media.Config → im_start_config (04 §12.2's table), with the native-only options of StartWith and
+// StartExtra (WithGOP → layers[i].gop_ms). Anything the engine would refuse that Go can tell is CodeInvalid without a
+// DLL call.
+func buildStart(op string, cfg media.Config, o startOptions) (*startArgs, error) {
 	a := &startArgs{sc: &imStartConfig{structSize: uint32(unsafe.Sizeof(imStartConfig{}))}}
 	sc := a.sc
 	if cfg.Source == "" {
@@ -1246,6 +1294,9 @@ func buildStart(op string, cfg media.Config) (*startArgs, error) {
 		sc.layers[i] = lc
 	}
 	sc.layerCount = uint32(len(cfg.Layers))
+	if err := applyGOPs(op, cfg.Layers, o.gop, sc); err != nil {
+		return nil, err
+	}
 	if cfg.Audio != nil {
 		// 05's half of the table: the single mode mapping and the exclusions (audio.go).
 		ac, ex, err := buildAudioConfig(op, cfg.Audio)
@@ -1261,8 +1312,26 @@ func buildStart(op string, cfg media.Config) (*startArgs, error) {
 	return a, nil
 }
 
+// applyGOPs sets layers[i].gop_ms from WithGOP's values (by rid); a layer without one keeps 0, the engine's default.
+func applyGOPs(op string, layers []media.LayerConfig, gops map[string]time.Duration, sc *imStartConfig) error {
+	for _, rid := range slices.Sorted(maps.Keys(gops)) { // sorted: the same error for the same bad options
+		gop := gops[rid]
+		i := slices.IndexFunc(layers, func(l media.LayerConfig) bool { return l.RID == rid })
+		if i < 0 {
+			return codeError(media.CodeInvalid, op, "", "WithGOP(%q): no layer of Config.Layers has that rid", rid)
+		}
+		if gop != 0 && (gop < minGOP || gop > maxGOP || gop%time.Millisecond != 0) {
+			return codeError(media.CodeInvalid, op, "", "WithGOP(%q, %v): 0, or 1 s to 10 s in whole milliseconds "+
+				"(04 §6.4)", rid, gop)
+		}
+		sc.layers[i].gopMS = uint32(gop / time.Millisecond)
+	}
+	return nil
+}
+
 // layerConfig is one media.LayerConfig → im_layer_config: rid, max_pixels, fps = MaxFPS, bitrate_bps = Bitrate,
-// gop_ms 0 (the engine's defaults, 01 §5.1), IM_LAYER_INACTIVE when Inactive; width and height 0.
+// gop_ms 0 (the engine's defaults, 01 §5.1; StartWith's WithGOP sets it afterwards), IM_LAYER_INACTIVE when Inactive;
+// width and height 0.
 func layerConfig(op string, i int, l media.LayerConfig) (imLayerConfig, error) {
 	var lc imLayerConfig
 	if l.RID == "" || len(l.RID) >= len(lc.rid) || strings.IndexByte(l.RID, 0) >= 0 {

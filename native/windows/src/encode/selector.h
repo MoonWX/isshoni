@@ -10,7 +10,7 @@
 //   relies on them, and clears the mark. With no full probe yet it runs one as well (lazily, 04 §9.8), so a start
 //   never needs im_probe first.
 // - The session's encoder catalog (session/encoder.h's EncoderCatalog) lists these after the test hooks' entries
-//   (README WA44's wiring of session/encoder_catalog.cpp); the probe's IM_ENC_FAKE entry (test-hooks builds) is left
+//   (session/encoder_catalog.cpp, wired by README WF10); the probe's IM_ENC_FAKE entry (test-hooks builds) is left
 //   out here, since the catalog adds the fake itself.
 //
 // Threads: every function here is thread-safe; CatalogEntries may run a probe, so it is called on the engine worker

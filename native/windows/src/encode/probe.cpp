@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -25,6 +26,7 @@
 #include "encode/ffmpeg_encoder.h"
 #include "encode/selector.h"
 #include "engine/delayload.h"
+#include "engine/engine.h"
 #include "engine/os.h"
 #include "gpu/device.h"
 #include "im/abi/status.h"
@@ -50,6 +52,18 @@ constexpr uint32_t kBuild2004 = 19041;         // IsCursorCaptureEnabled, WDA_EX
 constexpr uint32_t kBuild24H2 = 26100;         // MinUpdateInterval, IncludeSecondaryWindows
 
 int64_t NowNs() noexcept { return engine::os::QpcNs(); }
+
+// The encoder budget against the worker's bound for a full im_probe (04 §5.3, §9.10): no open or check starts after
+// kEncoderBudgetMs, so the last one to start may still open for up to kSlowOpenUs (a longer open marks the encoder
+// slow_open) and encode its test IDR (a few frames, kMaxDelayFrames below); the rest (the close, the audio flags,
+// which only post to 05's watcher) is quick. All of it must fit in bound::kProbeFull, so im_probe never times out
+// for the encoders' sake. The usual probe (opens of tens of ms) ends well under 04 §9.10's 2 s.
+constexpr std::chrono::milliseconds kAfterLastOpen{250}; // the test IDR, the close, the audio flags
+static_assert(std::chrono::milliseconds(kEncoderBudgetMs) + std::chrono::microseconds(kSlowOpenUs) + kAfterLastOpen <=
+                  engine::bound::kProbeFull,
+              "a full probe's encoder budget must keep im_probe inside the worker's bound");
+static_assert(std::chrono::milliseconds(kEncoderBudgetMs) < std::chrono::milliseconds(2000),
+              "04 §9.10: the encoders start within the whole probe's 2 s");
 
 // ---------------------------------------------------------------------------------------------------- 1. the OS
 

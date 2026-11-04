@@ -620,6 +620,91 @@ func TestStartOneSessionAtATime(t *testing.T) {
 	}
 }
 
+// TestStartWithGOP: WithGOP reaches im_layer_config.gop_ms through StartWith and StartExtra (whole milliseconds, by
+// rid; the other layers keep 0, the engine's default), a Reconfigure keeps it, and a bad value or rid is CodeInvalid
+// without an im_start call.
+func TestStartWithGOP(t *testing.T) {
+	sf := newSessionFake(t)
+	e := openFake(t, sf.f, Options{})
+	ctx := context.Background()
+	s, err := e.StartWith(ctx, baseConfig(), WithGOP("f", 3*time.Second), WithGOP("f", 10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := sf.lastStart(t).cfg
+	if c.layers[0].gopMS != 10_000 || c.layers[1].gopMS != 0 {
+		t.Errorf("gop_ms f %d, q %d: want 10000 (the last WithGOP of f) and 0", c.layers[0].gopMS, c.layers[1].gopMS)
+	}
+	var updated imLayerConfig
+	var mu sync.Mutex
+	sf.f.set(procUpdateLayer, func(args []uintptr) (uintptr, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		updated = *fakePtr[imLayerConfig](args[2])
+		return fakeResult(imOK), ""
+	})
+	if err := s.Reconfigure(media.Reconfig{Layers: []media.LayerConfig{{RID: "f", MaxFPS: 30}}}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if cBytes(updated.rid[:]) != "f" || updated.fps != 30 || updated.gopMS != 10_000 {
+		t.Errorf("im_update_layer got %+v: f's GOP kept", updated)
+	}
+	mu.Unlock()
+	if err := s.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	// One at a time, as Start.
+	s, err = e.StartWith(ctx, baseConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.StartWith(ctx, baseConfig())
+	wantError(t, err, media.CodeBusy, "", "start")
+
+	noAudio := baseConfig()
+	noAudio.Audio = nil
+	x, err := e.StartExtra(ctx, noAudio, WithGOP("q", 1500*time.Millisecond), WithGOP("f", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c = sf.lastStart(t).cfg
+	if c.layers[0].gopMS != 0 || c.layers[1].gopMS != 1500 {
+		t.Errorf("StartExtra: gop_ms f %d, q %d: want 0 and 1500", c.layers[0].gopMS, c.layers[1].gopMS)
+	}
+	for _, ms := range []media.Session{s, x} {
+		if err := ms.Stop(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for name, opt := range map[string]StartOption{
+		"below 1 s":       WithGOP("f", 999*time.Millisecond),
+		"above 10 s":      WithGOP("f", 10*time.Second+time.Millisecond),
+		"negative":        WithGOP("f", -time.Second),
+		"part of a ms":    WithGOP("f", 2*time.Second+time.Microsecond),
+		"an unknown rid":  WithGOP("h", 2*time.Second),
+		"an empty rid":    WithGOP("", 2*time.Second),
+		"a removed layer": WithGOP("q", 2*time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseConfig()
+			if name == "a removed layer" {
+				cfg.Layers = cfg.Layers[:1]
+			}
+			calls := sf.f.count(procStart)
+			_, err := e.StartWith(ctx, cfg, opt)
+			wantError(t, err, media.CodeInvalid, "", "start")
+			cfg.Audio = nil
+			_, err = e.StartExtra(ctx, cfg, opt)
+			wantError(t, err, media.CodeInvalid, "", "start_extra")
+			if sf.f.count(procStart) != calls {
+				t.Error("im_start was called")
+			}
+		})
+	}
+}
+
 func TestStartContext(t *testing.T) {
 	sf := newSessionFake(t)
 	e := openFake(t, sf.f, Options{})

@@ -65,6 +65,7 @@
 #include "im/ring/signal.h"
 #include "im/video/scale.h"
 #include "isshoni_media.h"
+#include "session/au_times.h"
 #include "session/encoder.h"
 #include "session/frames.h"
 #include "session/pattern_grid.h"
@@ -85,6 +86,7 @@ inline constexpr int64_t kFlashEveryNs = 1'000'000'000;         // the test patt
 // pacer's own bump (§8.4) is 1 µs, and two AUs 1 µs apart share one RTP timestamp: the SFU and the viewer would take
 // a static IDR and the late new frame right after it for one frame, and the IDR would be lost.
 inline constexpr int64_t kMinAuSpacingNs = 11'112;
+static_assert(AuTimes::kMinSpacingNs == kMinAuSpacingNs, "an AU's own time keeps the same spacing");
 
 // The engine clock (QPC ns) as im::os::Clock, for the pump's stale rule (§6.2).
 class EngineClock final : public os::Clock {
@@ -167,7 +169,9 @@ private:
     bool ring_idr_asked = false; // RequireKeyframe was issued for a ring that waits for a keyframe
     uint32_t index = 0;          // the next access unit's index (the fake's Marker frame)
     int64_t next_flash = 0;      // the next flash instant (epoch_ns + k × 1 s)
-    int64_t last_ts = 0;         // the last encoded AU's capture_ts_ns (0: none yet)
+    int64_t last_ts = 0;         // the capture_ts_ns of the last frame the encoder took (0: none yet)
+    // Each AU's own frame (04 §9.2): an encoder that holds frames back emits an earlier frame's AU.
+    AuTimes au_times;
     uint32_t last_idr_bytes = 0;
     uint64_t keyframes = 0;
     uint64_t refreshes = 0;

@@ -15,7 +15,8 @@
 // (ENDED{IM_ERR_ENCODER_LOST} device_removed within 1 s, then a new session on a new device); exhausted candidates; a
 // consumer that stops for 2 s (RING_OVERFLOW, stale drops, an IDR when it resumes); im_stop with a blocked consumer;
 // the session limits; the pick-token rules; the test tone's Marker and its beeps on the video flashes; stats and
-// session info.
+// session info; the encoder catalog with the probe's real encoders after the fakes (README WF10: still no GPU path for
+// a test: session); each AU's own capture time from an encoder one frame behind (04 §9.2); a layer's gop_ms.
 //
 // The test links the engine's objects (im_engine), so it calls the test hooks directly.
 #include <gtest/gtest.h>
@@ -30,16 +31,19 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "im/audio/opus_packet.h"
 #include "im/h264/nal.h"
 #include "im/h264/sps.h"
 #include "isshoni_media.h"
+#include "session/encoder.h"
 #include "session/session.h"
 #include "session/sources.h"
 #include "testhooks/fake_encoder.h"
@@ -1158,6 +1162,185 @@ TEST_F(Session, NothingToCaptureIsInvalid) {
   im_session s = 1;
   EXPECT_EQ(im_start(&cfg, &s, nullptr), IM_ERR_INVALID_ARG);
   EXPECT_EQ(s, 0u);
+}
+
+// ------------------------------------------------------------------------ the catalog, AU times, GOP (README WF10)
+
+// The session's catalog lists the probe's encoders (encode::CatalogEntries) after the test hooks' fakes: real
+// entries that take pixels, the probe's own IM_ENC_FAKE left out. A test: session still runs IM_ENC_FAKE without a
+// GPU path, and a fallback kind a test asked for comes before the real encoder of that kind.
+TEST_F(Session, CatalogListsTheProbesEncodersAfterTheFakes) {
+  im::testhooks::Options o;
+  o.fallback_kinds = {IM_ENC_MF_SW};
+  im::testhooks::Configure(o);
+  im_session_info info{};
+  const im_session s = Start(Config("test:pattern", false), &info); // im_start runs the encoder probe on the worker
+  ASSERT_NE(s, 0u);
+  EXPECT_EQ(info.layers[0].encoder, IM_ENC_FAKE);
+  EXPECT_EQ(info.layers[1].encoder, IM_ENC_FAKE);
+  EXPECT_FALSE(im::session::GpuPathOf(s)) << "the first candidate takes nothing: no device, whatever follows it";
+  EXPECT_EQ(im_stop(s), IM_OK);
+
+  const std::vector<im::session::EncoderEntry> catalog = im::session::EncoderCatalog(); // the stored probe
+  ASSERT_GE(catalog.size(), 4u) << "fake, fake-backed mf-sw, then at least the probe's MF software and OpenH264";
+  EXPECT_EQ(catalog[0].info.kind, IM_ENC_FAKE);
+  EXPECT_EQ(catalog[0].input, im::session::FrameInput::kNone);
+  EXPECT_EQ(catalog[1].info.kind, IM_ENC_MF_SW);
+  EXPECT_EQ(catalog[1].input, im::session::FrameInput::kNone) << "the fallback kind is the fake's";
+  bool mf_sw = false;
+  bool openh264 = false;
+  for (std::size_t i = 2; i < catalog.size(); ++i) {
+    const im::session::EncoderEntry &e = catalog[i];
+    SCOPED_TRACE("entry " + std::to_string(i) + ", kind " + std::to_string(e.info.kind));
+    EXPECT_NE(e.info.kind, IM_ENC_FAKE) << "the probe's IM_ENC_FAKE is left out: the catalog adds the fake itself";
+    EXPECT_EQ(e.input, im::session::FrameInput::kNv12);
+    EXPECT_NE(e.open, nullptr);
+    mf_sw = mf_sw || e.info.kind == IM_ENC_MF_SW;
+    openh264 = openh264 || e.info.kind == IM_ENC_OPENH264;
+  }
+  EXPECT_TRUE(mf_sw) << "the probe always lists MF software";
+  EXPECT_TRUE(openh264) << "the probe always lists OpenH264";
+}
+
+// An encoder that holds one frame back (some MF and QSV configurations, 04 §9.2): each Encode hands back the access
+// unit of the frame before, which the test hooks' fake encodes from that frame's EncodeInput (so its Marker carries
+// that frame's capture time), with EncodedAu::capture_ts_ns set to it; the first Encode returns nothing.
+class FrameBehindEncoder final : public im::session::VideoEncoder {
+public:
+  explicit FrameBehindEncoder(std::unique_ptr<im::session::VideoEncoder> inner, uint32_t layer) noexcept
+      : inner_(std::move(inner)), layer_(layer) {}
+
+  static im_status Open(const im::session::EncoderParams &p, std::unique_ptr<im::session::VideoEncoder> *out) noexcept {
+    try {
+      std::unique_ptr<im::session::VideoEncoder> inner;
+      const im_status st = im::testhooks::FakeEncoderEntry(IM_ENC_FAKE).open(p, &inner);
+      if (st != IM_OK) {
+        return st;
+      }
+      *out = std::make_unique<FrameBehindEncoder>(std::move(inner), p.layer);
+      return IM_OK;
+    } catch (...) {
+      return IM_ERR_INTERNAL;
+    }
+  }
+
+  im_status Encode(const im::session::EncodeInput &in, im::session::EncodedAu *out) noexcept override {
+    *out = im::session::EncodedAu{};
+    if (layer_ == 0 && FirstF().load() == 0) {
+      FirstF().store(in.ts_ns); // the first frame f's encoder was given (f's one video thread writes it)
+    }
+    if (!held_) {
+      held_ = in;
+      return IM_OK; // held back
+    }
+    const im::session::EncodeInput prev = *held_;
+    held_ = in;
+    const im_status st = inner_->Encode(prev, out);
+    if (st == IM_OK && !out->data.empty()) {
+      out->capture_ts_ns = prev.ts_ns;
+    }
+    return st;
+  }
+
+  im_status SetBitrate(uint32_t bps) noexcept override { return inner_->SetBitrate(bps); }
+
+  // The capture time of the first frame given to a layer-0 FrameBehindEncoder (0 before one); the test resets it.
+  static std::atomic<int64_t> &FirstF() noexcept {
+    static std::atomic<int64_t> first{0};
+    return first;
+  }
+
+private:
+  std::unique_ptr<im::session::VideoEncoder> inner_;
+  uint32_t layer_ = 0;
+  std::optional<im::session::EncodeInput> held_;
+};
+
+// Clears the catalog prefix a test set, also when an assertion ends it early.
+struct PrefixGuard {
+  explicit PrefixGuard(std::vector<im::session::EncoderEntry> entries) {
+    im::session::SetCatalogPrefixForTest(std::move(entries));
+  }
+  ~PrefixGuard() { im::session::SetCatalogPrefixForTest({}); }
+  PrefixGuard(const PrefixGuard &) = delete;
+  PrefixGuard &operator=(const PrefixGuard &) = delete;
+};
+
+// 04 §9.2's pts → capture-time table, at the session: with an encoder one frame behind, every packet carries its own
+// frame's capture time (the Marker's CaptureNS, which the fake wrote from that frame), not the next frame's, and the
+// first IDR carries the first frame's time.
+TEST_F(Session, AnEncoderOneFrameBehindKeepsEachAccessUnitsOwnCaptureTime) {
+  im::session::EncoderEntry e = im::testhooks::FakeEncoderEntry(IM_ENC_FAKE);
+  e.open = &FrameBehindEncoder::Open;
+  e.input = im::session::FrameInput::kNone;
+  FrameBehindEncoder::FirstF().store(0);
+  const PrefixGuard guard({e}); // listed before the test hooks' own fake: a test: source picks it first
+  const im_session s = Start(Config("test:pattern", false));
+  ASSERT_NE(s, 0u);
+  const std::vector<Pkt> pkts = Pull(s, milliseconds(1500));
+  EXPECT_EQ(im_stop(s), IM_OK);
+
+  std::vector<uint32_t> video(2, 0);
+  std::vector<int64_t> last(2, 0);
+  std::optional<Pkt> first_f;
+  for (const Pkt &p : pkts) {
+    if (!p.video() || p.layer > 1) {
+      continue;
+    }
+    ++video[p.layer];
+    if (p.layer == 0 && !first_f) {
+      first_f = p;
+    }
+    const std::optional<im::audio::Marker> m = VideoMarker(p.data);
+    ASSERT_TRUE(m.has_value()) << "layer " << p.layer << ": no Marker";
+    EXPECT_EQ(p.ts - epoch_, m->capture_ns)
+        << "layer " << p.layer << ", AU of frame " << m->frame << ": the packet's capture time is its own frame's";
+    EXPECT_GT(p.ts, last[p.layer]) << "capture times increase per layer";
+    last[p.layer] = p.ts;
+  }
+  EXPECT_GE(video[0], 60u) << "f runs at about 60 fps";
+  EXPECT_GE(video[1], 15u) << "q runs at about 15 fps";
+  ASSERT_TRUE(first_f.has_value());
+  EXPECT_TRUE(first_f->key() && first_f->reinit()) << "flags " << first_f->flags;
+  EXPECT_NE(FrameBehindEncoder::FirstF().load(), 0);
+  EXPECT_EQ(first_f->ts, FrameBehindEncoder::FirstF().load()) << "the first IDR carries the first frame's time";
+}
+
+// im_layer_config.gop_ms reaches the layer (04 §9.4): f with 1000 ms gets a periodic IDR about every second on the
+// moving pattern, q with 10000 ms none after its first within 3.5 s (its default would be 2 s).
+TEST_F(Session, LayerGopFromTheStartConfig) {
+  im_start_config cfg = Config("test:pattern", false);
+  cfg.layers[0].gop_ms = 1000;
+  cfg.layers[1].gop_ms = 10000;
+  const im_session s = Start(cfg);
+  ASSERT_NE(s, 0u);
+  const std::vector<Pkt> pkts = Pull(s, milliseconds(3500));
+  EXPECT_EQ(im_stop(s), IM_OK);
+  std::vector<int64_t> f_keys;
+  uint32_t q_keys = 0;
+  uint32_t q_packets = 0;
+  for (const Pkt &p : pkts) {
+    if (!p.video()) {
+      continue;
+    }
+    if (p.layer == 0 && p.key()) {
+      f_keys.push_back(p.ts);
+    }
+    if (p.layer == 1) {
+      ++q_packets;
+      q_keys += p.key() ? 1 : 0;
+    }
+  }
+  ASSERT_GE(f_keys.size(), 3u) << "the first IDR and periodic ones about 1 s apart";
+  for (std::size_t i = 1; i < f_keys.size(); ++i) {
+    const int64_t gap_ms = (f_keys[i] - f_keys[i - 1]) / 1'000'000;
+    // The pacer forces the IDR on the first new frame once 1 s passed since the last one (04 §9.4): about a frame
+    // later in capture time, with room for a loaded runner.
+    EXPECT_GE(gap_ms, 900) << "keyframe " << i;
+    EXPECT_LE(gap_ms, 1250) << "keyframe " << i;
+  }
+  EXPECT_GE(q_packets, 30u);
+  EXPECT_EQ(q_keys, 1u) << "q's GOP is 10 s: only its first packet is a keyframe";
 }
 
 } // namespace

@@ -45,7 +45,6 @@ type runLog struct {
 	Recs      []rec
 	Actions   []action
 	Stats     *media.EngineStats // sampled just before Stop
-	GOPMS     int64              // f's GOP (the engine's default: 4000 ms; media.Config has no GOP field)
 	StepsBase int                // f's bitrate before the first -bitrate-steps step
 	Steps     []int              // -bitrate-steps' targets
 }
@@ -338,11 +337,9 @@ func reinitSchedule(base int, steps []action) []appliedStep {
 }
 
 // -bitrate-steps on layer f (04 §9.5, §14): for a live encoder, no KEYFRAME or REINIT from the first step until 2 s
-// after the last (a periodic GOP IDR, which carries no REINIT and comes a whole GOP after the previous keyframe, is
-// tolerated: media.Config can't set f's GOP to 10 s; a deviation from 04 §14 that report.json lists, see
-// gopDeviation), and the rate within ±25 % of each target over the 2 s after its
-// step; for a re-init encoder, exactly one REINIT|KEYFRAME per applied step (the deferred ones included) and the rate
-// within ±25 % over the 2 s after each REINIT.
+// after the last (capture runs f with a 10 s GOP, stepsGOP, so no periodic IDR falls in there either), and the rate
+// within ±25 % of each target over the 2 s after its step; for a re-init encoder, exactly one REINIT|KEYFRAME per
+// applied step (the deferred ones included) and the rate within ±25 % over the 2 s after each REINIT.
 func checkBitrateSteps(l *runLog) []string {
 	var steps []action
 	for _, a := range l.Actions {
@@ -384,15 +381,10 @@ func checkBitrateSteps(l *runLog) []string {
 	iv := interval(l.fps("f"))
 	if ev.LiveBitrate {
 		first, last := steps[0].AtNS, steps[len(steps)-1].AtNS+int64(stepWindow)
-		prevKey := int64(-1)
 		for _, r := range fs {
-			if r.Key {
-				periodic := !r.Reinit && prevKey >= 0 && l.GOPMS > 0 && r.CaptureNS-prevKey >= l.GOPMS*1e6-iv
-				if r.CaptureNS >= first && r.CaptureNS <= last && !periodic {
-					fails = append(fails, fmt.Sprintf("-bitrate-steps: live encoder: a KEYFRAME (reinit %t) at %v, between the steps",
-						r.Reinit, time.Duration(r.CaptureNS).Round(time.Millisecond)))
-				}
-				prevKey = r.CaptureNS
+			if r.Key && r.CaptureNS >= first && r.CaptureNS <= last {
+				fails = append(fails, fmt.Sprintf("-bitrate-steps: live encoder: a KEYFRAME (reinit %t) at %v, between the steps",
+					r.Reinit, time.Duration(r.CaptureNS).Round(time.Millisecond)))
 			}
 		}
 		for i, s := range steps {
