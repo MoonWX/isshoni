@@ -1,0 +1,566 @@
+# Audiotest: the audio half of M2's exit criterion and the hardware run, on the owner's PC through an ephemeral
+# self-hosted runner (docs/m2/06-windows-release.md §10.4, §10.5, "06" below; docs/m2/05-windows-audio.md §18.8,
+# "05" below). The runner and its setup are deploy/windows/runner/README.md.
+#
+#   Run workflow (os, suite, release_run_id) ─┬─► environment ──────────────────────────────┐
+#                                             ├─► build (no release_run_id) ──┐              │
+#                                             └─► fetch (release_run_id) ─────┴─► artifact ──┴─► run (owner approves)
+#
+# - environment (ubuntu-24.04, contents: read): fails unless the environment "audiotest" exists with the repository
+#   owner as a required reviewer. GitHub creates an unprotected environment when a workflow names one that does not
+#   exist (README §8), and run would then start without the owner's approval.
+# - build (windows-2025, contents: read, no secrets), only without release_run_id: the release DLL as ci.yml's
+#   windows-native builds it (the FFmpeg lock check, the locked FFmpeg zip, msvc-env.ps1, vcpkg at the baseline, the
+#   win-x64-release preset with CI's stamping 0.0.0-ci.<run>, dll-check), isshoni-audiotest.exe (GOOS=windows, no
+#   cgo) and the `task native:dist` zip (isshoni-native-tools.zip, for the hwcheck suite). Uploads them flat, with
+#   the FFmpeg DLLs and a native-manifest.json, as this run's artifact audiotest-tools. Suite release refuses to
+#   build: a report of a rebuild is diagnostic only and never gates a release (06 §10.4, 05 §18.10).
+# - fetch (ubuntu-24.04, actions: read; the only job with that permission and the only one that uses a token), only
+#   with release_run_id: checks that the run is a release.yml run of this repository, downloads its artifact
+#   isshoni-exit-tools (06 §11.1), fails unless isshoni-media.dll's and the FFmpeg DLLs' SHA-256s equal
+#   native-manifest.json's, and re-uploads the folder as this run's audiotest-tools. The token that reads another
+#   run stays on GitHub's runner.
+# - run (self-hosted: windows, x64, isshoni-audio and the os input's label; environment audiotest, so it waits for
+#   the owner's approval): no checkout, no secrets, no token (permissions: {}); downloads audiotest-tools and checks
+#   the DLL against native-manifest.json again. Suites release and full: `isshoni-audiotest.exe probe`, then
+#   `run -gate -out <report>` (full: `run -gate -long`); 05's exit codes (0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 a
+#   required case SKIPPED, 4 setup error), any non-zero code fails the job; the redacted report is uploaded and the
+#   summary gets a table (scenario, verdict, excluded-tone level). Suite hwcheck: unpacks isshoni-native-tools.zip
+#   (with release_run_id: the exit tools, which carry hwcheck.ps1 flat) and runs hwcheck.ps1 (04 §14, §18.4), then
+#   uploads its result bundle, which carries no machine names or paths.
+#
+# Never a pull_request, pull_request_target or workflow_run trigger (tools/repocheck's TestAudiotestWorkflow reads
+# this file): a public repository's pull request must never reach the owner's PC. The repository and actor guard is
+# defence in depth, since a fork can't add a trigger to this file without a merge; the runner being offline except
+# during a test session is the real protection (06 §10.5).
+#
+# GitHub offers "Run workflow" only for a workflow file on the default branch: the first dispatch waits until this
+# file reaches main, then "Use workflow from" picks the ref that build rebuilds.
+#
+# Rules for every workflow (M1 06 §8.1): a read-only token by default, with jobs raising their own permissions;
+# third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
+# timeout-minutes on every job. The run job's PowerShell is Windows PowerShell 5.1 (shell: powershell), which every
+# Windows has; PowerShell 7 need not be installed on the owner's PC.
+
+name: Audiotest
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: The Windows install the self-hosted runner is registered on (its label win11 or win10)
+        type: choice
+        options: [win11, win10]
+        required: true
+      suite:
+        description: >-
+          release: run -gate on the exit tools of release_run_id (gates a release); full: run -gate -long (adds the
+          30-minute soak); hwcheck: the hardware run (hwcheck.ps1)
+        type: choice
+        options: [release, full, hwcheck]
+        default: release
+      release_run_id:
+        description: >-
+          The release.yml run whose isshoni-exit-tools artifact runs (required for suite release). Empty: build
+          rebuilds from this ref (diagnostic, never gates a release)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.os }}
+  cancel-in-progress: false
+
+env:
+  # CI's stamping (06 §10.4: "build rebuilds from the dispatched ref with CI's stamping").
+  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}
+
+jobs:
+  environment:
+    # The audiotest environment must exist with the owner as a required reviewer before run names it (README §8, 06
+    # §14 item 5). Reads the repository's environment settings, which a public repository shows to anyone.
+    if: github.repository == 'MoonWX/isshoni' && github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: The environment audiotest needs the owner's approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if ! env_json=$(gh api "repos/$REPO/environments/audiotest" 2>/dev/null); then
+            echo "::error::the environment audiotest does not exist: create it with $OWNER as required reviewer first (deploy/windows/runner/README.md)"
+            exit 1
+          fi
+          reviewers=$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | .reviewer.login // empty] | join(" ")' <<<"$env_json")
+          case " $reviewers " in
+            *" $OWNER "*) echo "audiotest: required reviewers: $reviewers" ;;
+            *)
+              echo "::error::the environment audiotest has no required reviewer $OWNER (reviewers: '${reviewers}'): add the protection rule first (deploy/windows/runner/README.md)"
+              exit 1
+              ;;
+          esac
+
+  build:
+    # The DLL as windows-native builds it (ci.yml), isshoni-audiotest.exe and the native:dist zip, from the dispatched
+    # ref. Skipped with release_run_id (fetch brings the release's own build instead).
+    if: inputs.release_run_id == ''
+    runs-on: windows-2025
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_DISABLE_METRICS: '1'
+    steps:
+      - name: Suite release needs release_run_id
+        env:
+          SUITE: ${{ inputs.suite }}
+        run: |
+          if ($env:SUITE -eq 'release') {
+            '::error::suite release runs the isshoni-exit-tools of a release.yml run: set release_run_id (a rebuild is diagnostic, use suite full)'
+            exit 1
+          }
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # the cache below is this workflow's own
+
+      - name: Find Go's module and build caches
+        id: goenv
+        run: |
+          "modcache=$(go env GOMODCACHE)" >> $env:GITHUB_OUTPUT
+          "gocache=$(go env GOCACHE)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.goenv.outputs.modcache }}
+            ${{ steps.goenv.outputs.gocache }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-audiotest-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-audiotest-
+
+      - name: Task's pin from .tool-versions
+        id: pins
+        run: |
+          $line = Get-Content -LiteralPath .tool-versions | Where-Object { $_ -match '^task\s+v?(\S+)' } | Select-Object -First 1
+          if (-not $line) { throw ".tool-versions needs a task pin, a line 'task <version>' (06 §7.1)" }
+          $null = $line -match '^task\s+v?(\S+)'
+          "task=$($Matches[1])" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ steps.pins.outputs.task }}
+
+      - name: The FFmpeg lock is current
+        run: |
+          go -C tools run ./desktoppkg ffmpeg-inputs -check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: FFmpeg from the lock
+        id: ffmpeg
+        run: |
+          # 06 §5.1: the locked zip from its deps release, its SHA-256 against lock.json, unpacked and checked.
+          $out = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          $root = [string](go -C tools run ./desktoppkg ffmpeg-fetch -out $out | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $root = $root.Trim()
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'include/libavcodec/avcodec.h'))) {
+            throw "ffmpeg-fetch printed '$root', which has no include/libavcodec/avcodec.h"
+          }
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "bin=$(Join-Path $root 'bin')" >> $env:GITHUB_OUTPUT
+
+      - name: MSVC environment
+        id: msvc
+        run: ./deploy/windows/msvc-env.ps1
+
+      - name: vcpkg at native/vcpkg.json's baseline
+        id: vcpkg
+        run: |
+          $baseline = [string](Get-Content -Raw -LiteralPath native/vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw 'native/vcpkg.json has no 40-hex builtin-baseline' }
+          $root = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git init -q $root
+          git -C $root remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $root fetch -q --depth 1 origin $baseline
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of vcpkg $baseline failed" }
+          git -C $root checkout -q --detach FETCH_HEAD
+          & (Join-Path $root 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg.bat failed (exit code $LASTEXITCODE)" }
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" >> $env:GITHUB_ENV
+          "cache=$cache" >> $env:GITHUB_OUTPUT
+
+      - name: Cache vcpkg's binary packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.vcpkg.outputs.cache }}
+          key: vcpkg-x64-windows-static-${{ steps.msvc.outputs.toolset }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json', 'native/triplets/*.cmake') }}
+
+      - name: CMake and Ninja
+        id: tools
+        run: |
+          # The ones on PATH, else the copies vcpkg pins and verifies by SHA-512 (as windows-native).
+          foreach ($tool in 'cmake', 'ninja') {
+            $cmd = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cmd) {
+              $path = $cmd.Source
+            } else {
+              $path = [string](& (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') fetch $tool | Select-Object -Last 1)
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $path.Trim())) { throw "vcpkg fetch $tool failed" }
+              $path = $path.Trim()
+            }
+            "${tool}: $path ($(& $path --version | Select-Object -First 1))"
+            "$tool=$path" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: win-x64-release - configure and build
+        id: release
+        working-directory: native
+        env:
+          CMAKE: ${{ steps.tools.outputs.cmake }}
+          NINJA: ${{ steps.tools.outputs.ninja }}
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+        run: |
+          # 06 §5.3's four-part version for CI's 0.0.0-ci.<run>: 0.0.0.<run mod 65000>, as windows-native.
+          if ($env:VERSION -notmatch '^(\d+)\.(\d+)\.(\d+)-ci\.(\d+)$') { throw "ISSHONI_VERSION '$env:VERSION' is not X.Y.Z-ci.N" }
+          $winver = '{0}.{1}.{2}.{3}' -f $Matches[1], $Matches[2], $Matches[3], ([int64]$Matches[4] % 65000)
+          $commit = [string](git rev-parse --short=7 HEAD)
+          & $env:CMAKE --preset win-x64-release "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_VERSION=$env:VERSION" `
+            "-DIM_WINVER=$winver" "-DIM_COMMIT=$($commit.Trim())" "-DIM_FFMPEG_ROOT=$env:FFMPEG_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:CMAKE --build --preset win-x64-release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "winver=$winver" >> $env:GITHUB_OUTPUT
+
+      - name: dll-check (the release DLL and the FFmpeg DLLs)
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          WINVER: ${{ steps.release.outputs.winver }}
+          FFMPEG_BIN: ${{ steps.ffmpeg.outputs.bin }}
+        run: |
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'native/build/win-x64-release/windows/isshoni-media.dll'
+          go -C tools run ./desktoppkg dll-check -dll $dll -version $env:VERSION -winver $env:WINVER -ffmpeg $env:FFMPEG_BIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: isshoni-audiotest.exe
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'audiotest-tools'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $commit = ([string](git rev-parse HEAD)).Trim()
+          $pkg = 'github.com/MoonWX/isshoni/internal/version'
+          $ldflags = "-s -w -X main.harnessVersion=$env:VERSION -X $pkg.version=$env:VERSION -X $pkg.commit=$commit"
+          go build -trimpath -ldflags $ldflags -o (Join-Path $out 'isshoni-audiotest.exe') ./cmd/isshoni-audiotest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: task native:dist (isshoni-native-tools.zip, for the hwcheck suite)
+        env:
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'audiotest-tools/isshoni-native-tools.zip'
+          task native:dist "FFMPEG_ROOT=$env:FFMPEG_ROOT" "OUT=$out"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The audiotest-tools folder
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          WINVER: ${{ steps.release.outputs.winver }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+        run: |
+          # Flat, like isshoni-exit-tools (06 §11.1): the release DLL with the FFmpeg DLLs next to it (the engine
+          # loads them from its own folder, 04 §9.2), and a native-manifest.json with the SHA-256s run checks.
+          $out = Join-Path $env:RUNNER_TEMP 'audiotest-tools'
+          Copy-Item -LiteralPath 'native/build/win-x64-release/windows/isshoni-media.dll' -Destination $out
+          $lock = Get-Content -Raw -LiteralPath native/ffmpeg/lock.json | ConvertFrom-Json
+          $ffmpegDlls = [ordered]@{}
+          foreach ($name in @("avcodec-$($lock.avcodecMajor).dll", "avutil-$($lock.avutilMajor).dll")) {
+            $file = Join-Path $env:FFMPEG_ROOT "bin/$name"
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            if ($sha -ne [string]$lock.dlls.$name) { throw "$name is not the one lock.json names" }
+            $ffmpegDlls[$name] = $sha
+            Copy-Item -LiteralPath $file -Destination $out
+          }
+          $header = Get-Content -Raw -LiteralPath native/include/isshoni_media.h
+          if ($header -notmatch '#define IM_ABI_MAJOR\s+(\d+)u') { throw 'no IM_ABI_MAJOR in the header' }
+          $major = [int]$Matches[1]
+          if ($header -notmatch '#define IM_ABI_MINOR\s+(\d+)u') { throw 'no IM_ABI_MINOR in the header' }
+          $minor = [int]$Matches[1]
+          $dllSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out 'isshoni-media.dll')).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            winver  = $env:WINVER
+            dll     = [ordered]@{ name = 'isshoni-media.dll'; sha256 = $dllSha; abi = ($major * 65536 + $minor) }
+            ffmpeg  = [ordered]@{ tag = [string]$lock.tag; dlls = $ffmpegDlls }
+          }
+          $json = $manifest | ConvertTo-Json -Depth 6
+          [IO.File]::WriteAllText((Join-Path $out 'native-manifest.json'), $json + "`n", (New-Object Text.UTF8Encoding($false)))
+          $commit = ([string](git rev-parse HEAD)).Trim()
+          $readme = "audiotest.yml run $env:GITHUB_RUN_ID: a rebuild of $commit ($env:VERSION). Diagnostic only, never a release gate.`n"
+          [IO.File]::WriteAllText((Join-Path $out 'README.txt'), $readme, (New-Object Text.UTF8Encoding($false)))
+          $json
+          Get-ChildItem -LiteralPath $out -File | Sort-Object Name | ForEach-Object { $_.Name }
+
+      - name: Upload audiotest-tools
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audiotest-tools
+          path: ${{ runner.temp }}/audiotest-tools/
+          retention-days: 1
+          if-no-files-found: error
+
+  fetch:
+    # The release candidate's own build (06 §11.1's isshoni-exit-tools), the only form that counts for the exit gate
+    # and the release tiers (05 §18.10). The only job with actions: read.
+    if: >-
+      inputs.release_run_id != '' && github.repository == 'MoonWX/isshoni' &&
+      github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - name: The run is a release.yml run of this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -euo pipefail
+          if ! [[ $RUN_ID =~ ^[0-9]{1,20}$ ]]; then
+            echo "::error::release_run_id '$RUN_ID' is not a run id (the number in the run's URL)"
+            exit 1
+          fi
+          run_json=$(gh api "repos/$REPO/actions/runs/$RUN_ID")
+          path=$(jq -r '.path' <<<"$run_json")
+          head_repo=$(jq -r '.head_repository.full_name' <<<"$run_json")
+          if [ "$path" != .github/workflows/release.yml ] || [ "$head_repo" != "$REPO" ]; then
+            echo "::error::run $RUN_ID is $path of $head_repo, not .github/workflows/release.yml of $REPO"
+            exit 1
+          fi
+          jq -r '"release.yml run \(.id): \(.head_branch) at \(.head_sha), \(.event), \(.status) \(.conclusion // "")"' <<<"$run_json"
+
+      - name: Download its isshoni-exit-tools
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: isshoni-exit-tools
+          path: ${{ runner.temp }}/audiotest-tools
+          run-id: ${{ inputs.release_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: The DLLs match native-manifest.json
+        working-directory: ${{ runner.temp }}/audiotest-tools
+        run: |
+          set -euo pipefail
+          manifest=native-manifest.json
+          [ -f "$manifest" ] || { echo "::error::isshoni-exit-tools has no native-manifest.json"; exit 1; }
+          [ -f isshoni-audiotest.exe ] || { echo "::error::isshoni-exit-tools has no isshoni-audiotest.exe"; exit 1; }
+          check() {
+            local file=$1 want=$2 got
+            [ -f "$file" ] || { echo "::error::isshoni-exit-tools has no $file"; exit 1; }
+            got=$(sha256sum "$file" | cut -d' ' -f1)
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::$file has SHA-256 $got, native-manifest.json has '$want'"
+              exit 1
+            fi
+            echo "$file: $got"
+          }
+          check "$(jq -r '.dll.name' "$manifest")" "$(jq -r '.dll.sha256 // empty' "$manifest")"
+          while IFS=$'\t' read -r name sha; do
+            check "$name" "$sha"
+          done < <(jq -r '.ffmpeg.dlls | to_entries[] | "\(.key)\t\(.value)"' "$manifest")
+          ls -l
+
+      - name: Upload audiotest-tools
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audiotest-tools
+          path: ${{ runner.temp }}/audiotest-tools/
+          retention-days: 1
+          if-no-files-found: error
+
+  run:
+    # On the owner's PC. No checkout, no secrets and no token: everything it runs comes from this run's artifact,
+    # and its permissions are none.
+    needs: [environment, build, fetch] # build or fetch is skipped, hence the result test
+    if: >-
+      !cancelled() && github.repository == 'MoonWX/isshoni' && github.actor == github.repository_owner &&
+      needs.environment.result == 'success' &&
+      (needs.build.result == 'success' || needs.fetch.result == 'success')
+    runs-on: [self-hosted, windows, x64, isshoni-audio, "${{ inputs.os }}"]
+    environment: audiotest # required reviewer: the owner, so every run waits for the owner's approval (05 §18.8)
+    # 06 §10.4's 30 minutes, and 75 for suite full: its 30-minute soak (case 23) comes on top of the ~15-minute gate.
+    timeout-minutes: ${{ inputs.suite == 'full' && 75 || 30 }}
+    permissions: {}
+    defaults:
+      run:
+        shell: powershell
+    env:
+      SUITE: ${{ inputs.suite }}
+      TARGET_OS: ${{ inputs.os }}
+    steps:
+      - name: Download audiotest-tools
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: audiotest-tools
+          path: ${{ runner.temp }}/audiotest/tools
+
+      - name: The DLL matches native-manifest.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'audiotest\tools'
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $tools 'native-manifest.json') | ConvertFrom-Json
+          $dll = Join-Path $tools ([string]$manifest.dll.name)
+          $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash.ToLowerInvariant()
+          if ($got -ne [string]$manifest.dll.sha256) {
+            throw "isshoni-media.dll has SHA-256 $got, native-manifest.json has $($manifest.dll.sha256)"
+          }
+          "isshoni-media.dll $($manifest.version): $got"
+          $readme = Join-Path $tools 'README.txt'
+          if (Test-Path -LiteralPath $readme) { Get-Content -LiteralPath $readme }
+
+      - name: isshoni-audiotest (suite ${{ inputs.suite }})
+        if: inputs.suite != 'hwcheck'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 3.0
+          $tools = Join-Path $env:RUNNER_TEMP 'audiotest\tools'
+          $out = Join-Path $env:RUNNER_TEMP 'audiotest\report'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = Join-Path $tools 'isshoni-audiotest.exe'
+          Set-Location -LiteralPath $tools
+
+          # Native programs run with ErrorActionPreference Continue (their stderr is no error); exit codes decide.
+          $ErrorActionPreference = 'Continue'
+          & $exe probe
+          if ($LASTEXITCODE -ne 0) { throw "isshoni-audiotest probe failed (exit code $LASTEXITCODE)" }
+
+          # 06 section 10.4: release -> run -gate, full -> run -gate -long; -out names the report's folder.
+          $runArgs = @('run', '-gate')
+          if ($env:SUITE -eq 'full') { $runArgs += '-long' }
+          $runArgs += @('-out', $out)
+          & $exe @runArgs
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+
+          # The summary table: scenario, verdict, excluded-tone level (the loudest tone a case expected absent).
+          $report = Get-ChildItem -LiteralPath $out -Filter 'audiotest-*.json' -File |
+            Where-Object { $_.Name -notlike '*-unredacted.json' } | Sort-Object LastWriteTime | Select-Object -Last 1
+          $lines = @("### Audiotest: $env:TARGET_OS, suite $env:SUITE", '')
+          $inconclusive = @()
+          if ($report) {
+            $r = Get-Content -Raw -LiteralPath $report.FullName | ConvertFrom-Json
+            $lines += "isshoni-audiotest $($r.harness), DLL $($r.dll.version), $($r.os.product) $($r.os.build).$($r.os.ubr)"
+            $lines += ''
+            $lines += '| Scenario | Verdict | Excluded-tone level |'
+            $lines += '|---|---|---|'
+            foreach ($c in @($r.cases)) {
+              $absent = @(@($c.checks) | Where-Object { $_ -and $_.expect -eq 'absent' })
+              $level = '-'
+              if ($absent.Count -gt 0) {
+                $max = ($absent | Measure-Object -Property levelDb -Maximum).Maximum
+                $level = ([double]$max).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + ' dB'
+              }
+              $verdict = [string]$c.result
+              if (-not $c.required) { $verdict += ' (not required)' }
+              if ($c.result -eq 'INCONCLUSIVE') { $inconclusive += [string]$c.name }
+              $lines += "| $($c.name) | $verdict | $level |"
+            }
+            $s = $r.summary
+            $lines += ''
+            $lines += "PASS $($s.pass), FAIL $($s.fail), INCONCLUSIVE $($s.inconclusive), SKIP $($s.skip), INFO $($s.info); exit code $code"
+          } else {
+            $lines += "No report in the output folder (exit code $code)."
+          }
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding($false)))
+
+          switch ($code) {
+            0 { 'every required case PASS' }
+            1 { '::error::a case FAILed (exit code 1)' }
+            2 { "::error::INCONCLUSIVE ($($inconclusive -join ', ')): re-run with -case <id>" }
+            3 { '::error::a required case was SKIPPED: the gate is incomplete (exit code 3)' }
+            4 { '::error::setup error (exit code 4)' }
+            default { "::error::isshoni-audiotest run exited with $code" }
+          }
+          exit $code
+
+      - name: Upload the report
+        if: always() && inputs.suite != 'hwcheck'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audiotest-report-${{ inputs.os }}-${{ inputs.suite }}
+          path: ${{ runner.temp }}/audiotest/report/audiotest-*.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: hwcheck.ps1
+        if: inputs.suite == 'hwcheck'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 3.0
+          $tools = Join-Path $env:RUNNER_TEMP 'audiotest\tools'
+          $hw = Join-Path $env:RUNNER_TEMP 'audiotest\hw'
+          $bundle = Join-Path $env:RUNNER_TEMP 'audiotest\hwcheck'
+          New-Item -ItemType Directory -Force -Path $hw, $bundle | Out-Null
+          # build's artifact carries the native:dist zip; the exit tools (fetch) carry hwcheck.ps1 and the tools flat.
+          $zip = Join-Path $tools 'isshoni-native-tools.zip'
+          if (Test-Path -LiteralPath $zip) {
+            Expand-Archive -LiteralPath $zip -DestinationPath $hw -Force
+          } else {
+            Copy-Item -Path (Join-Path $tools '*') -Destination $hw -Recurse
+          }
+          $script = Join-Path $hw 'hwcheck.ps1'
+          if (-not (Test-Path -LiteralPath $script)) { throw 'the tools have no hwcheck.ps1 (README WA76 adds it to native:dist)' }
+
+          # The result bundle lands in the current folder; hwcheck.ps1 keeps machine names and paths out of it (04 section 14).
+          Set-Location -LiteralPath $bundle
+          $start = Get-Date
+          $ErrorActionPreference = 'Continue'
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          # A bundle hwcheck.ps1 wrote next to itself instead counts too.
+          Get-ChildItem -LiteralPath $hw -Filter '*.zip' -File |
+            Where-Object { $_.Name -ne 'isshoni-native-tools.zip' -and $_.LastWriteTime -ge $start } |
+            ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $bundle }
+          $files = @(Get-ChildItem -LiteralPath $bundle -Filter '*.zip' -File)
+          $lines = @("### hwcheck: $env:TARGET_OS", '', "hwcheck.ps1 exit code $code", '')
+          foreach ($f in $files) { $lines += "- $($f.Name) ($($f.Length) bytes)" }
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding($false)))
+          if ($files.Count -eq 0) { throw "hwcheck.ps1 left no result bundle (exit code $code)" }
+          if ($code -ne 0) { "::error::hwcheck.ps1 exited with $code"; exit $code }
+
+      - name: Upload the hwcheck bundle
+        if: always() && inputs.suite == 'hwcheck'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hwcheck-${{ inputs.os }}
+          path: ${{ runner.temp }}/audiotest/hwcheck/*.zip
+          retention-days: 90
+          if-no-files-found: error
