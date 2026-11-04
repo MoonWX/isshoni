@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +59,19 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+// DllMajor reads N from "<prefix>-N.dll" (avutil-61.dll); false when the name has another shape. std::from_chars,
+// not sscanf, which MSVC's /WX build refuses (C4996).
+bool DllMajor(std::string_view name, std::string_view prefix, unsigned *major) {
+  if (name.size() <= prefix.size() + 5 || name.substr(0, prefix.size()) != prefix || name[prefix.size()] != '-' ||
+      name.substr(name.size() - 4) != ".dll") {
+    return false;
+  }
+  const char *first = name.data() + prefix.size() + 1;
+  const char *last = name.data() + name.size() - 4;
+  const auto [end, ec] = std::from_chars(first, last, *major);
+  return ec == std::errc() && end == last;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -267,8 +281,8 @@ TEST(FfmpegLoad, AnotherMajorOrAnOlderMinorIsVersion) {
   ASSERT_FALSE(avutil.empty()) << "built without FFmpeg's headers (IM_FFMPEG_ROOT)";
   unsigned avutil_major = 0;
   unsigned avcodec_major = 0;
-  ASSERT_EQ(std::sscanf(avutil.c_str(), "avutil-%u.dll", &avutil_major), 1);
-  ASSERT_EQ(std::sscanf(avcodec.c_str(), "avcodec-%u.dll", &avcodec_major), 1);
+  ASSERT_TRUE(DllMajor(avutil, "avutil", &avutil_major)) << avutil;
+  ASSERT_TRUE(DllMajor(avcodec, "avcodec", &avcodec_major)) << avcodec;
   struct Reset {
     ~Reset() { im::encode::ffmpeg::SetExpectedVersionsForTest(0, 0, 0, 0); }
   } reset;
@@ -362,8 +376,8 @@ TEST(FfmpegLoad, PinnedBuildLoadsAndProbes) {
   const im::encode::ffmpeg::Versions v = im::encode::ffmpeg::LoadedVersions();
   unsigned avutil_major = 0;
   unsigned avcodec_major = 0;
-  ASSERT_EQ(std::sscanf(im::encode::ffmpeg::AvutilDllName().c_str(), "avutil-%u.dll", &avutil_major), 1);
-  ASSERT_EQ(std::sscanf(im::encode::ffmpeg::AvcodecDllName().c_str(), "avcodec-%u.dll", &avcodec_major), 1);
+  ASSERT_TRUE(DllMajor(im::encode::ffmpeg::AvutilDllName(), "avutil", &avutil_major));
+  ASSERT_TRUE(DllMajor(im::encode::ffmpeg::AvcodecDllName(), "avcodec", &avcodec_major));
   EXPECT_EQ(v.avutil.rfind(std::to_string(avutil_major) + ".", 0), 0u) << v.avutil;
   EXPECT_EQ(v.avcodec.rfind(std::to_string(avcodec_major) + ".", 0), 0u) << v.avcodec;
   EXPECT_EQ(v.license.rfind("LGPL", 0), 0u) << "an LGPL build, never GPL: " << v.license;
