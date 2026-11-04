@@ -77,10 +77,13 @@ private:
   std::shared_ptr<winrt::handle> event_;
 };
 
+inline constexpr uint32_t kBorderlessWaitMs = 2000; // the picker and WGC's start (im_start ≤ 3 s)
+
 // Whether borderless capture is allowed (04 §7.1): GraphicsCaptureSession has IsBorderRequired and
 // GraphicsCaptureAccess::RequestAccessAsync(Borderless) returns Allowed. Asked once per process (an Allowed or a final
-// denial is kept; a query that failed or timed out is asked again next time), waiting at most 2 s, with
-// AsyncWait (so the picker's STA may call it). Never throws.
-bool BorderlessAllowed() noexcept;
+// denial is kept; a query that failed or timed out is asked again next time), waiting at most wait_ms, with
+// AsyncWait (so the picker's STA may call it); wait_ms 0 asks nothing and gives the kept answer (false while there is
+// none: a quick probe's < 100 ms, README WF12). Never throws.
+bool BorderlessAllowed(uint32_t wait_ms = kBorderlessWaitMs) noexcept;
 
 } // namespace im::capture

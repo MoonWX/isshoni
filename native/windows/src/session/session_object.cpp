@@ -80,6 +80,42 @@ void Session::Opener::Wait(uint32_t ms) { std::this_thread::sleep_for(std::chron
 
 Session::Session() : events_(&signal_), pump_(&events_, &signal_, &clock_) {}
 
+// ------------------------------------------------------------------------------------------- the capture's sink
+
+void Session::Sink::OnFrame(int64_t capture_ts_ns) noexcept {
+  if (s_->capture_stopped_.load(std::memory_order_acquire)) {
+    return; // the session ended: nothing more is counted or encoded
+  }
+  s_->frames_->PublishTime(capture_ts_ns); // a capture without slots (test hooks); with slots it published the frame
+  s_->frames_captured_.fetch_add(1, std::memory_order_relaxed);
+  s_->video_waiter_.Wake();
+}
+
+void Session::Sink::OnResized(video::Size content) noexcept {
+  s_->reported_size_.store(capture::PackSize(content), std::memory_order_relaxed);
+  s_->resize_reported_.store(true, std::memory_order_release);
+  s_->supervisor_waiter_.Wake();
+}
+
+void Session::Sink::OnClosed() noexcept {
+  s_->source_closed_.store(true, std::memory_order_release);
+  s_->supervisor_waiter_.Wake();
+}
+
+void Session::Sink::OnFailed(im_status status, std::string_view detail) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(s_->failure_mu_);
+    if (s_->failure_status_ == IM_OK) {
+      s_->failure_status_ = status;
+      s_->failure_detail_.assign(detail);
+    }
+  } catch (...) {
+    // No detail: the supervisor still ends the session (IM_ERR_INTERNAL when no status was kept).
+  }
+  s_->capture_failed_.store(true, std::memory_order_release);
+  s_->supervisor_waiter_.Wake();
+}
+
 Session::~Session() {
   // Stop ran (the area calls it before it lets go), or Start failed before any thread ran.
   for (Thread *t : {&video_thread_, &supervisor_thread_, &tone_thread_}) {
@@ -117,6 +153,7 @@ im_status Session::Start(const api::StartRequest &req, const SourceSpec *source,
   if (source != nullptr) {
     source_ = *source;
   }
+  src_size_ = video::Size{source_.width, source_.height};
   info_.struct_size = sizeof(im_session_info);
   info_.epoch_ns = epoch_;
   info_.layer_count = layer_count_;
@@ -244,7 +281,43 @@ im_status Session::StartVideo(const im_start_config &cfg) {
   pacer_.emplace(epoch_, std::span<const pace::LayerConfig>(pcfg.data(), layer_count_));
   PublishStats(epoch_); // im_get_stats names the encoders from the start; the video thread refreshes it
 
-  info_.flags |= IM_SESS_NO_OS_INDICATOR; // the test pattern: no OS border; WGC borderless and DD set it too (§7)
+  if (const im_status st = StartCapture(cfg); st != IM_OK) {
+    return st;
+  }
+  // §7.1: no OS border for the test pattern, and for a capture only when it runs borderless (WGC that Windows let
+  // drop the border; README WA60's DD always).
+  if (!capture_ || capture_->borderless()) {
+    info_.flags |= IM_SESS_NO_OS_INDICATOR;
+  }
+  return IM_OK;
+}
+
+im_status Session::StartCapture(const im_start_config &cfg) {
+  if (!capture::Captures(source_)) {
+    return IM_OK; // the supervisor's test pattern
+  }
+  capture::CaptureOptions o;
+  o.hide_cursor = (cfg.flags & IM_START_HIDE_CURSOR) != 0; // §7.8: drawn unless asked
+  o.keep_border = (cfg.flags & IM_START_KEEP_BORDER) != 0;
+  o.fps = layers_[0].fps; // §7.3: MinUpdateInterval from layer 0's fps
+  if (const im_status st = capture::StartSourceCapture(source_, frames_->slots(), o, &sink_, &capture_); st != IM_OK) {
+    return st;
+  }
+  // The source may have changed size between the pick and the start: the frames carry the new size, so it is a resize
+  // like any other (SOURCE_RESIZED at once, the re-init once it is stable).
+  const video::Size at = capture_->size();
+  if (at.width != 0 && at.height != 0 && !(at == src_size_)) {
+    reported_size_.store(capture::PackSize(at), std::memory_order_relaxed);
+    resize_reported_.store(true, std::memory_order_release);
+  }
+  watcher_.emplace(src_size_, capture_->window() != 0, epoch_);
+  log::Info("session", "capture started",
+            {{"borderless", capture_->borderless()},
+             {"window", capture_->window() != 0},
+             {"w", at.width},
+             {"h", at.height},
+             {"fps", o.fps},
+             {"cursor", !o.hide_cursor}});
   return IM_OK;
 }
 
@@ -255,6 +328,9 @@ im_status Session::StartFrames() {
   // candidate takes nothing (the test hooks' IM_ENC_FAKE on a test: source, which the catalog lists
   // before the probe's real encoders) gets no device: it stays off WARP like a session of fakes only (frames.h), and
   // a later candidate that takes pixels fails to open in it (open_failed), so the fallback moves on.
+  // A source whose capture writes into slots (a WGC pick, README WF12) keeps the GPU path all the same: on the first
+  // candidate that takes pixels, or on the default adapter when none does (an IM_ENC_FAKE session under test hooks).
+  const bool need_slots = capture::NeedsSlots(source_);
   const EncoderEntry *pixels = nullptr;
   for (const encpolicy::Candidate &c : candidates_) {
     if (c.probe_index >= catalog_.size()) {
@@ -262,11 +338,15 @@ im_status Session::StartFrames() {
     }
     if (catalog_[c.probe_index].input == FrameInput::kNv12) {
       pixels = &catalog_[c.probe_index];
+      break;
     }
-    break;
+    if (!need_slots) {
+      break; // only the first candidate decides
+    }
   }
-  if (pixels != nullptr) {
-    if (const im_status st = gpu::Device::Create(pixels->device, &gpu_); st != IM_OK) {
+  if (pixels != nullptr || need_slots) {
+    const gpu::DeviceRequest request = pixels != nullptr ? pixels->device : gpu::DeviceRequest{};
+    if (const im_status st = gpu::Device::Create(request, &gpu_); st != IM_OK) {
       return st;
     }
   }
@@ -634,6 +714,7 @@ void Session::VideoLoop() noexcept {
         }
         CountCaptured(now);
         ApplyCommands(now);
+        ApplySourceSize();
         ApplyRingRequests();
         if (!pacer_->paused() && !paused_.load(std::memory_order_acquire)) {
           // While paused the slots keep the frozen frame (§8.5): new frames wait in them, the newest is taken on
@@ -725,8 +806,8 @@ void Session::Apply(const Command &c, int64_t now) {
       L.max_pixels = cfg.max_pixels;
       L.box_width = cfg.width;
       L.box_height = cfg.height;
-      const video::OutputSize out = video::ComputeOutputSize(
-          video::Size{source_.width, source_.height}, video::LayerBounds{L.max_pixels, L.box_width, L.box_height});
+      const video::OutputSize out =
+          video::ComputeOutputSize(src_size_, video::LayerBounds{L.max_pixels, L.box_width, L.box_height});
       if (!(out.size == L.out.size)) {
         reasons |= encpolicy::reinit::kSize; // no re-init when the output size stays (§7.7)
       }
@@ -774,6 +855,27 @@ void Session::Apply(const Command &c, int64_t now) {
   }
 }
 
+void Session::ApplySourceSize() {
+  if (!settle_pending_.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+  const video::Size size = capture::UnpackSize(settled_size_.load(std::memory_order_acquire));
+  if (size.width == 0 || size.height == 0) {
+    return;
+  }
+  src_size_ = size;
+  uint32_t reinit = 0;
+  for (uint32_t l = 0; l < layer_count_; ++l) {
+    Layer &L = layers_[l];
+    // §7.7: only a layer whose output size changes re-inits (REINIT|KEYFRAME); the others keep fitting the content.
+    if (capture::ReinitForSize(size, video::LayerBounds{L.max_pixels, L.box_width, L.box_height}, L.out.size)) {
+      L.planner->Request(encpolicy::reinit::kSize);
+      reinit |= 1u << l;
+    }
+  }
+  log::Info("session", "source size settled", {{"w", size.width}, {"h", size.height}, {"reinit_layers", reinit}});
+}
+
 void Session::CountCaptured(int64_t now) noexcept {
   const uint64_t captured = frames_captured_.load(std::memory_order_relaxed);
   // The capture side wakes this thread for every frame, so the arrivals are recorded within a wake-up; more than the
@@ -817,8 +919,7 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
   if (c.probe_index >= catalog_.size() || catalog_[c.probe_index].open == nullptr) {
     return abi::Fail(IM_ERR_NO_ENCODER, abi::token::kOpenFailed, "session: the candidate has no encoder");
   }
-  L.out = video::ComputeOutputSize(video::Size{source_.width, source_.height},
-                                   video::LayerBounds{L.max_pixels, L.box_width, L.box_height});
+  L.out = video::ComputeOutputSize(src_size_, video::LayerBounds{L.max_pixels, L.box_width, L.box_height});
   EncoderParams p;
   p.layer = layer;
   p.rid = L.rid[0];
@@ -844,7 +945,7 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
   if (st == IM_OK && input == FrameInput::kNv12) {
     // The layer's converter drops the old encoder's targets and follows a new output size or frame rate (a re-init,
     // §7.7, §9.5).
-    st = frames_->Configure(layer, L.out, L.fps);
+    st = frames_->Configure(layer, L.out, L.fps, src_size_);
     if (st != IM_OK) {
       enc.reset();
     }
@@ -928,6 +1029,9 @@ void Session::Reinit(uint32_t layer, const encpolicy::ReinitAction &a, int64_t n
   }
   if ((a.reasons & encpolicy::reinit::kFps) != 0) {
     pacer_->SetFps(layer, L.fps, now);
+    if (layer == 0 && capture_) {
+      capture_->SetFps(L.fps); // §7.3: MinUpdateInterval follows layer 0's fps
+    }
   }
   pacer_->Reopen(layer, now);
   ++L.reinits;
@@ -1189,7 +1293,9 @@ bool Session::PublishPattern(const PatternGrid &grid, uint64_t k) {
 
 void Session::SupervisorLoop() noexcept {
   const uintptr_t token = engine::os::EnterThread("isshoni supervisor", engine::os::ThreadClass::kNormal);
-  const bool pattern = has_video_ && source_.capture_path == IM_CAPTURE_TEST && source_.pattern != Pattern::kNone;
+  // A source a capture area captures delivers its own frames (the sink); the others get the test pattern.
+  const bool pattern =
+      has_video_ && !capture_ && source_.capture_path == IM_CAPTURE_TEST && source_.pattern != Pattern::kNone;
   const PatternGrid grid{epoch_, source_.pattern_hz, source_.pattern_late_ns};
   uint64_t next_k = 0; // the next pattern frame
   bool pattern_done = !pattern;
@@ -1211,8 +1317,10 @@ void Session::SupervisorLoop() noexcept {
         pattern_done = true; // a static screen: the initial frame only
       }
     }
+    int64_t capture_due = kNever;
+    api::Guard("session capture", [&] { capture_due = SuperviseCapture(now); });
     api::Guard("session supervisor", [&] { SuperviseEvents(now); });
-    int64_t deadline = now + kSupervisorPollNs;
+    int64_t deadline = std::min(now + kSupervisorPollNs, capture_due);
     if (!pattern_done) {
       deadline = std::min(deadline, grid.DueNs(next_k));
     }
@@ -1267,6 +1375,73 @@ void Session::SuperviseEvents(int64_t now) {
   if (const uint64_t lost = events_.TakeDropped(); lost != 0) {
     log::Warn("session", "events dropped", {{"dropped", lost}});
   }
+}
+
+int64_t Session::SuperviseCapture(int64_t now) {
+  if (!capture_ || !watcher_ || capture_halted_) {
+    return kNever;
+  }
+  if (!ended_.load(std::memory_order_acquire)) {
+    if (source_closed_.load(std::memory_order_acquire)) {
+      // §7.3, §7.7: the window was closed or the monitor removed.
+      End(IM_ERR_SOURCE_GONE, "source_gone", "the shared window was closed or the screen was disconnected");
+    } else if (capture_failed_.load(std::memory_order_acquire)) {
+      im_status st = IM_ERR_INTERNAL;
+      std::string detail;
+      {
+        std::lock_guard<std::mutex> lock(failure_mu_);
+        if (failure_status_ != IM_OK) {
+          st = failure_status_;
+        }
+        detail = failure_detail_;
+      }
+      log::Warn("session", "capture failed", {{"status", st}, {"detail", detail}});
+      if (st == IM_ERR_ENCODER_LOST || DeviceLost()) {
+        EndDeviceRemoved("capture"); // §8.1, §9.8
+      } else if (st == IM_ERR_SOURCE_GONE) {
+        End(IM_ERR_SOURCE_GONE, "source_gone", detail);
+      } else if (st == IM_ERR_PERMISSION_DENIED) {
+        End(IM_ERR_PERMISSION_DENIED, "permission_denied", detail);
+      } else {
+        End(IM_ERR_INTERNAL, "internal", detail);
+      }
+    }
+  }
+  if (ended_.load(std::memory_order_acquire)) {
+    // Nothing is captured once the session ended (the privacy-relevant part); im_stop frees the rest. This is not one
+    // of the capture's threads, so its Stop may wait for a callback in flight.
+    capture_->Stop();
+    capture_halted_ = true;
+    log::Info("session", "capture stopped", {{"why", "ended"}});
+    return kNever;
+  }
+
+  std::optional<video::Size> reported;
+  if (resize_reported_.exchange(false, std::memory_order_acq_rel)) {
+    reported = capture::UnpackSize(reported_size_.load(std::memory_order_relaxed));
+  }
+  const capture::SourceWatcher::Step step = watcher_->Poll(reported, now, [&] { return capture_->minimized(); });
+  if (step.resized) {
+    // §5.6: SOURCE_RESIZED when the change is first seen; the re-init follows once the size is stable for 1 s.
+    const video::Size sz = *step.resized;
+    const std::string doc = EventJson([&](json::Writer &w) {
+      w.Key("width").Uint(sz.width);
+      w.Key("height").Uint(sz.height);
+    });
+    events_.Push(IM_EVENT_SOURCE_RESIZED, IM_OK, IM_NO_LAYER, now, doc);
+    log::Info("session", "source resized", {{"w", sz.width}, {"h", sz.height}});
+  }
+  if (step.settled) {
+    settled_size_.store(capture::PackSize(*step.settled), std::memory_order_release);
+    settle_pending_.store(true, std::memory_order_release);
+    video_waiter_.Wake();
+  }
+  if (step.minimize != capture::MinimizeTracker::Change::kNone) {
+    const bool minimized = step.minimize == capture::MinimizeTracker::Change::kMinimized;
+    events_.Push(minimized ? IM_EVENT_SOURCE_MINIMIZED : IM_EVENT_SOURCE_RESTORED, IM_OK, IM_NO_LAYER, now, "{}");
+    log::Info("session", minimized ? "source minimized" : "source restored");
+  }
+  return watcher_->NextDueNs();
 }
 
 // ---------------------------------------------------------------------------------------------- the test tone
@@ -1352,7 +1527,11 @@ void Session::Stop() noexcept {
     return;
   }
   const int64_t deadline = QpcNs() + kStopBoundNs;
-  // Capture first (the privacy-relevant part, within one frame interval), then the consumer, then the mixer.
+  // Capture first (the privacy-relevant part, within one frame interval), then the consumer, then the mixer. Once
+  // the capture's Stop returns it copies no frame and calls no sink; its slots and the device go in ReleaseVideo.
+  if (capture_) {
+    capture_->Stop();
+  }
   capture_stopped_.store(true, std::memory_order_release);
   pump_.Stop(); // a blocked im_next_packet returns IM_ENDED within one wake-up
   if (mixer_) {
@@ -1382,8 +1561,10 @@ void Session::ReleaseVideo() noexcept {
     L.enc.reset(); // the encoders go first: they hold the device (FFmpeg's hardware device wraps it, §9.2)
   }
   if (!gone(supervisor_thread_)) {
-    return; // an abandoned supervisor may still draw the test pattern into the slots
+    return; // an abandoned supervisor may still draw the test pattern into the slots, or poll the capture
   }
+  capture_.reset(); // stopped by Stop already; it holds the session's device through its frame pool
+  log::Debug("session", "video released");
   frames_.reset();
   gpu_.reset();
 }

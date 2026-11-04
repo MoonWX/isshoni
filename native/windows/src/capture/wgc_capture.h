@@ -31,6 +31,7 @@
 #include <memory>
 #include <string_view>
 
+#include "capture/capture_source.h"
 #include "capture/source_watch.h"
 #include "capture/window_match.h"
 #include "gpu/slots.h"
@@ -40,29 +41,8 @@
 
 namespace im::capture {
 
-// What a running capture tells its session. Called on WGC's threads, one call at a time, never after Stop returns:
-// each call must return quickly without blocking on the session (set a flag, wake a thread).
-class CaptureSink {
-public:
-  virtual ~CaptureSink() = default;
-  // A frame captured at capture_ts_ns (engine clock) is published in the slots.
-  virtual void OnFrame(int64_t capture_ts_ns) noexcept = 0;
-  // The source's content size changed to content (seen on the frame that carries it; ResizeTracker debounces).
-  virtual void OnResized(video::Size content) noexcept = 0;
-  // The item closed: the window was closed or the monitor removed (SOURCE_GONE).
-  virtual void OnClosed() noexcept = 0;
-  // Capture failed for good (the copy or the pool: IM_ERR_ENCODER_LOST with device_removed on device loss, else
-  // IM_ERR_INTERNAL); detail is im_last_error's text. No frame follows.
-  virtual void OnFailed(im_status status, std::string_view detail) noexcept = 0;
-};
-
-struct CaptureOptions {
-  bool hide_cursor = false; // IM_START_HIDE_CURSOR
-  bool keep_border = false; // IM_START_KEEP_BORDER: don't ask for borderless capture
-  uint32_t fps = 60;        // layer 0's frame rate (MinUpdateInterval)
-};
-
-class WgcCapture {
+// The capture of a WGC pick; the session holds it as a CaptureSource (capture_source.h: the sink and the options).
+class WgcCapture final : public CaptureSource {
 public:
   // Whether source is a pick this area captures with WGC (capture_path IM_CAPTURE_WGC with a picked item).
   static bool Handles(const session::SourceSpec &source) noexcept;
@@ -73,21 +53,25 @@ public:
   static im_status Start(const session::SourceSpec &source, gpu::FrameSlots &slots, const CaptureOptions &options,
                          CaptureSink *sink, std::unique_ptr<WgcCapture> *out) noexcept;
 
-  ~WgcCapture();
+  ~WgcCapture() override;
   WgcCapture(const WgcCapture &) = delete;
   WgcCapture &operator=(const WgcCapture &) = delete;
 
   // The session runs without Windows' capture border (IM_SESS_NO_OS_INDICATOR).
-  bool borderless() const noexcept { return borderless_; }
+  bool borderless() const noexcept override { return borderless_; }
   // The identified window (§7.6) for minimize polling; 0 for monitors and unidentified windows.
-  WindowHandle window() const noexcept { return window_; }
+  WindowHandle window() const noexcept override { return window_; }
+  // IsIconic(window()) (window_system_win.h's WindowMinimized).
+  bool minimized() const noexcept override;
+  // The item's size at Start: the frame pool's first size.
+  video::Size size() const noexcept override { return size_; }
 
   // Re-sets MinUpdateInterval for a new layer-0 frame rate (an fps re-init). No-op where the property is absent or
   // after Stop. Any thread.
-  void SetFps(uint32_t fps) noexcept;
+  void SetFps(uint32_t fps) noexcept override;
 
   // Stops capture; idempotent. After it returns no CaptureSink call is made.
-  void Stop() noexcept;
+  void Stop() noexcept override;
 
 private:
   struct Impl;
@@ -96,6 +80,7 @@ private:
   std::shared_ptr<Impl> impl_;
   bool borderless_ = false;
   WindowHandle window_ = 0;
+  video::Size size_;
 };
 
 } // namespace im::capture

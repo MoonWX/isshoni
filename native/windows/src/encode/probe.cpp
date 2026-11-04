@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "audio_bridge/audio_bridge.h"
+#include "capture/capture.h"
 #include "encode/encode.h"
 #include "encode/ffmpeg_api.h"
 #include "encode/ffmpeg_encoder.h"
@@ -47,9 +48,12 @@ constexpr uint32_t kVendorIntel = 0x8086;
 constexpr uint32_t kVendorAmd = 0x1002;
 constexpr uint32_t kVendorAmdAlt = 0x1022;
 constexpr uint32_t kMinSupportedBuild = 19045; // Windows 10 22H2
-constexpr uint32_t kBuildWgc = 18362;          // GraphicsCaptureSession::IsSupported() (1903)
-constexpr uint32_t kBuild2004 = 19041;         // IsCursorCaptureEnabled, WDA_EXCLUDEFROMCAPTURE
-constexpr uint32_t kBuild24H2 = 26100;         // MinUpdateInterval, IncludeSecondaryWindows
+constexpr uint32_t kBuild2004 = 19041;         // WDA_EXCLUDEFROMCAPTURE
+// A full probe's wait for GraphicsCaptureAccess's borderless answer (capture::OsFlags): it comes at once for a desktop
+// app, and the encoders' budget runs from the probe's start, so a slow answer takes at most this much of it. A probe
+// that gets none reports IM_OS_WGC_BORDERLESS clear; the pick and WGC's start ask again (2 s) and keep the answer for
+// later probes.
+constexpr uint32_t kProbeBorderlessWaitMs = 250;
 
 int64_t NowNs() noexcept { return engine::os::QpcNs(); }
 
@@ -179,32 +183,25 @@ bool DuplicationWorks(std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept 
   return false;
 }
 
-// The flags the build alone decides (cheap: a quick probe re-reads them).
-uint32_t BuildFlags(uint32_t build) noexcept {
+// The flags a quick probe re-reads (cheap): the build decides IM_OS_SUPPORTED and IM_OS_EXCLUDE_FROM_CAPTURE, and
+// Windows itself the WGC flags (capture::OsFlags: IsSupported, the properties present, borderless access, 04 §7.1);
+// borderless_wait_ms 0 (a quick probe) uses the borderless answer kept from an earlier query.
+uint32_t BuildFlags(uint32_t build, uint32_t borderless_wait_ms) noexcept {
   uint32_t f = 0;
   if (build >= kMinSupportedBuild) {
     f |= IM_OS_SUPPORTED;
   }
-  if (build >= kBuildWgc) {
-    // GraphicsCaptureSession::IsSupported() and the picker: README WA50's C++/WinRT asks Windows itself; until then
-    // the build that introduced them decides.
-    f |= IM_OS_WGC | IM_OS_WGC_PICKER;
-  }
   if (build >= kBuild2004) {
-    f |= IM_OS_WGC_CURSOR_TOGGLE | IM_OS_EXCLUDE_FROM_CAPTURE;
+    f |= IM_OS_EXCLUDE_FROM_CAPTURE;
   }
-  if (build >= kBuild24H2) {
-    f |= IM_OS_WGC_MIN_INTERVAL | IM_OS_WGC_SECONDARY_WINDOWS;
-  }
-  // IM_OS_WGC_BORDERLESS needs RequestAccessAsync(Borderless) (C++/WinRT): README WA50.
-  return f;
+  return f | capture::OsFlags(borderless_wait_ms);
 }
 
 // The flags that need trials (a D3D11 device per adapter, MFStartup): a full probe's, kept by a quick one.
 constexpr uint32_t kTrialOsFlags = IM_OS_DESKTOP_DUPLICATION | IM_OS_MEDIA_FOUNDATION;
 
 uint32_t OsFlags(uint32_t build, std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept {
-  uint32_t f = BuildFlags(build);
+  uint32_t f = BuildFlags(build, kProbeBorderlessWaitMs);
   if (DuplicationWorks(adapters)) {
     f |= IM_OS_DESKTOP_DUPLICATION;
   }
@@ -698,8 +695,9 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
 }
 
 // IM_PROBE_QUICK after a full im_probe (04 §5.3: "cached until the next full probe; a quick probe re-reads OS flags
-// only", < 100 ms): the stored adapters, encoders and audio flags; the OS version, the build's flags and HDR read
-// again, the trial flags (duplication, Media Foundation) kept. False when no complete, current probe is stored.
+// only", < 100 ms): the stored adapters, encoders and audio flags; the OS version, BuildFlags (borderless from the
+// kept answer) and HDR read again, the trial flags (duplication, Media Foundation) kept. False when no complete,
+// current probe is stored.
 bool QuickFromStored(im_caps &caps, int64_t t0) {
   const std::optional<StoredCaps> stored = StoredProbe();
   if (!stored || !stored->complete) {
@@ -710,7 +708,7 @@ bool QuickFromStored(im_caps &caps, int64_t t0) {
   const OsVersion v = ReadOsVersion();
   caps.os_build = v.build;
   caps.os_ubr = v.ubr;
-  caps.os_flags = BuildFlags(v.build) | (stored->caps.os_flags & kTrialOsFlags) |
+  caps.os_flags = BuildFlags(v.build, 0) | (stored->caps.os_flags & kTrialOsFlags) |
                   (AdvancedColorOn() ? static_cast<uint32_t>(IM_OS_HDR_DISPLAY) : 0u);
   caps.probe_ms = static_cast<uint32_t>(std::clamp<int64_t>((NowNs() - t0) / 1'000'000, 0, UINT32_MAX));
   return true;

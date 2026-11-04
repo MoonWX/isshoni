@@ -62,7 +62,7 @@ void Shutdown() noexcept {
   session::Sources().Clear();
 }
 
-uint32_t OsFlags() noexcept {
+uint32_t OsFlags(uint32_t borderless_wait_ms) noexcept {
   if (!WgcSupported()) {
     return 0;
   }
@@ -76,7 +76,7 @@ uint32_t OsFlags() noexcept {
   if (SessionHasProperty(L"IncludeSecondaryWindows")) {
     f |= IM_OS_WGC_SECONDARY_WINDOWS;
   }
-  if (BorderlessAllowed()) {
+  if (BorderlessAllowed(borderless_wait_ms)) {
     f |= IM_OS_WGC_BORDERLESS;
   }
   return f;

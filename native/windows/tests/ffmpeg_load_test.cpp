@@ -13,6 +13,8 @@
 //   - the pinned build loads: im_build_info's versions have the lock's majors and the LGPL license; a full probe lists
 //     every encoder with a status, in 04 §9.1's order, none of them available on a GPU-less runner except MF software
 //     (when Media Foundation works there: mf_sw_test encodes with it), and finishes within its 2 s;
+//   - the full probe's WGC OS flags are Windows' own answer (capture::OsFlags: IsSupported, the properties present,
+//     the borderless access the full probe kept; README WF12), and a quick probe reports the same flags;
 //   - encode::Probe fills im_caps.audio_flags from audio_bridge::Engine().ProbeFlags() (04 §9.10 step 4; group 4's
 //     hand-over of audio_bridge_test's ProbeFlags case, kept in this file with the probe it checks);
 //   - dll_search_test's vendor-runtime and libvpl part (04 §18.2): in a child process whose current directory and one
@@ -39,6 +41,7 @@
 
 #include <windows.h>
 
+#include <objbase.h>
 #include <psapi.h>
 
 #include <algorithm>
@@ -60,6 +63,7 @@
 
 #include "audio/mixer.h"
 #include "audio_bridge/audio_bridge.h"
+#include "capture/capture.h"
 #include "encode/ffmpeg_api.h"
 #include "encode/selector.h"
 #include "gpu/device.h"
@@ -398,6 +402,23 @@ TEST(FfmpegLoad, PinnedBuildLoadsAndProbes) {
 
   ASSERT_GT(caps.os_build, 0u);
   EXPECT_NE(caps.os_flags & IM_OS_SUPPORTED, 0u) << "windows-2025 is newer than Windows 10 22H2";
+  {
+    // The WGC bits come from Windows, not from the build number: asked here on an MTA thread as the probe asks on the
+    // engine worker. OsFlags(0) uses the borderless answer the full probe kept, so the two agree on that bit as well.
+    constexpr uint32_t kWgc = IM_OS_WGC | IM_OS_WGC_PICKER | IM_OS_WGC_CURSOR_TOGGLE | IM_OS_WGC_MIN_INTERVAL |
+                              IM_OS_WGC_SECONDARY_WINDOWS | IM_OS_WGC_BORDERLESS;
+    uint32_t windows_says = 0;
+    std::thread mta([&windows_says] {
+      const HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      windows_says = im::capture::OsFlags(0);
+      if (SUCCEEDED(hr)) {
+        ::CoUninitialize();
+      }
+    });
+    mta.join();
+    EXPECT_EQ(caps.os_flags & kWgc, windows_says & kWgc);
+    std::printf("wgc flags 0x%x\n", windows_says & kWgc);
+  }
   ASSERT_GE(caps.encoder_count, 2u);
   ASSERT_LE(caps.encoder_count, IM_MAX_ENCODERS);
   bool seen_mf_sw = false;
