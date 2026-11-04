@@ -114,8 +114,9 @@ func (n *wailsNotifier) notify(t app.Notification) error {
 
 // awaitToastActivation is -Embedding (03 §13.4 step 1, §15): COM started the app for a toast activation while no
 // instance ran. It registers Wails' activator (the notifications service over an application that never runs) and
-// waits at most timeout for the activation: true when it is open (the toast's body or its Open button), which
-// continues as a normal start; every other action carries a nonce of a run that is gone and is dropped.
+// waits at most timeout for the activation: true when it is open (the toast's body or its Open button), for which
+// start starts the app in a fresh process (this one's Wails application is the activator's); every other action
+// carries a nonce of a run that is gone and is dropped.
 func awaitToastActivation(log *slog.Logger, timeout time.Duration) bool {
 	_ = application.New(application.Options{Name: appID, Description: windowTitle, LogLevel: slog.LevelInfo})
 	ns := notifications.New()

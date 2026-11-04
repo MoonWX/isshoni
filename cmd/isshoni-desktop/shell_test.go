@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"image/png"
 	"runtime"
 	"slices"
@@ -102,29 +103,38 @@ func TestActivation(t *testing.T) {
 	}
 }
 
-// TestEmbeddingOpen (03 §13.4 step 1): -Embedding whose activation is open continues as a normal start without the
-// flag; any other activation, or none, exits 0 before anything else.
+// TestEmbeddingOpen (03 §13.4 step 1): -Embedding whose activation is open starts the app in a fresh process and
+// exits 0 without running the app in this one (its Wails application is the activator's); any other activation, or
+// none, exits 0 before anything else.
 func TestEmbeddingOpen(t *testing.T) {
 	for _, open := range []bool{false, true} {
 		r := &startRun{}
 		s := newStarter(r)
 		waited := false
 		s.embedding = func() bool { waited = true; return open }
-		var args []string
-		s.runApp = func(p app.Args, a []string, _ app.Pending, _ *forwarded, _ instance) int {
+		relaunched := 0
+		s.relaunch = func() error { relaunched++; return nil }
+		s.runApp = func(app.Args, []string, app.Pending, *forwarded, instance) int {
 			r.rec = append(r.rec, "app")
-			args = a
 			return 0
 		}
 		if code := s.start([]string{"-Embedding"}); code != exitOK || !waited {
 			t.Fatalf("open %v: exit %d, waited %v", open, code, waited)
 		}
-		ran := slices.Contains(r.rec, "app")
-		if ran != open {
-			t.Fatalf("open %v: the app ran %v (%v)", open, ran, r.rec)
+		if slices.Contains(r.rec, "app") {
+			t.Fatalf("open %v: the app ran in the -Embedding process (%v)", open, r.rec)
 		}
-		if open && slices.ContainsFunc(args, func(a string) bool { return strings.EqualFold(a, "-embedding") }) {
-			t.Errorf("the app got -Embedding: %v", args)
+		checkNoStartStep(t, "-Embedding", r.rec)
+		if want := map[bool]int{false: 0, true: 1}[open]; relaunched != want {
+			t.Fatalf("open %v: %d fresh starts, want %d", open, relaunched, want)
 		}
+	}
+	// A fresh start that fails is logged; the mode still exits 0.
+	r := &startRun{}
+	s := newStarter(r)
+	s.embedding = func() bool { return true }
+	s.relaunch = func() error { return errors.New("no exe") }
+	if code := s.start([]string{"-Embedding"}); code != exitOK || !strings.Contains(r.logs.String(), "no exe") {
+		t.Fatalf("exit %d\n%s", code, r.logs.String())
 	}
 }

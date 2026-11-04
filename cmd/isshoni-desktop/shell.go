@@ -109,7 +109,8 @@ func newShell(a *application.App, main application.WebviewWindowOptions, log *sl
 // bind gives the shell the app it reports to, and the toasts' actions their way back.
 func (s *wailsShell) bind(t shellApp) {
 	s.target.Store(&t)
-	s.notes.onAction(func(nonce, action string) { t.ToastAction(nonce, action) })
+	// Off Wails' notification callback (COM's activation thread): a Resume or Stop waits for the server.
+	s.notes.onAction(func(nonce, action string) { go t.ToastAction(nonce, action) })
 }
 
 // app0 is the bound app, nil before bind.

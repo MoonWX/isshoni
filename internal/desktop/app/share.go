@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"slices"
+	"sync"
 
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/desktop/session"
@@ -72,6 +74,38 @@ func newSession(d Deps) (*session.Session, error) {
 		o.AudioConfig = p.AudioConfig
 	}
 	return session.New(o)
+}
+
+// shareClients is the share controller's Publisher with the C2 client it last handed out kept, so the tray can tell
+// a server without share.pause before a Pause is tried (03 §11.1, §11.3: "Pause needs a newer server").
+type shareClients struct {
+	pub share.Publisher
+
+	mu   sync.Mutex
+	last share.Client
+}
+
+func watchClients(pub share.Publisher) *shareClients { return &shareClients{pub: pub} }
+
+func (w *shareClients) Ready(ctx context.Context) (share.Client, string, error) {
+	c, origin, err := w.pub.Ready(ctx)
+	if err == nil {
+		w.mu.Lock()
+		w.last = c
+		w.mu.Unlock()
+	}
+	return c, origin, err
+}
+
+// pauseUnavailable reports that the client of the last share lacks share.pause; false before any share.
+func (w *shareClients) pauseUnavailable() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	c := w.last
+	w.mu.Unlock()
+	return c != nil && !slices.Contains(c.Status().Features, protocol.FeatureSharePause)
 }
 
 // newShares is the share controller over the app's parts and C2.

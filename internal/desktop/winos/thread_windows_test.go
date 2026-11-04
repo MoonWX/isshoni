@@ -111,6 +111,46 @@ func TestEndSessionWaits(t *testing.T) {
 	}
 }
 
+// TestEndSessionConfirmed: WM_ENDSESSION with wParam TRUE delivers end-session-confirmed and returns once the app
+// has quit (EndSessionHandled), or after EndSessionQuitWait; with FALSE (the end was cancelled) it delivers nothing
+// and returns at once.
+func TestEndSessionConfirmed(t *testing.T) {
+	h := New()
+	defer func() { _ = h.Close() }()
+	go func() {
+		if ev := <-h.Events(); ev == app.EventEndSessionConfirmed {
+			time.Sleep(200 * time.Millisecond) // the quit
+			h.EndSessionHandled()
+		}
+	}()
+	start := time.Now()
+	send(t, h, wmEndSession, 1)
+	if d := time.Since(start); d < 150*time.Millisecond || d > EndSessionQuitWait {
+		t.Errorf("WM_ENDSESSION returned after %v", d)
+	}
+
+	start = time.Now()
+	send(t, h, wmEndSession, 0)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("a cancelled end's WM_ENDSESSION returned after %v", d)
+	}
+	select {
+	case ev := <-h.Events():
+		t.Errorf("a cancelled end delivered %q", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Nobody answers: it returns after EndSessionQuitWait.
+	start = time.Now()
+	send(t, h, wmEndSession, 1)
+	if d := time.Since(start); d < EndSessionQuitWait-100*time.Millisecond || d > EndSessionQuitWait+time.Second {
+		t.Errorf("WM_ENDSESSION without an answer returned after %v", d)
+	}
+	if ev := nextEvent(t, h); ev != app.EventEndSessionConfirmed {
+		t.Errorf("event %q", ev)
+	}
+}
+
 // TestHotkeyRegistration (03 §22.2): a hotkey registers and unregisters; the same combination registered again by
 // another window is ErrHotkeyTaken; a WM_HOTKEY of its id is delivered.
 func TestHotkeyRegistration(t *testing.T) {

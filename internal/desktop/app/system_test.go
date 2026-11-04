@@ -139,6 +139,12 @@ func (o *recOS) EndSessionHandled() {
 
 func (o *recOS) Events() <-chan SystemEvent { return o.events }
 
+func (s *sysEnv) acks() int {
+	s.os.mu.Lock()
+	defer s.os.mu.Unlock()
+	return s.os.acks
+}
+
 func (o *recOS) awakeCalls() []bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -295,7 +301,8 @@ func newSysEnv(t *testing.T, features ...protocol.Feature) *sysEnv {
 	a.d.Shell, a.d.OS, a.d.I18n, a.d.Engine = s.shell, s.os, cat, eng
 	a.after = s.timers.after
 	a.trayEvery = time.Millisecond
-	ctl := newShares(a.d, pausePublisher{c: s.client})
+	a.clients = watchClients(pausePublisher{c: s.client})
+	ctl := newShares(a.d, a.clients)
 	t.Cleanup(ctl.Close)
 	a.shares, a.sharing = ctl, ctl.Live
 	unsubscribe := ctl.Subscribe(a.onShareEvent)
@@ -553,7 +560,8 @@ func TestSuspendStops(t *testing.T) {
 	}
 }
 
-// TestEndSession: the end of the session stops the share within 2 s, lets the session end, and quits.
+// TestEndSession: WM_QUERYENDSESSION stops the share within 2 s and lets the session end, and the app goes on (the
+// end may be cancelled); WM_ENDSESSION's confirmed end quits, and the OS hooks are told once the quit ran.
 func TestEndSession(t *testing.T) {
 	s := newSysEnv(t)
 	s.goLive(t)
@@ -562,16 +570,22 @@ func TestEndSession(t *testing.T) {
 	if v.EndReason != share.EndSystem {
 		t.Fatalf("end reason %q", v.EndReason)
 	}
-	s.os.mu.Lock()
-	acks := s.os.acks
-	s.os.mu.Unlock()
-	if acks != 1 {
-		t.Fatalf("%d end-session acks", acks)
+	if n := s.acks(); n != 1 {
+		t.Fatalf("%d end-session acks", n)
 	}
-	for deadline := time.Now().Add(3 * time.Second); s.shell.count("quit") != 1; time.Sleep(2 * time.Millisecond) {
+	time.Sleep(50 * time.Millisecond)
+	if s.shell.count("quit") != 0 || s.app.quitting.Load() {
+		t.Fatal("the app quit at WM_QUERYENDSESSION: a cancelled end would leave it gone")
+	}
+
+	s.app.handleSystemEvent(EventEndSessionConfirmed)
+	for deadline := time.Now().Add(3 * time.Second); s.acks() != 2; time.Sleep(2 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatal("the app didn't quit at the end of the session")
+			t.Fatal("the confirmed end of the session wasn't acknowledged")
 		}
+	}
+	if s.shell.count("quit") != 1 || !s.app.quitting.Load() {
+		t.Fatal("the app hadn't quit when it acknowledged the end of the session")
 	}
 }
 
@@ -946,4 +960,167 @@ func (o *openerOS) OpenPath(p string) error {
 	}
 	o.opened = append(o.opened, p)
 	return nil
+}
+
+// lockPrompt reports the app's lock pause and its question.
+func (s *sysEnv) lockPrompt() (lockPaused, prompt bool) {
+	s.app.mu.Lock()
+	defer s.app.mu.Unlock()
+	return s.app.sys.lockPaused, s.app.sys.prompt
+}
+
+// lockLate goes live, waits past share.StateEvery (so the lock's paused event goes out inside SetPaused, before the
+// app records the lock pause), locks, and unlocks later than LockResume: "Resume sharing?" waits. It returns the
+// lock-paused toast.
+func (s *sysEnv) lockLate(t *testing.T) Notification {
+	t.Helper()
+	s.goLive(t)
+	time.Sleep(3 * share.StateEvery)
+	s.app.handleSystemEvent(EventLock)
+	s.waitState(t, share.StatePaused)
+	s.clock.Advance(6 * time.Minute)
+	s.app.handleSystemEvent(EventUnlock)
+	toasts := s.shell.toastsOf(ToastLockPaused)
+	if len(toasts) != 1 {
+		t.Fatalf("%d lock-paused toasts", len(toasts))
+	}
+	if lp, prompt := s.lockPrompt(); !lp || !prompt {
+		t.Fatalf("lockPaused %v, prompt %v after a late unlock", lp, prompt)
+	}
+	return toasts[0]
+}
+
+// waitLockCleared waits until a resume from outside the app ended the lock pause: no question, no 30 min timer,
+// keep-awake on and the tray out of its lock prompt.
+func (s *sysEnv) waitLockCleared(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+		if lp, prompt := s.lockPrompt(); !lp && !prompt {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the resume didn't end the lock pause")
+		}
+	}
+	if got := s.timers.pending(); len(got) != 0 {
+		t.Fatalf("timers %v after the resume", got)
+	}
+	s.waitAwake(t, true)
+	s.waitTray(t, func(v tray.View) bool {
+		return v.Icon == tray.IconLive && !strings.Contains(v.Tooltip, "Resume sharing?")
+	}, "live, without the lock prompt")
+}
+
+// TestOutsideResumeEndsLockPause (WA68-R1): a lock pause resumed through the controller from outside the app (the
+// panel's Resume through the bridge; WA80's hotkey and pill) ends, also when the lock's own paused event went out
+// before the app recorded the lock pause; the 30 min stop then never stops the live share.
+func TestOutsideResumeEndsLockPause(t *testing.T) {
+	s := newSysEnv(t)
+	s.lockLate(t)
+	if err := s.app.shares.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StateLive)
+	s.waitLockCleared(t)
+	if s.timers.fire() {
+		t.Fatal("a 30 min timer was still armed")
+	}
+	if n := len(s.shell.toastsOf(ToastStoppedLock)); n != 0 || s.state() != share.StateLive {
+		t.Fatalf("state %q, %d stopped-locked toasts", s.state(), n)
+	}
+}
+
+// TestLockStopFindsLiveShare: a 30 min timer that comes due for a share that is live again, before the app has its
+// live event, only forgets the lock pause.
+func TestLockStopFindsLiveShare(t *testing.T) {
+	s := newSysEnv(t)
+	s.lockLate(t)
+	if err := s.app.shares.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StateLive)
+	s.waitLockCleared(t)
+	// The live event not handled yet: the lock pause as it was before it.
+	s.app.mu.Lock()
+	s.app.sys.lockPaused, s.app.sys.prompt = true, true
+	gen := s.app.sys.gen
+	s.app.mu.Unlock()
+	s.app.lockStopReached(gen)
+	if lp, prompt := s.lockPrompt(); lp || prompt || s.state() != share.StateLive {
+		t.Fatalf("lockPaused %v, prompt %v, state %q", lp, prompt, s.state())
+	}
+	if n := len(s.shell.toastsOf(ToastStoppedLock)); n != 0 {
+		t.Fatalf("%d stopped-locked toasts for a live share", n)
+	}
+}
+
+// TestStaleLockToast (WA68-R3): a "Resume sharing?" toast answered another way (the tray's Resume, the share's end)
+// no longer acts: its Stop doesn't stop the live share, its Resume doesn't resume a pause the user chose.
+func TestStaleLockToast(t *testing.T) {
+	s := newSysEnv(t)
+	n := s.lockLate(t)
+	s.app.TrayAction(tray.ActionResume)
+	s.waitState(t, share.StateLive)
+	if s.app.ToastAction(n.Nonce, ToastStop) {
+		t.Fatal("the stale toast's Stop ran")
+	}
+	if err := s.app.shares.SetPaused(context.Background(), true); err != nil { // the user's own pause
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StatePaused)
+	if s.app.ToastAction(n.Nonce, ToastResume) {
+		t.Fatal("the stale toast's Resume ran")
+	}
+	if s.state() != share.StatePaused {
+		t.Fatalf("the share is %q", s.state())
+	}
+	if !s.app.ToastAction(n.Nonce, ToastOpen) {
+		t.Fatal("a stale toast's body doesn't open the window")
+	}
+
+	// The share's end settles it too.
+	s2 := newSysEnv(t)
+	n2 := s2.lockLate(t)
+	s2.app.TrayAction(tray.ActionStop)
+	s2.waitState(t, share.StateEnded)
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(2 * time.Millisecond) { // the ended event
+		if lp, _ := s2.lockPrompt(); !lp {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the share's end didn't end the lock pause")
+		}
+	}
+	if s2.app.ToastAction(n2.Nonce, ToastResume) || s2.app.ToastAction(n2.Nonce, ToastStop) {
+		t.Fatal("a toast of an ended share's lock pause acted")
+	}
+}
+
+// TestTrayPauseNeedsNewerServer (WA68-R4, 03 §11.1, §11.3): a share on a server without share.pause gets the
+// disabled "Pause needs a newer server" line instead of Pause sharing.
+func TestTrayPauseNeedsNewerServer(t *testing.T) {
+	for _, withPause := range []bool{true, false} {
+		var s *sysEnv
+		if withPause {
+			s = newSysEnv(t)
+		} else {
+			s = newSysEnv(t, protocol.Feature("share.other"))
+		}
+		s.goLive(t)
+		v := s.waitTray(t, func(v tray.View) bool { return v.Icon == tray.IconLive }, "live")
+		var pause *tray.MenuItem
+		for i := range v.Menu {
+			if v.Menu[i].Action == tray.ActionPause || v.Menu[i].Label == "Pause needs a newer server" {
+				pause = &v.Menu[i]
+			}
+		}
+		switch {
+		case pause == nil:
+			t.Fatalf("share.pause %v: no Pause line in %+v", withPause, v.Menu)
+		case withPause && (pause.Action != tray.ActionPause || !pause.Enabled):
+			t.Errorf("with share.pause: %+v", *pause)
+		case !withPause && (pause.Label != "Pause needs a newer server" || pause.Enabled || pause.Action != ""):
+			t.Errorf("without share.pause: %+v", *pause)
+		}
+	}
 }

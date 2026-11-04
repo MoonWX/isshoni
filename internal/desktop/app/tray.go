@@ -64,9 +64,11 @@ func (a *App) SetAudioAlert(voiceAppsHeard bool, questions int) {
 	a.scheduleTray()
 }
 
-// trayState is the tray's State now: the share controller's view, the lock prompt and the inputs above.
+// trayState is the tray's State now: the share controller's view, the lock prompt, whether the share's server has
+// share.pause, and the inputs above.
 func (a *App) trayState() tray.State {
 	v := a.shares.Current()
+	noPause := a.clients.pauseUnavailable()
 	a.mu.Lock()
 	prompt := a.sys.prompt
 	a.mu.Unlock()
@@ -81,6 +83,7 @@ func (a *App) trayState() tray.State {
 		s.Source, s.Watching = v.Label, v.Watching
 		s.LockPrompt = prompt && s.Mode == tray.Paused
 		s.VoiceAppsHeard, s.Questions = a.tray.voiceHeard, a.tray.questions
+		s.PauseUnavailable = noPause
 	}
 	return s
 }

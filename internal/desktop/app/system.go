@@ -23,6 +23,9 @@ const (
 	SystemStopTimeout = 2 * time.Second
 	// pauseTimeout bounds a lock's pause and an unlock's resume.
 	pauseTimeout = 10 * time.Second
+	// EndSessionQuitTimeout bounds the wait at WM_ENDSESSION for the app's parts (C1 and C2 closing with 1000) once
+	// the quit's own steps ran; the OS hooks wait a little longer for the acknowledgement (winos.EndSessionQuitWait).
+	EndSessionQuitTimeout = 2500 * time.Millisecond
 )
 
 // The watchdog of W17's fallback (03 §3.2, §20): the SPA calls App.Heartbeat every HeartbeatEvery; a visible window
@@ -43,7 +46,6 @@ type systemState struct {
 	// lockPaused: the share was paused by a lock (never one the user paused) and nothing has resumed it.
 	lockPaused bool
 	lockedAt   time.Time // the lock that paused it
-	sawPaused  bool      // the share's view was paused since the lock pause began
 	prompt     bool      // an unlock came later than LockResume: "Resume sharing?" waits for an answer
 	gen        int       // the lock pause's number, so a stale timer does nothing
 	stopTimer  stopper   // LockStop after lockedAt
@@ -60,7 +62,7 @@ type watchdog struct {
 }
 
 // endSessionAcker is the OS hooks' end-of-session handshake (winos): WM_QUERYENDSESSION waits, at most 2 s, until the
-// app has stopped its share.
+// app has stopped its share; WM_ENDSESSION waits, at most about 3 s, until the app has quit.
 type endSessionAcker interface {
 	EndSessionHandled()
 }
@@ -94,6 +96,8 @@ func (a *App) handleSystemEvent(ev SystemEvent) {
 		a.onResume()
 	case EventEndSession:
 		a.onEndSession()
+	case EventEndSessionConfirmed:
+		a.onEndSessionConfirmed()
 	case EventDisplayChange:
 		// The pill re-clamps its position (README WA80).
 	}
@@ -140,7 +144,7 @@ func (a *App) onLock() {
 		}
 		a.sys.gen++
 		gen := a.sys.gen
-		a.sys.lockPaused, a.sys.lockedAt, a.sys.sawPaused, a.sys.prompt = true, a.clock(), false, false
+		a.sys.lockPaused, a.sys.lockedAt, a.sys.prompt = true, a.clock(), false
 		a.sys.stopTimer = a.after(a.d.LockStop, func() { a.lockStopReached(gen) })
 		a.mu.Unlock()
 	}
@@ -188,6 +192,11 @@ func (a *App) askResume(gen int) {
 	a.notify(ToastLockPaused, t.T("desktop.native.toast.lockPaused"),
 		NotificationAction{ID: ToastResume, Title: t.T("desktop.native.toast.resume")},
 		NotificationAction{ID: ToastStop, Title: t.T("desktop.native.toast.stop")})
+	a.mu.Lock()
+	if !a.sys.lockPaused || a.sys.gen != gen { // answered while the toast went out
+		a.toasts.dropKind(ToastLockPaused)
+	}
+	a.mu.Unlock()
 }
 
 // endLockPause ends the lock pause gen (a resume from anywhere).
@@ -199,18 +208,22 @@ func (a *App) endLockPause(gen int) {
 	a.mu.Unlock()
 }
 
-// clearLockLocked forgets the lock pause; a.mu is held.
+// clearLockLocked forgets the lock pause; a.mu is held. Its question is answered: a "Resume sharing?" toast still
+// in Action Center no longer acts (03 §15: its buttons are for that question only).
 func (a *App) clearLockLocked() {
 	if a.sys.stopTimer != nil {
 		a.sys.stopTimer.Stop()
 		a.sys.stopTimer = nil
 	}
-	a.sys.lockPaused, a.sys.sawPaused, a.sys.prompt = false, false, false
+	a.sys.lockPaused, a.sys.prompt = false, false
+	a.toasts.dropKind(ToastLockPaused)
 }
 
 // lockStopReached is LockStop after the lock that paused the share: still paused by it, the share stops with the end
-// reason system and the toast "Sharing stopped while your PC was locked" (with Open).
+// reason system and the toast "Sharing stopped while your PC was locked" (with Open). A share that is live again
+// was resumed (its live event may still be on its way): it only forgets the lock pause.
 func (a *App) lockStopReached(gen int) {
+	v := a.shares.Current()
 	a.mu.Lock()
 	if !a.sys.lockPaused || a.sys.gen != gen {
 		a.mu.Unlock()
@@ -219,6 +232,12 @@ func (a *App) lockStopReached(gen int) {
 	a.sys.stopTimer = nil
 	a.clearLockLocked()
 	a.mu.Unlock()
+	if v == nil || v.State == share.StateLive || v.State == share.StateEnded ||
+		v.State == share.StateFailed {
+		a.syncAwake()
+		a.scheduleTray()
+		return
+	}
 	ctx, cancel := context.WithTimeout(a.ctx, QuitTimeout)
 	a.shares.Stop(ctx, share.CauseSystem)
 	cancel()
@@ -276,18 +295,41 @@ func (a *App) onResume() {
 	}
 }
 
-// onEndSession is WM_QUERYENDSESSION: a running share stops within 2 s (share.stop, C2's close 1000), the OS hooks
-// are told to let the session end, and the app quits (C1 and C2 close with 1000).
+// onEndSession is WM_QUERYENDSESSION: a running share stops within 2 s (share.stop, C2's close 1000) and the OS
+// hooks are told to let the session end. The app keeps running: the end may still be cancelled
+// (onEndSessionConfirmed quits).
 func (a *App) onEndSession() {
 	if _, live := a.Live(); live {
 		ctx, cancel := context.WithTimeout(a.ctx, SystemStopTimeout)
 		a.shares.Stop(ctx, share.CauseSystem)
 		cancel()
 	}
+	a.ackEndSession()
+}
+
+// onEndSessionConfirmed is WM_ENDSESSION with the session ending: the app quits (C1 and C2 close with 1000, the
+// audio service closes, settings are flushed) and then tells the OS hooks, which hold WM_ENDSESSION until then, so
+// Windows doesn't end the process first. It runs off the events loop: the loop is one of the parts the quit waits
+// for.
+func (a *App) onEndSessionConfirmed() {
+	go func() {
+		defer a.ackEndSession()
+		a.quit(true, share.CauseSystem, true)
+		parts := make(chan struct{})
+		go func() { a.wg.Wait(); close(parts) }()
+		select {
+		case <-parts:
+		case <-time.After(EndSessionQuitTimeout):
+			a.log.Warn("app: the app's parts didn't stop before the end of the session")
+		}
+	}()
+}
+
+// ackEndSession lets the OS hooks' waiting end-of-session message return.
+func (a *App) ackEndSession() {
 	if ack, ok := a.d.OS.(endSessionAcker); ok {
 		ack.EndSessionHandled()
 	}
-	go a.quit(false, share.CauseSystem, true)
 }
 
 // onShareEvent follows the share controller (its subscriber: it only reads the view): a lock pause that anything
@@ -297,13 +339,19 @@ func (a *App) onShareEvent(ev share.Event) {
 		return
 	}
 	v := ev.View
+	// A live event resumes a lock pause only when the share is live now: a live event read before the lock's pause
+	// may be delivered after it (the controller reads the view at the delivery, and the pause's own event may
+	// already have gone out inside SetPaused, before onLock recorded the lock pause).
+	resumed := v != nil && v.State == share.StateLive
+	if resumed {
+		cur := a.shares.Current()
+		resumed = cur != nil && cur.State == share.StateLive
+	}
 	a.mu.Lock()
 	switch {
 	case v == nil || v.State == share.StateEnded || v.State == share.StateFailed:
 		a.clearLockLocked()
-	case a.sys.lockPaused && v.State == share.StatePaused:
-		a.sys.sawPaused = true
-	case a.sys.lockPaused && a.sys.sawPaused && v.State == share.StateLive:
+	case a.sys.lockPaused && resumed:
 		a.clearLockLocked() // resumed: the panel, the hotkey, the tray, the pill or a toast
 	}
 	a.mu.Unlock()

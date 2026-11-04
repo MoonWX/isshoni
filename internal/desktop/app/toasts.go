@@ -108,6 +108,20 @@ func (b *toastBook) settle(nonce, action string) (pendingToast, bool) {
 	return p, true
 }
 
+// dropKind settles every pending toast of kind without an action: its question was answered another way (the
+// tray, the panel, a later stop, the share's end), so its buttons, still in Action Center, no longer act.
+func (b *toastBook) dropKind(kind string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.order = slices.DeleteFunc(b.order, func(n string) bool {
+		if p, ok := b.pending[n]; ok && p.kind == kind {
+			delete(b.pending, n)
+			return true
+		}
+		return false
+	})
+}
+
 // ToastAction is the shell's report of a toast activation: the nonce the toast carried ("" for none) and the
 // action ("" or ToastOpen for its body). Open always opens the window (and settles the toast when its nonce is
 // known); any other action runs only for a pending toast of this run that has that button, once. It reports whether

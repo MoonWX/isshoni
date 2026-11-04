@@ -8,7 +8,7 @@
 //
 // main handles a start in 03 §13.4's order: the first action (the DLL search order), then step 0
 // (--sound-check-helper), the one-shot modes (--version, --self-check=<path>, --forget-credentials, --purge-data,
-// -Embedding, whose toast activation continues as a normal start only when it is the toast's Open), step 2a (an installer running: a link start leaves its link in PendingServer/PendingRoom and every
+// -Embedding, whose toast activation starts the app afresh in a new process only when it is the toast's Open), step 2a (an installer running: a link start leaves its link in PendingServer/PendingRoom and every
 // start exits), single instance, the running mutex, the Pending values and the app. Steps 2 and 5 and --update-now
 // are marked in start.go where their slices put them.
 //

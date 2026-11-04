@@ -21,11 +21,16 @@ import (
 // WM_HOTKEY, WM_WTSSESSION_CHANGE (WTSRegisterSessionNotification), WM_POWERBROADCAST
 // (RegisterSuspendResumeNotification), WM_QUERYENDSESSION/WM_ENDSESSION, WM_DISPLAYCHANGE and WM_SETTINGCHANGE.
 // Requests reach it by PostMessageW(WM_APP+1); results come back on Go channels. Nothing on it blocks on the network
-// or the engine; WM_QUERYENDSESSION alone waits, at most EndSessionWait, for the app to stop its share.
+// or the engine; WM_QUERYENDSESSION alone waits, at most EndSessionWait, for the app to stop its share, and
+// WM_ENDSESSION, at most EndSessionQuitWait, for it to quit.
 
 // EndSessionWait bounds WM_QUERYENDSESSION's wait for the app's EndSessionHandled (03 §11.6: stop within 2 s, then
 // allow).
 const EndSessionWait = 2 * time.Second
+
+// EndSessionQuitWait bounds WM_ENDSESSION's wait for the app's quit (03 §11.6's "close sockets with 1000"): Windows
+// may end the process as soon as WM_ENDSESSION returns.
+const EndSessionQuitWait = 3 * time.Second
 
 // Window messages and their parameters (WinUser.h, WtsApi32.h).
 const (
@@ -268,18 +273,13 @@ func (t *thread) handle(message uint32, wParam, _ uintptr) (uintptr, bool) {
 		}
 		return 1, true // TRUE
 	case wmQueryEndSession:
-		select { // an acknowledgement of an earlier end that was cancelled
-		case <-t.endAck:
-		default:
-		}
-		t.emit(app.EventEndSession)
-		select {
-		case <-t.endAck:
-		case <-time.After(EndSessionWait):
-			t.log.Warn("winos: the share wasn't stopped before the end of the session")
-		}
+		t.emitAndWait(app.EventEndSession, EndSessionWait, "the share wasn't stopped before the end of the session")
 		return 1, true // TRUE: the session may end
 	case wmEndSession:
+		if wParam != 0 { // the session ends; FALSE: the end was cancelled and the app goes on
+			t.emitAndWait(app.EventEndSessionConfirmed, EndSessionQuitWait,
+				"the app didn't quit before the end of the session")
+		}
 		return 0, true
 	case wmDisplayChange:
 		t.emit(app.EventDisplayChange)
@@ -304,6 +304,20 @@ func (t *thread) handle(message uint32, wParam, _ uintptr) (uintptr, bool) {
 		return 0, false
 	}
 	return 0, false
+}
+
+// emitAndWait delivers ev and waits at most d for the app's EndSessionHandled; what is logged when it doesn't come.
+func (t *thread) emitAndWait(ev app.SystemEvent, d time.Duration, what string) {
+	select { // an acknowledgement of an earlier message whose wait was over
+	case <-t.endAck:
+	default:
+	}
+	t.emit(ev)
+	select {
+	case <-t.endAck:
+	case <-time.After(d):
+		t.log.Warn("winos: " + what)
+	}
 }
 
 // emit delivers a system event; a full channel drops it with a WARN (nobody is reading).

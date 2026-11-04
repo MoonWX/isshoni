@@ -110,8 +110,9 @@ type App struct {
 	probe     media.Probe
 	probeErr  error
 
-	pub    publisher         // C2 for the share controller; nil without a *session.Session
-	shares *share.Controller // 03 §10.1
+	pub     publisher         // C2 for the share controller; nil without a *session.Session
+	shares  *share.Controller // 03 §10.1
+	clients *shareClients     // the controller's Publisher: the share's C2 client, for the tray's Pause
 
 	// sharing reports a live share and its room (03 §13.2's "live share" rows): the share controller's Live.
 	sharing func() (roomID string, live bool)
@@ -158,6 +159,7 @@ func New(d Deps) (*App, error) {
 	}
 	pub, _ := d.Session.(publisher)
 	ctx, cancel := context.WithCancel(context.Background())
+	clients := watchClients(sharePublisher{pub})
 	a := &App{
 		d:         d,
 		log:       d.Log.With("component", "app"),
@@ -167,7 +169,8 @@ func New(d Deps) (*App, error) {
 		cancel:    cancel,
 		probeDone: make(chan struct{}),
 		pub:       pub,
-		shares:    newShares(d, sharePublisher{pub}),
+		shares:    newShares(d, clients),
+		clients:   clients,
 		after:     afterFunc,
 		trayEvery: TrayDebounce,
 	}

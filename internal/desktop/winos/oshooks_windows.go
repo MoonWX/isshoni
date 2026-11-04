@@ -150,7 +150,7 @@ func (h *Hooks) Events() <-chan app.SystemEvent {
 	return h.t.events
 }
 
-// EndSessionHandled lets a waiting WM_QUERYENDSESSION return (the app stopped its share).
+// EndSessionHandled lets a waiting WM_QUERYENDSESSION (the app stopped its share) or WM_ENDSESSION (it quit) return.
 func (h *Hooks) EndSessionHandled() {
 	if h.t == nil {
 		return

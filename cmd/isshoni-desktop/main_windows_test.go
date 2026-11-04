@@ -70,6 +70,14 @@ func testChild(role string) int {
 		return childStart(role)
 	case "toast":
 		return childToast(os.Getenv(idEnv))
+	case "embedding-open":
+		return childEmbeddingOpen()
+	case "fresh": // the exe started again by -Embedding's open: its command line goes to out
+		data, _ := json.Marshal(os.Args[1:])
+		if err := os.WriteFile(os.Getenv(outEnv), data, 0o600); err != nil { //nolint:gosec // G703: the test's temp file
+			return 7
+		}
+		return 0
 	}
 	return 2
 }
@@ -130,6 +138,22 @@ func childStart(role string) int {
 		}
 	}
 	return code
+}
+
+// childEmbeddingOpen is -Embedding whose toast activation is open, with the real fresh start (startFresh): the
+// copy it starts is this test binary again, in the role fresh. It never runs the app here (runApp would exit 9).
+func childEmbeddingOpen() int {
+	if err := os.Setenv(childEnv, "fresh"); err != nil {
+		return 3
+	}
+	s := &starter{
+		log:       slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		embedding: func() bool { return true },
+		relaunch:  startFresh,
+		runApp:    func(app.Args, []string, app.Pending, *forwarded, instance) int { return 9 },
+	}
+	i := slices.Index(os.Args, "--")
+	return s.start(os.Args[i+1:])
 }
 
 func randomName(t *testing.T) string {
@@ -309,6 +333,34 @@ func withoutEnv(env []string, name string) []string {
 		}
 	}
 	return out
+}
+
+// TestEmbeddingOpenStartsFresh (03 §13.4 step 1, §15, §20): -Embedding with the toast's Open starts a fresh copy of
+// the exe without arguments and exits 0 within 5 s, never running the app in the -Embedding process (its Wails
+// application is the activator's, which would drop every option of runApp's).
+func TestEmbeddingOpenStartsFresh(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "fresh.json")
+	start := time.Now()
+	err := childCmd(t, "embedding-open", []string{outEnv + "=" + out}, "-Embedding").Run()
+	if code := exitCode(t, err); code != 0 {
+		t.Fatalf("-Embedding with open exited %d (9: the app ran in the -Embedding process)", code)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("-Embedding with open took %v", d)
+	}
+	var data []byte
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if data, err = os.ReadFile(out); err == nil && len(data) > 0 { //nolint:gosec // G304: the test's temp file
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no fresh copy of the exe started")
+		}
+	}
+	var args []string
+	if err := json.Unmarshal(data, &args); err != nil || len(args) != 0 {
+		t.Fatalf("the fresh copy's arguments %q (%v), want none", data, err)
+	}
 }
 
 // TestVersionGUISubsystem: the real isshoni.exe, built as the release is (-H windowsgui, no console), prints one JSON

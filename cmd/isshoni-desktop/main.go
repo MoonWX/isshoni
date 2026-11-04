@@ -92,6 +92,7 @@ func run(args []string) int {
 		holdRunning: func() error { return winos.HoldRunningMutex(winos.RunningMutex) },
 		takePending: func() (app.Pending, error) { return app.TakePending(winos.NewRegistry(winos.RegistryKey)) },
 		embedding:   func() bool { return awaitToastActivation(slog.Default(), embeddingWait) },
+		relaunch:    startFresh,
 		runApp:      runApp,
 	}
 	return s.start(args)
