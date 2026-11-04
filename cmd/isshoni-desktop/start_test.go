@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -399,13 +400,20 @@ func TestForgetCredentialsStart(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		r := &startRun{store: store, serversErr: serversErr}
+		root := filepath.Join(t.TempDir(), "isshoni")
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		r := &startRun{store: store, serversErr: serversErr, root: root}
 		if code := newStarter(r).start([]string{"--forget-credentials"}); code != exitOK {
 			t.Errorf("exit %d", code)
 		}
-		want := []string{"store", "servers", "forget-all", "servers-closed"}
+		want := []string{"data-root", "store", "servers", "forget-all", "servers-closed"}
 		if serversErr != nil {
-			want = []string{"store", "servers"}
+			want = []string{"data-root", "store", "servers"}
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Errorf("--forget-credentials touched an existing data root: %v", err)
 		}
 		if !slices.Equal(r.rec, want) {
 			t.Errorf("steps %v, want %v", r.rec, want)
@@ -416,8 +424,34 @@ func TestForgetCredentialsStart(t *testing.T) {
 	}
 }
 
+// TestForgetCredentialsNoDataRoot: on a PC where the app never ran (no data root), --forget-credentials still
+// forgets every credential with 02's real servers (whose ForgetAll saves servers.json, creating the folder), and
+// leaves no data root behind.
+func TestForgetCredentialsNoDataRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "isshoni")
+	store := credstore.NewMemory()
+	if err := store.Put("https://127.0.0.1:2", testCredential()); err != nil {
+		t.Fatal(err)
+	}
+	r := &startRun{store: store, root: root}
+	s := newStarter(r)
+	s.openServers = realServers(root)
+	if code := s.start([]string{"--forget-credentials"}); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, r.logs.String())
+	}
+	if want := []string{"data-root", "store", "remove"}; !slices.Equal(r.rec, want) {
+		t.Errorf("steps %v, want %v", r.rec, want)
+	}
+	if left, err := store.List(); err != nil || len(left) != 0 {
+		t.Errorf("credentials left: %v %v", left, err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the mode left a data root behind: %v\n%s", err, r.logs.String())
+	}
+}
+
 // TestPurgeDataStart: --purge-data forgets the credentials as --forget-credentials does, then deletes the data root,
-// and exits 0; a data root it may not delete is exit 1.
+// and exits 0; a data root it may not delete is logged at ERROR and still exits 0 (03 §13.4 step 1, 06 §2.4).
 func TestPurgeDataStart(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "isshoni")
 	if err := os.MkdirAll(filepath.Join(root, "logs"), 0o700); err != nil {
@@ -442,8 +476,11 @@ func TestPurgeDataStart(t *testing.T) {
 	}
 	other := t.TempDir()
 	r = &startRun{root: other}
-	if code := newStarter(r).start([]string{"--purge-data"}); code != exitFailed {
+	if code := newStarter(r).start([]string{"--purge-data"}); code != exitOK {
 		t.Errorf("a folder that isn't a data root: exit %d", code)
+	}
+	if !strings.Contains(r.logs.String(), "level=ERROR") {
+		t.Errorf("the refusal wasn't logged at ERROR:\n%s", r.logs.String())
 	}
 	if _, err := os.Stat(other); err != nil {
 		t.Errorf("a folder that isn't a data root was touched: %v", err)

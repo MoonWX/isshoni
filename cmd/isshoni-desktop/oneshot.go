@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -196,6 +197,29 @@ func forgetCredentials(ctx context.Context, log *slog.Logger, openStore func() (
 		err = errors.Join(err, cerr)
 	}
 	return err
+}
+
+// forgetCredentialsMode is --forget-credentials (03 §13.4 step 1): forgetCredentials, leaving the disk as it found
+// it. ForgetAll always saves servers.json, which creates the data root, so on a PC where the app never ran (or whose
+// data root is gone) a keep-data uninstall would leave a data root the app never made: when the root didn't exist
+// before, removeDataRoot deletes it again afterwards. Errors are logged; the mode exits 0 regardless (06 §6.8).
+func forgetCredentialsMode(ctx context.Context, log *slog.Logger, openStore func() (credstore.Store, error),
+	openServers func(credstore.Store) (credentialForgetter, error), dataRoot func() (string, error),
+	remove func(string) error) {
+	root, rootErr := dataRoot()
+	absent := false
+	if rootErr == nil {
+		_, err := os.Stat(root)
+		absent = errors.Is(err, fs.ErrNotExist)
+	}
+	if err := forgetCredentials(ctx, log, openStore, openServers); err != nil {
+		log.Warn("desktop: not every credential was forgotten", "err", err)
+	}
+	if absent {
+		if err := removeDataRoot(ctx, root, purgeRetryBudget, purgeRetryEvery, remove); err != nil {
+			log.Warn("desktop: the data folder this mode created wasn't deleted", "err", err)
+		}
+	}
 }
 
 // deleteAllCredentials deletes every credential under the store's prefix (02's DeleteAll without the revokes).

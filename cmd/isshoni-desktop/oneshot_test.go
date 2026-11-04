@@ -297,6 +297,37 @@ func TestForgetCredentialsWithoutServers(t *testing.T) {
 	}
 }
 
+// TestForgetCredentialsModeDataRoot: --forget-credentials leaves the disk as it found it. With no data root (the app
+// never ran), 02's real ForgetAll still forgets a stray credential (its revoke refused at once), and the folder its
+// save creates is deleted again; an existing data root keeps servers.json (without the user or device).
+func TestForgetCredentialsModeDataRoot(t *testing.T) {
+	for _, existed := range []bool{false, true} {
+		root := filepath.Join(t.TempDir(), "isshoni")
+		if existed {
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			offlineServers(t, root)
+		}
+		store := credstore.NewMemory()
+		if err := store.Put("https://127.0.0.1:2", testCredential()); err != nil {
+			t.Fatal(err)
+		}
+		forgetCredentialsMode(t.Context(), discardLog(), func() (credstore.Store, error) { return store, nil },
+			realServers(root), func() (string, error) { return root, nil }, os.RemoveAll)
+		if left, err := store.List(); err != nil || len(left) != 0 {
+			t.Errorf("existed %v: credentials left: %v %v", existed, left, err)
+		}
+		_, err := os.Stat(filepath.Join(root, "servers.json"))
+		if existed && err != nil {
+			t.Errorf("an existing data root lost servers.json: %v", err)
+		}
+		if _, err := os.Stat(root); !existed && !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("a data root was left behind: %v", err)
+		}
+	}
+}
+
 // TestRemoveDataRoot: the data root goes with everything in it; a locked file is retried until it lets go, within
 // the budget; a root that stays locked is an error after the budget; a missing root is fine; and a folder that
 // isn't named like a data root is never touched.

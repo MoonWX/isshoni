@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,12 +85,20 @@ func TestForgetAndPurgeCredentialManager(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if mode == "--purge-data" {
-				release := lockFile(t, filepath.Join(root, "WebView2", "lockfile"))
-				time.AfterFunc(500*time.Millisecond, release)
-			}
 			running := `Local\` + randomName(t) + ".running"
 			s, logs := windowsStarter(t, running, store, root)
+			// The lock is released 500 ms after the first delete attempt (not before start: ForgetAll's time must
+			// not count against it), and the attempts are counted, so the run proves the retry.
+			var removes atomic.Int32
+			if mode == "--purge-data" {
+				release := lockFile(t, filepath.Join(root, "WebView2", "lockfile"))
+				var arm sync.Once
+				s.removeAll = func(p string) error {
+					removes.Add(1)
+					arm.Do(func() { time.AfterFunc(500*time.Millisecond, release) })
+					return os.RemoveAll(p)
+				}
+			}
 			start := time.Now()
 			if code := s.start([]string{mode}); code != exitOK {
 				t.Fatalf("exit %d\n%s", code, logs.String())
@@ -107,6 +116,9 @@ func TestForgetAndPurgeCredentialManager(t *testing.T) {
 			_, err := os.Stat(root)
 			if mode == "--purge-data" && !errors.Is(err, fs.ErrNotExist) {
 				t.Errorf("the data root is still there: %v\n%s", err, logs.String())
+			}
+			if n := removes.Load(); mode == "--purge-data" && n < 2 {
+				t.Errorf("%d delete attempts: the locked file didn't make the first one fail", n)
 			}
 			if mode == "--forget-credentials" && err != nil {
 				t.Errorf("--forget-credentials touched the data root: %v", err)

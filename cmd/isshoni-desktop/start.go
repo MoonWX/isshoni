@@ -265,17 +265,14 @@ func (s *starter) oneShot(p app.Args) int {
 	case app.ModeSelfCheck:
 		return selfCheckMode(context.Background(), s.log, p.SelfCheckPath, s.openEngine, s.checkSPA)
 	case app.ModeForgetCredentials:
-		if err := forgetCredentials(context.Background(), s.log, s.openStore, s.openServers); err != nil {
-			s.log.Warn("desktop: not every credential was forgotten", "err", err)
-		}
+		forgetCredentialsMode(context.Background(), s.log, s.openStore, s.openServers, s.dataRoot, s.removeAll)
 		return exitOK // also offline, and whatever went wrong: the uninstaller goes on regardless (06 §6.8)
 	case app.ModePurgeData:
 		if err := purgeData(context.Background(), s.log, s.openStore, s.openServers, s.dataRoot,
 			s.removeAll); err != nil {
 			s.log.Error("desktop: the data folder wasn't deleted", "err", err)
-			return exitFailed
 		}
-		return exitOK
+		return exitOK // exit 0 whatever happened (03 §13.4 step 1, 06 §2.4): the uninstaller only logs it (06 §6.8)
 	default:
 		// --update-now (README WA84, updatetest builds only).
 		s.log.Error("desktop: this mode is not in this build yet", "mode", string(p.OneShot))
