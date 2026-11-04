@@ -274,7 +274,7 @@ TEST(Utf8, FromWide) {
   std::wstring pair;
   pair.push_back(static_cast<wchar_t>(0xD83D)); // U+1F600 as a surrogate pair
   pair.push_back(static_cast<wchar_t>(0xDE00));
-  if (sizeof(wchar_t) == 2) {
+  if constexpr (sizeof(wchar_t) == 2) {
     EXPECT_EQ(Utf8FromWide(pair), "\xf0\x9f\x98\x80");
   }
   std::wstring lone;

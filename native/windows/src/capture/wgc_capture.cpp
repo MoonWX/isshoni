@@ -109,7 +109,8 @@ void WgcCapture::Impl::OnFrame(const wgc::Direct3D11CaptureFramePool &sender) no
       sink->OnFrame(ts);
     }
   } catch (const winrt::hresult_error &e) {
-    FailLocked(slots->device().Fail(e.code(), "WGC frame"));
+    // A removed device is the GPU's failure; anything else (RO_E_CLOSED when the source went away) maps through FailHr.
+    FailLocked(slots->device().Removed() ? slots->device().Fail(e.code(), "WGC frame") : FailHr(e.code(), "WGC frame"));
   } catch (const std::exception &e) {
     FailLocked(abi::Failf(IM_ERR_INTERNAL, {}, "capture: WGC frame: unexpected exception: %s", e.what()));
   } catch (...) {
@@ -205,8 +206,14 @@ im_status WgcCapture::Start(const session::SourceSpec &source, gpu::FrameSlots &
     // §7.1: borderless only when the property exists, access is granted and the session reads it back.
     bool borderless = false;
     if (!options.keep_border && BorderlessAllowed()) {
-      impl->session.IsBorderRequired(false);
-      borderless = !impl->session.IsBorderRequired();
+      try {
+        impl->session.IsBorderRequired(false);
+        borderless = !impl->session.IsBorderRequired();
+      } catch (const winrt::hresult_error &e) {
+        // Access may have been revoked since BorderlessAllowed cached its answer: capture with the border.
+        borderless = false;
+        log::Info("capture", "borderless refused, keeping the border", {{"hr", static_cast<int64_t>(e.code().value)}});
+      }
     }
     // §7.3: half the frame interval (24H2+); the pacer thins the surplus to fps.
     impl->min_interval = SessionHasProperty(L"MinUpdateInterval");

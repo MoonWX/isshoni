@@ -101,6 +101,7 @@ void Picker::Thread::Run(std::promise<std::string> ready) noexcept {
   const HRESULT hr = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
   if (FAILED(hr)) {
     ready.set_value("CoInitializeEx(STA) failed");
+    engine::os::LeaveThread(token);
     ::SetEvent(exited.get());
     return;
   }
@@ -276,6 +277,13 @@ im_status Picker::Pick(HWND parent, uint32_t timeout_ms, PickResult *out) {
     if (busy_) {
       return abi::Fail(IM_ERR_LIMIT, abi::token::kPickBusy, "im_pick_source: another pick is open");
     }
+    if (thread_ && ::WaitForSingleObject(thread_->exited.get(), 0) == WAIT_OBJECT_0) {
+      // The thread's loop ended on its own (WAIT_FAILED): reap it and start a fresh one.
+      if (thread_->th.joinable()) {
+        thread_->th.join();
+      }
+      thread_.reset();
+    }
     if (!thread_) {
       auto fresh = std::make_shared<Thread>();
       if (!fresh->ok()) {
@@ -311,9 +319,26 @@ im_status Picker::Pick(HWND parent, uint32_t timeout_ms, PickResult *out) {
     ::SetEvent(t->cancel.get()); // the picker thread is late: cancel and give it the grace once more
     r = ::WaitForSingleObject(req->done.get(), kCancelGraceMs + kAnswerMarginMs);
   }
+  std::shared_ptr<Thread> abandoned;
   {
     std::lock_guard<std::mutex> lock(mu_);
     busy_ = false;
+    if (r != WAIT_OBJECT_0 && thread_ == t) {
+      // The thread is stuck: abandon it so that the next pick gets a fresh one instead of queueing behind it.
+      abandoned = std::move(thread_);
+      thread_.reset();
+    }
+  }
+  if (abandoned) {
+    {
+      std::lock_guard<std::mutex> tlock(abandoned->mu);
+      abandoned->quit = true;
+    }
+    ::SetEvent(abandoned->cancel.get());
+    ::SetEvent(abandoned->wake.get());
+    if (abandoned->th.joinable()) {
+      abandoned->th.detach(); // it holds its own reference and ends when it gets back to its loop; never killed
+    }
   }
   if (r != WAIT_OBJECT_0) {
     log::Error("capture", "picker thread did not answer", {{"bound_ms", bound}});
