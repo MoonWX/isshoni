@@ -43,17 +43,21 @@ inline constexpr float kSilenceDb = -120.0f;
 // A linear peak (0..1) as dBFS, floored at kSilenceDb.
 float PeakToDb(float peak) noexcept;
 
-// One app's activity for a sample (05 §12.2): the peak of its sessions' meters over the last 100 ms.
+// One app's level for a sample (05 §12.2): the peak of its sessions' meters over the last 100 ms (activity), or, while
+// live, what friends hear of its running streams (captured: the mixer's post-fade peak and RMS over 100 ms, its
+// channels summed, README WA45).
 struct AppActivity {
   std::string_view app_id; // matches apps[].id of the report
   float peak_db = kSilenceDb;
   int64_t last_active_ns = 0; // engine clock; the sample orders apps by it, most recent first
   bool captured = false;      // source 0 (a running stream while live) or 1 (the session's activity meter)
+  float rms_db = kSilenceDb;  // captured entries only
 };
 
-// Builds a sample (05 §12.2): one entry per app id (entries of one id are merged: the loudest peak, the latest
-// activity), most recently active first, at most IM_MAX_LEVEL_APPS; rms_db = peak_db for activity entries; the mix at
-// mix_peak_db / mix_rms_db (kSilenceDb while not live).
+// Builds a sample (05 §12.2): one entry per app id (activity entries of one id are merged: the loudest peak, the
+// latest activity; a captured entry replaces the app's activity, keeping the latest activity time), most recently
+// active first, at most IM_MAX_LEVEL_APPS; rms_db = peak_db for activity entries; the mix at mix_peak_db / mix_rms_db
+// (kSilenceDb while not live).
 im_audio_levels MakeLevels(uint32_t report_seq, int64_t qpc_ns, float mix_peak_db, float mix_rms_db,
                            std::span<const AppActivity> apps);
 

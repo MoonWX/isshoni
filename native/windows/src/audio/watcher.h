@@ -3,8 +3,12 @@
 // publishes "What friends hear" (§12.1) and the level meters (§12.2). It is a small event loop: requests from the
 // audio exports, the callbacks' signals, and its ticks (100 ms levels, 1 s poll, 05 §7.3).
 //
-// This is the watcher half of 05's AudioEngine (README WA35): it captures nothing. While no share runs, the plan is
-// the include set's prediction with engine "none" (05 §6.5). README WA45 adds the capture streams and the mixer.
+// It is the watcher half of 05's AudioEngine (README WA35) and, while a share is live, its capture (README WA45): the
+// include set's streams (include_set.h) with their activator threads (activator.h), the capture thread
+// (capture_thread.h) and the held process handles (process_hold.h), feeding the share's mixer engine (live_mix.h).
+// While no share runs, or while its sound is off, the plan is the include set's prediction with engine "none" (05
+// §6.5). The fast path, the endpoint engine, the startup probe and the sound check are README WA53's: until then the
+// watcher plans without the fast path and as if process loopback works.
 //
 // Every method may be called from any thread, concurrently. Calls that need the thread's COM work post a request and
 // wait at most kWatcherWait, then fail with IM_ERR_TIMEOUT (05 §4.3); none calls CoInitializeEx on the caller's
@@ -17,6 +21,7 @@
 #include <memory>
 #include <thread>
 
+#include "audio/live_mix.h"
 #include "im/audiopolicy/exclusions.h"
 #include "isshoni_media.h"
 
@@ -62,6 +67,19 @@ public:
   // im_caps.audio_flags (05 §11.1): computed on the thread the first time and after every device change, else cached.
   // 0 when the thread doesn't answer in time.
   uint32_t ProbeFlags();
+
+  // A share's mixer started (Mixer::Start, 05 §10.5): from now on the include set's channels join mix's engine, the
+  // watcher watches until DetachLive (whatever im_audio_unwatch says meanwhile), and the capture threads run. Returns
+  // at once; the plan and the first activations follow on the thread. IM_ERR_BAD_STATE when the thread doesn't run.
+  im_status AttachLive(std::shared_ptr<LiveMix> mix);
+  // The share's mixer thread has stopped (Mixer::Stop): every channel and stream of mix goes. Waits at most wait for
+  // the thread (IM_ERR_TIMEOUT then; the request keeps mix alive until the thread lets go of it).
+  im_status DetachLive(const std::shared_ptr<LiveMix> &mix, std::chrono::milliseconds wait);
+  // im_audio_set_mode and im_audio_set_muted while live: the report's mode, muted and events, and the plan (sound off
+  // closes the streams, sound on plans as at start, 05 §6.5). The engine's silence flags are the caller's to set.
+  // Return at once.
+  void SetLiveMode(uint32_t mode);
+  void SetLiveMuted(bool muted);
 
   struct State; // shared between the caller side and the thread
 

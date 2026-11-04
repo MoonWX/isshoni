@@ -39,7 +39,15 @@ enum class AppReason : uint8_t {
   kLimit,
   kCaptureFailed,
 };
-enum class AppWarning : uint8_t { kSharedAppUsesMic, kSharedAppKeptOut, kIncludedUsesMic, kMultiProcessSession };
+// The report-level warning instance_gone (05 §5.3: an IM_RULE_INSTANCE whose pid doesn't exist) appears only in the
+// top-level warnings[], never in a row's.
+enum class AppWarning : uint8_t {
+  kSharedAppUsesMic,
+  kSharedAppKeptOut,
+  kIncludedUsesMic,
+  kMultiProcessSession,
+  kInstanceGone,
+};
 enum class SessionFlow : uint8_t { kRender, kCapture };
 enum class SessionState : uint8_t { kInactive, kActive };
 enum class SessionStream : uint8_t { kNone, kActivating, kPreroll, kRunning, kFading };

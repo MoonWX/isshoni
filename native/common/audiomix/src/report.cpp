@@ -117,6 +117,8 @@ const char *ReportName(AppWarning v) noexcept {
     return "included_uses_mic";
   case AppWarning::kMultiProcessSession:
     return "multi_process_session";
+  case AppWarning::kInstanceGone:
+    return "instance_gone";
   }
   return "";
 }

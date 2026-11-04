@@ -438,6 +438,7 @@ TEST(ReportWriter, EverySpelling) {
   EXPECT_STREQ(ReportName(AppReason::kPidReuse), "pid_reuse");
   EXPECT_STREQ(ReportName(AppReason::kCaptureFailed), "capture_failed");
   EXPECT_STREQ(ReportName(AppWarning::kSharedAppKeptOut), "shared_app_kept_out");
+  EXPECT_STREQ(ReportName(AppWarning::kInstanceGone), "instance_gone");
   EXPECT_STREQ(ReportName(SessionFlow::kCapture), "capture");
   EXPECT_STREQ(ReportName(SessionStream::kActivating), "activating");
   EXPECT_STREQ(ReportName(SessionStream::kPreroll), "preroll");

@@ -1,66 +1,13 @@
 #include "audio/probe_flags.h"
 
-#if defined(_MSC_VER)
-#pragma warning(push, 3)
-#endif
-#include <audioclientactivationparams.h> // Windows SDK 10.0.20348 and later (04 §13.1 pins 10.0.26100)
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-
-#include <cstring> // PropVariantInit is a memset
+#include <chrono>
+#include <memory>
 #include <utility>
+
+#include "audio/wasapi_capture.h"
 
 namespace im::audio {
 namespace {
-
-using ActivateAudioInterfaceAsyncFn = HRESULT(STDAPICALLTYPE *)(LPCWSTR, REFIID, PROPVARIANT *,
-                                                                IActivateAudioInterfaceCompletionHandler *,
-                                                                IActivateAudioInterfaceAsyncOperation **);
-
-// mmdevapi.dll's ActivateAudioInterfaceAsync, loaded from System32 at run time (no import-table entry).
-ActivateAudioInterfaceAsyncFn ActivateFn() noexcept {
-  static const auto fn = reinterpret_cast<ActivateAudioInterfaceAsyncFn>(
-      reinterpret_cast<void *>(win::SystemProc(L"mmdevapi.dll", "ActivateAudioInterfaceAsync")));
-  return fn;
-}
-
-// The completion handler of one activation: it keeps the result and signals done. Agile (IAgileObject), so Windows
-// calls it on any MTA thread without marshaling.
-class CompletionHandler final : public win::Sink<IActivateAudioInterfaceCompletionHandler> {
-public:
-  CompletionHandler() : done_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
-
-  HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation *op) override {
-    HRESULT activated = E_FAIL;
-    win::ComPtr<IUnknown> unk;
-    HRESULT hr = op != nullptr ? op->GetActivateResult(&activated, unk.Put()) : E_POINTER;
-    if (SUCCEEDED(hr) && SUCCEEDED(activated) && unk) {
-      win::ComPtr<IAudioClient> client;
-      hr = unk.As(client);
-      if (SUCCEEDED(hr)) {
-        client_ = std::move(client);
-      }
-    } else if (SUCCEEDED(hr)) {
-      hr = FAILED(activated) ? activated : E_NOINTERFACE;
-    }
-    result_ = hr;
-    SetEvent(done_.get());
-    return S_OK;
-  }
-
-  HANDLE done() const noexcept { return done_.get(); }
-  // Valid once done is signaled.
-  HRESULT result() const noexcept { return result_; }
-  win::ComPtr<IAudioClient> TakeClient() noexcept { return std::exchange(client_, {}); }
-
-private:
-  bool Agile(REFIID riid) const noexcept override { return IsEqualIID(riid, __uuidof(IAgileObject)) != 0; }
-
-  win::Handle done_;
-  HRESULT result_ = E_PENDING;
-  win::ComPtr<IAudioClient> client_;
-};
 
 // Shared-mode float32 48 kHz stereo (05 §8.2's first format), the int16 form the conversion flags accept too.
 WAVEFORMATEX Float32Stereo() noexcept {
@@ -81,47 +28,16 @@ constexpr REFERENCE_TIME kEndpointBuffer = 2'000'000; // 200 ms
 
 HRESULT ActivateProcessLoopback(uint32_t pid, bool include_tree, uint32_t timeout_ms, win::ComPtr<IAudioClient> &out) {
   out.Reset();
-  const ActivateAudioInterfaceAsyncFn activate = ActivateFn();
-  if (activate == nullptr) {
-    return E_NOTIMPL;
-  }
-  AUDIOCLIENT_ACTIVATION_PARAMS params{};
-  params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-  params.ProcessLoopbackParams.TargetProcessId = static_cast<DWORD>(pid);
-  params.ProcessLoopbackParams.ProcessLoopbackMode = include_tree ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
-                                                                  : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
-  PROPVARIANT pv;
-  PropVariantInit(&pv);
-  pv.vt = VT_BLOB;
-  pv.blob.cbSize = sizeof params;
-  pv.blob.pBlobData = reinterpret_cast<BYTE *>(&params); // not owned: no PropVariantClear
-
-  // The handler lives until its last reference goes: ours (released below) and Windows' own while the activation
-  // runs, so a completion after a timeout touches only the handler.
-  auto handler = win::ComPtr<CompletionHandler>::Attach(new CompletionHandler());
-  if (handler->done() == nullptr) {
-    return HRESULT_FROM_WIN32(GetLastError());
-  }
-  win::ComPtr<IActivateAudioInterfaceAsyncOperation> op;
-  HRESULT hr = activate(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient), &pv, handler.Get(), op.Put());
-  if (FAILED(hr)) {
+  // The capture streams' activation (wasapi_capture.h): its handler holds its own reference, so a completion after a
+  // timeout touches only the handler and the Completion.
+  std::unique_ptr<LoopbackActivation> act;
+  if (const HRESULT hr = LoopbackActivation::Start(pid, include_tree, &act); FAILED(hr)) {
     return hr;
   }
-  switch (WaitForSingleObject(handler->done(), timeout_ms)) {
-  case WAIT_OBJECT_0:
-    hr = handler->result();
-    if (SUCCEEDED(hr)) {
-      out = handler->TakeClient();
-      if (!out) {
-        hr = E_NOINTERFACE;
-      }
-    }
-    return hr;
-  case WAIT_TIMEOUT:
+  if (!act->completion()->WaitFor(std::chrono::milliseconds(timeout_ms))) {
     return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-  default:
-    return HRESULT_FROM_WIN32(GetLastError());
   }
+  return act->Result(out);
 }
 
 bool ProcessLoopbackWorks(uint32_t pid, uint32_t timeout_ms) {
