@@ -172,6 +172,27 @@ std::string MftRefusal(const std::string &encode_log) {
   return {}; // MF software's failure record is missing (the ring dropped it?): not provably the MFT's refusal
 }
 
+// MF software's "probe: first AU only on drain" record when its drained AUs were complete (SPS, PPS and an IDR): the
+// MFT encodes correctly but held every frame of the probe's budget, or "" when there is no such record.
+std::string OnlyOnDrain(const std::string &encode_log) {
+  std::string_view rest(encode_log);
+  while (!rest.empty()) {
+    const std::size_t eol = rest.find('\n');
+    const std::string_view line = rest.substr(0, eol);
+    if (line.find("\"msg\":\"probe: first AU only on drain\"") != std::string_view::npos &&
+        line.find("\"encoder\":\"mf-sw\"") != std::string_view::npos &&
+        line.find("\"sps\":true") != std::string_view::npos && line.find("\"pps\":true") != std::string_view::npos &&
+        line.find("\"idr\":true") != std::string_view::npos) {
+      return std::string(line);
+    }
+    if (eol == std::string_view::npos) {
+      break;
+    }
+    rest.remove_prefix(eol + 1);
+  }
+  return {};
+}
+
 struct Packet {
   uint32_t flags = 0;
   uint32_t profile = 0;
@@ -242,6 +263,16 @@ protected:
         std::printf("mf_sw_test: skipped: Windows Server; the H.264 encoder MFT refused: %s\n", refusal.c_str());
         GTEST_SKIP() << "Microsoft's H.264 encoder MFT is not supported on Windows Server and refused here: "
                      << refusal;
+      }
+      // The same unsupported MFT on Windows Server that encodes correctly but returns nothing before the drain: it
+      // holds more frames than the probe's budget (04 §9.10), so the probe rightly refuses it. Only complete drained
+      // AUs (SPS, PPS, IDR) count; on a client Windows this still fails.
+      if (const std::string held = OnlyOnDrain(why); IsWindowsServer() && !held.empty()) {
+        std::printf("mf_sw_test: skipped: Windows Server; the H.264 encoder MFT gave its AUs only on drain: %s\n",
+                    held.c_str());
+        GTEST_SKIP() << "Microsoft's H.264 encoder MFT is not supported on Windows Server; here it held every frame "
+                        "of the probe's budget and gave complete AUs only on drain: "
+                     << held;
       }
     }
     ASSERT_EQ(mf->status, IM_OK) << "MF software failed its probe: " << mf->reason << "; the engine's encode log:\n"
