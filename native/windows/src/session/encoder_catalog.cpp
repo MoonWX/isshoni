@@ -18,6 +18,7 @@ namespace {
 struct Prefix {
   std::mutex mu;
   std::vector<EncoderEntry> entries;
+  bool only = false; // no probe entries (SetCatalogPrefixForTest)
 };
 
 Prefix &ThePrefix() noexcept {
@@ -27,9 +28,10 @@ Prefix &ThePrefix() noexcept {
 
 } // namespace
 
-void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries) {
+void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries, bool only) {
   Prefix &p = ThePrefix();
   std::lock_guard<std::mutex> lock(p.mu);
+  p.only = only && !entries.empty();
   p.entries = std::move(entries);
 }
 #endif
@@ -42,10 +44,12 @@ im_status VideoEncoder::NextTarget(gpu::Nv12Target *out) noexcept {
 std::vector<EncoderEntry> EncoderCatalog() {
   std::vector<EncoderEntry> out;
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  bool only = false;
   {
     Prefix &p = ThePrefix();
     std::lock_guard<std::mutex> lock(p.mu);
     out = p.entries;
+    only = p.only;
   }
   // The fake encoders ignore pixels: a session of them runs no GPU path (encoder.h, FrameInput::kNone).
   const auto add_fake = [&](uint32_t kind) {
@@ -58,6 +62,9 @@ std::vector<EncoderEntry> EncoderCatalog() {
     if (kind != IM_ENC_FAKE && kind != IM_ENC_AUTO && !encpolicy::EncoderToken(kind).empty()) {
       add_fake(kind);
     }
+  }
+  if (only) {
+    return out; // the test's own candidates only (SetCatalogPrefixForTest)
   }
 #endif
   // The probe's encoders (libavcodec: NVENC, QSV, AMF, MF hardware and software; README WA51 OpenH264), in its order

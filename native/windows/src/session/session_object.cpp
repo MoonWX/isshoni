@@ -9,6 +9,7 @@
 
 #include "api/guard.h"
 #include "audio_bridge/audio_bridge.h"
+#include "encode/selector.h"
 #include "im/abi/status.h"
 #include "im/encpolicy/encoders.h"
 #include "im/json/writer.h"
@@ -22,8 +23,21 @@ using engine::os::QpcNs;
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 constexpr uint8_t kFaultNone = 0;
 constexpr uint8_t kFaultEncodeError = 1;
-std::atomic<bool> g_device_removed_for_test{false}; // SetDeviceRemovedForTest
+std::atomic<bool> g_device_removed_for_test{false};  // SetDeviceRemovedForTest
+std::atomic<int64_t> g_capture_adapter_for_test{-1}; // SetCaptureAdapterForTest: -1 none, else the adapter index
 #endif
+
+// The capture adapter of 04 §9.1's order for a session's candidates (README WA61): the primary monitor's adapter, as
+// the source's own monitor isn't reported yet (encode::PrimaryAdapterIndex; DD's output adapter comes with README
+// WA60). Called after EncoderCatalog, which stored the probe.
+uint32_t CaptureAdapterIndex() noexcept {
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (const int64_t v = g_capture_adapter_for_test.load(std::memory_order_acquire); v >= 0) {
+    return static_cast<uint32_t>(v);
+  }
+#endif
+  return encode::PrimaryAdapterIndex();
+}
 
 std::string_view RidView(const char (&rid)[4]) noexcept {
   return std::string_view(rid, static_cast<std::size_t>(std::find(rid, rid + 4, '\0') - rid));
@@ -53,6 +67,11 @@ bool ValidLayerBitrate(uint32_t layer, uint32_t bps) noexcept { return encpolicy
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 void SetDeviceRemovedForTest(bool removed) noexcept {
   g_device_removed_for_test.store(removed, std::memory_order_release);
+}
+
+void SetCaptureAdapterForTest(std::optional<uint32_t> adapter_index) noexcept {
+  g_capture_adapter_for_test.store(adapter_index ? static_cast<int64_t>(*adapter_index) : -1,
+                                   std::memory_order_release);
 }
 #endif
 
@@ -240,12 +259,18 @@ im_status Session::StartVideo(const im_start_config &cfg) {
   }
   encpolicy::CandidateQuery q;
   q.capture_path = source_.capture_path;
-  q.capture_adapter = encpolicy::kNoAdapter;
+  q.capture_adapter = CaptureAdapterIndex();
   q.forced = cfg.encoder;
   q.test_source = source_.test;
   candidates_.resize(std::max<std::size_t>(probe.size(), 1));
   candidates_.resize(encpolicy::BuildCandidates(probe, q, candidates_));
   const bool forced = cfg.encoder != IM_ENC_AUTO;
+  log::Debug("session", "candidates",
+             {{"count", candidates_.size()},
+              {"first", candidates_.empty() ? std::string_view() : encpolicy::EncoderToken(candidates_[0].kind)},
+              {"capture_adapter",
+               q.capture_adapter == encpolicy::kNoAdapter ? int64_t{-1} : static_cast<int64_t>(q.capture_adapter)},
+              {"forced", forced}});
   if (candidates_.empty()) {
     return abi::Failf(IM_ERR_NO_ENCODER, forced ? abi::token::kForcedFailed : abi::token::kLayerFailed,
                       "im_start: no encoder %s (layer %.*s)",
@@ -745,6 +770,7 @@ void Session::VideoLoop() noexcept {
       });
       if (ended_.load(std::memory_order_acquire)) {
         video_ended_ = true; // ENDED is queued: no more media (the session waits for im_stop)
+        ReleaseEncoders();
       }
     }
     video_waiter_.WaitUntil(video_ended_ ? engine::os::Waiter::kNoDeadline : NextDeadline());
@@ -828,7 +854,18 @@ void Session::Apply(const Command &c, int64_t now) {
     }
     break;
   }
-  case Command::Type::kProfile:
+  case Command::Type::kProfile: {
+    // §9.6: one profile for every layer. The session moves only when every layer's encoder can encode the asked
+    // profile; otherwise it stays (High asked of a session that runs a CB-only encoder on some layer, OpenH264, stays
+    // CB), im_set_profile has returned IM_OK, and the packets' profile tells 01 the truth.
+    bool all = true;
+    for (uint32_t l = 0; l < layer_count_; ++l) {
+      all = all && encpolicy::Supports(candidates_[layers_[l].candidate], c.value);
+    }
+    if (!all) {
+      log::Info("session", "profile kept", {{"asked", c.value}, {"profile", profile_}});
+      break;
+    }
     profile_ = c.value;
     for (uint32_t l = 0; l < layer_count_; ++l) {
       if (layers_[l].profile != profile_) {
@@ -836,6 +873,7 @@ void Session::Apply(const Command &c, int64_t now) {
       }
     }
     break;
+  }
   case Command::Type::kContentHint:
     if (c.value != content_hint_) { // the same hint again is a no-op (§9.5)
       content_hint_ = c.value;
@@ -932,16 +970,26 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
   p.gop_ms = L.gop_ms;
   p.content_hint = content_hint_;
   p.epoch_ns = epoch_;
-  const FrameInput input = catalog_[c.probe_index].input;
+  const EncoderEntry &entry = catalog_[c.probe_index];
+  const FrameInput input = entry.input;
   if (input == FrameInput::kNv12) {
     if (!frames_ || !frames_->has_device()) {
       return abi::Fail(IM_ERR_NO_ENCODER, abi::token::kOpenFailed, "session: the encoder takes pixels, no device");
     }
     p.device = frames_->device();
+    if (entry.device.adapter == gpu::DeviceRequest::Adapter::kLuid && p.device->luid() != entry.device.luid) {
+      // One device per session, on its first pixel candidate's adapter (§8.1): an encoder of another adapter would get
+      // a device it can't use, and the copy across adapters (§9.1 step 3) isn't built, so the order moves on (a
+      // software encoder reads back from any device).
+      log::Info("encode", "encoder skipped",
+                {{"layer", RidView(L.rid)}, {"encoder", encpolicy::EncoderToken(c.kind)}, {"why", "other_adapter"}});
+      return abi::Fail(IM_ERR_NO_ENCODER, abi::token::kOpenFailed,
+                       "session: the encoder is on another adapter than the session's device");
+    }
   }
   std::unique_ptr<VideoEncoder> enc;
   L.enc.reset(); // "replaces whatever the layer had": a session limit counts the old one otherwise
-  im_status st = catalog_[c.probe_index].open(p, &enc);
+  im_status st = entry.open(p, &enc);
   if (st == IM_OK && input == FrameInput::kNv12) {
     // The layer's converter drops the old encoder's targets and follows a new output size or frame rate (a re-init,
     // §7.7, §9.5).
@@ -1470,6 +1518,23 @@ void Session::End(im_status status, std::string_view reason, std::string_view de
   log::Warn("session", "ended", {{"status", status}, {"reason", reason}});
   supervisor_waiter_.Wake();
   tone_waiter_.Wake();
+  video_waiter_.Wake(); // the video thread closes its encoders (ReleaseEncoders)
+}
+
+void Session::ReleaseEncoders() noexcept {
+  // On the video thread, the encoders' only user once the session runs. §9.8: an ended session holds no encoder while
+  // the host has yet to call im_stop (an NVENC session counts against the system's limit; a removed device's FFmpeg
+  // contexts are dead); the frames and the device go with ReleaseVideo, once no thread can use them.
+  uint32_t released = 0;
+  for (uint32_t l = 0; l < layer_count_; ++l) {
+    if (layers_[l].enc) {
+      layers_[l].enc.reset();
+      ++released;
+    }
+  }
+  if (released != 0) {
+    log::Info("session", "encoders released", {{"layers", released}});
+  }
 }
 
 void Session::EndDeviceRemoved(std::string_view what) noexcept {
