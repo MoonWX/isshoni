@@ -1,7 +1,6 @@
 package native
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -664,26 +663,18 @@ func TestRelease(t *testing.T) {
 
 // TestNotImplementedYet: the parts later slices fill answer internal/not_implemented, with the Go method as Op.
 // (README WA23 implemented Probe, Sources, Pick, Start, StartExtra, SourceDetail and the session: bridge_test.go;
-// README WA35 the audio calls and the test hooks: audio_test.go.)
+// README WA35 the audio calls and the test hooks: audio_test.go; README WA51 the OpenH264 helpers: openh264_test.go.)
 func TestNotImplementedYet(t *testing.T) {
 	f := newFakeCaller(t)
 	e := openFake(t, f, Options{})
-	ctx := context.Background()
 	calls := f.total()
 	for op, err := range map[string]error{
-		"protect_window":    e.ProtectWindow(0),
-		"set_openh264_path": e.SetOpenH264Path(""),
-		"install_openh264":  second(InstallOpenH264(ctx, nil, t.TempDir())),
-		"verify_openh264":   VerifyOpenH264("x"),
-		"remove_openh264":   RemoveOpenH264(t.TempDir()),
+		"protect_window": e.ProtectWindow(0),
 	} {
 		wantError(t, err, media.CodeInternal, reasonNotImplemented, op)
 	}
 	if f.total() != calls {
 		t.Errorf("the stubs made %d DLL calls", f.total()-calls)
-	}
-	if OpenH264.Version != "2.6.0" || !strings.HasSuffix(OpenH264.URL, "/"+OpenH264.FileName+".bz2") {
-		t.Errorf("OpenH264 pin %+v", OpenH264)
 	}
 }
 

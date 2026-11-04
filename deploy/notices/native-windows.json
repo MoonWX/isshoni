@@ -14,5 +14,7 @@
   {"name": "AMD AMF headers", "version": "1.5.3", "license": "MIT",
    "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]},
   {"name": "C++/WinRT", "license": "MIT",
-   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["cppwinrt/LICENSE"]}
+   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["cppwinrt/LICENSE"]},
+  {"name": "OpenH264 headers", "version": "2.7.0", "license": "BSD-2-Clause",
+   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["openh264/LICENSE"]}
 ]

@@ -28,6 +28,18 @@ Cache &TheCache() noexcept {
   return *c;
 }
 
+// OpenH264's entry as it is now (README WA51): im_set_openh264_path takes effect at the next probe and im_start
+// (04 §5.3), also when that start or quick probe uses a full probe stored before the setting changed. The entry is
+// read again (no test encode: ProbeOpenH264's quick form keeps the last full probe's result for the same library).
+void RefreshOpenH264(im_caps &caps) noexcept {
+  const uint32_t n = std::min<uint32_t>(caps.encoder_count, IM_MAX_ENCODERS);
+  for (uint32_t i = 0; i < n; ++i) {
+    if (caps.encoders[i].kind == IM_ENC_OPENH264) {
+      ProbeOpenH264(false, caps.encoders[i]);
+    }
+  }
+}
+
 } // namespace
 
 session::OpenEncoderFn OpenFunctionFor(uint32_t kind) noexcept {
@@ -67,12 +79,17 @@ void ForgetProbe() noexcept {
 
 std::optional<StoredCaps> StoredProbe() {
   const std::string dir = ffmpeg::DefaultDir();
-  Cache &c = TheCache();
-  std::lock_guard<std::mutex> lock(c.mu);
-  if (!c.caps || session::ProbeCacheStale() || c.ffmpeg_dir != dir) {
-    return std::nullopt;
+  std::optional<StoredCaps> out;
+  {
+    Cache &c = TheCache();
+    std::lock_guard<std::mutex> lock(c.mu);
+    if (!c.caps || session::ProbeCacheStale() || c.ffmpeg_dir != dir) {
+      return std::nullopt;
+    }
+    out = StoredCaps{*c.caps, c.complete};
   }
-  return StoredCaps{*c.caps, c.complete};
+  RefreshOpenH264(out->caps);
+  return out;
 }
 
 std::vector<session::EncoderEntry> CatalogEntries() {
@@ -98,6 +115,7 @@ std::vector<session::EncoderEntry> CatalogEntries() {
       return {};
     }
   }
+  RefreshOpenH264(*caps);
   std::vector<session::EncoderEntry> out;
   const uint32_t n = std::min<uint32_t>(caps->encoder_count, IM_MAX_ENCODERS);
   out.reserve(n);

@@ -6,7 +6,9 @@
 //   ffmpeg_encoder  NVENC, QSV, AMF and Media Foundation through libavcodec behind session::VideoEncoder (§9.1-§9.5)
 //   selector        the kind → open function table and the probe's encoders as the sessions' catalog entries
 //   probe           im_probe (§9.10), with the live-bitrate check
-//   openh264_stub   OpenH264 until README WA51 (its probe entry says "disabled")
+//   openh264_*      Cisco's OpenH264, loaded at run time once the user turned it on (README WA51, 04 §9.9):
+//                   openh264_api (the DLL and the setting), openh264_encoder (the encoder and its probe entry),
+//                   openh264_support (portable settings and helpers), openh264_pin (the pinned release)
 #pragma once
 
 #include <cstdint>
