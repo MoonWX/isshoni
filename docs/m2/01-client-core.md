@@ -769,7 +769,10 @@ run in real time, and the pure-Go Decodable encoder can't keep up with real time
 `-race`), so the Decodable run skips in coverage builds (`testing.CoverMode() != ""`); `windows-go` and
 `desktop-macos` run it under `-race` without coverage. The Windows engine runs it on windows-2025 (06's
 `windows-desktop`) with the `win-x64-ci` DLL, `test:pattern`, `{Listed, TestTone, Encoder: "fake"}`, and on the
-owner's PC runner with a real monitor (`Listed`) per probed encoder (§14).
+owner's PC runner with a real monitor (`Listed`) per probed encoder (§14). On the DLL, check 1 reads the engine's own
+probe: the `win-x64-ci` build lists the test hooks' `IM_ENC_FAKE` as tested with both profiles, after the real
+encoders that a GPU-less runner can't open, so `TestDLLConformance` runs on the session engine directly (WF10 removed
+the `probeFallback` wrapper that answered check 1 before WA44's `im_probe` existed; 04 §9.1, §18.2).
 
 ## 7. The Windows binding (`internal/media/native`, M2)
 
@@ -2455,9 +2458,10 @@ server.
 - CI windows-2025 (06): `windows-go` runs `go test -race` (MinGW), then `CGO_ENABLED=0 go test` (the shipped mode),
   of `./internal/client/...` with the fake engine; `windows-desktop` runs 04's binding tests (04 §18.2) with the DLL
   built in the same workflow, and `mediatest.Conformance` on the `win-x64-ci` DLL with `test:pattern` and `{Listed,
-  TestTone, Encoder: "fake"}` (checks 5 and 7 run: 04 §18.2 specifies IM_ENC_FAKE's output; before WA44's `im_probe`,
-  through 04 §9.1's `probeFallback`, which WF10 removes). Until WA72's `windows-desktop` exists, `windows-native` runs
-  these DLL tests (06 R3a).
+  TestTone, Encoder: "fake"}` (checks 5 and 7 run: 04 §18.2 specifies IM_ENC_FAKE's output; before WA44's `im_probe`
+  it ran through 04 §9.1's `probeFallback`, which WF10 removed in group 11: the suite now runs on the session engine
+  itself, and check 1 finds the `IM_ENC_FAKE` that the `win-x64-ci` probe lists as tested). Until WA72's
+  `windows-desktop` exists, `windows-native` runs these DLL tests (06 R3a).
 - Owner's PC, self-hosted runner, tag `isshoni_hw` (`CGO_ENABLED=0`, no `-race`): Conformance with a real monitor
   (`Listed`) per probed encoder; `TestCaptureToSend` (§12.3).
 - Owner's PC, manual: g2g on Win11 and Win10 (§12.2, the exit gate: the `gate` run with sound on and cuts, plus the

@@ -2006,6 +2006,16 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
      `--self-check`, `--forget-credentials` and `--purge-data` (WA59), `--update-now` (WA84) and
      `--sound-check-helper` as step 0 (WA77) log an error and exit 2 with no window, single instance or mutex until
      their slices. The "closed unexpectedly" crash notice (§17) is only logged until its UI comes.
+   - As built (WA59, group 11; README §3 item 63): `--self-check`, `--forget-credentials` and `--purge-data` are real
+     (`cmd/isshoni-desktop/oneshot.go`, `oneshot_os.go`). `--self-check` opens the shipped engine with `native.Open`
+     in every build, `dev` and `e2e` included (never the fake), so it always checks the engine that ships, and its
+     `spa.ok` also serves `GET /` through the asset handler and needs 200 with the bridge tag, which is stricter than
+     building the handler alone. `--forget-credentials` leaves no data root behind that it created itself (the save
+     inside `ForgetAll` makes the folder, so a root that didn't exist before is deleted again), so a keep-data
+     uninstall on a PC where the app never ran leaves nothing. `--purge-data` deletes only a data root (`isshoni`, or
+     the dev build's `isshoni-dev`) and exits 0 as above even when that root can't be deleted after its 10 s of
+     retries (250 ms apart); the failure is logged at ERROR. The credential part never changes an exit code, offline
+     included.
 2. **Shell relaunch** (Windows, D16): skipped with `--relaunched` and when `Local\io.isshoni.desktop.running`
    already exists (this start will only forward). Look up the parent with a Toolhelp snapshot
    (`CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, own entry's `th32ParentProcessID`); a parent that is gone, or was
@@ -2022,6 +2032,9 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    values: the newest link wins), and **every** start then exits 0 without single instance, the running mutex, the
    updater or `Apply`; the installer's own app start (`/LAUNCH`, `/RELAUNCH`, Finish) handles the link (step 6).
    `ERROR_FILE_NOT_FOUND` means no installer: the start continues; any other error is logged and the start continues.
+   As built (WA59): the probe is `mutexOpens` in `cmd/isshoni-desktop/platform_windows.go`, not `winos.MutexExists`,
+   which counts `ACCESS_DENIED` as present; the name is the constant `installingMutex` in `start.go`, beside the
+   handover (`winos` was outside WA59's paths, so it isn't next to `RunningMutex`).
 3. **Single instance** (W6, §13.3): a second instance forwards and exits.
 4. **The running mutex**: the first instance calls `CreateMutexW(nil, FALSE, "Local\\io.isshoni.desktop.running")`
    and never closes the handle before the process exits; the installer and uninstaller wait on it (06 §6.7).

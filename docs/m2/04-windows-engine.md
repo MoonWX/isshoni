@@ -1016,7 +1016,13 @@ triple-buffer index as the slots (`gpu/triple_buffer.h`), so the newest frame wi
 path's. `PatternGrid` is the supervisor's pattern clock: frame k's capture time is exact at whole seconds (the tone's
 beeps) and rounded down between; under test hooks two of every three frames may be due late, below half an interval,
 with their capture times unchanged. `VideoFrames` (`frames.h`) holds either path: `PublishPattern` on the capture side,
-`Take`, `Convert` and `Configure` on the video thread.
+`Take`, `Convert` and `Configure` on the video thread. As changed by WF10 (group 11), once the probe's real encoders
+joined the catalog (§9.1): the device follows the session's **first** candidate only. When that candidate takes
+pixels, the device is created on its adapter; when it takes none (the test hooks' `IM_ENC_FAKE`, which the catalog
+lists before the real encoders, on a `test:` source), the session gets no device and stays on capture times, and a
+later candidate that takes pixels fails to open in it (`open_failed`), so the fallback moves on. Fake sessions and
+`IM_ENC_AUTO` sessions in the Go DLL tests thus stay off WARP wherever FFmpeg and MF happen to work; in a release
+build every entry takes pixels, so nothing changes there.
 
 **Audio**: with `IM_AUDIO_MODE_EXCLUDE_APPS` the session drives 05's `AudioEngine` itself in
 `src/session/session_object.cpp` (`SetRules` with the start's exclusions, `NewMixer`, the mixer's `Start`, `Stop`,
@@ -1178,6 +1184,21 @@ returns to the share sheet, and a pick of an isshoni window gives `self_window`.
 app shares through the engine (README's WA72, after 03's share sheet and tray slices); E10 can't run it because the
 app's share path doesn't exist yet.
 
+**As built (WA50, group 11; README §3 item 61)** (`src/capture/picker.cpp`, `window_match.h`, `capture.cpp`):
+- **The hidden owner window** of step 2 (a pick with `parent_window` NULL) is a 1×1, fully transparent layered tool
+  window (`WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`, alpha 0) that takes no input,
+  created once per picker thread, centered on the primary monitor before each pick and shown without activation
+  (`SW_SHOWNOACTIVATE`) only while that pick is open, then hidden again: a window that is never shown might not make
+  the picker modal and centered. M-PICK checks it.
+- **A late picker thread**: `Pick` waits the pick's timeout plus the cancel grace and an 8 s margin (the identity
+  match and the borderless query); past it the thread is cancelled and given the grace once more, and if it still
+  doesn't answer the pick is `IM_ERR_TIMEOUT` (`engine_timeout`) and the stuck thread is abandoned (detached, never
+  killed), so the next pick gets a fresh thread instead of queueing behind it.
+- **`monitor_id` stays `""`** for every pick, and a Windows 10 monitor pick reports `IM_CAPTURE_WGC` with
+  `IM_SRCF_OS_BORDER`: the `mon:` ids of `im_list_sources` and the mapping of §7.5 to Desktop Duplication are WA60's.
+- **Self**: "its `msedgewebview2` children" of step 4 is read as `msedgewebview2.exe` processes whose parent chain (at
+  most 4 links, `kMaxSelfDepth`, from one Toolhelp snapshot) reaches this process.
+
 ### 7.3 Windows.Graphics.Capture
 
 - Device: the session's D3D11 device (§8.1), wrapped with `CreateDirect3D11DeviceFromDXGIDevice`.
@@ -1197,6 +1218,29 @@ app's share path doesn't exist yet.
   the frame; signal the video thread.
 - `item.Closed` → `SOURCE_GONE` (window closed, monitor removed).
 - Protected content (DRM players) captures as black, on every path (plan); nothing to do.
+
+**As built (WA50, group 11; README §3 item 61)** (`src/capture/wgc_capture.{h,cpp}`, `source_watch.h`):
+`capture::WgcCapture` does the above for one session into its frame slots and reports to a `CaptureSink` (`OnFrame`,
+`OnResized`, `OnClosed`, `OnFailed`; called on WGC's threads, one at a time, never after `Stop` returns). Borderless is
+asked only when `BorderlessAllowed()` and not `IM_START_KEEP_BORDER`, and `borderless()` is true only when the session
+then reads back `IsBorderRequired() == false`; a throw from `IsBorderRequired(false)` (access revoked since the cached
+answer) falls back to capture with the border instead of failing the start, and an error raised mid-frame goes to
+`OnFailed` with the device's status when the device was removed, else through the `HRESULT` mapping, where `RO_E_CLOSED`
+and an invalid window handle are `IM_ERR_SOURCE_GONE`, not `IM_ERR_INTERNAL`. The interval value is the pure
+`capture::MinUpdateInterval100ns(fps)` (`10'000'000 / (2 × fps)`, 0 for 0), which lives in the portable `source_watch.h`
+beside `ResizeTracker` (§7.7's 1 s debounce, `kResizeSettleNs`) and `MinimizeTracker` (§7.6's `IsIconic` edges every
+`kMinimizePollNs` = 500 ms), so `window_match_test` checks all three without Windows headers; `SetFps` re-sets the
+interval. `capture::OsFlags()` (`capture.cpp`) asks Windows for the WGC part of `im_caps.os_flags` (`IsSupported`, the
+property checks, borderless access, §9.10 step 1). **Not wired in group 11**: nothing in the session starts `WgcCapture`
+or calls `OsFlags()` yet (`session_object` and `encode/probe.cpp` were outside WA50's paths), so a real pick passed to
+`im_start` runs a session without frames, `IM_SESS_NO_OS_INDICATOR` is still set unconditionally, and no `SOURCE_*`
+event goes out. WF12 (group 12) wires both: the session starts `WgcCapture` for a WGC source on the GPU path with the
+start flags (hide cursor, keep border, layer 0's fps), sets `IM_SESS_NO_OS_INDICATOR` only when it is borderless, counts
+frames and wakes the video thread from `OnFrame`, ends with `IM_ERR_SOURCE_GONE` on a closed source, sends
+`SOURCE_RESIZED` (re-initing the layers whose output size changes, `REINIT|KEYFRAME`) and
+`SOURCE_MINIMIZED`/`SOURCE_RESTORED` through the trackers, calls `SetFps` after a layer-0 fps re-init, and stops the
+capture before `ReleaseVideo` frees the slots and the device; and `probe.cpp`'s `BuildFlags` takes the WGC flags from
+`capture::OsFlags()`.
 
 ### 7.4 DXGI Desktop Duplication
 
@@ -1323,7 +1367,8 @@ Unidentified windows simply lack these extras; capture is unaffected.
   whose encoders are `IM_ENC_FAKE` (test hooks) creates no D3D device, so the fake-encoder tests never render on WARP.
   As built (WF2): the session creates the device in `StartFrames`, before its encoders open, on the adapter of its
   first candidate whose encoder takes pixels (`EncoderEntry::device`; WA44's probe sets that LUID), and later
-  candidates reuse it (WA44 decides a cross-adapter one's copy, §9.1).
+  candidates reuse it (WA44 decides a cross-adapter one's copy, §9.1). Since WF10 that is the first candidate only:
+  a session whose first candidate takes no pixels gets no device (§6.1).
 - **The context lock**: a `CRITICAL_SECTION` (recursive, like FFmpeg's own default D3D11 lock, because FFmpeg may
   take it again while holding it) around every use of the immediate context, by the capture copy, the video thread
   and FFmpeg. The FFmpeg D3D11 device context gets the same lock through `AVD3D11VADeviceContext.lock`/`unlock`
@@ -1516,12 +1561,20 @@ profiles) only while the probe answered `not_implemented` (§18.2).
 last full probe's `encoders[]` into the sessions' catalog entries (`encode::CatalogEntries()`: the probe's order, each
 entry's open function and the device on its adapter, a software encoder on the default adapter; with no full probe
 stored, or the cache marked stale by a device loss, it runs one first, so a start never needs `im_probe` before it).
-`src/session/encoder_catalog.cpp` was outside WA44's paths, so as merged `EncoderCatalog()` still lists only the test
-hooks' entries and a release DLL still answers `IM_ERR_NO_ENCODER` for every video layer (`isshoni-enginetest capture
--encoder nvenc|qsv|amf|mf-hw|mf-sw` exits 2); `mf_sw_test` reaches the real MF software entry through
-`SetCatalogPrefixForTest(encode::CatalogEntries())`. `probeFallback` became dead code, still in
-`internal/media/native/session_dll_test.go`. WF10 (group 11) appends the probe's entries to `EncoderCatalog()` in this
-section's order and removes `probeFallback` (`TestDLLConformance` then uses the session engine directly).
+`src/session/encoder_catalog.cpp` was outside WA44's paths, so as WA44 merged `EncoderCatalog()` still listed only
+the test hooks' entries and a release DLL answered `IM_ERR_NO_ENCODER` for every video layer, and `probeFallback`
+became dead code in `internal/media/native/session_dll_test.go`.
+
+**As built (WF10, group 11; README §3 item 60):** `EncoderCatalog()` lists `encode::CatalogEntries()` after the test
+hooks' entries, so a release DLL lists the probe's encoders only, in its order, all `FrameInput::kNv12`, and an
+`IM_TEST_HOOKS` build lists `SetCatalogPrefixForTest`'s entries, then `IM_ENC_FAKE` and the fake-backed fallback kinds
+a test asks for (`FrameInput::kNone`), then the probe's encoders (so a fallback kind a test asked for comes before the
+real encoder of the same kind). `encpolicy::BuildCandidates` keeps those whose probe status is `IM_OK` and sorts them
+into this section's order, the catalog's order breaking ties; without FFmpeg (a test executable's own folder) every
+real entry has `IM_ERR_DEPENDENCY` and takes no part. A session whose first candidate takes no pixels gets no device
+(§6.1). `mf_sw_test` uses the session's own catalog. `probeFallback` is gone, and `TestDLLConformance` uses the
+session engine directly: the `win-x64-ci` probe lists the test hooks' `IM_ENC_FAKE` as tested with both profiles
+(`encode/probe.cpp`'s `PlanEncoders`), which is what Conformance's check 1 finds (01 §6.4).
 
 ### 9.2 libavcodec integration
 
@@ -1554,10 +1607,14 @@ section's order and removes `probeFallback` (`TestDLLConformance` then uses the 
   with one frame of delay (some MF and QSV configurations) keep correct timestamps. A forced IDR sets
   `frame->pict_type = AV_PICTURE_TYPE_I` with the encoder's forced-IDR option on (table below). As built (WA44):
   `FfmpegEncoder` keeps the capture time of each AU it emits (`au_capture_ts_ns()`), but `session::EncodedAu`
-  (`src/session/encoder.h`, outside WA44's paths) has no timestamp, so as merged the session stamps each AU with the
-  frame it just sent: an encoder that holds one frame back gives every AU the next frame's time, and the first IDR
-  frame 2's. WF10 (group 11) adds `EncodedAu.capture_ts_ns`, set from `au_capture_ts_ns()`, and the session uses it
-  (README §3 item 55).
+  (`src/session/encoder.h`, outside WA44's paths) had no timestamp, so as WA44 merged the session stamped each AU with
+  the frame it had just sent. As built (WF10, group 11; README §3 item 60): `EncodedAu.capture_ts_ns` is the
+  `EncodeInput::ts_ns` of the frame the AU encodes, set from `au_capture_ts_ns()` (FfmpegEncoder's pts → capture-time
+  ring of 8 frames; 0 means the frame just given, as the fake and any encoder without delay report), and the portable
+  `src/session/au_times.h` (`AuTimes`, one per layer, on the video thread) stamps each packet with that frame's
+  capture time **and its `IM_PKT_REFRESH` flag**, moved to at least one 90 kHz tick (11 112 ns) past the layer's
+  previous packet if an encoder ever reports an older frame; the capture-to-packet latency is measured from the same
+  time. A held frame (an empty AU) is remembered and its AU carries its time when it comes.
 - **Logging**: `av_log_set_callback` routes FFmpeg's messages at warning and above into the engine log ring (FFmpeg
   calls it from encoder threads; the callback formats into a thread-local buffer and pushes without blocking).
 
@@ -1760,19 +1817,26 @@ and before the first share if it hasn't finished.
 
 **As built (WA44, group 10; README §3 item 55)** (`encode/probe.h`, `probe.cpp`, `selector.h`):
 - **Budget**: the encoders share `kEncoderBudgetMs` = 1500 ms from the probe's start. Past it no encoder starts (its
-  entry is `IM_ERR_TIMEOUT`, token `engine_timeout`), and an encoder already started skips its remaining trials (the
-  CB trial open: `IM_ENCF_CB` clear; the 720p retry; the live-bitrate check: the table's flag kept), each logged. One
-  open (marked `slow_open` afterwards if it took over 1 s; it is not cut short) and the test IDR can still follow, so
-  a probe normally stays near the 2 s above; a single open that blocks for over ~1.5 s can still exceed the worker's
-  bound (`bound::kProbeFull` = 2 s + 1 s, §5.3), and `im_probe` then answers `IM_ERR_TIMEOUT`.
+  entry is `IM_ERR_TIMEOUT`, token `engine_timeout`), and an encoder already started skips its remaining trials (the CB
+  trial open: `IM_ENCF_CB` clear; the 720p retry; the live-bitrate check: the table's flag kept), each logged. One open
+  (marked `slow_open` afterwards if it took over 1 s; it is not cut short) and the test IDR can still follow, so a probe
+  normally stays near the 2 s above; a single open that blocks for over ~1.5 s can still exceed the worker's bound
+  (`bound::kProbeFull` = 2 s + 1 s, §5.3), and `im_probe` then answers `IM_ERR_TIMEOUT`. WF10 (group 11) put this into a
+  `static_assert` in `probe.cpp`: the budget, one open of at most `kSlowOpenUs` (1 s) and 250 ms for its test IDR, the
+  close and the audio flags, about 2.75 s in all, fit in `bound::kProbeFull`. `kSlowOpenUs` is not a cap
+  (`avcodec_open2` can't be interrupted), so the assert holds for opens of up to 1 s; the 2 s above is the typical probe
+  (E7), not a bound the code enforces.
 - **OS flags**: until C++/WinRT lands (README WA50), step 1's WGC flags come from the build number alone, with no
   `GraphicsCaptureSession::IsSupported` or `ApiInformation::IsPropertyPresent` call: `IM_OS_WGC | IM_OS_WGC_PICKER`
   from 18362 (1903), `IM_OS_WGC_CURSOR_TOGGLE | IM_OS_EXCLUDE_FROM_CAPTURE` from 19041 (2004),
   `IM_OS_WGC_MIN_INTERVAL | IM_OS_WGC_SECONDARY_WINDOWS` from 26100 (24H2), and `IM_OS_SUPPORTED` from 19045.
   `IM_OS_WGC_BORDERLESS` stays clear (there is no `RequestAccessAsync(Borderless)`). A quick probe re-reads these
   build flags; the trial flags (`IM_OS_DESKTOP_DUPLICATION`, `IM_OS_MEDIA_FOUNDATION`) come from a full probe.
-  WA50 provides the C++/WinRT checks in its own folder, and `probe.cpp`'s `BuildFlags` calls them in a follow-up
-  after group 11, since WF10 owns `encode/` in that group (README §3 item 55, WA50's row).
+  WA50 (group 11) provides the C++/WinRT checks as `capture::OsFlags()` (`src/capture/capture.cpp`: `IM_OS_WGC |
+  IM_OS_WGC_PICKER` from `GraphicsCaptureSession::IsSupported()`, the cursor, interval and secondary-window flags
+  from the property checks, `IM_OS_WGC_BORDERLESS` when `IsBorderRequired` exists and borderless access is granted),
+  but `probe.cpp` (WF10's in that group) doesn't call it yet; WF12 (group 12) makes `BuildFlags` use it (README §3
+  item 61, the WF12 row).
 - **Size**: each encoder opens at 1920×1080 and, when that open fails with `open_failed`, once more at 1280×720 (the
   "adapter's maximum if smaller" of step 3); the probe reads no adapter maximum.
 - **`IM_PROBE_QUICK`**: once a complete full probe is stored (same FFmpeg folder, not marked stale), a quick probe
@@ -2055,7 +2119,20 @@ func (e *Engine) Clock() (ClockSample, error)                  // im_clock
 func (e *Engine) SetOpenH264Path(path string) error            // verifies the hash first; "" disables
 func (e *Engine) ProtectWindow(hwnd uintptr) error             // im_protect_window (§11); enginetest only (app: 03's winos)
 func (e *Engine) SourceDetail(id string) (SourceDetail, bool)  // the im_source_info fields media.Source lacks
-func (e *Engine) StartExtra(ctx context.Context, cfg media.Config) (media.Session, error) // enginetest only
+// enginetest only (WF10): Start with native-only options, the same mapping and one-session rule.
+func (e *Engine) StartWith(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error)
+// enginetest only: video only, up to the DLL's 4 sessions; opts as StartWith's.
+func (e *Engine) StartExtra(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error)
+
+// StartOption is a native-only start setting beyond media.Config (which has no GOP field, 01 §5.1), for enginetest.
+type StartOption func(*startOptions)
+// WithGOP sets the GOP of the layer whose RID is rid (im_layer_config.gop_ms, §9.4): 1 s to 10 s in whole ms (§6.4),
+// or 0 for the engine's default; an unknown rid or a value outside the range is CodeInvalid without a DLL call; the
+// last WithGOP of a rid wins.
+func WithGOP(rid string, gop time.Duration) StartOption
+// GOPOf reads back the per-layer GOPs that opts set, by rid (nil when none), without the range check, so callers
+// that build options can test what they pass.
+func GOPOf(opts ...StartOption) map[string]time.Duration
 
 // SourceDetail holds only what im_source_info says beyond media.Source (README §3 item 29): monitor_id, capture_path
 // and IM_SRCF_OS_BORDER are media.Source's MonitorID, Capture and OSBorder (01 §5.1). Local data, never logged.
@@ -2092,9 +2169,17 @@ func (s *session) SetAudioBitrate(bps int) error                  // im_set_audi
   whatever the configs (01 §5.1, §5.3; the core's one-share rule D12; Conformance check 9). `StartExtra` skips that
   check and runs up to the DLL's 4 video-only sessions (§6.4; audio is one session per process, and the DLL answers a
   second session with audio, like a fifth session, with `IM_ERR_LIMIT`, so `busy`), so that `enginetest sessions` can
-  open several; the app never calls it. (These two extras, `SourceDetail` and `StartExtra`, are the only additions
+  open several; the app never calls it. (These two extras, `SourceDetail` and `StartExtra`, were the only additions
   beyond `BuildInfo`, `Clock`, `SetOpenH264Path` and `ProtectWindow`: `Mapped` and `Window` are diagnostics for
-  enginetest and the owner's-PC checks, and the session-limit check needs several sessions.)
+  enginetest and the owner's-PC checks, and the session-limit check needs several sessions. WF10 added the third
+  below.)
+- **Per-layer GOP** (WF10, group 11; README §3 item 60): `StartWith` is `Start` with `StartOption`s, and `StartExtra`
+  takes the same options; `WithGOP(rid, d)` sets that layer's `im_layer_config.gop_ms`, which the `media.Config`
+  mapping otherwise leaves 0. It exists for `isshoni-enginetest capture -bitrate-steps`, which runs `f` with a 10 s GOP
+  (§14) and may have audio, so it needs `StartWith` (`StartExtra` refuses audio); `captureStartOptions` passes no
+  option for any other run. `media.Config` keeps no GOP field and the app's sessions always run the defaults, so the
+  fake engine needs nothing. `bridge_test`'s `TestStartWithGOP` and `TestGOPOf` and the tool's
+  `TestCaptureStartOptions` cover it (§18.3).
 - **Audio lives on `*Engine`**: mute, mode, exclusions, levels and the report are process-wide in the ABI, so the
   session has no audio surface beyond `SetAudioBitrate` (and `SetBitrate(media.LayerAudio)`); 05's `audio.Service`
   calls the `media.AudioController` methods. There are no native audio types (`media.Exclusions`, `media.AudioConfig`
@@ -2120,7 +2205,7 @@ func (s *session) SetAudioBitrate(bps int) error                  // im_set_audi
 | `Encoder` | `""` → `IM_ENC_AUTO` (what 01 always passes); a token of §5.6 → that kind (enginetest, 03's hidden support override) |
 | `Profile` | `"6400"` → `IM_PROFILE_HIGH`, `"42e0"` → `IM_PROFILE_CB`, `"640c"` → `IM_PROFILE_HIGH` (the engine never sets constraint_set4/5, so packets and `EventLayer` say `6400`) |
 | `Preset` | `content_hint`: `auto` → `AUTO`, `game` and `movie` → `MOTION`, `text` → `DETAIL` |
-| (no GOP field, 01 §5.1) | every `layers[i].gop_ms` 0: the defaults of §9.4 (`f` 4000, others 2000) |
+| (no GOP field, 01 §5.1) | every `layers[i].gop_ms` 0: the defaults of §9.4 (`f` 4000, others 2000); `StartWith`/`StartExtra`'s `WithGOP` sets a layer's (enginetest only) |
 | `Layers[i]` | `layers[i]`: `rid`; `max_pixels` = `MaxPixels`; `fps` = `MaxFPS`; `bitrate_bps` = `Bitrate` (01's ratectl initial target, ≤ `maxBitrate`); `flags` `IM_LAYER_INACTIVE` when `Inactive`; `width`/`height` 0 |
 | `Audio == nil` | `audio.mode` = `IM_AUDIO_MODE_OFF` |
 | `Audio` (05's `media.AudioConfig`) | `audio.mode` from `Mode` through 05 §13.1's single mode mapping (`""` and `exclude-apps` → `EXCLUDE_APPS`, `media.AudioTestTone` → `TEST_TONE`; `everything` and `off` → `*media.Error{Code: invalid}` without a DLL call in M2); `bitrate_bps` = `BitrateBPS`; `flags`: `TapPCM` → `IM_AUDIOF_TAP_PCM`, `TestFlags` passed through (`IM_AUDIOF_TEST_FAIL_PROBE`); `exclusions` → an `imExclusions` built from `Exclusions` (rules in order, `KeepOutMicUsers` → `IM_EXCLF_KEEP_OUT_MIC_USERS`, `FastPath` → `IM_EXCLF_FAST_PATH`, `SharedPID`) |
@@ -2563,16 +2648,16 @@ to the slice's PR. No machine names or paths go into the reports (they are attac
 
 **As built (WA44, group 10; README §3 item 55)**: the tool has `probe`, `capture` and `bench` (later subcommands are
 one file each, README §5). Where the merged tool differs from the table:
-- **`-bitrate-steps` keeps `f`'s GOP at the engine's 4000 ms**, not 10 000 ms: `media.Config` and
-  `native.StartExtra` carry no per-layer GOP, so `im_layer_config.gop_ms` stays 0. `checkBitrateSteps` therefore
-  tolerates a periodic IDR between the steps (no `REINIT`, a whole GOP after the previous keyframe) and counts it in
-  the rate windows, and `report.json` lists the difference in its `deviations` array. WF10 (group 11) adds the
-  optional per-layer GOP (mapped to `gop_ms`), sets `f`'s to 10 000 ms with `-bitrate-steps` and removes the
-  tolerance and the deviation entry.
-- **No real encoder yet**: until WF10 wires `encode::CatalogEntries()` into the session's catalog (§9.1), `capture
-  -encoder nvenc|qsv|amf|mf-hw|mf-sw` exits 2 and `-encoder auto` finds no real encoder (only a test-hooks DLL's fake), so the hardware
-  runs (per-encoder `capture`, `-bitrate-steps`, `bench`, `-dump-aus` for the Windows fixtures, §9.3's VBV
-  comparison) wait for WF10.
+- **`-bitrate-steps`' GOP**: as WA44 merged, `f`'s GOP stayed at the engine's 4000 ms (no per-layer GOP in the
+  binding), so `checkBitrateSteps` tolerated a periodic IDR between the steps and `report.json` listed the
+  difference. As built (WF10, group 11; README §3 item 60): `capture` starts its session with `native.StartWith`, and
+  with `-bitrate-steps` `captureStartOptions` passes `WithGOP("f", 10 s)` (`stepsGOP`, §12.2), so no periodic IDR
+  falls between the steps; the tolerance and the `deviations` entry are gone, and a periodic IDR between the steps
+  now fails the run like any other keyframe (`check_test`, `capture_test`'s `TestCaptureStartOptions`).
+- **Real encoders**: as WA44 merged, `capture -encoder nvenc|qsv|amf|mf-hw|mf-sw` exited 2 because the session's
+  catalog had no real entry. Since WF10 wired `encode::CatalogEntries()` into it (§9.1), sessions open the probe's
+  encoders, so the hardware runs (per-encoder `capture`, `-bitrate-steps`, `bench`, `-dump-aus` for the Windows
+  fixtures, §9.3's VBV comparison) can run on the owner's PC (README §8).
 - **`-dump-aus N`** writes `q`'s first N access units, as the engine emits them (normalized), to
   `DIR/aus/<token>/`. The committed fixtures of §18.1's `annexb_test` are VideoToolbox streams made on the Mac
   (`native/common/tests/testdata/aus/videotoolbox/` and `videotoolbox-cb/`, 640×360, 12 AUs each, described in its
@@ -2681,7 +2766,7 @@ and `dll_search_test` runs with the engine's delay-load hook; the DLL's real exp
 | Test | Asserts |
 |---|---|
 | `exports_test` | every export with null and invalid arguments returns its documented code, and `im_last_error` starts with the §5.7 token where one applies; `struct_size` below v1.0 → `IM_ERR_ABI`, above → accepted; JSON functions follow snprintf; `im_clock` is monotonic and within 50 ms of the system time; `im_abi_layout` equals the golden file; `isshoni-media.def` lists exactly the header's `IM_API` functions (both parsed); a hook that stalls the worker makes a posted call return `IM_ERR_TIMEOUT` (`engine_timeout`) after its bound + 1 s |
-| `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone (no D3D device: `IM_ENC_FAKE` sessions stay off WARP, §6.1, so the timing bounds hold; "a new device" below is the session's device id): first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s, while the stats' `fpsIn` stays above 40 (§5.6, WF2); `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired` |
+| `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone (no D3D device: `IM_ENC_FAKE` sessions stay off WARP, §6.1, so the timing bounds hold; "a new device" below is the session's device id): first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s, while the stats' `fpsIn` stays above 40 (§5.6, WF2); `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired`. WF10 (group 11) added: the catalog lists the probe's encoders after the fakes and a fake session still gets no device; an encoder one frame behind gives each AU its own frame's capture time and the first IDR the first frame's; `im_layer_config.gop_ms` per layer reaches the layer |
 | `session_gpu_test` (WF2) | a session's GPU path through the C ABI on WARP, with the test hooks: the test lists an encoder of its own first in the catalog (`session::SetCatalogPrefixForTest`; `testhooks::Reset` doesn't clear it, the test does), one that takes pixels on a WARP device, reads every converted picture back and leaves the access unit to `IM_ENC_FAKE`. Such a session runs the GPU path (`session::GpuPathOf`; an `IM_ENC_FAKE` one doesn't); each layer's first packet `KEYFRAME\|REINIT` within 500 ms; every picture of a new frame shows that frame's counter and flash box (the frame whose grid instant is its `capture_ts_ns`) on `f` (1:1) and `q` (2:1); on a static screen refreshes and keyframes show the one frame again; with no frame at all the first keyframe is black (Y 16, Cb/Cr 128); while paused every picture shows one frame captured before the pause, and resuming shows new frames; device loss that first shows as an ordinary error (a conversion's target, a recovery's re-opens, a re-init's open; `session::SetDeviceRemovedForTest` stands in, since WARP can't be removed) ends the session `ENDED{IM_ERR_ENCODER_LOST}` `device_removed` with the probe's cache stale, while the same failure on a sound device is an encode error the session recovers from. The two 500 ms first-keyframe bounds on WARP may be tight in the nightly `win-x64-asan` run |
 | `session_frames_test` (WF2) | the session's two portable frame pieces, without a GPU or the test hooks (every test build): `PatternGrid` (frame times exact at whole seconds and WA23's arithmetic for 1 to 240 Hz, late frames below half an interval with every third on time, `NewestDue` the newest due frame and never one before `next`) and `FrameTimes` (fresh, skipped and the newest time; across two threads every published frame is taken or skipped and the times taken only grow, bounded by a 10 s deadline). Being portable it also builds on the Mac against the host preset's GoogleTest (group 5's integration ran it plain, under TSan and under ASan+UBSan), though no host target lists it |
 | `audio_bridge_test` | with a fake `AudioEngine`: `im_init`/`im_shutdown` call `Init`/`Shutdown`; every audio export forwards its arguments (rules, flags, `shared_pid` copied); `im_start_config.exclusions` → `SetRules` before `Mixer::Start`; modes OFF and TEST_TONE create no mixer; after `im_init(IM_INIT_NO_AUDIO)`, `im_start` with `IM_AUDIO_MODE_EXCLUDE_APPS` and exclusions calls neither `SetRules` nor `NewMixer` (05 §4.3, README §3 item 35); `im_start` with `audio.mode` `IM_AUDIO_MODE_EVERYTHING` and `im_audio_set_mode(IM_AUDIO_MODE_EVERYTHING)` → `IM_ERR_INVALID_ARG`, no mixer created and the fake's mode unchanged; `im_set_paused` → `Mixer::SetPaused`; the fake mixer's chunks come out as Opus packets every 20 ms and, with `IM_AUDIOF_TAP_PCM`, PCM packets every 10 ms |
@@ -2690,7 +2775,7 @@ and `dll_search_test` runs with the engine's delay-load hook; the DLL's real exp
 | `ffmpeg_load_test` | with the pinned artifact: loads, versions check, encoders listed (none available without a GPU, MF software if the runner has Media Foundation); `ffmpeg_dir` pointed at an empty folder → `IM_ERR_DEPENDENCY` (`missing`) and an audio-only test-tone session still works; a stub DLL with another major → `IM_ERR_DEPENDENCY` (`version`). As built (WA44): the other major is the real avutil DLL offered under another major's name, and a minor below the build's is `version` too; it also checks §9.10 step 4 (`audio_flags` from `ProbeFlags()`, a fake `AudioEngine`) and, in a child process, `dll_search_test`'s vendor-runtime and libvpl part (markers `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll`, `libmfxhw64.dll` in the current directory and on `PATH`, `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` at them; the two libvpl names also next to the child's executable; after a full probe the child also opens `h264_nvenc`, `h264_qsv` and `h264_amf` on a default device, since a GPU-less runner's probe plans none of them, and on a device without video support (Basic Render: no `ID3D11VideoDevice`, so FFmpeg's D3D11VA device init fails before `avcodec_open2`) opens them without a device, where FFmpeg loads the same runtimes; each open must reach its runtime or libvpl's dispatcher in FFmpeg's log; no marker loads). The FFmpeg folder is `ISSHONI_TEST_FFMPEG_DIR` (the locked zip's `bin`); without it the cases skip, except in CI, where they fail |
 | `dll_search_test` (§13.3) | Run as a child process whose current directory and one `PATH` entry each hold marker DLLs (a tiny test DLL whose `DllMain` writes a file named after itself; built by the tests, never shipped). **Delay-load hook** (E2): the `win-x64-ci` build's test binary links the engine code with an extra `/DELAYLOAD:im-test-missing.dll` (a name that is in no system folder; the windows-2025 image has `mfplat.dll` in System32, which is searched before the current directory, so a planted `mfplat.dll` could never show the bug); with `im-test-missing.dll` planted in both places, `__HrLoadAllImportsForDll("im-test-missing.dll")` fails, no marker file appears and `GetModuleHandleW(L"im-test-missing.dll")` is NULL; the same check with `mfplat.dll` passes and loads it from System32 (`GetModuleFileNameW`), asked as `mfplat.dll` while `mfplat.lib` stores `MFPlat.DLL` (§13.1). **The `/DEPENDENTLOADFLAG` verdict** (06 §5.1): two probe DLLs (`tests/support/dlprobe.cpp`) delay-load the marker with the default helper and no hook, one linked plain and one with `/DEPENDENTLOADFLAG:0x800`; whether the flagged one still loads the planted marker goes to the test log and to `<build>/windows/dependentloadflag-verdict.txt`, which `windows-native` writes into its summary. **Vendor runtimes and libvpl** (E7, in `ffmpeg_load_test`'s harness with the pinned FFmpeg): markers named `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll` and `libmfxhw64.dll` (none exist on the GPU-less runner) planted in both places, the two libvpl names also next to the child's executable (a copy of the test binary in a temporary folder; FFmpeg's `win32_dlopen` takes the other three from the application folder by design, layer 4), `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` set to the marker folders, and **no** process default set (the host-independent case); after `im_init`, a full `im_probe` and a forced open of each vendor encoder, no marker file exists and `EnumProcessModules` lists none of them. A failure of the libvpl names is §17's libvpl risk, not a flake: FFmpeg r1 failed it from `PATH`, and r2's libvpl patch is what makes it pass |
 | `openh264_test` | CI downloads Cisco's DLL and checks the pinned hash (a mismatch fails the job); `test:pattern` 1280×720@30 for 3 s through the full session (WARP, readback, OpenH264) and back through OpenH264's decoder: PSNR ≥ 35 dB on the pattern's static regions; profile key `42e0`; SPS and PPS before every IDR; a live bitrate step lands within ±25 % |
-| `mf_sw_test` | the same through MF software when `MFStartup` works on the runner; otherwise skipped and logged. On Windows Server, where Microsoft's H.264 encoder MFT is not supported, a failed probe is skipped only when FFmpeg's log shows the MFT refused (the skip prints its HRESULT); any other failure fails |
+| `mf_sw_test` | the same through MF software when `MFStartup` works on the runner, through the session's own catalog (WF10), with capture times increasing per layer; otherwise skipped and logged. On Windows Server, where Microsoft's H.264 encoder MFT is not supported, a failed probe is skipped only when FFmpeg's log shows the MFT refused (the skip prints its HRESULT); any other failure fails |
 
 **`IM_ENC_FAKE`** (`IM_TEST_HOOKS` builds; for a `test:` source `IM_ENC_AUTO` selects it first, so CI is deterministic
 without a GPU). Every access unit carries a real SPS and PPS for the session profile and the layer size (High:
@@ -2706,8 +2791,9 @@ on native output.
 **Go on Windows** (`go test ./internal/media/native/...` with `ISSHONI_TEST_ENGINE_DLL` = the `win-x64-ci` DLL): `Open`
 and the ABI check; a missing export → `*media.Error{dependency, Reason "abi"}` naming it; the clock cross-check passes;
 quick `Probe`; **`mediatest.Conformance`** (01 §6.4) with the `test:pattern` source (`IM_ENC_FAKE`; audio from 05's
-mixer, which on a runner without a render endpoint sends silent frames, 05 §4.3; before WA44's `im_probe`, through
-§9.1's `probeFallback`, which WF10 removes); `Next`/`Stop` under `goleak`; every status maps to its `*media.Error` code
+mixer, which on a runner without a render endpoint sends silent frames, 05 §4.3; before WA44's `im_probe` it ran
+through §9.1's `probeFallback`, which WF10 removed: the session engine itself, whose `win-x64-ci` probe lists the
+tested `IM_ENC_FAKE`); `Next`/`Stop` under `goleak`; every status maps to its `*media.Error` code
 and `Reason`; `EventLayer` before media and before each `REINIT`; `KindPCM` packets from `Next` with `TapPCM` (README §3
 item 32); `InstallOpenH264` against an `httptest` server (a bz2 fixture; a tampered file is rejected and leaves nothing
 behind); **the process default** (§13.3 layer 2): `cmd/isshoni-enginetest`'s startup function, run in a child process
@@ -2740,20 +2826,22 @@ writer hook), the temp file is gone, and the heap grows by less than 16 MB (`run
 `VerifyOpenH264` rejects a file of the wrong size without hashing it; `Open` returns an error wrapping
 `media.ErrUnsupportedOS`. **`bridge_test`** drives the whole binding through `fakeCaller` (01 §7.7): every status and
 token → `*media.Error` (code, `Reason`, `Op`); the snprintf retry; `media.Config` → `imStartConfig` for every row of
-§12.2 (including `imExclusions` and the listed-source flag); `Reconfigure`'s calls and order; `AudioConfig.Mode`
-`everything` (at start) and `SetAudioMode(AudioEverything)` → `*media.Error{invalid}` with no DLL call (README §3 item
-15); `imCaps` → `media.Probe` (`Probe.Audio` from `media.AudioCapsFromFlags`); `IM_ERR_DEPENDENCY` → `dependency` and
-`IM_ERR_NO_ENCODER` → `no_encoder`, each with its token as `Reason`; the copy and limits (oversized, invalid kind or
-layer, negative `CaptureNS` → dropped and a keyframe requested); `ENDED` → Next's error and exactly one `im_stop`;
-`Stop` idempotent, `Next` after `Stop` → `ErrStopped` without a DLL call, `INVALID_ARG` during `Stop` → `ErrStopped`
-(for `Next`, a control call and `Stats` alike), a blocked `Next` returns within 50 ms of `Stop`; `SetBitrate(layer, 0)`
-and an out-of-range bitrate → `invalid` without a call; the event table of §12.3 row by row, in particular
-`LIMIT_CHANGED` `gpu` then `none` → two `EventLimit` packets with `Limit` `"gpu"` and `"none"` (the `none` edge reaches
-`Next`), and `ENCODER_CHANGED` followed by a `REINIT` packet → `EventEncoderChanged{Layer, Encoder: <to>}`, then the new
-encoder's `EventLayer`, then the packet; `EventLayer` synthesis after start and before a `REINIT` (the packet held for
-the next call); PCM as `KindPCM` packets from `Next`, only with `TapPCM` (README §3 item 32); `Now` = `qpcNS −
-epoch_ns`; the clock cross-check (pass, and a 2 ms offset fails `Open`); a self pick → `invalid`/`self_window` and the
-token released.
+§12.2 (including `imExclusions` and the listed-source flag); `Reconfigure`'s calls and order; `StartWith`'s and
+`StartExtra`'s `WithGOP` reaching `layers[i].gop_ms` by rid and kept by a later `Reconfigure`'s `im_update_layer`, an
+unknown rid or a value outside 1–10 s refused without a call, and `GOPOf` (`TestStartWithGOP`, `TestGOPOf`, WF10);
+`AudioConfig.Mode` `everything` (at start) and `SetAudioMode(AudioEverything)` → `*media.Error{invalid}` with no DLL
+call (README §3 item 15); `imCaps` → `media.Probe` (`Probe.Audio` from `media.AudioCapsFromFlags`); `IM_ERR_DEPENDENCY`
+→ `dependency` and `IM_ERR_NO_ENCODER` → `no_encoder`, each with its token as `Reason`; the copy and limits (oversized,
+invalid kind or layer, negative `CaptureNS` → dropped and a keyframe requested); `ENDED` → Next's error and exactly one
+`im_stop`; `Stop` idempotent, `Next` after `Stop` → `ErrStopped` without a DLL call, `INVALID_ARG` during `Stop` →
+`ErrStopped` (for `Next`, a control call and `Stats` alike), a blocked `Next` returns within 50 ms of `Stop`;
+`SetBitrate(layer, 0)` and an out-of-range bitrate → `invalid` without a call; the event table of §12.3 row by row, in
+particular `LIMIT_CHANGED` `gpu` then `none` → two `EventLimit` packets with `Limit` `"gpu"` and `"none"` (the `none`
+edge reaches `Next`), and `ENCODER_CHANGED` followed by a `REINIT` packet → `EventEncoderChanged{Layer, Encoder: <to>}`,
+then the new encoder's `EventLayer`, then the packet; `EventLayer` synthesis after start and before a `REINIT` (the
+packet held for the next call); PCM as `KindPCM` packets from `Next`, only with `TapPCM` (README §3 item 32); `Now` =
+`qpcNS − epoch_ns`; the clock cross-check (pass, and a 2 ms offset fails `Open`); a self pick → `invalid`/`self_window`
+and the token released.
 
 ### 18.4 The owner's PC (Windows 11 24H2 or 25H2 and Windows 10 22H2, dual boot)
 
