@@ -5,10 +5,11 @@
 // It runs when Media Foundation works on the machine (MFStartup, IM_OS_MEDIA_FOUNDATION) and the H.264 encoder MFT is
 // registered; otherwise it is skipped with the reason logged. On Windows Server, where Microsoft's H.264 encoder MFT
 // is not supported ("Minimum supported server: None supported") yet can enumerate and open, a probe failure is skipped
-// too, but only when FFmpeg's log shows the MFT itself refused (h264_mf's error with the MFT's HRESULT), which the skip
-// prints; any other failure (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows
-// must pass in full. A failed probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's
-// (ISSHONI_TEST_FFMPEG_DIR; required in CI).
+// too, but only when FFmpeg's log shows the MFT itself refused during MF software's own probe (h264_mf's error with
+// the MFT's HRESULT, before MF software's failed open or failed encode call), which the skip prints; any other failure
+// (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows must pass in full. A failed
+// probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's (ISSHONI_TEST_FFMPEG_DIR; required in
+// CI).
 //
 // It asserts, for a High and a Constrained Baseline session forced to IM_ENC_MF_SW:
 //   - the probe lists MF software as available, without zero copy or live bitrate (04 §9.1, §9.5);
@@ -130,21 +131,37 @@ std::string EncodeLog() {
   return out;
 }
 
-// The first "ffmpeg" line of encode_log showing that the encoder MFT itself refused (h264_mf's messages that end in the
-// MFT's HRESULT), or "" when there is none (then the failure may be ours: no AU, or no SPS/PPS/IDR in it).
+// h264_mf's "ffmpeg" line showing that the encoder MFT itself refused while MF software was probed (its messages that
+// end in the MFT's HRESULT), or "" when there is none. Only lines inside MF software's own probe count: after the
+// previous encoder's "encoder probed" record and before MF software's failure record, which must be "probe open
+// failed" or "probe: test encode failed" with "ok":false (an encode call failed). A test encode that ran but gave no
+// AU, or an AU without SPS/PPS/IDR ("ok":true), is ours and never matches; nor does MF hardware's h264_mf error.
 std::string MftRefusal(const std::string &encode_log) {
   static constexpr std::string_view kMarkers[] = {"failed processing input",  "failed processing output",
                                                   "could not start stream",   "failed draining",
                                                   "could not set input type", "could not set output type"};
+  const auto has = [](std::string_view line, std::string_view s) { return line.find(s) != std::string_view::npos; };
+  std::string candidate; // the first marker line since the last "encoder probed" record
   std::string_view rest(encode_log);
   while (!rest.empty()) {
     const std::size_t eol = rest.find('\n');
     const std::string_view line = rest.substr(0, eol);
-    if (line.find("\"component\":\"ffmpeg\"") != std::string_view::npos) {
-      for (const std::string_view m : kMarkers) {
-        if (line.find(m) != std::string_view::npos) {
-          return std::string(line);
+    if (has(line, "\"component\":\"ffmpeg\"")) {
+      if (candidate.empty()) {
+        for (const std::string_view m : kMarkers) {
+          if (has(line, m)) {
+            candidate = std::string(line);
+            break;
+          }
         }
+      }
+    } else if (has(line, "\"component\":\"encode\"")) {
+      if (has(line, "\"msg\":\"encoder probed\"")) {
+        candidate.clear(); // the previous encoder's probe ended; its h264_mf errors are not MF software's
+      } else if (has(line, "\"encoder\":\"mf-sw\"") &&
+                 (has(line, "\"msg\":\"probe open failed\"") ||
+                  (has(line, "\"msg\":\"probe: test encode failed\"") && has(line, "\"ok\":false")))) {
+        return candidate;
       }
     }
     if (eol == std::string_view::npos) {
@@ -152,7 +169,7 @@ std::string MftRefusal(const std::string &encode_log) {
     }
     rest.remove_prefix(eol + 1);
   }
-  return {};
+  return {}; // MF software's failure record is missing (the ring dropped it?): not provably the MFT's refusal
 }
 
 struct Packet {
@@ -219,7 +236,8 @@ protected:
       }
       // Microsoft's H.264 encoder MFT: "Minimum supported server: None supported". On Windows Server (GitHub's
       // windows-2025 runner) it can enumerate and open, then refuse to encode. Skipped only when FFmpeg's log shows
-      // the MFT itself refused, with its HRESULT; anything else (no AU, no SPS/PPS/IDR) still fails below.
+      // the MFT itself refused in MF software's own probe, with its HRESULT (MftRefusal); anything else (no AU, no
+      // SPS/PPS/IDR, an h264_mf error from MF hardware's probe) still fails below.
       if (const std::string refusal = MftRefusal(why); IsWindowsServer() && !refusal.empty()) {
         std::printf("mf_sw_test: skipped: Windows Server; the H.264 encoder MFT refused: %s\n", refusal.c_str());
         GTEST_SKIP() << "Microsoft's H.264 encoder MFT is not supported on Windows Server and refused here: "

@@ -519,9 +519,10 @@ TEST(FfmpegLoadChild, Run) {
     };
     const VendorOpen opens[] = {
         {IM_ENC_NVENC, "h264_nvenc", {"nvcuda", "nvEncodeAPI"}},
-        // libvpl's failure is "Error creating a MFX session: <sts>" (error); its "Use Intel(R) oneVPL" line is verbose,
-        // below the level the engine sets, so "vpl" never shows.
-        {IM_ENC_QSV, "h264_qsv", {"mfx"}},
+        // libvpl's failure is "Error creating a MFX session: <sts>" (error), logged only after MFXEnumImplementations
+        // has run the DLL search. Not plain "mfx": qsv.c's "Error creating a MFX loader" / "... configuration" lines
+        // come before any search. Its "Use Intel(R) oneVPL" line is verbose, below the level the engine sets.
+        {IM_ENC_QSV, "h264_qsv", {"Error creating a MFX session"}},
         {IM_ENC_AMF, "h264_amf", {"amfrt64"}},
     };
     for (const VendorOpen &v : opens) {

@@ -161,8 +161,9 @@ void SetExpectedVersionsForTest(uint32_t avutil_major, uint32_t avutil_minor, ui
 // so must not include ffmpeg_encoder.h): avcodec_open2 of the kind's encoder at 1920x1080 NV12 in system memory, with
 // no hw_device_ctx or hw_frames_ctx, closed again at once. NVENC (nvcuda.dll, then nvEncodeAPI64.dll), AMF (amfrt64.dll
 // through an AV_HWDEVICE_TYPE_AMF device) and QSV (libvpl's MFXLoad and MFXEnumImplementations) load their runtime
-// inside avcodec_open2 before they need a device, through the same loaders as the engine's D3D11VA open; this reaches
-// them on a device without video support, where the engine's open stops at av_hwdevice_ctx_init. FFmpeg must be
+// inside avcodec_open2 before they need a device: NVENC and AMF through the same loaders as the engine's D3D11VA open,
+// QSV through the same libvpl dispatcher search (avcodec's copy in qsv.c rather than avutil's in hwcontext_qsv.c); this
+// reaches them on a device without video support, where the engine's open stops at av_hwdevice_ctx_init. FFmpeg must be
 // loaded. Returns the AVERROR (0 = it opened); *error is FFmpeg's text for it ("" when it opened).
 int OpenEncoderWithoutDeviceForTest(uint32_t kind, std::string *error) noexcept;
 #endif

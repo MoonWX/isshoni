@@ -573,8 +573,12 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
   }
   last_pts_ = pts;
   frame->pts = pts;
-  // One frame interval in time_base (1/1e6): h264_mf passes it on as the sample's duration, which is 0 otherwise.
-  frame->duration = static_cast<int64_t>(1'000'000 / params_.fps);
+  if (params_.kind == IM_ENC_MF_HW || params_.kind == IM_ENC_MF_SW) {
+    // One nominal frame interval in time_base (1/1e6): h264_mf passes it on as the sample's duration, which is 0
+    // otherwise. MF only: AMF would take it as the surface duration for rate control, and the real spacing can be
+    // wider.
+    frame->duration = static_cast<int64_t>(1'000'000 / params_.fps);
+  }
   pts_ring_[pts_next_] = PtsTs{pts, in.ts_ns};
   pts_next_ = (pts_next_ + 1) % kPtsRing;
   au_ts_ns_ = 0;
