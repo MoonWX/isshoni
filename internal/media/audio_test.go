@@ -210,7 +210,7 @@ const reportV1 = `{
   ],
   "warnings": [{"code": "multi_process_session", "app": "exe:foo.exe"}],
   "counters": {"streams": 7, "activations": 9, "activationFailures": 1, "underruns": 2, "trims": 3,
-    "overflows": 4, "discontinuities": 5, "mixerResyncs": 6, "fastpathExits": 7,
+    "tailFades": 14, "overflows": 4, "discontinuities": 5, "mixerResyncs": 6, "fastpathExits": 7,
     "fastpathLateCuts": 8, "silentReopens": 10, "deviceChanges": 11, "pidReuseBlocks": 13, "maxResamplePpm": 41,
     "audioCpuMsPerS": 6.2},
   "events": [{"tNs": 81234560000000, "code": "stream_running", "app": "exe:spotify.exe", "detail": "d"}]

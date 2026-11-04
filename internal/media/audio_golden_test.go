@@ -73,6 +73,10 @@ var goldenChecks = map[string]func(t *testing.T, r media.AudioReport){
 		want(t, streams == 48 && r.Counters.Streams == 48 && limit > 0, "48 streams, the rest over the limit")
 		want(t, app(r, "exe:app007.exe").Name == "Café Radio" && app(r, "exe:app008.exe").Name == "音乐播放器",
 			"the UTF-8 names")
+		// The tail fade (05 §9.5, §12.1): three counted, one event (at most one per channel per second).
+		last := r.Events[len(r.Events)-1]
+		want(t, r.Counters.TailFades == 3 && last.Code == media.AudioEventTailFade && last.App == "exe:app007.exe" &&
+			app(r, last.App).Streams == 1, "three tail fades, the last event a tail fade of a heard stream")
 	},
 	// The sheet before a share; Chrome holds the mic, so the whole browser is kept out (05 §5.5).
 	"report-browser-mic.json": func(t *testing.T, r media.AudioReport) {
@@ -136,6 +140,46 @@ func TestAudioGoldens(t *testing.T) {
 	}
 }
 
+// TestAudioReportAdditive: the report changes only additively (05 §12.1). A report from a DLL before the tail fade,
+// without counters.tailFades, still parses, with TailFades 0 and everything else as before; one with a tail_fade
+// event and the report-level warning instance_gone (05 §5.3) passes the value checks.
+func TestAudioReportAdditive(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "audio", "report-many-apps.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err := media.ParseAudioReport(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := bytes.Replace(b, []byte(`"tailFades":3,`), nil, 1)
+	if bytes.Equal(old, b) {
+		t.Fatal("report-many-apps.json has no tailFades 3")
+	}
+	r, err := media.ParseAudioReport(old)
+	if err != nil {
+		t.Fatalf("a report without tailFades: %v", err)
+	}
+	if r.Counters.TailFades != 0 {
+		t.Errorf("TailFades %d without the field, want 0", r.Counters.TailFades)
+	}
+	r.Counters.TailFades = cur.Counters.TailFades
+	if !reflect.DeepEqual(r, cur) {
+		t.Errorf("without tailFades:\n%+v\nwant\n%+v", r, cur)
+	}
+
+	cur.Warnings = append(cur.Warnings, media.AudioWarning{Code: "instance_gone", App: "exe:game.exe"})
+	cur.Events = append(cur.Events, media.AudioEvent{TNanos: cur.QPCNanos, Code: "tail_fade", App: "exe:app001.exe"})
+	again, err := media.ParseAudioReport(encodeReport(t, cur))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(again, cur) {
+		t.Errorf("round trip:\n%+v\nwant\n%+v", again, cur)
+	}
+	checkReportValues(t, again)
+}
+
 // encodeReport writes r as the golden files hold it: encoding/json without HTML escaping or a final newline.
 func encodeReport(t *testing.T, r media.AudioReport) []byte {
 	t.Helper()
@@ -158,13 +202,14 @@ var (
 	keptOutReasons  = []string{"builtin", "user", "mic", "viewer", "isshoni"}
 	notCaptReasons  = []string{"launcher", "tree", "pid_reuse", "limit", "capture_failed"}
 	appWarnings     = []string{"shared_app_uses_mic", "shared_app_kept_out", "included_uses_mic", "multi_process_session"}
+	reportWarnings  = []string{"multi_process_session", "instance_gone"} // the top-level warnings[] (05 §5.3, §6.3)
 	sessionStreams  = []string{"none", "activating", "preroll", "running", "fading"}
 	sessionNotes    = []string{"", "covered", "no_handle"}
 	reportEventCode = []string{"session_created", "session_expired", "stream_opened", "stream_running",
 		"stream_removed", "stream_failed", "activation_failed", "fastpath_enter", "fastpath_exit", "fastpath_late_cut",
 		"default_device_changed", "device_added", "device_removed", "no_device", "audiosrv_restart", "probe_ok",
-		"probe_failed", "mixer_resync", "underrun", "trim", "silent_reopen", "rules_changed", "muted", "unmuted",
-		"mode_changed", "reanchor"}
+		"probe_failed", "mixer_resync", "underrun", "trim", media.AudioEventTailFade,
+		"silent_reopen", "rules_changed", "muted", "unmuted", "mode_changed", "reanchor"}
 )
 
 // checkReportValues checks r against 05 §12.1's caps and value sets, and that its rows agree with each other.
@@ -227,6 +272,12 @@ func checkReportValues(t *testing.T, r media.AudioReport) {
 		in("session flow", s.Flow, []string{"render"})
 		if s.Created == "" || s.Created[0] == '-' {
 			t.Errorf("session of pid %d: created %q", s.PID, s.Created)
+		}
+	}
+	for _, w := range r.Warnings {
+		in("report warning", w.Code, reportWarnings)
+		if w.App == "" {
+			t.Errorf("report warning %s names no app", w.Code)
 		}
 	}
 	for _, e := range r.Events {

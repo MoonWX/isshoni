@@ -166,19 +166,26 @@ type AudioSession struct {
 	Note         string `json:"note"` // "" | "covered" | "no_handle"
 }
 
-// AudioWarning is one warnings[] entry of 05 §12.1.
+// AudioWarning is one warnings[] entry of 05 §12.1: a report-level warning about the app with id App. Code is
+// "multi_process_session" (an audio session shared by several processes, 05 §6.3) or "instance_gone" (an
+// IM_RULE_INSTANCE rule whose pid doesn't exist, so it is ignored, 05 §5.3); a row's own warnings are in
+// AudioApp.Warnings. Like every value set of the report, it may grow additively: callers ignore codes they don't
+// know.
 type AudioWarning struct {
 	Code string `json:"code"`
 	App  string `json:"app"`
 }
 
-// AudioCounters are the mixer's counters of 05 §12.1.
+// AudioCounters are the mixer's counters of 05 §12.1. A counter that a report doesn't carry (one from a DLL older
+// than the field, such as tailFades) reads as 0. TailFades counts the sounds that stopped into digital silence and
+// had their last 5 ms ramped out (the tail fade, 05 §9.5; docs/m2/README.md §3 item 53), over every channel.
 type AudioCounters struct {
 	Streams            int     `json:"streams"`
 	Activations        int     `json:"activations"`
 	ActivationFailures int     `json:"activationFailures"`
 	Underruns          int     `json:"underruns"`
 	Trims              int     `json:"trims"`
+	TailFades          int     `json:"tailFades"` // additive (05 §12.1): 0 in a report without it
 	Overflows          int     `json:"overflows"`
 	Discontinuities    int     `json:"discontinuities"`
 	MixerResyncs       int     `json:"mixerResyncs"`
@@ -191,7 +198,13 @@ type AudioCounters struct {
 	AudioCPUMsPerS     float64 `json:"audioCpuMsPerS"`
 }
 
-// AudioEvent is one events[] entry of 05 §12.1.
+// AudioEventTailFade is the events[] code of the tail fade (05 §9.5, §12.1): a sound of App stopped into digital
+// silence and was ramped out. The mixer raises it at most once per second per channel; AudioCounters.TailFades
+// counts every one.
+const AudioEventTailFade = "tail_fade"
+
+// AudioEvent is one events[] entry of 05 §12.1. Code is one of 05 §12.1's event codes ("stream_running", "underrun",
+// AudioEventTailFade, …); the set may grow additively.
 type AudioEvent struct {
 	TNanos int64  `json:"tNs"` // engine clock
 	Code   string `json:"code"`
