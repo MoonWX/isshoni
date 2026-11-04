@@ -921,7 +921,7 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
   if (st == IM_OK && input == FrameInput::kNv12) {
     // The layer's converter drops the old encoder's targets and follows a new output size or frame rate (a re-init,
     // §7.7, §9.5).
-    st = frames_->Configure(layer, L.out, L.fps);
+    st = frames_->Configure(layer, L.out, L.fps, src_size_);
     if (st != IM_OK) {
       enc.reset();
     }

@@ -12,11 +12,12 @@
 // runs besides); a closed source ends the session with ENDED{IM_ERR_SOURCE_GONE} source_gone and the capture stops; a
 // failed capture ends it (source_gone, internal, or encoder_lost device_removed); a resize sends one SOURCE_RESIZED
 // {"width","height"} and, once the size is stable for 1 s, re-inits only the layers whose output size changes
-// (REINIT|KEYFRAME at the new size); a source whose size changed since the pick is a resize at once; a minimized
-// window sends SOURCE_MINIMIZED and SOURCE_RESTORED; a layer-0 fps re-init calls SetFps (a layer-1 one doesn't);
-// im_stop stops the capture first, before the session releases its frames and device (the capture's last callback
-// still finds them; the logs show the order); a capture that needs slots gets them (the GPU path) even for
-// IM_ENC_FAKE.
+// (REINIT|KEYFRAME at the new size), and such a re-init moves the layer's converter to the settled source size, so a
+// later resize's content is letterboxed into the current output, not stretched (VideoFrames on WARP); a source whose
+// size changed since the pick is a resize at once; a minimized window sends SOURCE_MINIMIZED and SOURCE_RESTORED; a
+// layer-0 fps re-init calls SetFps (a layer-1 one doesn't); im_stop stops the capture first, before the session
+// releases its frames and device (the capture's last callback still finds them; the logs show the order); a capture
+// that needs slots gets them (the GPU path) even for IM_ENC_FAKE.
 #include <gtest/gtest.h>
 
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
@@ -38,9 +39,14 @@
 #include "capture/capture_source.h"
 #include "capture/source_watch.h"
 #include "engine/os.h"
+#include "gpu/converter.h"
+#include "gpu/device.h"
+#include "gpu/frame.h"
 #include "gpu/slots.h"
 #include "im/log/ring.h"
+#include "im/video/scale.h"
 #include "isshoni_media.h"
+#include "session/frames.h"
 #include "testhooks/testhooks.h"
 
 namespace {
@@ -515,6 +521,54 @@ TEST_F(SessionCapture, ResizeSendsSourceResizedThenReinitsTheLayersWhoseSizeChan
   EXPECT_EQ(now.layers[0].width, 1920u);
   EXPECT_EQ(now.layers[1].width, 640u);
   EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+// A re-init's Configure gives the layer's converter the settled source size as well as the output size (§7.7): content
+// of that size fills the output's content rect, and a later resize's content of another size is fitted into the
+// current output with the aspect kept (black bars), not stretched over the rect computed for the old size.
+TEST(SessionCaptureFrames, AReinitMovesTheConvertersSourceSizeWithTheOutput) {
+  std::unique_ptr<im::gpu::Device> device;
+  im::gpu::DeviceRequest request;
+  request.adapter = im::gpu::DeviceRequest::Adapter::kWarp;
+  ASSERT_EQ(im::gpu::Device::Create(request, &device), IM_OK) << LastError();
+  const im::video::Size pick{1280, 720};
+  const im::video::Size square{1000, 1000};
+  const im::video::LayerBounds f_bounds{1920 * 1080, 0, 0};
+  const im::session::VideoFrames::LayerSetup layers[] = {{im::video::ComputeOutputSize(pick, f_bounds), 60}};
+  im::session::VideoFrames::Config fc;
+  fc.source = pick;
+  fc.layers = layers;
+  std::unique_ptr<im::session::VideoFrames> frames;
+  ASSERT_EQ(im::session::VideoFrames::Create(device.get(), fc, &frames), IM_OK) << LastError();
+  const im::gpu::Converter *c = frames->converter(0);
+  ASSERT_NE(c, nullptr);
+
+  // Slots grow to the largest content they were written with: 1280x1000 holds both sizes.
+  auto frame_of = [](im::video::Size content) {
+    im::gpu::SourceFrame src;
+    src.texture_size = im::video::Size{1280, 1000};
+    src.content = content;
+    return src;
+  };
+
+  // The resize to 1000x1000 settled: f re-inits at its output size for it.
+  const im::video::OutputSize sq = im::video::ComputeOutputSize(square, f_bounds);
+  ASSERT_EQ(frames->Configure(0, sq, 60, square), IM_OK) << LastError();
+  EXPECT_EQ(c->config().source, square);
+  EXPECT_EQ(c->Geometry(frame_of(square)).dest, sq.content) << "the settled size fills the output";
+
+  // Back to 1280x720, before that size settles: letterboxed into 1000x1000, not stretched over it.
+  const im::video::Rect back = c->Geometry(frame_of(pick)).dest;
+  EXPECT_EQ(back, im::video::FitRect(pick, sq.size));
+  EXPECT_EQ(back.width, sq.size.width);
+  EXPECT_LT(back.height, sq.size.height) << "16:9 content in a square output has bars above and below";
+
+  // Once it settles, f re-inits at 1280x720 again and the content fills the output's rect.
+  const im::video::OutputSize wide = im::video::ComputeOutputSize(pick, f_bounds);
+  ASSERT_EQ(frames->Configure(0, wide, 60, pick), IM_OK) << LastError();
+  EXPECT_EQ(c->config().source, pick);
+  EXPECT_EQ(c->Geometry(frame_of(pick)).dest, wide.content);
+  EXPECT_EQ(c->config().input, pick) << "the input stays the slots' starting size";
 }
 
 TEST_F(SessionCapture, ASizeChangedSinceThePickIsAResizeAtOnce) {
