@@ -80,6 +80,9 @@ const (
 	EventResume        SystemEvent = "resume"         // PBT_APMRESUMEAUTOMATIC
 	EventEndSession    SystemEvent = "end-session"    // WM_QUERYENDSESSION
 	EventDisplayChange SystemEvent = "display-change" // WM_DISPLAYCHANGE
+	// EventEndSessionConfirmed: the session ends (WM_ENDSESSION with wParam TRUE); a cancelled end (FALSE) sends
+	// nothing.
+	EventEndSessionConfirmed SystemEvent = "end-session-confirmed"
 )
 
 // Pill is the Sharing pill, a native Win32 window drawn by Go (03 D8, §11.4).

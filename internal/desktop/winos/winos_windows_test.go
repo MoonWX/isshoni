@@ -20,7 +20,6 @@ import (
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
-	"github.com/MoonWX/isshoni/internal/desktop/hotkey"
 )
 
 // The child processes of these tests: the test binary run again with childEnv set.
@@ -499,20 +498,18 @@ func TestRegistryPending(t *testing.T) {
 
 func TestHooks(t *testing.T) {
 	h := New()
+	defer func() { _ = h.Close() }()
 	if h.OSBuild() < 10240 {
 		t.Errorf("OSBuild = %d", h.OSBuild())
 	}
 	if err := SetAppUserModelID("io.isshoni.test"); err != nil {
 		t.Error(err)
 	}
-	// Not there yet (README WA68, WA80, WA84): a clear error, never a silent success.
-	if err := h.RegisterHotkey(app.HotkeyPause, hotkey.DefaultPause); !errors.Is(err, errNotImplemented) {
-		t.Errorf("RegisterHotkey: %v", err)
-	}
+	// Not there yet (README WA80, WA84): a clear error, never a silent success.
 	if err := h.SetAutostart(true, `C:\x.exe`); !errors.Is(err, errNotImplemented) {
 		t.Errorf("SetAutostart: %v", err)
 	}
-	if h.Pill() == nil || h.Hotkeys() != nil || h.Events() != nil {
+	if h.Pill() == nil || h.Hotkeys() == nil || h.Events() == nil {
 		t.Error("Pill, Hotkeys or Events")
 	}
 }

@@ -3,33 +3,126 @@
 package main
 
 import (
+	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime"
+	"strings"
+	"sync/atomic"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/bridge"
+	"github.com/MoonWX/isshoni/internal/desktop/tray"
 )
 
-// errNotImplemented is returned by the Shell methods whose slices have not landed yet.
-var errNotImplemented = errors.New("desktop: not implemented yet")
+var (
+	_ app.Shell     = (*wailsShell)(nil)
+	_ app.TrayShell = (*wailsShell)(nil)
+	_ shellApp      = (*app.App)(nil)
+)
 
-var _ app.Shell = (*wailsShell)(nil)
+// trayIcons are 03 §11.1's tray icons (build/tray/icons.go writes them): tray-idle, tray-live, tray-paused and
+// tray-warn, .ico with 16 to 32 px images.
+//
+//go:embed build/tray/*.ico
+var trayIcons embed.FS
 
-// wailsShell is internal/desktop/app's Shell over Wails: one application with its main window (03 §4.4). Notify and
-// the tray come with WA68.
+// trayIcon is the icon file of id; the idle icon for an id without one.
+func trayIcon(id tray.IconID) []byte {
+	b, err := trayIcons.ReadFile("build/tray/" + string(id) + ".ico")
+	if err != nil {
+		b, _ = trayIcons.ReadFile("build/tray/" + string(tray.IconIdle) + ".ico")
+	}
+	return b
+}
+
+// shellApp is what the shell reports to internal/desktop/app (*app.App).
+type shellApp interface {
+	WindowClosing()
+	WindowCreated()
+	TrayClicked()
+	TrayAction(act tray.Action)
+	ToastAction(nonce, action string) bool
+	Shutdown()
+}
+
+// wailsShell is internal/desktop/app's Shell over Wails (03 §4.4, §11.1, §15): one application with its main
+// window, the tray icon for the app's whole life, the close hook (W7) and toasts (W8). The app it reports to is
+// bound once it exists (bind); until then a close closes and the tray does nothing.
 type wailsShell struct {
 	app  *application.App
 	main *application.WebviewWindow
+	tray *application.SystemTray
 	// openURL opens a URL that passed validation in the system browser; nil means Wails' Browser.OpenURL.
 	openURL func(string) error
+	notes   notifier
+
+	target   atomic.Pointer[shellApp]
+	quitting atomic.Bool // Quit or Wails' shutdown began: a close is a close
 }
 
-// newShell creates the main window on app; Wails shows it when Run starts.
-func newShell(app *application.App, main application.WebviewWindowOptions) *wailsShell {
-	return &wailsShell{app: app, main: app.Window.NewWithOptions(main)}
+// newShell creates the main window, the tray icon and the toasts on app; Wails shows them when Run starts.
+func newShell(a *application.App, main application.WebviewWindowOptions, log *slog.Logger) *wailsShell {
+	s := &wailsShell{app: a, main: a.Window.NewWithOptions(main), tray: a.SystemTray.New(), notes: newNotifier(log)}
+	// W7: closing the window is the app's choice (hide to the tray or quit, 03 §11.6), off the UI thread.
+	s.main.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		t := s.app0()
+		if t == nil || s.quitting.Load() {
+			return
+		}
+		e.Cancel()
+		go t.WindowClosing()
+	})
+	// W10: the native handle exists; WDA_EXCLUDEFROMCAPTURE goes on it (03 §11.5). Both are idempotent.
+	for _, ev := range []events.WindowEventType{events.Common.WindowRuntimeReady, events.Common.WindowShow} {
+		s.main.OnWindowEvent(ev, func(*application.WindowEvent) {
+			if t := s.app0(); t != nil {
+				go t.WindowCreated()
+			}
+		})
+	}
+	// W18: the tray. A left click opens the window; a right click opens the menu the app keeps up to date.
+	s.tray.SetIcon(trayIcon(tray.IconIdle))
+	s.tray.SetTooltip("isshoni")
+	s.tray.SetMenu(application.NewMenu())
+	s.tray.OnClick(func() {
+		if t := s.app0(); t != nil {
+			go t.TrayClicked()
+		}
+	})
+	s.tray.OnRightClick(s.tray.OpenMenu)
+	// W14: a quit Wails began itself still stops the share first (and after the app's own Quit it does nothing).
+	a.OnShutdown(func() {
+		s.quitting.Store(true)
+		if t := s.app0(); t != nil {
+			t.Shutdown()
+		}
+		s.notes.stop()
+	})
+	return s
 }
+
+// bind gives the shell the app it reports to, and the toasts' actions their way back.
+func (s *wailsShell) bind(t shellApp) {
+	s.target.Store(&t)
+	// Off Wails' notification callback (COM's activation thread): a Resume or Stop waits for the server.
+	s.notes.onAction(func(nonce, action string) { go t.ToastAction(nonce, action) })
+}
+
+// app0 is the bound app, nil before bind.
+func (s *wailsShell) app0() shellApp {
+	if p := s.target.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// started is called once Wails runs: the toasts' service starts (it needs the running application).
+func (s *wailsShell) started() error { return s.notes.start() }
 
 // Run runs Wails until the app quits.
 func (s *wailsShell) Run() error { return s.app.Run() }
@@ -77,14 +170,64 @@ func (s *wailsShell) OpenURL(url string) error {
 	return nil
 }
 
-func (s *wailsShell) Notify(app.Notification) error { return errNotImplemented }
+// Notify shows a toast through Wails' notifications service (03 §15, W8).
+func (s *wailsShell) Notify(n app.Notification) error {
+	if s.notes == nil {
+		return errNoToasts
+	}
+	return s.notes.notify(n)
+}
 
-func (s *wailsShell) Quit() { s.app.Quit() }
+// errNoToasts is Notify on a shell without its notifier.
+var errNoToasts = errors.New("desktop: no toasts")
+
+// SetTray draws the app's tray view (W18): the icon, the tooltip and a new menu whose items report their action.
+// Wails has no bold menu items, so the default item is drawn like the others.
+func (s *wailsShell) SetTray(v tray.View) {
+	s.tray.SetIcon(trayIcon(v.Icon))
+	s.tray.SetTooltip(v.Tooltip)
+	s.tray.SetMenu(trayMenu(v, func(act tray.Action) {
+		if t := s.app0(); t != nil {
+			go t.TrayAction(act)
+		}
+	}))
+}
+
+// trayMenu is v's menu; a chosen item calls do with its action.
+func trayMenu(v tray.View, do func(tray.Action)) *application.Menu {
+	m := application.NewMenu()
+	for _, item := range v.Menu {
+		if item.Separator {
+			m.AddSeparator()
+			continue
+		}
+		mi := m.Add(menuLabel(item.Label)).SetEnabled(item.Enabled)
+		if act := item.Action; act != tray.ActionNone && item.Enabled {
+			mi.OnClick(func(*application.Context) { do(act) })
+		}
+	}
+	return m
+}
+
+// menuLabel keeps a label's "&" (a share label may have one) from becoming a Windows menu mnemonic.
+func menuLabel(s string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ReplaceAll(s, "&", "&&")
+	}
+	return s
+}
+
+// Quit quits Wails; its shutdown runs the app's Shutdown, which does nothing after the app's own Quit.
+func (s *wailsShell) Quit() {
+	s.quitting.Store(true)
+	s.app.Quit()
+}
 
 // registerServices builds the bound services over d (internal/desktop/bridge, 03 §6.2) and registers each with
 // Wails, between application.New and Run. The services' events go out through the shell's Emit. Each NewService call
 // names its type, which is what `wails3 generate bindings` (task gen:bindings) reads: a service added to bridge needs
-// its line here, or it gets no TypeScript and no binding.
+// its line here, or it gets no TypeScript and no binding. Wails' notifications service is deliberately not one of
+// them: registered, its methods would be bound for page script; notify_windows.go starts it itself.
 func registerServices(s *wailsShell, d bridge.Deps) (*bridge.Services, error) {
 	if d.Emit == nil {
 		d.Emit = s.Emit

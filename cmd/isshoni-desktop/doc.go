@@ -8,7 +8,7 @@
 //
 // main handles a start in 03 §13.4's order: the first action (the DLL search order), then step 0
 // (--sound-check-helper), the one-shot modes (--version, --self-check=<path>, --forget-credentials, --purge-data,
-// -Embedding), step 2a (an installer running: a link start leaves its link in PendingServer/PendingRoom and every
+// -Embedding, whose toast activation starts the app afresh in a new process only when it is the toast's Open), step 2a (an installer running: a link start leaves its link in PendingServer/PendingRoom and every
 // start exits), single instance, the running mutex, the Pending values and the app. Steps 2 and 5 and --update-now
 // are marked in start.go where their slices put them.
 //
@@ -28,9 +28,14 @@
 //	firstaction_*.go     main's first action (SetDefaultDllDirectories, SetDllDirectory) and --version's stdout
 //	engine_release.go    the engine of every release: native.Open (01 §7.1)
 //	engine_fake.go       the engine of dev and e2e builds: 01's fake with 05's audio scenarios (03 §4.5, §22.4)
-//	shell.go             internal/desktop/app's Shell over Wails (03 §6.1; the tray and toasts come with WA68), its
-//	                     validated OpenURL (03 §5.5), and registerServices: the bound services of
-//	                     internal/desktop/bridge (03 §6.2) registered with Wails, which `task gen:bindings` reads
+//	shell.go             internal/desktop/app's Shell over Wails (03 §6.1): the main window with its close hook (W7)
+//	                     and WDA report (W10), the tray drawn from internal/desktop/tray's View with the embedded
+//	                     build/tray icons (W18), Wails' shutdown into App.Shutdown (W14), its validated OpenURL
+//	                     (03 §5.5), and registerServices: the bound services of internal/desktop/bridge (03 §6.2)
+//	                     registered with Wails, which `task gen:bindings` reads
+//	notify*.go           toasts (03 §15, W8): Wails' notifications service on Windows, started by the shell and never
+//	                     bound for page script, the nonce in each toast's data and -Embedding's wait for its
+//	                     activation; nothing on the macOS dev build
 //	webview2.go          the WebView2 runtime minimum and its message box text (03 §5.4)
 //	platform_windows.go  Windows facts: the asset origin and its Guard, the data root and the profile folder from
 //	                     the shell's known folders, the WebView2 profile folder, the OS build, step 2a's probe of
@@ -38,6 +43,8 @@
 //	platform_darwin.go   macOS dev-build facts (WKWebView's Guard, the dev data folder)
 //	flavor_*.go          what the build tags production, dev and e2e change (03 §5.3, §5.4)
 //	main_other.go        the stub of every other OS
+//	build/tray/          the tray icons (tray-idle, -live, -paused, -warn; .ico of 16 to 32 px), written by icons.go
+//	                     (a //go:build ignore program)
 //	build/windows/       icon.ico and app.manifest, which `task desktop:exe:windows` puts into the exe's resources
 //	                     with syso.go (a //go:build ignore program built in the tools/wails3 module)
 //	checklist_test.go    03 §3.2's Wails checklist in the real webview (-tags isshoni_hw: the owner's PC, a Mac)
@@ -51,6 +58,6 @@
 // dev server, http loopback servers, the fake engine) and e2e (the CDP build: http loopback servers, the WEBVIEW2_*
 // variables kept, the fake engine). A release has exactly production (06 §5.2).
 //
-// Still to come, by README slice: the tray and notifications (WA68), the shell relaunch and --sound-check-helper
-// (WA77), the start-time update and --update-now (WA84).
+// Still to come, by README slice: the shell relaunch and --sound-check-helper (WA77), the hotkeys and the pill
+// (WA80), the start-time update and --update-now (WA84).
 package main

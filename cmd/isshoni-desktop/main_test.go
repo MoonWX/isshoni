@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -234,9 +235,9 @@ func TestAppStartsOverTheBundle(t *testing.T) {
 	}
 }
 
-func TestShellIsNotImplementedYetWhereSaid(t *testing.T) {
+func TestShellWithoutNotifier(t *testing.T) {
 	var s wailsShell
-	if err := s.Notify(app.Notification{Title: "x"}); err == nil {
-		t.Fatal("Notify works before its slice")
+	if err := s.Notify(app.Notification{Title: "x"}); !errors.Is(err, errNoToasts) {
+		t.Fatalf("Notify without a notifier: %v", err)
 	}
 }

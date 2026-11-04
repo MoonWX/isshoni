@@ -50,6 +50,9 @@ const (
 	windowMinHeight = 560
 )
 
+// embeddingWait bounds -Embedding's wait for its toast activation: the mode exits within 5 s (03 §13.4 step 1, §20).
+const embeddingWait = 4 * time.Second
+
 // autoplayArg lets viewer audio play without a click (03 §5.4, W13).
 const autoplayArg = "--autoplay-policy=no-user-gesture-required"
 
@@ -88,6 +91,8 @@ func run(args []string) int {
 		},
 		holdRunning: func() error { return winos.HoldRunningMutex(winos.RunningMutex) },
 		takePending: func() (app.Pending, error) { return app.TakePending(winos.NewRegistry(winos.RegistryKey)) },
+		embedding:   func() bool { return awaitToastActivation(slog.Default(), embeddingWait) },
+		relaunch:    startFresh,
 		runApp:      runApp,
 	}
 	return s.start(args)
@@ -230,7 +235,7 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 	// Wails' own logger never logs below Info, whatever the log level is: at Debug the pinned Wails logs every
 	// bound call's raw arguments and result (03 §17).
 	wailsApp := application.New(appOptions(handler, assetGuard(), webviewData, wailsLog))
-	shell := newShell(wailsApp, mainWindowOptions())
+	shell := newShell(wailsApp, mainWindowOptions(), slog.Default())
 	a, err := app.New(app.Deps{
 		Settings:         st,
 		Servers:          srv,
@@ -240,12 +245,15 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		I18n:             cat,
 		Log:              slog.Default(),
 		InsecureLoopback: insecureLoopback(),
+		LogsDir:          filepath.Join(root, "logs"),
+		NoticesFile:      noticesFile(),
 	})
 	if err != nil {
 		log.Error("desktop: the app can't start", "err", err)
 		return exitFailed
 	}
 	theApp.Store(a)
+	shell.bind(a)
 	// The bound services (03 §6.2), registered before Wails runs.
 	svcs, err := registerServices(shell, bridge.Deps{App: a, Servers: bridge.ServersOf(srv), ProbeApp: appInfo(),
 		AllowInsecureLoopback: insecureLoopback(), Settings: st, PolicyOff: update.PolicyDisabled,
@@ -264,6 +272,9 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 	wailsApp.OnShutdown(fwd.stop)
 	wailsApp.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		started.Do(func() {
+			if err := shell.started(); err != nil {
+				log.Warn("desktop: no toasts", "err", err)
+			}
 			go func() {
 				defer close(runDone)
 				if err := a.Run(ctx); err != nil {
@@ -294,6 +305,16 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		return exitFailed
 	}
 	return exitOK
+}
+
+// noticesFile is the installed THIRD_PARTY_NOTICES.txt (06 §2.2): <exe dir>\licenses\. "" when the exe's path is
+// unknown (App.OpenNotices then answers not_implemented).
+func noticesFile() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "licenses", "THIRD_PARTY_NOTICES.txt")
 }
 
 // setupLogging makes the process's default logger and returns the app's own, which adds component=app. The default

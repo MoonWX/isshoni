@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"os/exec"
 	"sync"
 
 	"github.com/MoonWX/isshoni/internal/client/credstore"
@@ -54,6 +56,13 @@ type starter struct {
 	singleInstance func() (instance, error)    // step 3
 	holdRunning    func() error                // step 4: the running mutex
 	takePending    func() (app.Pending, error) // step 6
+	// embedding is -Embedding's wait for the toast activation that COM started this process for (notify_*.go's
+	// awaitToastActivation): true when it is open, which continues as a normal start. nil drops every activation.
+	embedding func() (open bool)
+	// relaunch starts a fresh copy of the exe without arguments (startFresh): -Embedding's open. The normal start
+	// can't go on in the -Embedding process, whose Wails application (the activator's) already exists: Wails keeps
+	// one per process, and a second application.New returns it with every option of runApp dropped.
+	relaunch func() error
 	// runApp is step 7: the app with its services and Wails, for the first instance; its result is the exit code.
 	// fwd holds what second launches forwarded since step 3 and hands it to the app once it has booted; inst is the
 	// held single-instance lock (nil when it is unavailable), which runApp closes as soon as Wails has stopped.
@@ -74,6 +83,17 @@ func (s *starter) start(args []string) int {
 
 	// Step 1: the one-shot modes, never with --open-url (ParseArgs leaves OneShot empty then). No window, no single
 	// instance, no mutex.
+	if p.OneShot == app.ModeEmbedding && s.embedding != nil && s.embedding() {
+		// The toast's Open: a normal start, as if the user had started the app (03 §13.4 step 1, §15), in a fresh
+		// process that goes through steps 2–7 itself; this one exits.
+		s.log.Info("desktop: started by a toast's Open; starting the app")
+		if s.relaunch == nil {
+			s.log.Warn("desktop: this build can't start the app for a toast's Open")
+		} else if err := s.relaunch(); err != nil {
+			s.log.Warn("desktop: the app didn't start for a toast's Open", "err", err)
+		}
+		return exitOK
+	}
 	if p.OneShot != "" {
 		return s.oneShot(p)
 	}
@@ -132,6 +152,20 @@ func (s *starter) start(args []string) int {
 
 	// Step 7: the app.
 	return s.runApp(p, args, pending, fwd, inst)
+}
+
+// startFresh starts the exe again without arguments and doesn't wait for it.
+func startFresh() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	// The fresh app outlives this process: a context that never ends.
+	cmd := exec.CommandContext(context.Background(), exe) //nolint:gosec // G204: this exe itself
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
 }
 
 // installerHandover is 03 §13.4 step 2a. It reports whether the start must exit 0 now: when installingMutex
@@ -258,8 +292,8 @@ func (s *starter) oneShot(p app.Args) int {
 		}
 		return exitOK
 	case app.ModeEmbedding:
-		// A toast button pressed while no instance runs: every action carries a nonce of a run that is gone, so all
-		// are dropped (03 §15). The activator and the "open" action come with toasts (README WA68).
+		// A toast button pressed while no instance runs: every action but open carries a nonce of a run that is gone,
+		// so all are dropped (03 §15); open continued as a normal start above.
 		s.log.Info("desktop: a toast activation without a running app; dropped")
 		return exitOK
 	case app.ModeSelfCheck:

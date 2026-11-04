@@ -60,9 +60,6 @@ func clientOS() string {
 	return runtime.GOOS
 }
 
-// Heartbeat is the SPA's watchdog beat (W17's fallback, 03 §20): every 5 s. The watchdog itself is README WA68's.
-func (a *App) Heartbeat() {}
-
 // Live reports a share being started or running, and its room (03 §11.6's "while live"): the bridge answers busy
 // for what a live share forbids. It is the share controller's Live.
 func (a *App) Live() (roomID string, live bool) { return a.sharing() }
@@ -113,12 +110,6 @@ func (a *App) OpenOSSettings(p OSPage) error {
 	}
 	return a.d.OS.OpenSettingsPage(p)
 }
-
-// OpenLogsFolder opens Explorer at the logs folder (03 §6.2); README WA68 adds the shell open.
-func (a *App) OpenLogsFolder() error { return ErrNotImplemented }
-
-// OpenNotices opens <exe dir>\licenses\THIRD_PARTY_NOTICES.txt (03 §6.2, 06 §2.2); README WA68 adds it.
-func (a *App) OpenNotices() error { return ErrNotImplemented }
 
 // MaxOwnConnections bounds App.OwnConnections (03 §20).
 const MaxOwnConnections = 64
