@@ -166,6 +166,9 @@ var reservedEnv = []string{
 	"ISSHONI_WINOS_TEST_OUT",
 	"ISSHONI_APPLOG_CRASH_CHILD",
 	"ISSHONI_MEDIATEST_MUTANT",
+	"ISSHONI_ENGINETEST_TEST_CHILD",
+	// The FFmpeg folder of the native encoder tests (M2 04 §9.10; windows-native sets it to the locked zip's bin).
+	"ISSHONI_TEST_FFMPEG_DIR",
 }
 
 // envOnly are the env-only switches of §4.3: read directly, never warned about.

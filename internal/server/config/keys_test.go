@@ -341,6 +341,8 @@ var devEnvNames = []struct{ name, readBy string }{
 	{"ISSHONI_WINOS_TEST_OUT", "internal/desktop/winos/winos_windows_test.go"},
 	{"ISSHONI_APPLOG_CRASH_CHILD", "internal/desktop/applog/applog_test.go"},
 	{"ISSHONI_MEDIATEST_MUTANT", "internal/media/mediatest/mutant_test.go"},
+	{"ISSHONI_ENGINETEST_TEST_CHILD", "cmd/isshoni-enginetest/main_windows_test.go"},
+	{"ISSHONI_TEST_FFMPEG_DIR", "native/windows/tests/ffmpeg_load_test.cpp, mf_sw_test.cpp, set by ci.yml windows-native"},
 }
 
 // The server never warns about the names M2's desktop dev and e2e builds, tasks and tests read (WF7, after README
