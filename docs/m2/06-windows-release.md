@@ -286,7 +286,8 @@ by hand against FFmpeg's release key):
   `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` from that list on Windows and keeps the places Intel's drivers
   install the runtimes (both driver stores, the registry keys, System32 and SysWOW64). The two variables go as well,
   although the engine clears them (04 §13.3 layer 4): without them the dispatcher's search doesn't depend on the host
-  process (ffcheck, `isshoni-enginetest`, the test binaries) or on when it clears them. The patch's header gives the
+  process (ffcheck, `isshoni-enginetest`, the test binaries) or on when it clears them. It guards against planted
+  files only: the kept search still reads `%windir%` and the HKCU dispatcher key. The patch's header gives the
   details; `build.sh` applies it (§4.3 step 3). The libvpl pin stays v2.17.0: a pin bump has to carry the patch
   forward (it must apply with no fuzz, or the build fails).
 - **Patches** are files under `native/ffmpeg/patches/`, unified diffs with a header saying why, applied to an

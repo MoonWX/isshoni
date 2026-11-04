@@ -452,14 +452,12 @@ TEST(EncPolicy, LiveEncoderThatEmitsAnIdrIsReinit) {
 }
 
 TEST(EncPolicy, TestEncodePlan) {
-  // §9.10: the same frame budget for every kind; only MF software is paced and may drain.
+  // §9.10: the same frame budget for every kind; only MF software is paced and drains (to diagnose a failure).
   for (const uint32_t kind : {IM_ENC_NVENC, IM_ENC_QSV, IM_ENC_AMF, IM_ENC_MF_HW, IM_ENC_MF_SW, IM_ENC_OPENH264}) {
     const TestEncodePlan plan = TestEncodePlanFor(kind);
     EXPECT_EQ(plan.max_delay_frames, 3) << EncoderToken(kind);
     EXPECT_EQ(plan.drain, kind == IM_ENC_MF_SW) << EncoderToken(kind);
     EXPECT_EQ(plan.paced, kind == IM_ENC_MF_SW) << EncoderToken(kind);
-    // A drained encoder can't run the live-bitrate check after the test IDR.
-    EXPECT_FALSE(plan.drain && Traits(kind).live_bitrate) << EncoderToken(kind);
   }
 }
 

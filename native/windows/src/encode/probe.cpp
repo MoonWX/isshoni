@@ -497,7 +497,7 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
   info.flags |= profile == IM_PROFILE_HIGH ? IM_ENCF_HIGH : IM_ENCF_CB;
 
   // The IDR, allowing the encoder a few frames of delay before its first AU (encpolicy::TestEncodePlan: MF software's
-  // frames are paced, and what it still holds after them may be drained).
+  // frames are paced, and when they bring no AU a drain shows what the MFT still held; it never passes the probe).
   const encpolicy::TestEncodePlan plan = encpolicy::TestEncodePlanFor(info.kind);
   TestRun run(*enc, plan.paced);
   bool produced = false;
@@ -507,22 +507,33 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
     ++delay;
     ok = run.Frame(false, &produced);
   }
-  bool drained = false;
+  const std::size_t budget_aus = run.aus().size(); // what the frame budget brought, before any drain
   if (ok && !produced && plan.drain) {
-    drained = true;
-    ok = run.Drain();
+    // Diagnosis only: an encoder whose first AU needs more than the frame budget, or comes out only at end of
+    // stream, would hold back that many frames in a session, which never drains. The log tells "nothing at all"
+    // from "the AU was there, too late"; the probe fails either way.
+    const bool drain_ok = run.Drain();
+    const AuFacts drained = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
     log::Info("encode", "probe: first AU only on drain",
-              {{"encoder", name}, {"frames", delay + 1}, {"ok", ok}, {"aus", run.aus().size()}});
+              {{"encoder", name},
+               {"frames", delay + 1},
+               {"ok", drain_ok},
+               {"aus", run.aus().size()},
+               {"sps", drained.sps},
+               {"pps", drained.pps},
+               {"idr", drained.idr},
+               {"detail", abi::LastErrorText()}});
+    abi::ClearLastError();
   }
-  const AuFacts first = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
+  const AuFacts first = budget_aus == 0 ? AuFacts{} : Inspect(run.aus().front());
   if (!ok || !first.sps || !first.pps || !first.idr) {
+    // At most log::kMaxAttrs (8) attributes, or the ring leaves the last ones out.
     log::Info(
         "encode", "probe: test encode failed",
         {{"encoder", name},
          {"ok", ok},
          {"frames", delay + 1},
-         {"drained", drained},
-         {"aus", run.aus().size()},
+         {"aus", budget_aus},
          {"sps", first.sps},
          {"pps", first.pps},
          {"idr", first.idr},
@@ -537,11 +548,7 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
 
   // 04 §9.10's live-bitrate check: two P frames, a 50 % change as §9.5 applies it, two more frames (plus the
   // encoder's delay, so their AUs come out); an IDR in either of those AUs makes it a re-init encoder.
-  // A drained encoder takes no more frames; TestEncodePlan drains only a kind the table doesn't mark live.
-  if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && drained) {
-    info.flags = encpolicy::ApplyLiveBitrateCheck(info.flags, true);
-    log::Info("encode", "probe: drained, live-bitrate check not run", {{"encoder", name}});
-  } else if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && OverBudget(deadline_ns)) {
+  if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && OverBudget(deadline_ns)) {
     log::Info("encode", "probe: over budget, live-bitrate check skipped", {{"encoder", name}});
   } else if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0) {
     bool live_ok = run.Frame(false, &produced) && run.Frame(false, &produced);
@@ -565,6 +572,7 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
     }
   }
   enc.reset();
+  // Diagnostics only; for MF software it includes the pacing between frames.
   info.test_encode_us = static_cast<uint32_t>(std::clamp<int64_t>((NowNs() - t0) / 1000, 0, UINT32_MAX));
 
   // The other profile, by a trial open (04 §9.10: "High and CB from trial opens"), at the size that opened.

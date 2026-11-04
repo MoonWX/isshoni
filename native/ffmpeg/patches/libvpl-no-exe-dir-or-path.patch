@@ -16,6 +16,10 @@ isshoni-enginetest, the test binaries) or on the order of its calls. Other platf
 low-latency path already searches the driver store and System32 only, and the 1.x MFXInit search (main.cpp) isn't
 used by FFmpeg's libvpl code (qsv.c and hwcontext_qsv.c call MFXLoad and MFXCreateSession).
 
+The limit: this closes the search to planted files, not to a host that controls the process. The kept search still
+builds System32 / SysWOW64 from %windir% (an environment variable) and still reads the HKCU dispatcher key, which
+the user can write. Whoever can set the process's environment or write HKCU can already run code as that user.
+
 native/ffmpeg/build.sh applies it with `patch -p1 --fuzz=0` in the unpacked libvpl source and fails the build if it
 doesn't apply. It is an input of inputsSha256 (06 §4.1): changing it needs a new revision.
 
@@ -38,7 +42,7 @@ doesn't apply. It is an input of inputsSha256 (06 §4.1): changing it needs a ne
  
  #if defined(_WIN32) || defined(_WIN64)
      // retrieve list of DX11 graphics adapters (lightweight)
-@@ -504,35 +507,9 @@
+@@ -504,35 +507,10 @@
          it++;
      }
  
@@ -73,7 +77,8 @@ doesn't apply. It is an input of inputsSha256 (06 §4.1): changing it needs a ne
 -    }
 +    // isshoni: no search of the executable's folder, the PATH entries or ONEVPL_SEARCH_PATH (nor, above,
 +    //   ONEVPL_PRIORITY_PATH): a runtime is loaded only from the driver store, the dispatcher's registry keys
-+    //   and %windir%\system32 / syswow64, never from a folder a planted DLL can sit in.
++    //   and %windir%\system32 / syswow64, never from a folder a DLL can be planted in by dropping a file
++    //   (%windir% and the HKCU key still come from the host: the header gives the limit).
  
      // legacy MSDK installation: DriverStore has priority
      searchDirList.clear();

@@ -783,7 +783,7 @@ fake), WA29 (`internal/client/core` §11.2), WA41 (`internal/desktop/app` and `O
 | `golang.org/x/sys` in `tools/go.mod` | `g2g`'s GDI capture | WA08 |
 | `golang.org/x/crypto/ssh`, `golang.org/x/net/idna` (already required) | the SSHSIG verifier; deep-link hosts | WA25; WA20 |
 | vcpkg `opus`, `speexdsp` (BSD-3-Clause, static), `gtest` (feature `tests`, never shipped) | `builtin-baseline` in `native/vcpkg.json` | WA03 |
-| FFmpeg 9.0.2 with nv-codec-headers 12.1, AMF headers, libvpl | `native/ffmpeg/pins.json`; published once as `deps-ffmpeg-9.0.2-r1`, assets pinned in `lock.json` | WA07 |
+| FFmpeg 9.0.2 with nv-codec-headers 12.1, AMF headers, libvpl | `native/ffmpeg/pins.json`; published as `deps-ffmpeg-9.0.2-r1`, assets pinned in `lock.json`; r2 (the libvpl patch) is pending publish, and `lock.json` stays r1 until then | WA07 |
 | Cisco OpenH264 | the newest Cisco release at WA51 (2.6.0 today), URL and SHA-256 compiled in; downloaded at run time, never shipped | WA51 |
 | VS 2022 17.14 or VS 2026 (vswhere `[17.0,19.0)`, `VC.Tools.x86.x64`), MSVC toolset 14.44 exact through `deploy/windows/msvc-env.ps1` (vcpkg's ports too, through `native/triplets/`), Windows SDK 10.0.26100, NSIS 3.13, the WebView2 bootstrapper, Pester 5.x, PSScriptAnalyzer 1.x | `deploy/windows/tools.json` | WA07 (MSVC), WA11, WA49, WA67 |
 | GitHub Windows runner | `windows-2025` | WA04 |

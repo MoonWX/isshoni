@@ -44,9 +44,10 @@ constexpr uint32_t ApplyLiveBitrateCheck(uint32_t flags, bool idr_after_change) 
 // after ProcessInput, and an avcodec_receive_packet with no new frame returns EAGAIN without asking the MFT, so a
 // frame the MFT is still encoding on its own worker threads (Microsoft's "slice encoding" mode, its default) shows up
 // only at a later send. paced: the frames after the IDR go in one frame interval apart, as a session sends them, not
-// back to back. drain: when the budget gives no AU, an end of stream (MFT_MESSAGE_COMMAND_DRAIN) collects what the
-// MFT still holds from those frames; no extra frame is sent. A drained encoder takes no more frames, so drain is only
-// for a kind without the live-bitrate check.
+// back to back. drain: diagnosis only. When the budget gives no AU, an end of stream (MFT_MESSAGE_COMMAND_DRAIN) shows
+// in the log what the MFT still held from those frames (no extra frame is sent), and the probe fails all the same: a
+// session never drains, so an encoder whose first AU comes out only that way would hold back more frames than the
+// budget allows.
 struct TestEncodePlan {
   int max_delay_frames = 3; // some MF and QSV configurations hold one
   bool paced = false;
