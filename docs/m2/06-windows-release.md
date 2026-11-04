@@ -388,7 +388,9 @@ build manifest). No third-party action. The same command rebuilds the DLLs from 
    tools for Windows"), else from `PATH`. When the built DLLs differ from `lock.json`'s, the log line names the
    lock's and this build's toolset, compiler and linker.
 2. **Sources**: each `pins.json` tarball into `WORKDIR/src/`, downloaded with MSYS2's `curl` (3 retries) unless
-   already there or in the source archive's `src/`, and checked against its SHA-256 either way.
+   already there or in the source archive's `src/`, and checked against its SHA-256 either way. When a download
+   fails (ffmpeg.org was down on 2026-11-04), the tarball comes out of the source archive of `lock.json`'s release
+   (`src/<name>`, the same upstream bytes an earlier run published); `pins.json`'s SHA-256 still decides.
 3. **libvpl**: the patches of §4.1 (`libvpl-no-exe-dir-or-path.patch`), each with `patch -p1 --fuzz=0` after a
    `--dry-run`; a patch that doesn't apply exactly (a hunk off, fuzz needed, already applied) fails the build. Then
    `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW

@@ -271,8 +271,31 @@ check_imports() {
   log "$(basename "$dll") imports: $(printf '%s\n' "$list" | awk '{printf "%s%s (%s)", sep, $2, $1; sep = ", "}')"
 }
 
-# fetch NAME URL SHA256 puts the tarball NAME into $src_dir: from the source archive's src/, a previous run, or a
-# download (three retries), and fails unless its SHA-256 matches.
+# from_published NAME DST copies the tarball NAME out of the source archive of lock.json's release (the same upstream
+# bytes, published by an earlier run) into DST: the fallback when its upstream host is down. pins.json's SHA-256 is
+# still what decides. Fails quietly (status 1) when there is no lock.json or the copy can't be had.
+from_published() {
+  local name=$1 dst=$2 tag base tar
+  [ -f "$lock_file" ] || return 1
+  tag=$(json_string "$lock_file" tag)
+  [ -n "$tag" ] || return 1
+  base=${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-MoonWX/isshoni}/releases/download
+  tar=$work/published-${tag#deps-}-source.tar
+  if [ ! -f "$tar" ]; then
+    curl -fsSL --proto '=https' --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 900 \
+      -o "$tar.part" "$base/$tag/${tag#deps-}-source.tar" || {
+      rm -f "$tar.part"
+      return 1
+    }
+    mv "$tar.part" "$tar"
+  fi
+  tar -xOf "$tar" "${tag#deps-}-source/src/$name" >"$dst" 2>/dev/null || return 1
+  log "$name: from $tag's source archive (the upstream download failed)"
+}
+
+# fetch NAME URL SHA256 puts the tarball NAME into $src_dir: from the source archive's src/, a previous run, a
+# download (three retries), or, when the download fails, lock.json's published source archive; it fails unless its
+# SHA-256 matches.
 fetch() {
   local name=$1 url=$2 want=$3 dst=$src_dir/$1
   if [ -f "$dst" ] && [ "$(sha256 "$dst")" = "$want" ]; then
@@ -285,8 +308,8 @@ fetch() {
     log "$name: from src/"
   else
     curl -fsSL --proto '=https' --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 900 \
-      -o "$dst.part" "$url" || die "$name: download of $url failed"
-    log "$name: downloaded from $url"
+      -o "$dst.part" "$url" && log "$name: downloaded from $url" ||
+      from_published "$name" "$dst.part" || die "$name: download of $url failed"
   fi
   local got
   got=$(sha256 "$dst.part")
