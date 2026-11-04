@@ -1758,8 +1758,17 @@ and before the first share if it hasn't finished.
 - **Budget**: the encoders share `kEncoderBudgetMs` = 1500 ms from the probe's start. Past it no encoder starts (its
   entry is `IM_ERR_TIMEOUT`, token `engine_timeout`), and an encoder already started skips its remaining trials (the
   CB trial open: `IM_ENCF_CB` clear; the 720p retry; the live-bitrate check: the table's flag kept), each logged. One
-  open (at most 1 s before `slow_open`) and the test IDR can still follow, so the whole probe stays near the 2 s above
-  and inside the worker's bound (`bound::kProbeFull` = 2 s + 1 s, §5.3).
+  open (marked `slow_open` afterwards if it took over 1 s; it is not cut short) and the test IDR can still follow, so
+  a probe normally stays near the 2 s above; a single open that blocks for over ~1.5 s can still exceed the worker's
+  bound (`bound::kProbeFull` = 2 s + 1 s, §5.3), and `im_probe` then answers `IM_ERR_TIMEOUT`.
+- **OS flags**: until C++/WinRT lands (README WA50), step 1's WGC flags come from the build number alone, with no
+  `GraphicsCaptureSession::IsSupported` or `ApiInformation::IsPropertyPresent` call: `IM_OS_WGC | IM_OS_WGC_PICKER`
+  from 18362 (1903), `IM_OS_WGC_CURSOR_TOGGLE | IM_OS_EXCLUDE_FROM_CAPTURE` from 19041 (2004),
+  `IM_OS_WGC_MIN_INTERVAL | IM_OS_WGC_SECONDARY_WINDOWS` from 26100 (24H2), and `IM_OS_SUPPORTED` from 19045.
+  `IM_OS_WGC_BORDERLESS` stays clear (there is no `RequestAccessAsync(Borderless)`). A quick probe re-reads these
+  build flags; the trial flags (`IM_OS_DESKTOP_DUPLICATION`, `IM_OS_MEDIA_FOUNDATION`) come from a full probe.
+  WA50 provides the C++/WinRT checks in its own folder, and `probe.cpp`'s `BuildFlags` calls them in a follow-up
+  after group 11, since WF10 owns `encode/` in that group (README §3 item 55, WA50's row).
 - **Size**: each encoder opens at 1920×1080 and, when that open fails with `open_failed`, once more at 1280×720 (the
   "adapter's maximum if smaller" of step 3); the probe reads no adapter maximum.
 - **`IM_PROBE_QUICK`**: once a complete full probe is stored (same FFmpeg folder, not marked stale), a quick probe
