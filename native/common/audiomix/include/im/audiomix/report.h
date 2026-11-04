@@ -166,7 +166,9 @@ struct ReportCounters {
   double audio_cpu_ms_per_s = 0;
 };
 
-struct ReportEvent {
+// ReportEntry is one event of the report. Not "ReportEvent": <windows.h> defines that name as a macro
+// (ReportEventW), which renamed the type in some Windows translation units and broke the link.
+struct ReportEntry {
   int64_t t_ns = 0; // engine clock
   ReportEventCode code = ReportEventCode::kSessionCreated;
   std::string app; // an app id, or ""
@@ -196,7 +198,7 @@ struct Report {
   std::vector<ReportSession> sessions;
   std::vector<ReportWarning> warnings; // the writer keeps the first kMaxWarnings
   ReportCounters counters;
-  std::vector<ReportEvent> events; // oldest first; the writer keeps the last kMaxEvents
+  std::vector<ReportEntry> events; // oldest first; the writer keeps the last kMaxEvents
 };
 
 // The report's JSON (§12.1). Allocates.

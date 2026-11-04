@@ -152,7 +152,7 @@ public:
   std::vector<StreamView> Views() const;
   StreamCounters counters() const;
   // Events for the report since the last call (stream_opened, activation_failed, stream_failed), oldest first.
-  std::vector<audiomix::ReportEvent> TakeEvents();
+  std::vector<audiomix::ReportEntry> TakeEvents();
   // The app id of a channel tag, also shortly after its stream went (the mixer's events name it); "" if unknown.
   std::string AppOfTag(uint64_t tag) const;
 
@@ -209,7 +209,7 @@ private:
   std::vector<audiopolicy::ProcessKey> given_up_;
   std::deque<std::pair<uint64_t, std::string>> gone_apps_; // tags of entries gone, newest last (at most 64)
   StreamCounters counters_;
-  std::vector<audiomix::ReportEvent> events_;
+  std::vector<audiomix::ReportEntry> events_;
   int64_t now_ns_ = 0;
   bool replan_ = false;                             // Apply met a key mismatch: the next Pump asks for a plan
   std::vector<audiopolicy::ProcessKey> mismatched_; // the targets the last Apply met a mismatch on

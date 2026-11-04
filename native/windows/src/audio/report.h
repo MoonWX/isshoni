@@ -19,7 +19,7 @@
 namespace im::audio {
 
 using audiomix::Report;
-using audiomix::ReportEvent;
+using audiomix::ReportEntry;
 
 // The report's limits (05 §12.1, §17), as the writer applies them.
 inline constexpr std::size_t kReportMaxEvents = audiomix::Report::kMaxEvents;

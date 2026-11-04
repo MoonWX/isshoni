@@ -540,7 +540,7 @@ private:
       }
       return planner_.CommitCheck(*fresh, a);
     });
-    for (ReportEvent &e : set_.TakeEvents()) {
+    for (ReportEntry &e : set_.TakeEvents()) {
       PushEvent(std::move(e));
     }
     bool replan_engine = false;
@@ -1272,10 +1272,10 @@ private:
   // ------------------------------------------------------------------------------------------------ events
 
   void Event(int64_t now, ReportEventCode code, std::string app = {}, std::string detail = {}) {
-    PushEvent(ReportEvent{now, code, std::move(app), std::move(detail)});
+    PushEvent(ReportEntry{now, code, std::move(app), std::move(detail)});
   }
 
-  void PushEvent(ReportEvent e) {
+  void PushEvent(ReportEntry e) {
     events_.push_back(std::move(e));
     while (events_.size() > kReportMaxEvents) {
       events_.pop_front();
@@ -1301,7 +1301,7 @@ private:
   uint32_t seq_ = 0;
   std::string visible_;
   audiomix::ReportCounters counters_; // the watcher's own: deviceChanges, pidReuseBlocks
-  std::deque<ReportEvent> events_;
+  std::deque<ReportEntry> events_;
 
   // The live share (README WA45). live_ is declared before the include set, which feeds its engine, so the set goes
   // first; Run detaches it before the loop ends anyway.
