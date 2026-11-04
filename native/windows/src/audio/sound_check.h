@@ -12,12 +12,14 @@
 #include <cstdint>
 #include <string>
 
+#include "audio/engine_gate.h"
 #include "audio/loopback_io.h"
+#include "isshoni_media.h"
 
 namespace im::audio {
 
 inline constexpr double kSoundCheckPassDb = -40.0;            // 05 §11.3 step 4, per partial
-inline constexpr uint32_t kSoundCheckActivationMs = 3000;     // one INCLUDE activation (05 §8.1)
+inline constexpr uint32_t kSoundCheckActivationMs = 3000;     // one capture open's activations (05 §8.1)
 inline constexpr uint32_t kSoundCheckWindowFrames = 100 * 48; // Goertzel windows of 100 ms
 inline constexpr uint32_t kSoundCheckHopFrames = 20 * 48;
 inline constexpr uint32_t kSoundCheckChimeLeadFrames = 100 * 48; // the DLL's own chime starts 100 ms after its stream
@@ -36,6 +38,14 @@ struct SoundCheckResult {
   std::string backend = "none"; // "process-loopback", "endpoint", "none"
   std::string reason;           // not captured: silent, activation_failed, no_device, device_busy, timeout
 };
+
+// The capture path's flags for this PC: im_caps.audio_flags without IM_AUDIO_PROCESS_LOOPBACK on a Windows 10 build
+// (os_build below kMinIncludeSetBuild; 0: unknown, not gated). Every share there runs the endpoint engine (05 §6.1), so
+// the wizard must capture through the endpoint and show the degraded case ("backend":"endpoint", 05 §11.3 step 3).
+constexpr uint32_t SoundCheckFlags(uint32_t os_build, uint32_t audio_flags) noexcept {
+  return os_build != 0 && os_build < kMinIncludeSetBuild ? audio_flags & ~uint32_t{IM_AUDIO_PROCESS_LOOPBACK}
+                                                         : audio_flags;
+}
 
 // Runs the check on the calling thread; returns within about timeout_ms (abort ends it early: reason timeout).
 SoundCheckResult RunSoundCheck(LoopbackIo &io, const SoundCheckParams &p, const std::atomic<bool> *abort);

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "audio/engine_gate.h"
 #include "audio/loopback_io.h"
@@ -23,13 +24,14 @@
 namespace im::audio {
 
 inline constexpr uint32_t kProbeActivationMs = 500;      // 05 §11.2 step 1
+inline constexpr uint32_t kProbeDeadlineMs = 600;        // 05 §11.2: the whole probe; past it the probe is skipped
 inline constexpr uint32_t kProbeLeadFrames = 30 * 48;    // zeros before the tone
 inline constexpr uint32_t kProbeTailFrames = 60 * 48;    // and after it, so its end is captured
 inline constexpr uint32_t kProbeWindowFrames = 160 * 48; // the measured window: the tone minus 20 ms at each end
 inline constexpr uint32_t kProbeHopFrames = 10 * 48;
 
 // One probe on io (05 §11.2 steps 1-5): no render client → skipped; the INCLUDE stream fails → unsupported; else the
-// tone is played and measured. abort ends it early (skipped).
+// tone is played and measured. abort ends it early (skipped), and so does kProbeDeadlineMs from its start (io's clock).
 ProbeReport RunStartupProbe(LoopbackIo &io, const std::atomic<bool> *abort);
 
 // Where a ProbeRunner gets its probe from.
@@ -58,8 +60,12 @@ public:
   // The result of the last probe, once (false while none is ready).
   bool TakeResult(ProbeReport *out);
   // Aborts a running probe and joins it within 2 s; one stuck in a driver call is abandoned (05 §10.5). Its result is
-  // dropped.
+  // dropped. Also joins the probes Abort left behind (the same 2 s in all).
   void Stop() noexcept;
+  // Aborts a running probe without waiting (a share stops on the watcher thread, which must not block): its result is
+  // dropped and its thread is joined once it has ended, by the next Start, Stop or the destructor. A new probe may
+  // start at once.
+  void Abort() noexcept;
   bool running() const;
 
 private:
@@ -71,11 +77,17 @@ private:
     std::atomic<bool> abort{false};
   };
   void Reap();
+  void ReapAborted(bool wait) noexcept;
 
   std::shared_ptr<ProbeBackend> backend_;
   std::function<void()> wake_;
   std::shared_ptr<Shared> sh_;
   std::thread thread_;
+  struct Aborted {
+    std::shared_ptr<Shared> sh;
+    std::thread thread;
+  };
+  std::vector<Aborted> aborted_; // aborted probes whose threads still run
 };
 
 } // namespace im::audio

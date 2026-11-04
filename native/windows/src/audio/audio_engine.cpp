@@ -211,7 +211,8 @@ public:
     if (!w) {
       return NoAudio("im_audio_sound_check");
     }
-    const uint32_t flags = w->ProbeFlags(); // cached since im_probe, or computed now (05 §11.1)
+    // Cached since im_probe, or computed now (05 §11.1); a Windows 10 build takes the endpoint as its shares do.
+    const uint32_t flags = SoundCheckFlags(win::OsBuild(), w->ProbeFlags());
     struct Shared {
       std::mutex mu;
       std::condition_variable cv;
@@ -230,7 +231,7 @@ public:
           if (FAILED(com.hr())) {
             r.reason = "activation_failed";
           } else {
-            const std::unique_ptr<LoopbackIo> io = NewWindowsLoopbackIo(kSoundCheckActivationMs);
+            const std::unique_ptr<LoopbackIo> io = NewWindowsLoopbackIo(kSoundCheckActivationMs, &sh->abort);
             r = RunSoundCheck(*io, SoundCheckParams{helper_pid, timeout_ms, flags}, &sh->abort);
           }
           json = SoundCheckJson(r);

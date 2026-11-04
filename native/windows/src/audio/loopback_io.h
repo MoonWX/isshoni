@@ -5,6 +5,7 @@
 // tests use fakes. One thread drives an instance (a DLL-owned MTA thread on Windows).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -47,8 +48,9 @@ public:
   virtual void Wait(uint32_t ms) noexcept = 0;
 };
 
-// Windows' io (loopback_io_win.cpp). activation_timeout_ms: how long one process-loopback activation may take. Call on
-// a thread in COM's multithreaded apartment.
-std::unique_ptr<LoopbackIo> NewWindowsLoopbackIo(uint32_t activation_timeout_ms);
+// Windows' io (loopback_io_win.cpp). activation_timeout_ms: how long the activations of one capture open may take in
+// all (one per format tried); abort (may be null; it must outlive the io) cuts a wait short (the open fails). Call on a
+// thread in COM's multithreaded apartment.
+std::unique_ptr<LoopbackIo> NewWindowsLoopbackIo(uint32_t activation_timeout_ms, const std::atomic<bool> *abort);
 
 } // namespace im::audio

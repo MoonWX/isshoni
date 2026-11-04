@@ -3,6 +3,8 @@
 // thread (COM MTA).
 #include "audio/loopback_io.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <utility>
 #include <vector>
@@ -39,7 +41,8 @@ OpenOutcome OutcomeOf(const OpenResult &r) {
 
 class WinLoopbackIo final : public LoopbackIo {
 public:
-  explicit WinLoopbackIo(uint32_t activation_timeout_ms) : timeout_(activation_timeout_ms) {}
+  WinLoopbackIo(uint32_t activation_timeout_ms, const std::atomic<bool> *abort)
+      : timeout_(activation_timeout_ms), abort_(abort) {}
   ~WinLoopbackIo() override {
     CloseCapture();
     CloseRender();
@@ -127,14 +130,31 @@ public:
   void Wait(uint32_t ms) noexcept override { Sleep(ms); }
 
 private:
+  bool Aborted() const noexcept { return abort_ != nullptr && abort_->load(std::memory_order_acquire); }
+
+  // The activations of one Open (a fresh one per format) share timeout_ in all, waited in slices of 10 ms that check
+  // abort_, so a stop or a share's end never waits on a slow activation (05 §11.2: the probe takes <= 600 ms).
   OpenOutcome Open(const OpenRequest &req, std::string *format) noexcept {
     CloseCapture();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_);
     OpenResult r = OpenCaptureStream(
         req,
-        [this](const std::shared_ptr<Completion> &c) {
-          return c->WaitFor(std::chrono::milliseconds(timeout_)) ? WaitResult::kDone : WaitResult::kTimeout;
+        [this, deadline](const std::shared_ptr<Completion> &c) {
+          for (;;) {
+            if (Aborted()) {
+              return WaitResult::kAborted;
+            }
+            using std::chrono::milliseconds;
+            const auto left = std::chrono::duration_cast<milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (left.count() <= 0) {
+              return c->done() ? WaitResult::kDone : WaitResult::kTimeout;
+            }
+            if (c->WaitFor(std::min(left, milliseconds(kAbortSliceMs)))) {
+              return WaitResult::kDone;
+            }
+          }
         },
-        nullptr);
+        [this] { return Aborted(); });
     const OpenOutcome o = OutcomeOf(r);
     if (o != OpenOutcome::kOk) {
       log::Info("audio", "audio check capture did not open",
@@ -150,7 +170,9 @@ private:
     return OpenOutcome::kOk;
   }
 
+  static constexpr int64_t kAbortSliceMs = 10;
   const uint32_t timeout_;
+  const std::atomic<bool> *abort_;
   std::unique_ptr<CaptureClient> client_;
   std::unique_ptr<audiomix::CaptureRing> ring_;
   std::unique_ptr<WasapiRender> render_;
@@ -166,7 +188,7 @@ public:
       const win::ComApartment com;
       if (SUCCEEDED(com.hr())) {
         try {
-          const std::unique_ptr<LoopbackIo> io = NewWindowsLoopbackIo(kProbeActivationMs);
+          const std::unique_ptr<LoopbackIo> io = NewWindowsLoopbackIo(kProbeActivationMs, &abort);
           r = RunStartupProbe(*io, &abort);
         } catch (...) {
           r = ProbeReport{}; // skipped: an allocation failed
@@ -180,8 +202,8 @@ public:
 
 } // namespace
 
-std::unique_ptr<LoopbackIo> NewWindowsLoopbackIo(uint32_t activation_timeout_ms) {
-  return std::make_unique<WinLoopbackIo>(activation_timeout_ms);
+std::unique_ptr<LoopbackIo> NewWindowsLoopbackIo(uint32_t activation_timeout_ms, const std::atomic<bool> *abort) {
+  return std::make_unique<WinLoopbackIo>(activation_timeout_ms, abort);
 }
 
 std::shared_ptr<ProbeBackend> NewWindowsProbeBackend() { return std::make_shared<WinProbeBackend>(); }

@@ -7,16 +7,18 @@
 //   never plans it;
 // - the engine gate: Windows 10 builds (a faked build number) plan the endpoint engine with the probe unsupported and
 //   the state degraded (the banner exclusion-unavailable), a failed or forced-failed startup probe falls back to the
-//   endpoint engine, an ok one is cached, "twice in 10 s" switches mid-share, and a default-device change re-probes
-//   once 2 s later;
+//   endpoint engine, an ok one is cached, "twice in 10 s" switches mid-share (one app's stream failing again and again
+//   doesn't count: it goes to capture_failed), and a default-device change re-probes once 2 s later;
 // - the endpoint engine: its stream crossfades in over the include set, and follows a default-device change by
 //   reopening on the new default and fading the old stream once the new one runs; a passing re-probe crossfades back;
 // - the mode, mute and pause flags: sound off fades the streams at once and a resume doesn't bring sound back, mute
 //   and pause keep the streams and silence the bus;
 // - the silent-stream check: reopen after 1 s of silent streams under a loud meter, at most once per 5 s, then
-//   capture_failed after two failed reopens; the include set's ReopenApp and GiveUpApp;
+//   capture_failed after two failed reopens; the include set's ReopenApp and GiveUpApp; the fast path's EXCLUDE stream
+//   under the same check;
 // - the startup probe and the sound check against a simulated device (loopback working, silent, unsupported, busy),
-//   their JSON, and the test exports' burst onsets predicted from the render clock.
+//   the probe's 600 ms deadline and the runner's Abort, the sound check's Windows 10 gate, their JSON, and the test
+//   exports' burst onsets predicted from the render clock.
 // Portable: no OS call, so it also builds and runs on the Mac. Simulated time drives the mixer and the devices; the
 // activator threads are real, so every wait for their results is bounded (README §4 "Testing").
 #include <gtest/gtest.h>
@@ -554,6 +556,70 @@ TEST(AudioEngineGate, AFailedProcessLoopbackStreamCountsForTheGate) {
   EXPECT_EQ(r.set->counters().stream_failures, 1u);
 }
 
+// 05 §6.5 vs §8.5: one app's stream that fails again and again while another app's stream keeps running is that app's
+// problem, not "process loopback stops working": it goes through the reopens to capture_failed, and the share stays in
+// process loopback (the gate gets the counter as the watcher feeds it).
+TEST(AudioEngineGate, OneAppsStreamFailingAgainAndAgainGoesToCaptureFailedNotTheEndpointEngine) {
+  Rig r(false);
+  ASSERT_TRUE(r.gate.StartAudio(r.now, "{endpoint-a}", false));
+  r.procs.push_back(Proc(300, 4, 3000, "music.exe", "C:\\Apps\\Music"));
+  r.playing = {300};
+  r.Settle(100);
+  ASSERT_EQ(r.capture.live.size(), 1u);
+  const std::shared_ptr<CaptureStream> music = r.capture.live[0];
+  r.playing = {100, 300};
+  r.Settle(100);
+  ASSERT_EQ(r.Streams(StreamKind::kInclude, SessionStream::kRunning), 2);
+  const auto game = [&]() -> std::shared_ptr<CaptureStream> {
+    for (const auto &s : r.capture.live) {
+      if (s != music) {
+        return s;
+      }
+    }
+    return nullptr;
+  };
+  uint64_t seen = 0;
+  const auto feed_gate = [&] {
+    if (const uint64_t lf = r.set->counters().loopback_failures; lf != seen) {
+      seen = lf;
+      r.gate.LoopbackFailed(r.now);
+    }
+  };
+  // Fails at once each time it is back (in its preroll, before it runs): failures in a row, 100 ms, 500 ms, 2 s apart.
+  uint32_t failures = 0;
+  const auto end = std::chrono::steady_clock::now() + 10s;
+  while (r.set->CaptureFailed().empty() && std::chrono::steady_clock::now() < end) {
+    if (const auto g = game(); g && !g->failed.load()) {
+      g->failure.store(static_cast<int32_t>(0x88890026u)); // AUDCLNT_E_RESOURCES_INVALIDATED
+      g->failed.store(true);
+      ++failures;
+    }
+    r.Run(10);
+    feed_gate();
+    r.PumpUntilActivated();
+    feed_gate();
+    ASSERT_TRUE(r.gate.process_loopback()) << "after failure " << failures;
+  }
+  ASSERT_EQ(r.set->CaptureFailed().size(), 1u);
+  EXPECT_EQ(r.set->CaptureFailed()[0].pid, 100u);
+  EXPECT_EQ(failures, kFailuresBeforeGivingUp) << "the first failure and the three reopens";
+  EXPECT_EQ(r.set->counters().loopback_failures, 0u) << "one of two apps' streams failing is no loopback failure";
+  EXPECT_TRUE(r.gate.process_loopback());
+  EXPECT_EQ(r.Streams(StreamKind::kInclude, SessionStream::kRunning), 1) << "the music app is still heard";
+  EXPECT_NE(std::find(r.capture.live.begin(), r.capture.live.end(), music), r.capture.live.end());
+
+  // Streams of two apps failing in the same pump, though, is the system's: it counts.
+  Rig two(false);
+  two.procs.push_back(Proc(300, 4, 3000, "music.exe", "C:\\Apps\\Music"));
+  two.playing = {100, 300};
+  two.Settle(100);
+  ASSERT_EQ(two.capture.live.size(), 2u);
+  two.capture.live[0]->failed.store(true);
+  two.capture.live[1]->failed.store(true);
+  two.Run(10);
+  EXPECT_EQ(two.set->counters().loopback_failures, 1u);
+}
+
 // ---------------------------------------------------------------------------------------------- the endpoint engine
 
 // 05 §7.5: the default render device changes while the endpoint engine runs. Its stream reopens on the new default
@@ -703,6 +769,23 @@ TEST(AudioSilentCheck, ReopensAfterOneSecondAtMostEveryFiveSecondsThenGivesUp) {
   EXPECT_TRUE(s2(6000 * kMs, true).reopen.empty());
   EXPECT_EQ(s2(7000 * kMs, true).reopen.size(), 1u);
   EXPECT_TRUE(s2(8000 * kMs, true).give_up.empty()) << "only one failed reopen in a row so far";
+
+  // An app that flaps (sound for one sample right after its reopen, then silent again) is still reopened at most once
+  // per 5 s.
+  SilentStreamCheck flap;
+  const auto s3 = [&](int64_t u, bool silent) {
+    const SilentSample s{"y", -20.0f, true, silent};
+    return flap.Sample(u, std::span<const SilentSample>(&s, 1));
+  };
+  std::vector<int64_t> flap_reopens;
+  for (int64_t u = 0; u <= 7000 * kMs; u += 100 * kMs) {
+    if (!s3(u, u != 1100 * kMs).reopen.empty()) {
+      flap_reopens.push_back(u);
+    }
+  }
+  ASSERT_EQ(flap_reopens.size(), 2u);
+  EXPECT_EQ(flap_reopens[0], 1000 * kMs);
+  EXPECT_EQ(flap_reopens[1], 6000 * kMs) << "not at 2200 ms: one loud sample doesn't lift the 5 s";
 }
 
 TEST(AudioSilentCheck, TheIncludeSetReopensAnAppsStreamsOrGivesUpOnThem) {
@@ -728,6 +811,56 @@ TEST(AudioSilentCheck, TheIncludeSetReopensAnAppsStreamsOrGivesUpOnThem) {
   EXPECT_EQ(plan.sessions[0].reason, Reason::kCaptureFailed);
   r.set->ForgetFailures(); // the next device or session event
   EXPECT_EQ(r.Reconcile().activate.size(), 1u);
+}
+
+// 05 §7.5, §8.5: the fast path's EXCLUDE stream delivers digital silence (after a default-device change, say) while a
+// heard app's meter is loud: reopened after 1 s, at most once per 5 s, as the watcher does every 100 ms.
+TEST(AudioSilentCheck, TheFastPathsSilentExcludeStreamIsReopened) {
+  const auto run = [](Rig &r, float meter_db, int ms, std::vector<int64_t> *reopens) {
+    ExclusiveSilentCheck chk;
+    auto snap = std::make_unique<audiomix::LevelsSnapshot>();
+    const int64_t from = r.now;
+    while (r.now - from < ms * kMs) {
+      r.Run(100);
+      if (!r.engine.ReadLevels(snap.get())) {
+        ADD_FAILURE() << "no levels";
+        return;
+      }
+      const ExclusiveSilentAction a = chk.Sample(r.now, meter_db, *snap, r.set->ExclusiveTag());
+      if (a.reopen) {
+        EXPECT_TRUE(r.set->ReopenExclusive(r.now));
+        reopens->push_back(r.now - from);
+        r.Run(20); // the 10 ms fade-out, then it opens again at once
+        r.PumpUntilActivated();
+      }
+    }
+  };
+  Rig r;
+  r.value = [](int64_t) { return 0.0f; }; // the EXCLUDE ring gets zeros
+  ASSERT_EQ(r.Settle(100).engine, Engine::kExcludeSelf);
+  ASSERT_EQ(r.Streams(StreamKind::kExclude, SessionStream::kRunning), 1);
+  ASSERT_NE(r.set->ExclusiveTag(), 0u);
+  std::vector<int64_t> reopens;
+  run(r, -20.0f, 7000, &reopens);
+  ASSERT_EQ(reopens.size(), 2u);
+  EXPECT_EQ(reopens[0], 1100 * kMs) << "the first sample at 100 ms, then 1 s of a loud meter over silence";
+  EXPECT_GE(reopens[1] - reopens[0], kSilentReopenEveryNs) << "at most once per 5 s";
+  EXPECT_EQ(r.opener->exclude.load(), 3) << "opened again twice";
+  EXPECT_EQ(r.set->counters().silent_reopens, 2u);
+  EXPECT_EQ(r.Streams(StreamKind::kExclude, SessionStream::kRunning), 1);
+  EXPECT_EQ(r.opener->include.load(), 0) << "the fast path stays";
+
+  // An EXCLUDE stream that delivers sound, or a quiet meter: nothing.
+  Rig loud;
+  loud.Settle(100);
+  std::vector<int64_t> none;
+  run(loud, -20.0f, 3000, &none);
+  EXPECT_TRUE(none.empty());
+  Rig quiet;
+  quiet.value = [](int64_t) { return 0.0f; };
+  quiet.Settle(100);
+  run(quiet, -70.0f, 3000, &none);
+  EXPECT_TRUE(none.empty());
 }
 
 // ------------------------------------------------------------------------------- simulated render and loopback device
@@ -780,6 +913,10 @@ public:
 class SimIo final : public LoopbackIo {
 public:
   OpenOutcome OpenProcessCapture(uint32_t pid, std::string *format) noexcept override {
+    dev.Advance(open_ms); // the activation's time
+    if (on_open) {
+      on_open();
+    }
     if (process != OpenOutcome::kOk) {
       return process;
     }
@@ -835,7 +972,9 @@ public:
   OpenOutcome process = OpenOutcome::kOk;
   OpenOutcome endpoint = OpenOutcome::kOk;
   OpenOutcome render = OpenOutcome::kOk;
-  int64_t helper_from_ms = -1; // a helper process plays the chime from then on (-1: none)
+  uint32_t open_ms = 0;          // how long a process-loopback open takes
+  std::function<void()> on_open; // called during a process-loopback open
+  int64_t helper_from_ms = -1;   // a helper process plays the chime from then on (-1: none)
   int64_t helper_frame = 0;
   uint32_t capturing = 0;
   bool endpoint_used = false;
@@ -879,6 +1018,26 @@ TEST(AudioStartupProbe, MeasuresTheToneAndClassifiesIt) {
   none.render = OpenOutcome::kNoDevice;
   EXPECT_EQ(RunStartupProbe(none, nullptr).outcome, ProbeOutcome::kSkipped);
 
+  // 05 §11.2: the probe takes <= 600 ms. A slow activation leaves time for the tone, a slower one makes it skipped
+  // (nothing decided: the engine keeps its mode), never longer than the deadline.
+  SimIo slowish;
+  slowish.open_ms = 200;
+  r = RunStartupProbe(slowish, nullptr);
+  EXPECT_EQ(r.outcome, ProbeOutcome::kOk);
+  EXPECT_LE(r.ms, kProbeDeadlineMs);
+  SimIo slow;
+  slow.open_ms = 450;
+  r = RunStartupProbe(slow, nullptr);
+  EXPECT_EQ(r.outcome, ProbeOutcome::kSkipped) << "past the 600 ms deadline";
+  EXPECT_GE(r.ms, kProbeDeadlineMs);
+  EXPECT_LE(r.ms, kProbeDeadlineMs + 20);
+  // A stop during the activation: the open fails because of it, which decides nothing.
+  std::atomic<bool> stop{false};
+  SimIo stopped;
+  stopped.process = OpenOutcome::kFailed;
+  stopped.on_open = [&] { stop.store(true); };
+  EXPECT_EQ(RunStartupProbe(stopped, &stop).outcome, ProbeOutcome::kSkipped);
+
   EXPECT_EQ(ClassifyProbeLevel(-66.0), ProbeLevel::kOk);
   EXPECT_EQ(ClassifyProbeLevel(-54.0), ProbeLevel::kOk);
   EXPECT_EQ(ClassifyProbeLevel(-53.9), ProbeLevel::kMismatch);
@@ -890,7 +1049,7 @@ class FakeBackend final : public ProbeBackend {
 public:
   ProbeReport Run(const std::atomic<bool> &abort) noexcept override {
     const auto end = std::chrono::steady_clock::now() + 5s;
-    while (hold.load() && !abort.load() && std::chrono::steady_clock::now() < end) {
+    while (hold.load() && (ignore_abort.load() || !abort.load()) && std::chrono::steady_clock::now() < end) {
       std::this_thread::sleep_for(1ms);
     }
     ProbeReport r;
@@ -899,6 +1058,7 @@ public:
     return r;
   }
   std::atomic<bool> hold{false};
+  std::atomic<bool> ignore_abort{false}; // a probe stuck in a driver call
 };
 
 TEST(AudioStartupProbe, TheRunnerRunsOneProbeAtATimeAndWakesTheWatcher) {
@@ -924,6 +1084,35 @@ TEST(AudioStartupProbe, TheRunnerRunsOneProbeAtATimeAndWakesTheWatcher) {
   runner.Stop(); // aborts it
   EXPECT_FALSE(runner.running());
   EXPECT_FALSE(runner.TakeResult(&r)) << "a stopped probe's result is dropped";
+}
+
+// A share that stops while the probe runs (the watcher's DetachLive) aborts it without waiting for it, and the next
+// share's probe starts at once; the aborted probe's result is dropped and its thread is joined later.
+TEST(AudioStartupProbe, AbortDoesNotWaitAndANewProbeStartsAtOnce) {
+  auto backend = std::make_shared<FakeBackend>();
+  backend->hold.store(true);
+  backend->ignore_abort.store(true); // it doesn't see the abort for now
+  std::atomic<int> wakes{0};
+  ProbeRunner runner(backend, [&] { wakes.fetch_add(1); });
+  ASSERT_TRUE(runner.Start());
+  const auto t0 = std::chrono::steady_clock::now();
+  runner.Abort();
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s) << "Stop would wait 2 s for this probe";
+  EXPECT_FALSE(runner.running());
+  ProbeReport r;
+  EXPECT_FALSE(runner.TakeResult(&r));
+  ASSERT_TRUE(runner.Start()) << "the next share's probe";
+  EXPECT_TRUE(runner.running());
+  backend->hold.store(false); // both end
+  const auto end = std::chrono::steady_clock::now() + 10s;
+  bool got = false;
+  while (!(got = runner.TakeResult(&r)) && std::chrono::steady_clock::now() < end) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_TRUE(got) << "the new probe's result";
+  EXPECT_FALSE(runner.TakeResult(&r)) << "only one: the aborted probe's is dropped";
+  runner.Stop(); // joins the aborted one too
+  EXPECT_FALSE(runner.running());
 }
 
 // ---------------------------------------------------------------------------------------------- the sound check
@@ -965,6 +1154,24 @@ TEST(AudioSoundCheck, CapturesAHelpersChimeAndFallsBackToTheEndpoint) {
   r = RunSoundCheck(endpoint_only, SoundCheckParams{4242, 3000, IM_AUDIO_ENDPOINT_LOOPBACK}, nullptr);
   EXPECT_TRUE(r.captured);
   EXPECT_EQ(r.backend, "endpoint");
+}
+
+// A Windows 10 build runs every share on the endpoint engine (05 §6.1), so the wizard takes the endpoint too and shows
+// the degraded case (05 §11.3 step 3), though im_caps.audio_flags has IM_AUDIO_PROCESS_LOOPBACK there.
+TEST(AudioSoundCheck, AWindows10BuildCapturesThroughTheEndpoint) {
+  EXPECT_EQ(SoundCheckFlags(19045, kBothLoopbacks), uint32_t{IM_AUDIO_ENDPOINT_LOOPBACK});
+  EXPECT_EQ(SoundCheckFlags(19045, IM_AUDIO_PROCESS_LOOPBACK), 0u);
+  EXPECT_EQ(SoundCheckFlags(21999, kBothLoopbacks), uint32_t{IM_AUDIO_ENDPOINT_LOOPBACK});
+  EXPECT_EQ(SoundCheckFlags(22000, kBothLoopbacks), kBothLoopbacks);
+  EXPECT_EQ(SoundCheckFlags(26100, kBothLoopbacks), kBothLoopbacks);
+  EXPECT_EQ(SoundCheckFlags(0, kBothLoopbacks), kBothLoopbacks) << "an unknown build is not gated";
+  SimIo io;
+  io.helper_from_ms = 400;
+  const SoundCheckResult r =
+      RunSoundCheck(io, SoundCheckParams{4242, 3000, SoundCheckFlags(19045, kBothLoopbacks)}, nullptr);
+  EXPECT_TRUE(r.captured);
+  EXPECT_EQ(r.backend, "endpoint");
+  EXPECT_TRUE(io.endpoint_used);
 }
 
 TEST(AudioSoundCheck, ReportsWhyNothingWasCaptured) {
@@ -1030,6 +1237,36 @@ TEST(AudioTestExports, BurstOnsetsArePredictedFromTheRenderClock) {
   }
   EXPECT_GE(dev.played, dev.written) << "it returns once the last burst has played";
   EXPECT_EQ(onsets[5], 0) << "only count onsets are written";
+
+  // Many bursts, most of them more than 1 s ahead of the first position reads, and bursts a long period apart: still
+  // exact.
+  SimDevice many;
+  Bursts m = b;
+  m.burst_ms = 1;
+  m.period_ms = 2;
+  m.count = 2000;
+  std::vector<int64_t> many_onsets(m.count);
+  ASSERT_EQ(PlayBursts(many, m, many_onsets.data(), static_cast<int32_t>(m.count), nullptr), 2000);
+  for (uint32_t k = 0; k < m.count; ++k) {
+    const uint64_t f = (200 + 2 * k) * 48;
+    ASSERT_EQ(many_onsets[k], many.qpc0 + static_cast<int64_t>(f) * 1'000'000'000 / kSignalRate) << k;
+  }
+  SimDevice sparse;
+  Bursts p = b;
+  p.period_ms = 3000;
+  p.count = 4;
+  int64_t sparse_onsets[4] = {};
+  ASSERT_EQ(PlayBursts(sparse, p, sparse_onsets, 4, nullptr), 4);
+  for (uint32_t k = 0; k < 4; ++k) {
+    const uint64_t f = (200 + 3000 * k) * 48;
+    EXPECT_EQ(sparse_onsets[k], sparse.qpc0 + static_cast<int64_t>(f) * 1'000'000'000 / kSignalRate) << k;
+  }
+  // The prediction of a frame far ahead (count 100000 x period 60 s: about 1667 h) doesn't overflow.
+  const uint64_t far = uint64_t{100000} * 60000 * 48;
+  EXPECT_EQ(PredictFrameNs(far, 0, 7'000 * kMs), 7'000 * kMs + int64_t{6'000'000'000} * 1'000'000);
+  EXPECT_EQ(PredictFrameNs(far + 1, 1, 0), int64_t{6'000'000'000} * 1'000'000);
+  EXPECT_EQ(PredictFrameNs(0, 48, 0), -1'000'000) << "a frame before the sample";
+  EXPECT_EQ(PredictFrameNs(0, 1, 0), -20'833);
 
   SimDevice small;
   int64_t two[2] = {};

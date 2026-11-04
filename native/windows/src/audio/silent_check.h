@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "im/audiomix/mix_engine.h"
+
 namespace im::audio {
 
 inline constexpr float kSilentCheckMeterDb = -60.0f;           // the session meter's peak above this: it plays
@@ -49,6 +51,28 @@ private:
     bool given_up = false;
   };
   std::unordered_map<std::string, App> apps_;
+};
+
+// The same check on the fast path's EXCLUDE stream (05 §7.5: after a default render change "include and EXCLUDE
+// streams stay, and the silent-stream check of §8.5 watches them"; it runs whenever the fast path does): the EXCLUDE
+// stream carries every heard app, so a heard app's meter above -60 dBFS for 1 s while its channel delivers digital
+// silence reopens it, at most once per 5 s. After two reopens that didn't bring sound back it is left alone (the
+// engine has no capture_failed; give_up says so once) until it delivers sound or goes.
+struct ExclusiveSilentAction {
+  bool reopen = false;
+  bool give_up = false;
+};
+
+class ExclusiveSilentCheck {
+public:
+  // One sample (every 100 ms): heard_meter_db, the loudest activity meter of the heard apps' render sessions;
+  // levels, the mixer's last levels; tag, the EXCLUDE stream's channel (0: none joined).
+  ExclusiveSilentAction Sample(int64_t now_ns, float heard_meter_db, const audiomix::LevelsSnapshot &levels,
+                               uint64_t tag);
+  void Reset() noexcept { check_.Reset(); }
+
+private:
+  SilentStreamCheck check_;
 };
 
 } // namespace im::audio

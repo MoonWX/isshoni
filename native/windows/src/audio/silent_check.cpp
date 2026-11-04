@@ -2,6 +2,8 @@
 
 #include <unordered_set>
 
+#include "im/audiomix/constants.h"
+
 namespace im::audio {
 
 SilentActions SilentStreamCheck::Sample(int64_t now_ns, std::span<const SilentSample> samples) {
@@ -18,7 +20,11 @@ SilentActions SilentStreamCheck::Sample(int64_t now_ns, std::span<const SilentSa
       continue;
     }
     if (!s.streams_silent) {
-      a = App{}; // its streams deliver sound: the failures in a row start over
+      // Its streams deliver sound: the failures in a row start over, but not the 5 s between reopens (a flapping app
+      // isn't reopened more often).
+      const int64_t last = a.last_reopen;
+      a = App{};
+      a.last_reopen = last;
       continue;
     }
     if (s.meter_peak_db <= kSilentCheckMeterDb) {
@@ -50,6 +56,20 @@ SilentActions SilentStreamCheck::Sample(int64_t now_ns, std::span<const SilentSa
     it = seen.count(it->first) == 0 ? apps_.erase(it) : std::next(it);
   }
   return out;
+}
+
+ExclusiveSilentAction ExclusiveSilentCheck::Sample(int64_t now_ns, float heard_meter_db,
+                                                  const audiomix::LevelsSnapshot &levels, uint64_t tag) {
+  SilentSample s{"exclude", heard_meter_db, false, true};
+  for (uint32_t i = 0; tag != 0 && i < levels.count && i < audiomix::kMaxMixChannels; ++i) {
+    const audiomix::ChannelLevel &ch = levels.channels[i];
+    if (ch.tag == tag && ch.running) {
+      s.has_streams = true;
+      s.streams_silent = ch.peak_db <= audiomix::kLevelFloorDb;
+    }
+  }
+  const SilentActions a = check_.Sample(now_ns, std::span<const SilentSample>(&s, 1));
+  return ExclusiveSilentAction{!a.reopen.empty(), !a.give_up.empty()};
 }
 
 } // namespace im::audio

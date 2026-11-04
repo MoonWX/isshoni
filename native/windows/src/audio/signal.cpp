@@ -193,8 +193,11 @@ ProbeLevel ClassifyProbeLevel(double level_db) noexcept {
 }
 
 int64_t PredictFrameNs(uint64_t f, uint64_t pos, int64_t qpc_ns) noexcept {
+  // d x 1e9 would overflow int64 for frames more than about 53 h away: whole seconds and the rest apart (the same
+  // result, both parts truncated toward zero with the same sign).
+  constexpr int64_t kRate = kSignalRate;
   const int64_t d = static_cast<int64_t>(f) - static_cast<int64_t>(pos);
-  return qpc_ns + d * 1'000'000'000 / static_cast<int64_t>(kSignalRate);
+  return qpc_ns + d / kRate * 1'000'000'000 + d % kRate * 1'000'000'000 / kRate;
 }
 
 int32_t PlayBursts(RenderTarget &target, const Bursts &b, int64_t *onset_ns, int32_t cap,
@@ -240,6 +243,9 @@ int32_t PlayBursts(RenderTarget &target, const Bursts &b, int64_t *onset_ns, int
   const auto on_pos = [&](uint64_t pos, int64_t qpc) {
     for (uint32_t k = next; k < b.count; ++k) {
       const uint64_t f = first_of(k);
+      if (f > pos + kSignalRate) {
+        break; // more than 1 s ahead (and so are the rest): a later sample, nearer to it, predicts it
+      }
       if (pos <= f) {
         onset[k] = PredictFrameNs(f, pos, qpc); // the last sample before its first frame plays
         have[k] = 1;

@@ -75,8 +75,8 @@ struct StreamCounters {
   uint64_t stream_failures = 0;     // joined streams that failed (05 §8.5)
   uint64_t discontinuities = 0;     // of the streams gone; Views' streams add theirs
   uint64_t fastpath_cuts = 0;       // EXCLUDE streams cut at the fast path's exit (05 §6.4)
-  uint64_t loopback_failures = 0; // pumps in which a joined process-loopback stream failed (05 §6.5: "twice in 10 s")
-  uint64_t silent_reopens = 0;    // include streams reopened by the silent-stream check (05 §8.5)
+  uint64_t loopback_failures = 0; // pumps in which process loopback as a whole failed (05 §6.5: "twice in 10 s"; Pump)
+  uint64_t silent_reopens = 0;    // include and EXCLUDE streams the silent-stream check reopened (05 §7.5, §8.5)
   uint32_t streams = 0;           // streams joined to the mixer now (counters.streams)
 };
 
@@ -133,6 +133,11 @@ public:
   // The silent-stream check (05 §8.5): app_id's joined include streams fade out and open again at once (no failure
   // counted). Returns how many.
   uint32_t ReopenApp(const std::string &app_id, int64_t now_ns);
+  // The same for the fast path's EXCLUDE stream (05 §7.5, §8.5): a joined one fades out and opens again at once.
+  // Returns whether it did.
+  bool ReopenExclusive(int64_t now_ns);
+  // The joined EXCLUDE stream's channel tag (0: none), for the silent-stream check.
+  uint64_t ExclusiveTag() const noexcept;
   // ...or app_id's include targets become capture_failed (until the next device or session event, ForgetFailures) and
   // their streams go. Returns how many targets.
   uint32_t GiveUpApp(const std::string &app_id);

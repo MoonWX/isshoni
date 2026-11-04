@@ -308,6 +308,29 @@ uint32_t StreamSet::ReopenApp(const std::string &app_id, int64_t now_ns) {
   return n;
 }
 
+bool StreamSet::ReopenExclusive(int64_t now_ns) {
+  now_ns_ = now_ns;
+  for (auto &e : entries_) {
+    if (e->act.kind == StreamKind::kExclude && e->phase == Phase::kJoined && !e->covered_wait) {
+      e->phase = Phase::kRemoving;
+      e->reopen_now = true;
+      e->channel->Remove();
+      ++counters_.silent_reopens;
+      return true;
+    }
+  }
+  return false;
+}
+
+uint64_t StreamSet::ExclusiveTag() const noexcept {
+  for (const auto &e : entries_) {
+    if (e->act.kind == StreamKind::kExclude && e->phase == Phase::kJoined && !e->covered_wait) {
+      return e->id;
+    }
+  }
+  return 0;
+}
+
 uint32_t StreamSet::GiveUpApp(const std::string &app_id) {
   uint32_t n = 0;
   for (std::size_t i = 0; i < entries_.size();) {
@@ -538,7 +561,17 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
     }
     return false;
   };
-  bool loopback_failed = false;
+  // 05 §6.5's "process loopback stops working" is a failure of the whole system, not of one app's stream (that one
+  // goes through §8.5's reopens to capture_failed). A pump counts for the engine gate when the EXCLUDE stream failed,
+  // when every joined process-loopback stream failed together, or when streams of at least 2 targets failed. A
+  // repeated failure of a target still in its backoff (failures_ holds it until its stream runs again) never counts.
+  bool exclusive_failed = false;
+  uint32_t joined_loopback = 0;
+  uint32_t failed_loopback = 0;
+  std::vector<audiopolicy::ProcessKey> fresh_targets; // include targets whose stream failed fresh in this pump
+  for (const auto &e : entries_) {
+    joined_loopback += e->phase == Phase::kJoined && e->act.kind != StreamKind::kEndpoint ? 1u : 0u;
+  }
   for (std::size_t i = 0; i < entries_.size();) {
     Entry &e = *entries_[i];
     if (e.hold && e.hold->exited() && e.phase != Phase::kRemoving) {
@@ -563,7 +596,16 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
     if (e.phase == Phase::kJoined) {
       if (e.stream->failed.load(std::memory_order_acquire)) {
         ++counters_.stream_failures;
-        loopback_failed = loopback_failed || e.act.kind != StreamKind::kEndpoint;
+        if (e.act.kind == StreamKind::kInclude) {
+          ++failed_loopback;
+          if (!failures_.contains(e.act.target) &&
+              std::find(fresh_targets.begin(), fresh_targets.end(), e.act.target) == fresh_targets.end()) {
+            fresh_targets.push_back(e.act.target);
+          }
+        } else if (e.act.kind != StreamKind::kEndpoint) {
+          ++failed_loopback;
+          exclusive_failed = true;
+        }
         Event(now_ns, ReportEventCode::kStreamFailed, e.app_id);
         log::Warn("audio", "capture stream failed",
                   {{"hr", static_cast<int64_t>(e.stream->failure.load(std::memory_order_relaxed))}});
@@ -616,7 +658,8 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
     }
     ++i;
   }
-  if (loopback_failed) {
+  const bool all_failed = joined_loopback > 0 && failed_loopback == joined_loopback && !fresh_targets.empty();
+  if (exclusive_failed || all_failed || fresh_targets.size() >= 2) {
     ++counters_.loopback_failures;
   }
   SubmitWaiting(now_ns);

@@ -460,6 +460,7 @@ private:
     live_engine_ = audiopolicy::Engine::kNone;
     silent_.Reset();
     loopback_failures_seen_ = set_.counters().loopback_failures;
+    exclusive_silent_.Reset();
     // The engine gate and the startup probe (05 §6.1, §11.2): the probe runs beside the first plan, which acts as if it
     // passed (the include set never leaks); a gated build (Windows 10) plans the endpoint engine at once.
     EnsureEnumerator(now);
@@ -497,9 +498,10 @@ private:
     }
     set_.Detach();
     live_.reset();
-    probe_.Stop();
+    probe_.Abort(); // without waiting: Mixer::Stop waits for this detach (kDetachWait)
     engine_gate_.StopAudio();
     silent_.Reset();
+    exclusive_silent_.Reset();
     live_engine_ = audiopolicy::Engine::kNone;
     threads_idle_since_ = now;
     if (!user_watch_) {
@@ -892,6 +894,7 @@ private:
       r.sessions.push_back(std::move(s));
       if (track) {
         tracked[k]->app_id = sr.app_id;
+        tracked[k]->heard = sr.verdict == audiopolicy::Verdict::kHeard;
         if (!tracked[k]->announced && sr.verdict != audiopolicy::Verdict::kPending) {
           tracked[k]->announced = true;
           Event(now, ReportEventCode::kSessionCreated, sr.app_id);
@@ -1145,7 +1148,8 @@ private:
   // the same 100 ms). Muted, paused or off, every channel reads silent, so the check waits. Returns whether a stream
   // was reopened or given up on.
   bool CheckSilentStreams(int64_t now) {
-    if (!live_ || live_mode_ != IM_AUDIO_MODE_EXCLUDE_APPS || live_engine_ != audiopolicy::Engine::kIncludeSet) {
+    if (!live_ || live_mode_ != IM_AUDIO_MODE_EXCLUDE_APPS ||
+        (live_engine_ != audiopolicy::Engine::kIncludeSet && !FastPathRunning())) {
       return false;
     }
     const audiomix::MixEngine &e = live_->engine();
@@ -1155,6 +1159,9 @@ private:
     auto snap = std::make_unique<audiomix::LevelsSnapshot>();
     if (!live_->engine().ReadLevels(snap.get())) {
       return false;
+    }
+    if (FastPathRunning()) {
+      return CheckExclusiveSilent(now, *snap);
     }
     std::vector<SilentSample> samples;
     const auto entry = [&](const std::string &app) -> SilentSample & {
@@ -1201,6 +1208,28 @@ private:
       log::Info("audio", "silent-stream check", {{"reopened", a.reopen.size()}, {"given_up", a.give_up.size()}});
     }
     return changed;
+  }
+
+  // The fast path's EXCLUDE stream under the same check (05 §7.5, §8.5): it carries every heard app, so the loudest
+  // heard render session's meter is held against its channel.
+  bool CheckExclusiveSilent(int64_t now, const audiomix::LevelsSnapshot &snap) {
+    float heard_db = kSilenceDb;
+    for (const TrackedSession *t : endpoints_.sessions()) {
+      if (t->flow == audiopolicy::Flow::kRender && t->heard) {
+        heard_db = std::max(heard_db, t->peak_db);
+      }
+    }
+    const ExclusiveSilentAction a = exclusive_silent_.Sample(now, heard_db, snap, set_.ExclusiveTag());
+    if (a.give_up) {
+      log::Warn("audio", "the EXCLUDE stream stays silent after two reopens while apps play");
+    }
+    if (a.reopen && set_.ReopenExclusive(now)) {
+      ++counters_.silent_reopens;
+      Event(now, ReportEventCode::kSilentReopen, {}, "exclude");
+      log::Info("audio", "silent-stream check: the EXCLUDE stream reopens");
+      return true;
+    }
+    return false;
   }
 
   // ------------------------------------------------------------------------------------------------- probe
@@ -1289,6 +1318,7 @@ private:
   // README WA53: the engine gate with the startup probe, the live plan's engine and the silent-stream check.
   EngineGate engine_gate_;
   ProbeRunner probe_;
+  ExclusiveSilentCheck exclusive_silent_; // the fast path's EXCLUDE stream (05 §7.5, §8.5)
   SilentStreamCheck silent_;
   audiopolicy::Engine live_engine_ = audiopolicy::Engine::kNone;
   uint64_t loopback_failures_seen_ = 0;
