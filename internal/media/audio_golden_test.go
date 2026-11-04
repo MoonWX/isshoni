@@ -208,8 +208,8 @@ var (
 	reportEventCode = []string{"session_created", "session_expired", "stream_opened", "stream_running",
 		"stream_removed", "stream_failed", "activation_failed", "fastpath_enter", "fastpath_exit", "fastpath_late_cut",
 		"default_device_changed", "device_added", "device_removed", "no_device", "audiosrv_restart", "probe_ok",
-		"probe_failed", "mixer_resync", "underrun", "trim", media.AudioEventTailFade, "silent_reopen", "rules_changed", "muted", "unmuted",
-		"mode_changed", "reanchor"}
+		"probe_failed", "mixer_resync", "underrun", "trim", media.AudioEventTailFade,
+		"silent_reopen", "rules_changed", "muted", "unmuted", "mode_changed", "reanchor"}
 )
 
 // checkReportValues checks r against 05 §12.1's caps and value sets, and that its rows agree with each other.
