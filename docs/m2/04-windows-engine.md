@@ -1191,9 +1191,9 @@ app's share path doesn't exist yet.
   (`SW_SHOWNOACTIVATE`) only while that pick is open, then hidden again: a window that is never shown might not make
   the picker modal and centered. M-PICK checks it.
 - **A late picker thread**: `Pick` waits the pick's timeout plus the cancel grace and an 8 s margin (the identity
-  match and the borderless query); past it the thread is cancelled and given the grace once more, and if it still
-  doesn't answer the pick is `IM_ERR_TIMEOUT` (`engine_timeout`) and the stuck thread is abandoned (detached, never
-  killed), so the next pick gets a fresh thread instead of queueing behind it.
+  match and the borderless query); past it the thread is cancelled and waited for once more, for the cancel grace plus
+  the 8 s margin, and if it still doesn't answer the pick is `IM_ERR_TIMEOUT` (`engine_timeout`) and the stuck thread
+  is abandoned (detached, never killed), so the next pick gets a fresh thread instead of queueing behind it.
 - **`monitor_id` stays `""`** for every pick, and a Windows 10 monitor pick reports `IM_CAPTURE_WGC` with
   `IM_SRCF_OS_BORDER`: the `mon:` ids of `im_list_sources` and the mapping of §7.5 to Desktop Duplication are WA60's.
 - **Self**: "its `msedgewebview2` children" of step 4 is read as `msedgewebview2.exe` processes whose parent chain (at
@@ -2657,7 +2657,7 @@ one file each, README §5). Where the merged tool differs from the table:
 - **Real encoders**: as WA44 merged, `capture -encoder nvenc|qsv|amf|mf-hw|mf-sw` exited 2 because the session's
   catalog had no real entry. Since WF10 wired `encode::CatalogEntries()` into it (§9.1), sessions open the probe's
   encoders, so the hardware runs (per-encoder `capture`, `-bitrate-steps`, `bench`, `-dump-aus` for the Windows
-  fixtures, §9.3's VBV comparison) can run on the owner's PC (README §8).
+  fixtures, §9.3's VBV comparison) can run on the owner's PC once the FFmpeg r2 lock is in (README §8 and §3 item 64).
 - **`-dump-aus N`** writes `q`'s first N access units, as the engine emits them (normalized), to
   `DIR/aus/<token>/`. The committed fixtures of §18.1's `annexb_test` are VideoToolbox streams made on the Mac
   (`native/common/tests/testdata/aus/videotoolbox/` and `videotoolbox-cb/`, 640×360, 12 AUs each, described in its
