@@ -71,8 +71,8 @@ ReportSession Session(uint32_t pid, uint64_t created, const char *exe, const cha
   return s;
 }
 
-ReportEvent Event(int64_t t, ReportEventCode code, const char *app = "") {
-  ReportEvent e;
+ReportEntry Event(int64_t t, ReportEventCode code, const char *app = "") {
+  ReportEntry e;
   e.t_ns = t;
   e.code = code;
   e.app = app;

@@ -85,7 +85,7 @@ void StreamSet::ForgetFailures() {
 }
 
 void StreamSet::Event(int64_t t, ReportEventCode code, const std::string &app, std::string detail) {
-  events_.push_back(audiomix::ReportEvent{t, code, app, std::move(detail)});
+  events_.push_back(audiomix::ReportEntry{t, code, app, std::move(detail)});
 }
 
 void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, const Below &below, int64_t now_ns) {
@@ -500,7 +500,7 @@ StreamCounters StreamSet::counters() const {
   return c;
 }
 
-std::vector<audiomix::ReportEvent> StreamSet::TakeEvents() { return std::exchange(events_, {}); }
+std::vector<audiomix::ReportEntry> StreamSet::TakeEvents() { return std::exchange(events_, {}); }
 
 std::string StreamSet::AppOfTag(uint64_t tag) const {
   for (const auto &e : entries_) {

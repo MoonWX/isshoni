@@ -98,7 +98,7 @@ TEST(AudioReport, VisibleState) {
   b.qpc_ns = 99;
   b.seq = 7;
   b.counters.device_changes = 3;
-  b.events.push_back(ReportEvent{1, audiomix::ReportEventCode::kDeviceAdded, "", ""});
+  b.events.push_back(ReportEntry{1, audiomix::ReportEventCode::kDeviceAdded, "", ""});
   EXPECT_EQ(VisibleState(a), VisibleState(b));
   b.apps[0].playing = true;
   EXPECT_NE(VisibleState(a), VisibleState(b));

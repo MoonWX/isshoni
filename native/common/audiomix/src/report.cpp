@@ -399,7 +399,7 @@ std::string WriteReportJson(const Report &r) {
   w.Key("events").BeginArray();
   const std::size_t first = r.events.size() > Report::kMaxEvents ? r.events.size() - Report::kMaxEvents : 0;
   for (std::size_t i = first; i < r.events.size(); ++i) {
-    const ReportEvent &e = r.events[i];
+    const ReportEntry &e = r.events[i];
     w.BeginObject();
     o.I("tNs", e.t_ns);
     o.Name("code", ReportName(e.code));
