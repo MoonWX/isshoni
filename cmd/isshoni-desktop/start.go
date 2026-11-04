@@ -3,17 +3,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"sync"
 
+	"github.com/MoonWX/isshoni/internal/client/credstore"
 	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/version"
 )
+
+// exitUnavailable is the exit code of a mode this build doesn't have yet (03 §13.4; exitOK and exitFailed are in
+// oneshot.go).
+const exitUnavailable = 2
+
+// installingMutex is the installer's mutex (06 §2.4): it exists while an installer runs (interactive, /S or a
+// start-time update), and the app probes it at step 2a.
+const installingMutex = `Local\io.isshoni.desktop.installing`
 
 // instance is the single-instance lock (winos.SingleInstance).
 type instance interface {
@@ -26,8 +36,21 @@ type instance interface {
 // starter is 03 §13.4's order of main, with its OS parts behind functions so that the order is tested with fakes.
 // main's first action (the DLL search order) has run before start is called.
 type starter struct {
-	log            *slog.Logger
-	stdout         func() io.Writer            // --version's output
+	log    *slog.Logger
+	stdout func() io.Writer // --version's output
+	// installerRunning is step 2a's probe of installingMutex (OpenMutexW): true while an installer runs, false
+	// when the name doesn't exist (ERROR_FILE_NOT_FOUND), an error otherwise.
+	installerRunning func() (bool, error)
+	writePending     func(app.Pending) error // step 2a: a link start's PendingServer and PendingRoom
+	// The one-shot modes' parts (oneshot.go): --self-check's engine (native.Open from the exe's folder) and SPA
+	// check (the asset handler over the bundled SPA); the credential store and 02's servers of
+	// --forget-credentials and --purge-data; --purge-data's data root and how it is deleted (os.RemoveAll).
+	openEngine     func() (selfCheckEngine, error)
+	checkSPA       func() error
+	openStore      func() (credstore.Store, error)
+	openServers    func(credstore.Store) (credentialForgetter, error)
+	dataRoot       func() (string, error)
+	removeAll      func(string) error
 	singleInstance func() (instance, error)    // step 3
 	holdRunning    func() error                // step 4: the running mutex
 	takePending    func() (app.Pending, error) // step 6
@@ -36,13 +59,6 @@ type starter struct {
 	// held single-instance lock (nil when it is unavailable), which runApp closes as soon as Wails has stopped.
 	runApp func(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst instance) int
 }
-
-// The exit codes of the app's modes (03 §13.4; README §4 "Errors").
-const (
-	exitOK          = 0
-	exitFailed      = 1 // a one-shot mode failed, or the app couldn't start
-	exitUnavailable = 2 // a mode this build doesn't have yet
-)
 
 // start runs a start in 03 §13.4's order and returns the exit code. Each step is skipped or answered as that
 // section says; the steps that later slices own are marked where they go.
@@ -62,8 +78,13 @@ func (s *starter) start(args []string) int {
 		return s.oneShot(p)
 	}
 
-	// Step 2, the shell relaunch (README WA77), and step 2a, the installer probe with its Pending values (README
-	// WA59), go here.
+	// Step 2, the shell relaunch (README WA77), goes here.
+
+	// Step 2a: an installer runs right now. A link start leaves its link to the installer's own app start, and
+	// every start exits: no single instance, running mutex, updater or Apply (06 §2.4, §8.7).
+	if s.installerHandover(p) {
+		return exitOK
+	}
 
 	// Step 3: single instance. A second instance forwards its arguments unchanged and exits 0 (03 §13.3).
 	fwd := newForwarded(s.log)
@@ -111,6 +132,33 @@ func (s *starter) start(args []string) int {
 
 	// Step 7: the app.
 	return s.runApp(p, args, pending, fwd, inst)
+}
+
+// installerHandover is 03 §13.4 step 2a. It reports whether the start must exit 0 now: when installingMutex
+// exists. A start from --open-url then writes its link's origin to PendingServer and its room id to PendingRoom
+// (overwriting older values: the newest link wins), which the installer's own app start handles at step 6. When
+// the probe fails with anything but "not found", the error is logged and the start goes on.
+func (s *starter) installerHandover(p app.Args) bool {
+	running, err := s.installerRunning()
+	if err != nil {
+		s.log.Warn("desktop: couldn't tell whether an installer runs; starting normally", "err", err)
+		return false
+	}
+	if !running {
+		return false
+	}
+	if p.Link != "" {
+		// Never log the link: its path names a room. A link that doesn't parse leaves the Pending values alone.
+		if pending, err := pendingFromLink(p.Link); err != nil {
+			s.log.Info("desktop: an installer runs and this start's link isn't valid; nothing kept", "err", err)
+		} else if err := s.writePending(pending); err != nil {
+			s.log.Warn("desktop: an installer runs and this start's link wasn't kept", "err", err)
+		} else {
+			s.log.Info("desktop: an installer runs; its app start opens this start's link")
+		}
+	}
+	s.log.Info("desktop: an installer runs; it starts the app when it is done")
+	return true
 }
 
 // maxQueuedForwards bounds what second launches can queue before the first instance's app has booted.
@@ -214,9 +262,19 @@ func (s *starter) oneShot(p app.Args) int {
 		// are dropped (03 §15). The activator and the "open" action come with toasts (README WA68).
 		s.log.Info("desktop: a toast activation without a running app; dropped")
 		return exitOK
+	case app.ModeSelfCheck:
+		return selfCheckMode(context.Background(), s.log, p.SelfCheckPath, s.openEngine, s.checkSPA)
+	case app.ModeForgetCredentials:
+		forgetCredentialsMode(context.Background(), s.log, s.openStore, s.openServers, s.dataRoot, s.removeAll)
+		return exitOK // also offline, and whatever went wrong: the uninstaller goes on regardless (06 §6.8)
+	case app.ModePurgeData:
+		if err := purgeData(context.Background(), s.log, s.openStore, s.openServers, s.dataRoot,
+			s.removeAll); err != nil {
+			s.log.Error("desktop: the data folder wasn't deleted", "err", err)
+		}
+		return exitOK // exit 0 whatever happened (03 §13.4 step 1, 06 §2.4): the uninstaller only logs it (06 §6.8)
 	default:
-		// --self-check, --forget-credentials and --purge-data (README WA59); --update-now (WA84, updatetest builds
-		// only).
+		// --update-now (README WA84, updatetest builds only).
 		s.log.Error("desktop: this mode is not in this build yet", "mode", string(p.OneShot))
 		return exitUnavailable
 	}

@@ -61,3 +61,6 @@ func webviewDataDir() (string, error) { return "", nil }
 
 // osBuild is 0 on macOS: BridgeConfig.App.OSBuild is a Windows build number.
 func osBuild() int { return 0 }
+
+// mutexOpens is always false on macOS: no installer runs there (03 §13.4 step 2a is Windows').
+func mutexOpens(string) (bool, error) { return false, nil }

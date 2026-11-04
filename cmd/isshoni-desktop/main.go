@@ -69,8 +69,16 @@ func run(args []string) int {
 		log.Warn("desktop: "+firstActionError(firstActionErr).Error(), "err", firstActionErr)
 	}
 	s := &starter{
-		log:    log,
-		stdout: versionOutput,
+		log:              log,
+		stdout:           versionOutput,
+		installerRunning: func() (bool, error) { return mutexOpens(installingMutex) },
+		writePending:     winos.NewRegistry(winos.RegistryKey).WritePending,
+		openEngine:       selfCheckEngineOf(slog.Default()),
+		checkSPA:         checkBundledSPA,
+		openStore:        openAppCredentials,
+		openServers:      openAppServers,
+		dataRoot:         dataRoot,
+		removeAll:        os.RemoveAll,
 		singleInstance: func() (instance, error) {
 			si, err := winos.NewSingleInstance(winos.InstanceID, slog.Default())
 			if err != nil {
