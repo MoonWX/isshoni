@@ -40,9 +40,11 @@ import (
 // Win11 and Win10 22H2), or on the self-hosted runner once one is registered. They need a GPU, a monitor and the
 // release engine, so they are built only with the isshoni_hw tag, on Windows, and skip unless
 // ISSHONI_TEST_ENGINE_DLL names the engine (isshoni-media.dll or its folder, with the FFmpeg DLLs next to it, as
-// the app ships them). Run them without -race (the detector slows the pump and the pacer, which these tests time),
-// on a PC with nothing else busy, the primary monitor at 1080p or larger (16:9):
+// the app ships them). Run them in the shipped mode, CGO_ENABLED=0 without -race (§12.5; the detector also slows the
+// pump and the pacer, which these tests time), on a PC with nothing else busy, the primary monitor at 1080p or larger
+// (16:9):
 //
+//	$env:CGO_ENABLED = '0'
 //	$env:ISSHONI_TEST_ENGINE_DLL = '<folder of isshoni-media.dll>'
 //	go test -tags isshoni_hw -count=1 -timeout 30m -v -run '^(TestCaptureToSend|TestCaptureConformance)$' ./internal/client/core/
 //
@@ -57,6 +59,7 @@ const (
 	hwRun       = 30 * time.Second      // the measured span
 	hwFPS       = 60                    // the full layer's frame rate at 1080p60
 	hwBitrate   = 8_000_000             // the Auto preset's full layer at the end of the ramp (§9.3)
+	hwMinSent   = 7_000_000             // the full layer's sent rate in every window: the load held (as D16's)
 	hwMinFill   = 0.8                   // a window must hold at least this share of 60 fps worth of samples
 	hwStartWait = 30 * time.Second      // the core online, the share live, the first frames at the viewer
 )
@@ -72,8 +75,9 @@ const hwWindow = 10 * time.Second
 // in-process server, where an sfutest.Viewer of the same user watches the full layer with the audio. Once the ramp
 // has taken the full layer to 8 Mbit/s, the core's own LayerSnapshot.CaptureToSend (capture → last packet written,
 // over publish's 10 s window) is read at the end of three back-to-back windows: p95 ≤ 35 ms and p50 ≤ 20 ms in each
-// (so over the 30 s), with at least 80 % of 60 fps worth of frames in each, the full layer at 1080p on the forced
-// encoder throughout, and its packets at the viewer.
+// (so over the 30 s), with at least 80 % of 60 fps worth of frames in each, the full layer active at 1080p on the
+// forced encoder (with HW when the probe lists it as hardware) and at 8 Mbit/s (target, and at least 7 Mbit/s sent)
+// at the end of every window, and at least 90 % of the frames the core sent at the viewer, whole.
 func TestCaptureToSend(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the 30 s hardware run per encoder runs outside -short")
@@ -81,7 +85,7 @@ func TestCaptureToSend(t *testing.T) {
 	eng := openHWEngine(t)
 	encoders := testedEncoders(t, eng)
 	mon := primaryMonitor(t)
-	src := monitorSource(t, eng, mon)
+	src := monitorSource(t, eng, mon, true)
 	animate(t, mon.rect)
 	cs := hwServer(t)
 	for _, enc := range encoders {
@@ -99,7 +103,7 @@ func TestCaptureConformance(t *testing.T) {
 	eng := openHWEngine(t)
 	encoders := testedEncoders(t, eng)
 	mon := primaryMonitor(t)
-	src := monitorSource(t, eng, mon)
+	src := monitorSource(t, eng, mon, false)
 	if err := eng.Close(); err != nil {
 		t.Fatalf("closing the probing engine: %v", err)
 	}
@@ -108,6 +112,9 @@ func TestCaptureConformance(t *testing.T) {
 		t.Run(enc.Name, func(t *testing.T) {
 			mediatest.Conformance(t, func(t *testing.T) media.Engine { return openHWEngine(t) }, src,
 				mediatest.Options{Listed: true, TestTone: true, Encoder: enc.Name})
+			if !t.Failed() {
+				t.Logf("%s: conformance passed on %s (capture %s)", enc.Name, src.ID, src.Capture)
+			}
 		})
 	}
 }
@@ -168,9 +175,20 @@ func captureToSend(t *testing.T, cs *compatServer, eng media.Engine, src media.S
 			t.Fatalf("the share ended during the run: %+v", sh.Snapshot().End)
 		case <-time.After(time.Until(deadline)):
 		}
+		w := len(got) + 1
 		f := fullOf(sh)
 		if f == nil || !f.Active || f.Encoder != enc.Name {
-			t.Fatalf("during the run the full layer became %+v, want it active on %s", f, enc.Name)
+			t.Fatalf("window %d: the full layer became %+v, want it active on %s", w, f, enc.Name)
+		}
+		if !fills1080p(f.Width, f.Height) {
+			t.Fatalf("window %d: the full layer is %d×%d, want 1080p (1920 wide or 1080 high)", w, f.Width, f.Height)
+		}
+		if enc.HW && !f.HW {
+			t.Fatalf("window %d: the full layer runs on %s without HW, which the probe lists as hardware", w, enc.Name)
+		}
+		if f.TargetBps < hwBitrate || f.SentBps < hwMinSent {
+			t.Fatalf("window %d: the full layer targets %d bit/s and sent %d, want a target of %d and at least %d sent",
+				w, f.TargetBps, f.SentBps, hwBitrate, hwMinSent)
 		}
 		got = append(got, reading{c2s: f.CaptureToSend, eng: f.EngineLatency, fps: f.FPS, sent: f.SentBps})
 	}
@@ -180,8 +198,8 @@ func captureToSend(t *testing.T, cs *compatServer, eng media.Engine, src media.S
 	var worst publish.LatencyStats
 	for i, r := range got {
 		t.Logf("%s (hw %v, %d×%d, %s): window %d: capture-to-send p50 %v, p95 %v, max %v over %d frames; "+
-			"engine p50 %v, p95 %v; sent %d bit/s at %.1f fps", enc.Name, enc.HW, f.Width, f.Height, runtime.GOOS,
-			i+1, r.c2s.P50, r.c2s.P95, r.c2s.Max, r.c2s.Samples, r.eng.P50, r.eng.P95, r.sent, r.fps)
+			"engine p50 %v, p95 %v; sent %d bit/s at %.1f fps; source %s (capture %s)", enc.Name, enc.HW, f.Width,
+			f.Height, runtime.GOOS, i+1, r.c2s.P50, r.c2s.P95, r.c2s.Max, r.c2s.Samples, r.eng.P50, r.eng.P95, r.sent, r.fps, src.ID, src.Capture)
 		if r.c2s.Samples < minSamples {
 			t.Errorf("window %d holds %d frames of the full layer, want at least %d (%.0f %% of %d fps): not 1080p60",
 				i+1, r.c2s.Samples, minSamples, hwMinFill*100, hwFPS)
@@ -190,16 +208,17 @@ func captureToSend(t *testing.T, cs *compatServer, eng media.Engine, src media.S
 		worst.Max, worst.Samples = max(worst.Max, r.c2s.Max), worst.Samples+r.c2s.Samples
 	}
 	t.Logf("%s: over %v, %d frames: capture-to-send p50 ≤ %v, p95 ≤ %v (the worst window's), max %v; the viewer "+
-		"got %d whole frames", enc.Name, hwRun, worst.Samples, worst.P50, worst.P95, worst.Max, frames)
+		"got %d whole frames; source %s (capture %s)", enc.Name, hwRun, worst.Samples, worst.P50, worst.P95, worst.Max,
+		frames, src.ID, src.Capture)
 	if worst.P95 > hwP95 {
 		t.Errorf("%s: capture-to-send p95 %v, want at most %v (§12.3)", enc.Name, worst.P95, hwP95)
 	}
 	if worst.P50 > hwP50 {
 		t.Errorf("%s: capture-to-send p50 %v, want at most %v (§12.3)", enc.Name, worst.P50, hwP50)
 	}
-	if frames < minSamples*int(hwRun/hwWindow) {
-		t.Errorf("%s: the viewer got %d whole frames of the full layer in %v, want what was sent", enc.Name, frames,
-			hwRun)
+	if frames < worst.Samples*9/10 {
+		t.Errorf("%s: the viewer got %d whole frames of the full layer of the %d sent in %v, want at least 90 %%",
+			enc.Name, frames, worst.Samples, hwRun)
 	}
 }
 
@@ -267,21 +286,32 @@ func testedEncoders(t *testing.T, eng media.Engine) []media.EncoderInfo {
 	return out
 }
 
-// monitorSource returns the engine's listed source of the monitor (Engine.Sources' "mon:<device>"). Without such a
-// source it falls back to 04's test:pattern, as §12.3 allows, with a note.
-func monitorSource(t *testing.T, eng media.Engine, mon monitor) media.Source {
+// monitorSource returns the engine's listed source of the monitor (Engine.Sources' "mon:<device>"). When Sources
+// lists no monitor at all and fallback is set, it returns 04's test:pattern instead, as §12.3 allows for
+// TestCaptureToSend, with a note; in every other case without a match (monitors listed but none the primary one, or
+// no fallback) it fails the test.
+func monitorSource(t *testing.T, eng media.Engine, mon monitor, fallback bool) media.Source {
 	t.Helper()
 	srcs, err := eng.Sources(ctxFor(t))
 	if err != nil {
 		t.Fatalf("Sources: %v", err)
 	}
+	monitors := 0
 	for _, s := range srcs {
 		if strings.EqualFold(s.ID, "mon:"+mon.device) {
-			t.Logf("sharing the primary monitor (%s, %d×%d)", s.ID, s.Width, s.Height)
+			t.Logf("sharing the primary monitor (%s, %d×%d, capture %s)", s.ID, s.Width, s.Height, s.Capture)
 			return s
 		}
+		if s.Kind == media.SourceScreen && strings.HasPrefix(s.ID, "mon:") {
+			monitors++
+		}
 	}
-	t.Logf("Sources lists %d monitors, none of them the primary one: sharing test:pattern instead", len(srcs))
+	if !fallback || monitors > 0 {
+		t.Fatalf("Sources lists no primary monitor (mon:%s) among %d sources (%d monitors)", mon.device, len(srcs),
+			monitors)
+	}
+	t.Logf("Sources lists no monitor among %d sources: sharing test:pattern instead (§12.3), not a monitor run",
+		len(srcs))
 	return media.Source{ID: "test:pattern", Kind: media.SourceScreen, Capture: "test"}
 }
 
