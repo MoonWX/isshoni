@@ -1135,6 +1135,9 @@ tasks:
       NATIVE_DIST_PS1: |
         $ErrorActionPreference = 'Stop'
         Set-StrictMode -Version 3.0
+        # Started from PowerShell 7 (CI's pwsh steps), Windows PowerShell 5.1 inherits 7's PSModulePath and can't
+        # autoload its own modules (Get-FileHash, Compress-Archive): use the machine's module path.
+        $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
         $root = (Get-Location).Path
         function Get-RepoPath([string]$Path) {
           if (-not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path $root $Path }
@@ -1315,6 +1318,9 @@ tasks:
       ISSHONI_FFMPEG_BUILD_PS1: |
         $ErrorActionPreference = 'Stop'
         Set-StrictMode -Version 3.0
+        # Started from PowerShell 7 (CI's pwsh steps), Windows PowerShell 5.1 inherits 7's PSModulePath and can't
+        # autoload its own modules (Get-FileHash, Compress-Archive): use the machine's module path.
+        $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $ProgressPreference = 'SilentlyContinue'
         $root = (Get-Location).Path
