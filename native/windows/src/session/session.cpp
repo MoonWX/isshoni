@@ -42,6 +42,11 @@ im_status Start(const api::StartRequest &req, StartResult &out) {
   if (req.audio_only() && cfg.audio.mode == IM_AUDIO_MODE_OFF) {
     return abi::Fail(IM_ERR_INVALID_ARG, {}, "im_start: no source and audio off: the session would capture nothing");
   }
+  // README §3 item 35, 05 §4.3: after IM_INIT_NO_AUDIO the engine touches no audio API, so a share of the system's
+  // sound can't run; the test tone is 04's own source and still starts. Refused before anything opens.
+  if (cfg.audio.mode == IM_AUDIO_MODE_EXCLUDE_APPS && (engine::CurrentOptions().init_flags & IM_INIT_NO_AUDIO) != 0) {
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "im_start: audio is off (IM_INIT_NO_AUDIO)");
+  }
   // The limits first, so a start beyond them opens nothing (the insert below re-checks the count atomically).
   const auto live = Sessions().Snapshot();
   if (live.size() >= kMaxSessions) {
@@ -162,6 +167,17 @@ im_status SetAudioBitrate(im_session s, uint32_t bps) {
     return st;
   }
   return p->SetAudioBitrate(bps);
+}
+
+im_status SetToneMuted(bool muted) {
+  bool any = false;
+  for (const auto &entry : Sessions().Snapshot()) {
+    any = entry.second->SetToneMuted(muted) || any;
+  }
+  if (!any) {
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "im_audio_set_muted: no running test-tone session");
+  }
+  return IM_OK;
 }
 
 im_status GetStats(im_session s, std::string &json) {

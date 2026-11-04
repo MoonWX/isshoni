@@ -48,6 +48,21 @@ template <class F> std::string EventJson(F &&fill) noexcept {
 
 bool ValidLayerBitrate(uint32_t layer, uint32_t bps) noexcept { return encpolicy::ValidVideoBitrate(layer, bps); }
 
+// The word that starts a failure's detail before ": " (a 04 §5.7 token, or the failing call's name such as
+// "im_set_exclusions"), or "" when it starts with none: lower-case letters and '_' only. The session logs
+// only this of a detail that 05's audio code wrote: such a text may name an app, an executable or a rule, and no log
+// record at any level may (04 §5.6, README §3 item 18).
+std::string_view DetailToken(std::string_view detail) noexcept {
+  std::size_t n = 0;
+  while (n < detail.size() && ((detail[n] >= 'a' && detail[n] <= 'z') || detail[n] == '_')) {
+    ++n;
+  }
+  if (n == 0 || n + 1 >= detail.size() || detail[n] != ':' || detail[n + 1] != ' ') {
+    return {};
+  }
+  return detail.substr(0, n);
+}
+
 } // namespace
 
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
@@ -326,16 +341,17 @@ im_status Session::StartAudio(const im_start_config &cfg, uint32_t init_flags) {
     return IM_OK;
   }
 
-  // IM_AUDIO_MODE_EXCLUDE_APPS: 05's mixer feeds the stage (04 §10.2). Audio never fails a share (05 §4.3): without
-  // a mixer the session runs without audio packets and says so (audio state off).
+  // IM_AUDIO_MODE_EXCLUDE_APPS: 05's mixer feeds the stage (04 §10.2). After IM_INIT_NO_AUDIO the engine touches no
+  // audio API: session.cpp's Start refuses the mode before anything opens (README §3 item 35); this is its backstop.
+  // Otherwise audio never fails a share (05 §4.3): without a mixer the session runs without audio packets and says so
+  // (audio state off).
   if ((init_flags & IM_INIT_NO_AUDIO) != 0) {
-    audio_state_ = IM_AUDIO_STATE_OFF;
-    return IM_OK;
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "im_start: audio is off (IM_INIT_NO_AUDIO)");
   }
   audio::AudioEngine &ae = audio_bridge::Engine();
   if (cfg.exclusions != nullptr) {
     if (const im_status st = ae.SetRules(cfg.exclusions); st != IM_OK) {
-      log::Warn("session", "audio rules not applied", {{"status", st}, {"detail", abi::LastErrorText()}});
+      log::Warn("session", "audio rules not applied", {{"status", st}, {"token", DetailToken(abi::LastErrorText())}});
       abi::ClearLastError();
     }
   }
@@ -347,7 +363,7 @@ im_status Session::StartAudio(const im_start_config &cfg, uint32_t init_flags) {
   }
   audio::MixerConfig mc{audio_mode_, cfg.audio.flags, stage_.get()};
   if (const im_status st = mixer->Start(mc); st != IM_OK) {
-    log::Warn("session", "audio mixer did not start", {{"status", st}, {"detail", abi::LastErrorText()}});
+    log::Warn("session", "audio mixer did not start", {{"status", st}, {"token", DetailToken(abi::LastErrorText())}});
     abi::ClearLastError();
     audio_state_ = IM_AUDIO_STATE_OFF;
     return IM_OK;
@@ -555,6 +571,15 @@ im_status Session::SetPaused(bool paused) {
   return Push(c);
 }
 
+bool Session::SetToneMuted(bool muted) noexcept {
+  if (!tone_) {
+    return false;
+  }
+  // Its own flag beside the pause (04 §8.5): effective mute = user mute OR pause, each cleared only by its own call.
+  tone_->tone().SetMuted(muted);
+  return true;
+}
+
 im_status Session::SetAudioBitrate(uint32_t bps) {
   if (!stage_) {
     return abi::Fail(IM_ERR_INVALID_ARG, {}, "im_set_audio_bitrate: the session has no audio");
@@ -614,9 +639,11 @@ void Session::VideoLoop() noexcept {
         CountCaptured(now);
         ApplyCommands(now);
         ApplyRingRequests();
-        if (!pacer_->paused()) {
+        if (!pacer_->paused() && !paused_.load(std::memory_order_acquire)) {
           // While paused the slots keep the frozen frame (§8.5): new frames wait in them, the newest is taken on
-          // resume.
+          // resume. paused_ is set by im_set_paused itself, so no check made after the call takes a frame, also in
+          // the wake-up that was already past ApplyCommands when the call queued its command; resume still waits for
+          // the command (Apply's kPaused takes the newest frame then, uncounted).
           TakeFrame(now, true);
         }
         for (uint32_t l = 0; l < layer_count_ && !ended_.load(std::memory_order_acquire); ++l) {
