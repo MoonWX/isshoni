@@ -1,6 +1,6 @@
 // The shipped audio test exports' area (docs/m2/05-windows-audio.md §4.1, §13.2, §18; for cmd/isshoni-audiotest):
 // im_test_render_tone and im_test_render_bursts render test signals on a render endpoint and capture nothing.
-// test_exports_stub.cpp is the skeleton's version; 05 replaces it (README WA53). Arguments arrive checked
+// test_exports.cpp implements them (README WA53). Pointer arguments arrive checked
 // (src/api/exports.cpp); failures set the thread's detail.
 #pragma once
 

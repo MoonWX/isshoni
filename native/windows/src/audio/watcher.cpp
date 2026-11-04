@@ -19,6 +19,7 @@
 #include "api/guard.h"
 #include "audio/activator.h"
 #include "audio/capture_thread.h"
+#include "audio/engine_gate.h"
 #include "audio/include_set.h"
 #include "audio/levels.h"
 #include "audio/live_mix.h"
@@ -27,6 +28,8 @@
 #include "audio/process_snapshot.h"
 #include "audio/report.h"
 #include "audio/sessions.h"
+#include "audio/silent_check.h"
+#include "audio/startup_probe.h"
 #include "audio/wasapi_capture.h"
 #include "engine/os.h"
 #include "im/abi/status.h"
@@ -42,7 +45,6 @@ namespace im::audio {
 namespace {
 
 constexpr int64_t kMs = 1'000'000;
-constexpr int64_t kDebounceNs = 20 * kMs;          // a burst of session events plans once (05 §7.3)
 constexpr int64_t kSampleNs = 100 * kMs;           // tick_100ms: levels and playing (05 §12.2)
 constexpr int64_t kPollNs = 1000 * kMs;            // tick_1s: the safety net (05 §7.3)
 constexpr int64_t kRestartWaitNs = 1000 * kMs;     // the audio service restarts: wait 1 s (05 §7.5)
@@ -107,13 +109,6 @@ audiopolicy::Exclusions ImplicitRules() {
   return x;
 }
 
-// The rules as the planner gets them: without the fast path, which is README WA53's (05 §6.4) along with the endpoint
-// engine, so the plans of this slice use the include set alone.
-audiopolicy::Exclusions PlannerRules(audiopolicy::Exclusions ex) {
-  ex.flags &= ~static_cast<uint32_t>(IM_EXCLF_FAST_PATH);
-  return ex;
-}
-
 uint64_t FiletimeNow() {
   FILETIME ft{};
   GetSystemTimeAsFileTime(&ft);
@@ -121,6 +116,37 @@ uint64_t FiletimeNow() {
 }
 
 void WakeSignals(void *ctx) { static_cast<Signals *>(ctx)->waiter.Wake(); }
+
+// The report's state as Mixer::State gives it (05 §12.1).
+uint32_t AudioStateOf(audiomix::ReportState s) {
+  switch (s) {
+  case audiomix::ReportState::kStarting:
+    return IM_AUDIO_STATE_STARTING;
+  case audiomix::ReportState::kOk:
+    return IM_AUDIO_STATE_OK;
+  case audiomix::ReportState::kDegraded:
+    return IM_AUDIO_STATE_DEGRADED;
+  case audiomix::ReportState::kNoDevice:
+    return IM_AUDIO_STATE_NO_DEVICE;
+  case audiomix::ReportState::kStopped:
+    break;
+  }
+  return IM_AUDIO_STATE_OFF;
+}
+
+const char *ProbeOutcomeName(ProbeOutcome o) {
+  switch (o) {
+  case ProbeOutcome::kOk:
+    return "ok";
+  case ProbeOutcome::kFailed:
+    return "failed";
+  case ProbeOutcome::kUnsupported:
+    return "unsupported";
+  case ProbeOutcome::kSkipped:
+    break;
+  }
+  return "skipped";
+}
 
 // The mixer's events as the report spells them (05 §12.1). kTailFade is not one of them: the watcher logs it.
 ReportEventCode MixEventToReport(audiomix::MixEventCode c) {
@@ -172,8 +198,9 @@ public:
       : st_(std::move(st)), com_(com), endpoints_(st_->signals), rules_(ImplicitRules()),
         pool_(NewWasapiOpener(), ActivatorHooks(st_->signals.get())),
         gate_(NewWindowsProcessGate(&WakeSignals, st_->signals.get())),
-        set_(StreamSetDeps{&pool_, &capture_, gate_.get(), &FiletimeNow}) {
-    planner_.SetExclusions(PlannerRules(rules_));
+        set_(StreamSetDeps{&pool_, &capture_, gate_.get(), &FiletimeNow}), engine_gate_(win::OsBuild()),
+        probe_(NewWindowsProbeBackend(), [signals = st_->signals] { signals->waiter.Wake(); }) {
+    planner_.SetExclusions(rules_);
   }
 
   void Run() {
@@ -189,6 +216,7 @@ public:
       Tick(engine::os::QpcNs());
     }
     FailPending("the audio watcher stopped");
+    probe_.Stop();
     if (live_) {
       // Shutdown with a share still live (04 stops its sessions first, so this is a backstop): the mixer thread goes
       // first, then the streams it read.
@@ -217,6 +245,7 @@ private:
     if (live_) {
       d = std::min(d, engine::os::QpcNs() + kLivePumpNs);
       d = std::min(d, set_.NextDeadline());
+      d = std::min(d, engine_gate_.NextDeadline());
     } else if (threads_idle_since_ != 0) {
       d = std::min(d, threads_idle_since_ + kThreadsIdleNs);
     }
@@ -224,7 +253,7 @@ private:
       d = std::min({d, next_sample_ns_, next_poll_ns_}); // keeps the live pump's and the reopen delays' deadlines
       if (st_->signals->sessions.load(std::memory_order_acquire) > 0) {
         const int64_t first = st_->signals->first_session_ns.load(std::memory_order_acquire);
-        d = std::min(d, first == 0 ? 0 : first + kDebounceNs);
+        d = std::min(d, SessionPlanDue(first, FastPathRunning()));
       }
       if (!en_ && restart_at_ns_ == 0) {
         d = std::min(d, enumerator_retry_ns_); // a pending restart re-creates it at restart_at_ns_
@@ -273,7 +302,7 @@ private:
         ApplyRules(std::move(r.rules), now);
       } else {
         rules_ = std::move(r.rules);
-        planner_.SetExclusions(PlannerRules(rules_));
+        planner_.SetExclusions(rules_);
         StartWatching(now);
       }
       DropOneShot();
@@ -358,7 +387,7 @@ private:
 
   void ApplyRules(audiopolicy::Exclusions ex, int64_t now) {
     rules_ = std::move(ex);
-    planner_.SetExclusions(PlannerRules(rules_));
+    planner_.SetExclusions(rules_);
     if (watching_) {
       Event(now, ReportEventCode::kRulesChanged);
       Reconcile(now); // applied at once (05 §4.1: within 50 ms)
@@ -428,6 +457,18 @@ private:
       log::Error("audio", "audio capture threads did not start: the share's audio stays silent");
     }
     set_.Attach(&live_->engine());
+    live_engine_ = audiopolicy::Engine::kNone;
+    silent_.Reset();
+    loopback_failures_seen_ = set_.counters().loopback_failures;
+    // The engine gate and the startup probe (05 §6.1, §11.2): the probe runs beside the first plan, which acts as if it
+    // passed (the include set never leaks); a gated build (Windows 10) plans the endpoint engine at once.
+    EnsureEnumerator(now);
+    const bool force_fail = (live_->flags & IM_AUDIOF_TEST_FAIL_PROBE) != 0;
+    if (engine_gate_.StartAudio(now, DefaultRenderId(), force_fail)) {
+      StartProbe();
+    } else if (force_fail) {
+      Event(now, ReportEventCode::kProbeFailed, {}, "forced");
+    }
     cpu_mark_ns_ = now;
     cpu_mark_busy_ = BusyNs();
     cpu_ms_per_s_ = 0;
@@ -456,6 +497,10 @@ private:
     }
     set_.Detach();
     live_.reset();
+    probe_.Stop();
+    engine_gate_.StopAudio();
+    silent_.Reset();
+    live_engine_ = audiopolicy::Engine::kNone;
     threads_idle_since_ = now;
     if (!user_watch_) {
       StopWatching();
@@ -493,13 +538,25 @@ private:
     for (ReportEvent &e : set_.TakeEvents()) {
       PushEvent(std::move(e));
     }
+    bool replan_engine = false;
+    if (const uint64_t lf = set_.counters().loopback_failures; lf != loopback_failures_seen_) {
+      // Process loopback stopped working: twice in 10 s switches to the endpoint engine (05 §6.5).
+      loopback_failures_seen_ = lf;
+      const bool before = engine_gate_.process_loopback();
+      engine_gate_.LoopbackFailed(now);
+      if (before && !engine_gate_.process_loopback()) {
+        Event(now, ReportEventCode::kProbeFailed, {}, "loopback_failed");
+        log::Warn("audio", "process loopback failed twice in 10 s: endpoint engine");
+        replan_engine = true;
+      }
+    }
     std::string views;
     for (const StreamView &v : set_.Views()) {
       views += std::to_string(v.target.pid) + ':' + audiomix::ReportName(v.stream) + ';';
     }
-    if (replan || views != views_) {
+    if (replan || replan_engine || views != views_) {
       views_ = std::move(views);
-      Reconcile(now); // a stream left, or sessions[].stream changed
+      Reconcile(now); // a stream left, sessions[].stream changed, or the engine must change
     }
   }
 
@@ -616,6 +673,17 @@ private:
         log::Info("audio", "audio devices changed",
                   {{"added", added}, {"removed", removed}, {"default", default_render}});
         Rebuild(now);
+        if (live_) {
+          if (default_render > 0) {
+            // 05 §7.5: the probe result is invalidated, a share in the endpoint engine re-probes 2 s later, and the
+            // endpoint stream reopens on the new default with preroll and fade; include and EXCLUDE streams stay.
+            engine_gate_.DefaultDeviceChanged(now, DefaultRenderId());
+            if (set_.ReopenEndpoint(now)) {
+              log::Info("audio", "endpoint stream reopens on the new default device");
+            }
+          }
+          engine_gate_.DeviceEvent(now);
+        }
         Reconcile(now);
       }
     }
@@ -628,8 +696,9 @@ private:
       return;
     }
     const int64_t first = s.first_session_ns.load(std::memory_order_acquire);
-    if (first != 0 && now - first < kDebounceNs) {
-      return; // more may follow: Deadline() wakes the loop when the 20 ms are up
+    const bool fast = FastPathRunning();
+    if (first != 0 && now < SessionPlanDue(first, fast)) {
+      return; // more may follow: Deadline() wakes the loop when the 20 ms are up (none while the fast path runs)
     }
     // Reset before the refresh: an event during it starts the next round, so none is lost. The count goes first
     // (Signals::OnSession counts, then sets the time): an event counted between the two resets leaves sessions > 0
@@ -641,10 +710,21 @@ private:
     if (endpoints_.RefreshSessions(true, now) == AUDCLNT_E_SERVICE_NOT_RUNNING) {
       ServiceGone(now);
     }
-    Reconcile(now);
+    // While the fast path runs this reconcile comes without the debounce, and the session callback's time is the C of
+    // the retroactive cut (05 §6.4): a kept-out process it reveals cuts the EXCLUDE stream at C - 20 ms.
+    Reconcile(now, fast ? first : 0);
   }
 
   void Tick(int64_t now) {
+    if (live_) {
+      ProbeReport pr;
+      if (probe_.TakeResult(&pr)) {
+        ProbeDone(pr, now);
+      }
+      if (engine_gate_.ProbeDue(now)) {
+        StartProbe();
+      }
+    }
     PumpLive(now);
     if (!live_ && threads_idle_since_ != 0 && now - threads_idle_since_ >= kThreadsIdleNs) {
       StopCaptureThreads(); // 5 s after the last share (05 §10.5)
@@ -681,8 +761,10 @@ private:
     }
     if (now >= next_sample_ns_) {
       next_sample_ns_ = now + kSampleNs;
-      if (endpoints_.Sample(now)) {
-        Reconcile(now); // apps[].playing changed
+      bool changed = endpoints_.Sample(now);
+      changed = CheckSilentStreams(now) || changed;
+      if (changed) {
+        Reconcile(now); // apps[].playing changed, or a stream was reopened or given up on
       }
       PublishLevels(now);
     }
@@ -692,7 +774,7 @@ private:
 
   // One plan by planner_ over a fresh process table and eps' sessions, as a report (05 §7.3, §12.1). With track, the
   // sessions keep their app ids (the levels' rows) and announce themselves, and the report gets the watcher's events.
-  Report Plan(EndpointSet &eps, int64_t now, bool track) {
+  Report Plan(EndpointSet &eps, int64_t now, bool track, int64_t reveal_ns = 0) {
     std::vector<audiopolicy::ProcessEntry> entries;
     snapshotter_.Take(entries);
     std::vector<TrackedSession *> tracked = eps.sessions();
@@ -723,9 +805,10 @@ private:
     // Capture runs only while a share is live with sound on; otherwise the plan is the include set's prediction with
     // engine none (05 §6.5).
     in.mode = live && live_mode_ == IM_AUDIO_MODE_EXCLUDE_APPS ? IM_AUDIO_MODE_EXCLUDE_APPS : IM_AUDIO_MODE_OFF;
-    // As if the startup probe passed (05 §6.1: the include set never leaks); the probe and the endpoint engine are
-    // README WA53's.
-    in.process_loopback = true;
+    // The engine gate (05 §6.1): process loopback while the startup probe runs or after it passed, the endpoint engine
+    // on a gated build (Windows 10), after a failed probe and after "twice in 10 s". A prediction without a share
+    // plans no capture (engine none) either way.
+    in.process_loopback = live ? engine_gate_.process_loopback() : !engine_gate_.build_gated();
     in.sessions = sessions;
     in.streams = streams;
     in.capture_failed = failed;
@@ -745,7 +828,8 @@ private:
             const auto d = table.Find(desc);
             return a && d && *a != *d && table.InTree(*d, *a, false);
           },
-          now);
+          now, reveal_ns);
+      EngineChanged(plan, now);
     }
 
     Report r;
@@ -753,18 +837,20 @@ private:
     const uint32_t capture = eps.capture_count();
     r.mode = live && live_mode_ == IM_AUDIO_MODE_OFF ? audiomix::ReportMode::kOff : audiomix::ReportMode::kExcludeApps;
     r.engine = ToReport(plan.engine);
-    r.state = render > 0 ? audiomix::ReportState::kOk : audiomix::ReportState::kNoDevice;
+    r.state = render == 0 ? audiomix::ReportState::kNoDevice
+              : live      ? engine_gate_.LiveState()
+                          : audiomix::ReportState::kOk;
     r.live = live;
     if (live) {
       const audiomix::MixEngine &e = live_->engine();
       r.muted = e.muted();
       r.paused = e.paused();
-      live_->state.store(render > 0 ? IM_AUDIO_STATE_OK : IM_AUDIO_STATE_NO_DEVICE, std::memory_order_relaxed);
+      live_->state.store(AudioStateOf(r.state), std::memory_order_relaxed);
     }
     r.rebuilding = restart_at_ns_ != 0;
-    // The startup probe (05 §11.2) is README WA53's: pending with an active render endpoint, skipped without.
-    r.probe.result = render > 0 ? audiomix::ProbeResult::kPending : audiomix::ProbeResult::kSkipped;
-    r.probe.os_build = win::OsBuild();
+    // The startup probe (05 §11.2): its last result, pending while it runs or before any share; a gated build
+    // reports unsupported (the banner exclusion-unavailable, 05 §14.7).
+    r.probe = engine_gate_.Report(render > 0);
     r.device = audiomix::ReportDevice{render > 0, render, capture};
     r.apps.reserve(plan.apps.size());
     for (const audiopolicy::AppRow &a : plan.apps) {
@@ -790,7 +876,7 @@ private:
         s.created = p.key.created;
         s.exe = p.exe;
         for (const StreamView &v : views) {
-          if (v.target == p.key) {
+          if (v.kind == audiopolicy::StreamKind::kInclude && v.target == p.key) {
             s.stream = v.stream; // the session's own process is a target (05 §12.1 sessions[].stream)
             s.format = v.format;
           }
@@ -897,11 +983,11 @@ private:
     snapshotter_.Describe(entries, want);
   }
 
-  void Reconcile(int64_t now) {
+  void Reconcile(int64_t now, int64_t reveal_ns = 0) {
     if (!watching_) {
       return;
     }
-    Report r = Plan(endpoints_, now, true);
+    Report r = Plan(endpoints_, now, true, reveal_ns);
     std::string visible = VisibleState(r);
     if (visible != visible_) {
       ++seq_; // anything visible changed (05 §12.1)
@@ -983,6 +1069,138 @@ private:
       apps.push_back(AppActivity{id, sum.peak_db(), now, true, sum.rms_db()});
     }
     st_->levels.Publish(MakeLevels(seq_, now, mix_peak, mix_rms, apps));
+  }
+
+  // ---------------------------------------------------------------------------- engine, startup probe, health
+
+  // Whether the fast path runs (05 §6.4): session events then skip the 20 ms debounce.
+  bool FastPathRunning() const { return live_ && live_engine_ == audiopolicy::Engine::kExcludeSelf; }
+
+  // The default render endpoint's id (UTF-8), "" without one: the probe's cache key (05 §11.2).
+  std::string DefaultRenderId() {
+    if (!en_) {
+      return {};
+    }
+    win::ComPtr<IMMDevice> dev;
+    LPWSTR wid = nullptr;
+    if (FAILED(en_->GetDefaultAudioEndpoint(eRender, eConsole, dev.Put())) || FAILED(dev->GetId(&wid)) ||
+        wid == nullptr) {
+      return {};
+    }
+    std::string id = win::Utf8(wid);
+    CoTaskMemFree(wid);
+    return id;
+  }
+
+  void StartProbe() {
+    if (probe_.Start()) {
+      engine_gate_.ProbeStarted();
+      log::Info("audio", "audio startup probe started");
+    } else {
+      log::Warn("audio", "audio startup probe did not start: process loopback is assumed to work");
+    }
+  }
+
+  // The probe's result: the next plan picks the engine (a failed one the endpoint engine; the planner treats leaving
+  // the endpoint engine as an engine start, so the fast path is used at once when its condition holds, 05 §6.4).
+  void ProbeDone(const ProbeReport &pr, int64_t now) {
+    engine_gate_.ProbeDone(pr);
+    log::Info("audio", "audio startup probe",
+              {{"result", ProbeOutcomeName(pr.outcome)},
+               {"level_db", pr.level_db},
+               {"ms", pr.ms},
+               {"level_mismatch", pr.level_mismatch}});
+    switch (pr.outcome) {
+    case ProbeOutcome::kOk:
+      Event(now, ReportEventCode::kProbeOk, {}, pr.level_mismatch ? "probe_level_mismatch" : "");
+      break;
+    case ProbeOutcome::kFailed:
+    case ProbeOutcome::kUnsupported:
+      Event(now, ReportEventCode::kProbeFailed, {}, ProbeOutcomeName(pr.outcome));
+      break;
+    case ProbeOutcome::kSkipped:
+      break; // nothing decided: the next device event probes again
+    }
+    Reconcile(now);
+  }
+
+  // The plan's engine against the previous live plan's: the fast path's events and counter (05 §6.4, §12.1).
+  void EngineChanged(const audiopolicy::Plan &plan, int64_t now) {
+    if (plan.engine == live_engine_) {
+      return;
+    }
+    if (plan.engine == audiopolicy::Engine::kExcludeSelf) {
+      Event(now, ReportEventCode::kFastpathEnter);
+    } else if (live_engine_ == audiopolicy::Engine::kExcludeSelf && plan.engine == audiopolicy::Engine::kIncludeSet) {
+      Event(now, ReportEventCode::kFastpathExit);
+      ++counters_.fastpath_exits;
+    }
+    log::Info("audio", "audio capture engine",
+              {{"from", audiopolicy::EngineName(live_engine_)}, {"to", audiopolicy::EngineName(plan.engine)}});
+    live_engine_ = plan.engine;
+  }
+
+  // The silent-stream check (05 §8.5) on the 100 ms sample while a share captures with sound: each heard app's
+  // loudest session meter against what its running include streams delivered (the mixer's per-channel levels over
+  // the same 100 ms). Muted, paused or off, every channel reads silent, so the check waits. Returns whether a stream
+  // was reopened or given up on.
+  bool CheckSilentStreams(int64_t now) {
+    if (!live_ || live_mode_ != IM_AUDIO_MODE_EXCLUDE_APPS || live_engine_ != audiopolicy::Engine::kIncludeSet) {
+      return false;
+    }
+    const audiomix::MixEngine &e = live_->engine();
+    if (e.muted() || e.paused() || e.sound_off()) {
+      return false;
+    }
+    auto snap = std::make_unique<audiomix::LevelsSnapshot>();
+    if (!live_->engine().ReadLevels(snap.get())) {
+      return false;
+    }
+    std::vector<SilentSample> samples;
+    const auto entry = [&](const std::string &app) -> SilentSample & {
+      for (SilentSample &x : samples) {
+        if (x.app_id == app) {
+          return x;
+        }
+      }
+      samples.push_back(SilentSample{app, kSilenceDb, false, true});
+      return samples.back();
+    };
+    for (const TrackedSession *t : endpoints_.sessions()) {
+      if (t->flow == audiopolicy::Flow::kRender && !t->app_id.empty()) {
+        SilentSample &x = entry(t->app_id);
+        x.meter_peak_db = std::max(x.meter_peak_db, t->peak_db);
+      }
+    }
+    for (uint32_t i = 0; i < snap->count; ++i) {
+      const audiomix::ChannelLevel &ch = snap->channels[i];
+      const std::string app = ch.running ? set_.AppOfTag(ch.tag) : std::string();
+      if (app.empty()) {
+        continue;
+      }
+      SilentSample &x = entry(app);
+      x.has_streams = true;
+      x.streams_silent = x.streams_silent && ch.peak_db <= audiomix::kLevelFloorDb;
+    }
+    const SilentActions a = silent_.Sample(now, samples);
+    bool changed = false;
+    for (const std::string &app : a.reopen) {
+      if (set_.ReopenApp(app, now) > 0) {
+        ++counters_.silent_reopens;
+        Event(now, ReportEventCode::kSilentReopen, app);
+        changed = true;
+      }
+    }
+    for (const std::string &app : a.give_up) {
+      if (set_.GiveUpApp(app) > 0) {
+        log::Warn("audio", "a playing app's streams stay silent after two reopens: capture_failed");
+        changed = true;
+      }
+    }
+    if (changed) {
+      log::Info("audio", "silent-stream check", {{"reopened", a.reopen.size()}, {"given_up", a.give_up.size()}});
+    }
+    return changed;
   }
 
   // ------------------------------------------------------------------------------------------------- probe
@@ -1067,6 +1285,13 @@ private:
   int64_t cpu_mark_busy_ = 0;
   double cpu_ms_per_s_ = 0;
   std::string views_; // the streams' states of the last report
+
+  // README WA53: the engine gate with the startup probe, the live plan's engine and the silent-stream check.
+  EngineGate engine_gate_;
+  ProbeRunner probe_;
+  SilentStreamCheck silent_;
+  audiopolicy::Engine live_engine_ = audiopolicy::Engine::kNone;
+  uint64_t loopback_failures_seen_ = 0;
 };
 
 void RunThread(const std::shared_ptr<Watcher::State> &st) noexcept {
