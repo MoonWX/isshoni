@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 
@@ -60,4 +61,24 @@ func webviewDataDir() (string, error) {
 // osBuild is the Windows build number, such as 26100 (BridgeConfig.App.OSBuild).
 func osBuild() int {
 	return int(windows.RtlGetVersion().BuildNumber)
+}
+
+// mutexOpens is 03 §13.4 step 2a's probe: OpenMutexW(SYNCHRONIZE, FALSE, name). It succeeds while the mutex exists
+// (true); ERROR_FILE_NOT_FOUND means it doesn't (false); any other error (access denied included) is returned, and
+// the start logs it and goes on. winos.MutexExists counts access denied as existing, which step 2a must not.
+func mutexOpens(name string) (bool, error) {
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return false, err
+	}
+	h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, p)
+	switch {
+	case err == nil:
+		_ = windows.CloseHandle(h)
+		return true, nil
+	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
+		return false, nil
+	default:
+		return false, fmt.Errorf("OpenMutexW: %w", err)
+	}
 }

@@ -78,6 +78,8 @@ func childStart(role string) int {
 	s := &starter{
 		log:    slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		stdout: func() io.Writer { f, _ := os.Create(out); return f }, //nolint:gosec // G703: the parent test's temp file
+		// No installer runs for these children: the real installer's mutex is the app's, never a test's.
+		installerRunning: func() (bool, error) { return false, nil },
 		singleInstance: func() (instance, error) {
 			si, err := winos.NewSingleInstance(id, nil)
 			if err != nil {
