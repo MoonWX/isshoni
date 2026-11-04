@@ -57,6 +57,7 @@ struct MixCounters {
   uint64_t mixer_resyncs = 0;
   uint64_t reanchors = 0;
   uint64_t fastpath_late_cuts = 0;
+  uint64_t tail_fades = 0;      // sounds that stopped into digital silence and got the tail fade (dsp.h)
   int32_t max_resample_ppm = 0; // the largest |ppm| a channel used
   int64_t delay_ns = 0;         // L now
 };
@@ -70,6 +71,8 @@ enum class MixEventCode : uint8_t {
   kMixerResync,     // mixer_resync (tag 0)
   kReanchor,        // reanchor (tag 0)
   kFastpathLateCut, // fastpath_late_cut
+  kTailFade,        // tail_fade: a sound stopped into digital silence and was ramped out (dsp.h); at most once per
+                    // second per channel. Not one of the report's event codes (05 §12.1): the Windows engine logs it
 };
 const char *MixEventName(MixEventCode code) noexcept;
 
@@ -112,6 +115,8 @@ struct LevelSum {
 class MixEngine {
 public:
   static constexpr uint32_t kEventCapacity = 256;
+  // The most input frames a tick peeks from one channel: the resampler's input plus the tail fade's look-ahead.
+  static constexpr uint32_t kInFrames = 1024;
 
   // sink must outlive the engine.
   explicit MixEngine(ChunkSink *sink, const MixParams &params = {});
@@ -163,6 +168,10 @@ private:
   void Release(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept;
   void StartFade(Channel &ch, uint32_t frames) noexcept;
   void EmitTail(Channel &ch, uint32_t from) noexcept;
+  // The tail fade (dsp.h) on the n peeked input frames in in_ (in_silent_ filled): ramps the last 5 ms of every sound
+  // that the peek shows followed by 5 ms of digital silence, and records where those stops are (the first silent
+  // frame, >= 1) in stops_; returns how many it recorded.
+  uint32_t TailFade(uint32_t n) noexcept;
   void PushEvent(int64_t t_ns, MixEventCode code, uint64_t tag) noexcept;
   void PublishLevels(int64_t tick_ns, float bus_gain) noexcept;
   void Count(std::atomic<uint64_t> &c) noexcept {
@@ -180,7 +189,7 @@ private:
 
   // Counters (written by the mixer thread only).
   std::atomic<uint64_t> chunks_{0}, gaps_{0}, underruns_{0}, trims_{0}, overflows_{0}, resyncs_{0}, reanchors_{0},
-      late_cuts_{0};
+      late_cuts_{0}, tail_fades_{0};
   std::atomic<int32_t> max_ppm_{0};
   std::atomic<int64_t> delay_pub_{0};
 
@@ -217,11 +226,13 @@ private:
   double bus_sumsq_[10] = {};
   uint32_t bus_level_pos_ = 0;
   float bus_[kChunkSamples] = {};
-  float in_[2 * 600] = {};      // a channel's peeked input (up to 600 frames)
-  bool in_silent_[600] = {};    // per peeked frame: digital silence (before the onset ramp)
-  uint32_t onset_sf_[600] = {}; // the onset state after each peeked frame
-  uint32_t onset_op_[600] = {};
-  float out_[kChunkSamples] = {}; // a channel's resampled chunk
+  float in_[2 * kInFrames] = {};      // a channel's peeked input
+  bool in_silent_[kInFrames] = {};    // per peeked frame: digital silence (before the onset and tail fades)
+  uint32_t onset_sf_[kInFrames] = {}; // the onset state after each peeked frame
+  uint32_t onset_op_[kInFrames] = {};
+  static constexpr uint32_t kMaxStops = 8;
+  uint32_t stops_[kMaxStops] = {}; // TailFade's stops of this channel's peek
+  float out_[kChunkSamples] = {};  // a channel's resampled chunk
 };
 
 } // namespace im::audiomix

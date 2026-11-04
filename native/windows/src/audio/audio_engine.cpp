@@ -1,24 +1,67 @@
-// 05's AudioEngine (docs/m2/05-windows-audio.md §10.5; "05" below), the watcher half (README WA35): Init and Shutdown
-// with the watcher thread, the rules, watch and unwatch, the report, the levels and the probe flags. The capture
-// streams and the mixer (NewMixer, SetMode, SetMuted while live) are README WA45's, the sound check WA53's; until then
-// no audio session can run, so NewMixer gives none (04's session then runs without audio packets, audio state off),
-// and SetMode and SetMuted answer IM_ERR_BAD_STATE as 05 §4.3 says for "no running audio session".
+// 05's AudioEngine (docs/m2/05-windows-audio.md §10.5; "05" below): Init and Shutdown with the watcher thread, the
+// rules, watch and unwatch, the report, the levels and the probe flags (README WA35), and a share's Mixer with the
+// include set's capture (README WA45): NewMixer, and SetMode and SetMuted while it runs. The sound check is README
+// WA53's; until then it answers IM_ERR_NOT_IMPLEMENTED. Without a running audio session SetMode and SetMuted answer
+// IM_ERR_BAD_STATE (05 §4.3).
 #include "audio/mixer.h"
 
 #include <windows.h>
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
 
+#include "audio/live_mix.h"
 #include "audio/watcher.h"
 #include "im/abi/status.h"
+#include "im/audiomix/mixer.h"
 #include "im/audiopolicy/exclusions.h"
 #include "im/log/ring.h"
 
 namespace im::audio {
 namespace {
+
+// How long Mixer::Stop waits for the watcher to let go of the share's streams (Stop's bound is 500 ms, 05 §10.5; the
+// mixer thread's join comes first).
+constexpr std::chrono::milliseconds kDetachWait{400};
+
+class WindowsAudioEngine;
+
+// A share's mixer (05 §9, §10.5): the im_audiomix mixer thread on the Windows clock, under MMCSS, feeding the session's
+// PcmSink, with the include set's channels from the watcher. Every method may come from any thread.
+class WindowsMixer final : public Mixer {
+public:
+  WindowsMixer(WindowsAudioEngine *owner, std::shared_ptr<Watcher> watcher)
+      : owner_(owner), watcher_(std::move(watcher)) {}
+  ~WindowsMixer() override { Stop(); } // also after a failed Start (the session then runs without it)
+  WindowsMixer(const WindowsMixer &) = delete;
+  WindowsMixer &operator=(const WindowsMixer &) = delete;
+
+  im_status Start(const MixerConfig &cfg) override;
+  void Stop() override;
+
+  void SetPaused(bool paused) override {
+    std::lock_guard<std::mutex> l(mu_);
+    paused_ = paused;
+    if (mix_) {
+      mix_->engine().SetPaused(paused); // the bus fades in 10 ms; mute and mode off are their own flags (05 §9.6)
+    }
+  }
+
+  uint32_t State() const override {
+    std::lock_guard<std::mutex> l(mu_);
+    return mix_ ? mix_->state.load(std::memory_order_relaxed) : IM_AUDIO_STATE_OFF;
+  }
+
+private:
+  WindowsAudioEngine *const owner_;
+  const std::shared_ptr<Watcher> watcher_;
+  mutable std::mutex mu_;
+  std::shared_ptr<LiveMix> mix_;
+  bool paused_ = false;
+};
 
 class WindowsAudioEngine final : public AudioEngine {
 public:
@@ -50,15 +93,20 @@ public:
 
   void Shutdown() override {
     std::shared_ptr<Watcher> w;
+    std::shared_ptr<LiveMix> live;
     {
       std::lock_guard<std::mutex> l(mu_);
       w = std::move(watcher_);
+      live = std::exchange(live_, {});
       rules_.reset(); // the process-wide set belongs to this im_init
       no_audio_ = false;
       initialized_ = false;
     }
+    if (live) {
+      live->mixer->Stop(); // 04 stops its sessions first; a mixer still running stops here, before its streams go
+    }
     if (w) {
-      w->Stop(); // unwatches and joins the watcher thread (<= 2 s)
+      w->Stop(); // detaches a live share, unwatches and joins the audio threads (<= 2 s each)
     }
   }
 
@@ -114,9 +162,27 @@ public:
     return w ? w->Unwatch() : IM_OK; // idempotent: nothing watches
   }
 
-  im_status SetMode(uint32_t) override { return NoAudioSession("im_audio_set_mode"); }
+  // Sound off and on for the live share (05 §6.5, §9.6): the bus's mode-off flag at once, the plan on the watcher.
+  im_status SetMode(uint32_t mode) override {
+    auto [mix, w] = Live();
+    if (!mix) {
+      return NoAudioSession("im_audio_set_mode");
+    }
+    mix->engine().SetSoundOff(mode == IM_AUDIO_MODE_OFF);
+    w->SetLiveMode(mode);
+    return IM_OK;
+  }
 
-  im_status SetMuted(bool) override { return NoAudioSession("im_audio_set_muted"); }
+  // The user's (pause) mute of the live share (05 §9.6).
+  im_status SetMuted(bool muted) override {
+    auto [mix, w] = Live();
+    if (!mix) {
+      return NoAudioSession("im_audio_set_muted");
+    }
+    mix->engine().SetMuted(muted);
+    w->SetLiveMuted(muted);
+    return IM_OK;
+  }
 
   im_status LevelsGet(im_audio_levels *out) override {
     const std::shared_ptr<Watcher> w = Current();
@@ -133,13 +199,40 @@ public:
     return abi::Fail(IM_ERR_NOT_IMPLEMENTED, {}, "im_audio_sound_check: not implemented yet (README WA53)");
   }
 
-  // The include-set capture and the mixer are README WA45's: no mixer yet, so a share runs without audio packets.
-  std::unique_ptr<Mixer> NewMixer() override { return nullptr; }
+  // A share's mixer; nullptr after IM_INIT_NO_AUDIO or when the watcher didn't start (the share then runs without
+  // audio packets, 05 §4.3).
+  std::unique_ptr<Mixer> NewMixer() override {
+    const std::shared_ptr<Watcher> w = Current();
+    if (!w) {
+      return nullptr;
+    }
+    return std::make_unique<WindowsMixer>(this, w);
+  }
+
+  // From WindowsMixer: the live share's mix (one session with audio per process, 04 §6.4).
+  void SetLive(std::shared_ptr<LiveMix> mix) {
+    std::lock_guard<std::mutex> l(mu_);
+    live_ = std::move(mix);
+  }
+  void ClearLive(const std::shared_ptr<LiveMix> &mix) {
+    std::lock_guard<std::mutex> l(mu_);
+    if (live_ == mix) {
+      live_.reset();
+    }
+  }
 
 private:
   std::shared_ptr<Watcher> Current() const {
     std::lock_guard<std::mutex> l(mu_);
     return watcher_;
+  }
+
+  std::pair<std::shared_ptr<LiveMix>, std::shared_ptr<Watcher>> Live() const {
+    std::lock_guard<std::mutex> l(mu_);
+    if (!live_ || !watcher_) {
+      return {};
+    }
+    return {live_, watcher_};
   }
 
   // Validates and copies ex (04 §5.1) with the implicit instance rule on this process (05 §4.3).
@@ -165,10 +258,64 @@ private:
 
   mutable std::mutex mu_;
   std::shared_ptr<Watcher> watcher_;
+  std::shared_ptr<LiveMix> live_;
   std::optional<audiopolicy::Exclusions> rules_;
   bool no_audio_ = false;
   bool initialized_ = false;
 };
+
+im_status WindowsMixer::Start(const MixerConfig &cfg) {
+  std::lock_guard<std::mutex> l(mu_);
+  if (mix_) {
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "audio mixer: already started");
+  }
+  if (cfg.sink == nullptr) {
+    return abi::Fail(IM_ERR_INVALID_ARG, {}, "audio mixer: no sink");
+  }
+  if (cfg.mode != IM_AUDIO_MODE_EXCLUDE_APPS) {
+    return abi::Failf(IM_ERR_INVALID_ARG, {}, "audio mixer: mode %u has no mixer", cfg.mode);
+  }
+  auto mix = std::make_shared<LiveMix>();
+  mix->sink = NewPcmSinkAdapter(cfg.sink); // the two-line adapter (05 §10.5)
+  mix->clock = NewWindowsTickClock();
+  mix->flags = cfg.flags;
+  audiomix::MixerOptions o;
+  o.sink = mix->sink.get();
+  o.clock = mix->clock.get();
+  o.thread_hook = &MixerThreadHook;
+  if (const im_status st = audiomix::Mixer::Create(o, &mix->mixer); st != IM_OK) {
+    return abi::Fail(st, {}, "audio mixer: not created");
+  }
+  mix->engine().SetPaused(paused_); // IM_START_PAUSED reaches SetPaused before Start
+  // The clock first: chunks of silence on the grid from now on (05 §10.5: Start returns once the mixer clock runs);
+  // the watcher's plan and the first activations follow asynchronously, so the first chunks are silence (§17).
+  if (const im_status st = mix->mixer->Start(); st != IM_OK) {
+    return abi::Fail(st, {}, "audio mixer: the mixer thread did not start");
+  }
+  if (const im_status st = watcher_->AttachLive(mix); st != IM_OK) {
+    mix->mixer->Stop();
+    return st;
+  }
+  mix_ = mix;
+  owner_->SetLive(std::move(mix));
+  return IM_OK;
+}
+
+void WindowsMixer::Stop() {
+  std::shared_ptr<LiveMix> mix;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    mix = std::exchange(mix_, {});
+  }
+  if (!mix) {
+    return;
+  }
+  owner_->ClearLive(mix);
+  mix->mixer->Stop(); // joins the mixer thread: no OnChunk or OnGap after this
+  if (watcher_->DetachLive(mix, kDetachWait) != IM_OK) {
+    abi::ClearLastError();
+  }
+}
 
 } // namespace
 

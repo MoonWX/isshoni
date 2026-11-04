@@ -92,7 +92,8 @@ public:
   int64_t target_age_ns() const noexcept { return target_pub_.load(std::memory_order_relaxed); }
   uint64_t underruns() const noexcept { return underruns_.load(std::memory_order_relaxed); }
   uint64_t trims() const noexcept { return trims_.load(std::memory_order_relaxed); }
-  bool bypassed() const noexcept { return bypass_flag_.load(std::memory_order_relaxed); } // in the silent bypass
+  bool bypassed() const noexcept { return bypass_flag_.load(std::memory_order_relaxed); }      // in the silent bypass
+  uint64_t tail_fades() const noexcept { return tail_fades_.load(std::memory_order_relaxed); } // dsp.h's tail fade
 
 private:
   friend class MixEngine;
@@ -118,6 +119,7 @@ private:
   std::atomic<uint64_t> underruns_{0};
   std::atomic<uint64_t> trims_{0};
   std::atomic<bool> bypass_flag_{false};
+  std::atomic<uint64_t> tail_fades_{0};
 
   // The mixer thread's own state.
   FillController ctl_;
@@ -142,6 +144,8 @@ private:
   uint64_t seen_overflows_ = 0;
   float last_l_ = 0.0f, last_r_ = 0.0f; // the last two frames this channel added to the bus
   float prev_l_ = 0.0f, prev_r_ = 0.0f;
+  int64_t tail_event_ns_ = 0;             // the tick of its last kTailFade event (at most one per second)
+  bool tail_evented_ = false;             // a kTailFade event was raised
   uint32_t tail_pos_ = 0;                 // the backstop tail in progress: next frame 1..64, 0 = none
   float tail_v_[2] = {}, tail_s_[2] = {}; // its start value and slope per channel
   float peak_[10] = {};                   // the last 10 ticks' peak and sum of squares (levels over 100 ms, §9.6)

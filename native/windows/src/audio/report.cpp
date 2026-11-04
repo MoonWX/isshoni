@@ -1,158 +1,141 @@
 #include "audio/report.h"
 
-#include <algorithm>
-#include <string>
-#include <string_view>
-
-#include "im/abi/utf8.h"
-#include "im/json/writer.h"
+#include <utility>
 
 namespace im::audio {
-namespace {
 
-// s cut to kReportMaxStringBytes on a UTF-8 boundary (05 §12.1: "strings ≤ 260 bytes").
-std::string_view Cap(std::string_view s) noexcept { return s.substr(0, abi::Utf8PrefixLen(s, kReportMaxStringBytes)); }
-
-void Str(json::Writer &w, std::string_view key, std::string_view value) { w.Key(key).String(Cap(value)); }
-
-void Warnings(json::Writer &w, uint32_t bits) {
-  w.Key("warnings").BeginArray();
-  for (uint32_t bit = 1; bit != 0; bit <<= 1) {
-    if ((bits & bit) != 0) {
-      if (const std::string_view name = audiopolicy::WarningName(bit); !name.empty()) {
-        w.String(name);
-      }
-    }
+audiomix::ReportEngine ToReport(audiopolicy::Engine e) noexcept {
+  switch (e) {
+  case audiopolicy::Engine::kIncludeSet:
+    return audiomix::ReportEngine::kIncludeSet;
+  case audiopolicy::Engine::kExcludeSelf:
+    return audiomix::ReportEngine::kExcludeSelf;
+  case audiopolicy::Engine::kEndpoint:
+    return audiomix::ReportEngine::kEndpoint;
+  case audiopolicy::Engine::kNone:
+    break;
   }
-  w.EndArray();
+  return audiomix::ReportEngine::kNone;
 }
 
-void App(json::Writer &w, const audiopolicy::AppRow &a) {
-  w.BeginObject();
-  Str(w, "id", a.id);
-  Str(w, "name", a.name);
-  Str(w, "exe", a.exe);
-  Str(w, "verdict", audiopolicy::VerdictName(a.verdict));
-  Str(w, "reason", audiopolicy::ReasonName(a.reason));
-  w.Key("playing").Bool(a.playing);
-  w.Key("usesMic").Bool(a.uses_mic);
-  w.Key("browser").Bool(a.browser);
-  w.Key("shared").Bool(a.shared);
-  w.Key("pids").Uint(a.pids);
-  w.Key("sessions").Uint(a.sessions);
-  w.Key("streams").Uint(a.streams);
-  Str(w, "detail", a.detail);
-  Warnings(w, a.warnings);
-  w.EndObject();
+audiomix::AppVerdict ToReport(audiopolicy::Verdict v) noexcept {
+  switch (v) {
+  case audiopolicy::Verdict::kHeard:
+    return audiomix::AppVerdict::kHeard;
+  case audiopolicy::Verdict::kKeptOut:
+    return audiomix::AppVerdict::kKeptOut;
+  case audiopolicy::Verdict::kNotCaptured:
+    return audiomix::AppVerdict::kNotCaptured;
+  case audiopolicy::Verdict::kPending:
+    break;
+  }
+  return audiomix::AppVerdict::kPending;
 }
 
-void Session(json::Writer &w, const ReportSession &s) {
-  w.BeginObject();
-  w.Key("pid").Uint(s.pid);
-  w.Key("created").String(std::to_string(s.created));
-  Str(w, "exe", s.exe);
-  Str(w, "appId", s.app_id);
-  Str(w, "flow", audiopolicy::FlowName(s.flow));
-  Str(w, "state", s.state == audiopolicy::SessionState::kActive ? "active" : "inactive");
-  w.Key("multiProcess").Bool(s.multi_process);
-  Str(w, "verdict", audiopolicy::VerdictName(s.verdict));
-  Str(w, "reason", audiopolicy::ReasonName(s.reason));
-  Str(w, "stream", s.stream);
-  Str(w, "format", s.format);
-  Str(w, "note", audiopolicy::NoteName(s.note));
-  w.EndObject();
+audiomix::AppReason ToReport(audiopolicy::Reason r) noexcept {
+  switch (r) {
+  case audiopolicy::Reason::kNone:
+    return audiomix::AppReason::kNone;
+  case audiopolicy::Reason::kBuiltin:
+    return audiomix::AppReason::kBuiltin;
+  case audiopolicy::Reason::kUser:
+    return audiomix::AppReason::kUser;
+  case audiopolicy::Reason::kMic:
+    return audiomix::AppReason::kMic;
+  case audiopolicy::Reason::kViewer:
+    return audiomix::AppReason::kViewer;
+  case audiopolicy::Reason::kIsshoni:
+    return audiomix::AppReason::kIsshoni;
+  case audiopolicy::Reason::kLauncher:
+    return audiomix::AppReason::kLauncher;
+  case audiopolicy::Reason::kTree:
+    return audiomix::AppReason::kTree;
+  case audiopolicy::Reason::kPidReuse:
+    return audiomix::AppReason::kPidReuse;
+  case audiopolicy::Reason::kLimit:
+    return audiomix::AppReason::kLimit;
+  case audiopolicy::Reason::kCaptureFailed:
+    return audiomix::AppReason::kCaptureFailed;
+  }
+  return audiomix::AppReason::kNone;
 }
 
-// The part seq covers, between "v" and "counters" (05 §12.1). Counters and events follow only in the full report.
-void Visible(json::Writer &w, const Report &r) {
-  Str(w, "mode", r.mode);
-  Str(w, "engine", audiopolicy::EngineName(r.engine));
-  Str(w, "state", r.state);
-  w.Key("muted").Bool(r.muted);
-  w.Key("paused").Bool(r.paused);
-  w.Key("live").Bool(r.live);
-  w.Key("rebuilding").Bool(r.rebuilding);
-  w.Key("probe").BeginObject();
-  Str(w, "result", r.probe.result);
-  w.Key("osBuild").Uint(r.probe.os_build);
-  Str(w, "format", r.probe.format);
-  w.Key("levelDb").Double(r.probe.level_db);
-  w.Key("ms").Int(r.probe.ms);
-  w.EndObject();
-  w.Key("device").BeginObject();
-  w.Key("present").Bool(r.device.present);
-  w.Key("renderEndpoints").Uint(r.device.render_endpoints);
-  w.Key("captureEndpoints").Uint(r.device.capture_endpoints);
-  w.EndObject();
-  w.Key("apps").BeginArray();
-  for (std::size_t i = 0; i < std::min(r.apps.size(), kReportMaxApps); ++i) {
-    App(w, r.apps[i]);
+audiomix::SessionNote ToReport(audiopolicy::Note n) noexcept {
+  switch (n) {
+  case audiopolicy::Note::kCovered:
+    return audiomix::SessionNote::kCovered;
+  case audiopolicy::Note::kNoHandle:
+    return audiomix::SessionNote::kNoHandle;
+  case audiopolicy::Note::kNone:
+    break;
   }
-  w.EndArray();
-  w.Key("sessions").BeginArray();
-  for (std::size_t i = 0; i < std::min(r.sessions.size(), kReportMaxSessions); ++i) {
-    Session(w, r.sessions[i]);
-  }
-  w.EndArray();
-  w.Key("warnings").BeginArray();
-  for (const ReportWarning &x : r.warnings) {
-    w.BeginObject();
-    Str(w, "code", x.code);
-    Str(w, "app", x.app);
-    w.EndObject();
-  }
-  w.EndArray();
+  return audiomix::SessionNote::kNone;
 }
 
-} // namespace
+audiomix::SessionFlow ToReport(audiopolicy::Flow f) noexcept {
+  return f == audiopolicy::Flow::kCapture ? audiomix::SessionFlow::kCapture : audiomix::SessionFlow::kRender;
+}
 
-std::string WriteReportJson(const Report &r) {
-  json::Writer w;
-  w.BeginObject();
-  w.Key("v").Int(1);
-  w.Key("seq").Uint(r.seq);
-  w.Key("qpcNs").Int(r.qpc_ns);
-  Visible(w, r);
-  const ReportCounters &c = r.counters;
-  w.Key("counters").BeginObject();
-  w.Key("streams").Uint(c.streams);
-  w.Key("activations").Uint(c.activations);
-  w.Key("activationFailures").Uint(c.activation_failures);
-  w.Key("underruns").Uint(c.underruns);
-  w.Key("trims").Uint(c.trims);
-  w.Key("overflows").Uint(c.overflows);
-  w.Key("discontinuities").Uint(c.discontinuities);
-  w.Key("mixerResyncs").Uint(c.mixer_resyncs);
-  w.Key("fastpathExits").Uint(c.fastpath_exits);
-  w.Key("fastpathLateCuts").Uint(c.fastpath_late_cuts);
-  w.Key("silentReopens").Uint(c.silent_reopens);
-  w.Key("deviceChanges").Uint(c.device_changes);
-  w.Key("pidReuseBlocks").Uint(c.pid_reuse_blocks);
-  w.Key("maxResamplePpm").Int(c.max_resample_ppm);
-  w.Key("audioCpuMsPerS").Double(c.audio_cpu_ms_per_s);
-  w.EndObject();
-  w.Key("events").BeginArray();
-  const std::size_t first = r.events.size() > kReportMaxEvents ? r.events.size() - kReportMaxEvents : 0;
-  for (std::size_t i = first; i < r.events.size(); ++i) {
-    const ReportEvent &e = r.events[i];
-    w.BeginObject();
-    w.Key("tNs").Int(e.t_ns);
-    Str(w, "code", e.code);
-    Str(w, "app", e.app);
-    Str(w, "detail", e.detail);
-    w.EndObject();
+audiomix::SessionState ToReport(audiopolicy::SessionState s) noexcept {
+  return s == audiopolicy::SessionState::kActive ? audiomix::SessionState::kActive : audiomix::SessionState::kInactive;
+}
+
+std::vector<audiomix::AppWarning> WarningsOf(uint32_t bits) {
+  std::vector<audiomix::AppWarning> out;
+  if ((bits & audiopolicy::kWarnSharedAppUsesMic) != 0) {
+    out.push_back(audiomix::AppWarning::kSharedAppUsesMic);
   }
-  w.EndArray();
-  w.EndObject();
-  return w.Take();
+  if ((bits & audiopolicy::kWarnSharedAppKeptOut) != 0) {
+    out.push_back(audiomix::AppWarning::kSharedAppKeptOut);
+  }
+  if ((bits & audiopolicy::kWarnIncludedUsesMic) != 0) {
+    out.push_back(audiomix::AppWarning::kIncludedUsesMic);
+  }
+  if ((bits & audiopolicy::kWarnMultiProcessSession) != 0) {
+    out.push_back(audiomix::AppWarning::kMultiProcessSession);
+  }
+  return out;
+}
+
+audiomix::ReportApp ToReport(const audiopolicy::AppRow &row) {
+  audiomix::ReportApp a;
+  a.id = row.id;
+  a.name = row.name;
+  a.exe = row.exe;
+  a.verdict = ToReport(row.verdict);
+  a.reason = ToReport(row.reason);
+  a.playing = row.playing;
+  a.uses_mic = row.uses_mic;
+  a.browser = row.browser;
+  a.shared = row.shared;
+  a.pids = row.pids;
+  a.sessions = row.sessions;
+  a.streams = row.streams;
+  a.detail = row.detail;
+  a.warnings = WarningsOf(row.warnings);
+  return a;
+}
+
+bool ToReport(const audiopolicy::PlanWarning &w, audiomix::ReportWarning *out) {
+  if (w.code == "multi_process_session") {
+    out->code = audiomix::AppWarning::kMultiProcessSession;
+  } else if (w.code == "instance_gone") {
+    out->code = audiomix::AppWarning::kInstanceGone;
+  } else {
+    return false;
+  }
+  out->app = w.app;
+  return true;
 }
 
 std::string VisibleState(const Report &r) {
-  json::Writer w;
-  w.BeginObject();
-  Visible(w, r);
-  w.EndObject();
-  return w.Take();
+  // The whole report through the one writer, without what seq doesn't cover.
+  Report v = r;
+  v.seq = 0;
+  v.qpc_ns = 0;
+  v.counters = {};
+  v.events.clear();
+  return audiomix::WriteReportJson(v);
 }
 
 } // namespace im::audio

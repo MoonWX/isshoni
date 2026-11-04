@@ -17,8 +17,13 @@ constexpr uint32_t kTrimToFrames = 40 * kFramesPerMs;       // a trim keeps the 
 constexpr uint32_t kBypassAfterFrames = 100 * kFramesPerMs; // 100 ms of silent input: the silent bypass (§9.3)
 constexpr int64_t kBypassMaxCorrection = 48;                // frames dropped or padded per tick in the bypass
 // The input a chunk can need: at most 480 * (1 + 992e-6) frames plus speexdsp's carry of a frame or two at the
-// highest ratio; 496 leaves room (MixEngine::in_ holds 600, enough for the bypass's 528 too).
+// highest ratio; 496 leaves room (the bypass peeks up to 528).
 constexpr uint32_t kPeekFrames = kChunkFrames + 16;
+// The tail fade (dsp.h) decides a frame's ramp at the tick that consumes it: the frame may be the first of a 5 ms ramp
+// whose stop and its 5 ms of silence lie up to 10 ms ahead, so the peek reaches that far past the resampler's input.
+constexpr uint32_t kLookFrames = kPeekFrames + kOffsetRampFrames + kOffsetSilenceFrames;
+static_assert(kLookFrames <= MixEngine::kInFrames && kChunkFrames + 48 <= MixEngine::kInFrames,
+              "MixEngine::in_ holds every peek");
 constexpr uint32_t kLevelTicks = 10; // levels over 100 ms (§9.6)
 constexpr double kLevelSamples = static_cast<double>(kLevelTicks) * kChunkSamples;
 
@@ -56,6 +61,8 @@ const char *MixEventName(MixEventCode code) noexcept {
     return "reanchor";
   case MixEventCode::kFastpathLateCut:
     return "fastpath_late_cut";
+  case MixEventCode::kTailFade:
+    return "tail_fade";
   }
   return "";
 }
@@ -101,6 +108,7 @@ MixCounters MixEngine::counters() const noexcept {
   c.mixer_resyncs = resyncs_.load(std::memory_order_relaxed);
   c.reanchors = reanchors_.load(std::memory_order_relaxed);
   c.fastpath_late_cuts = late_cuts_.load(std::memory_order_relaxed);
+  c.tail_fades = tail_fades_.load(std::memory_order_relaxed);
   c.max_resample_ppm = max_ppm_.load(std::memory_order_relaxed);
   c.delay_ns = delay_pub_.load(std::memory_order_relaxed);
   return c;
@@ -295,6 +303,35 @@ void MixEngine::EmitTail(Channel &ch, uint32_t from) noexcept {
   }
 }
 
+uint32_t MixEngine::TailFade(uint32_t n) noexcept {
+  uint32_t found = 0;
+  for (uint32_t t = 1; t + kOffsetSilenceFrames <= n; ++t) {
+    if (!in_silent_[t] || in_silent_[t - 1]) {
+      continue; // not the first silent frame after sound
+    }
+    uint32_t k = t + 1;
+    while (k < t + kOffsetSilenceFrames && in_silent_[k]) {
+      ++k;
+    }
+    if (k < t + kOffsetSilenceFrames) {
+      t = k; // a gap shorter than 5 ms: not a stop (k is sound again)
+      continue;
+    }
+    // Ramp [t - 5 ms, t) down to zero: frame i gets (t - i) / 5 ms. Frames before the peek were consumed at an
+    // earlier tick, which saw this stop as well (kLookFrames) and ramped them then.
+    for (uint32_t i = t > kOffsetRampFrames ? t - kOffsetRampFrames : 0; i < t; ++i) {
+      const float g = static_cast<float>(t - i) / static_cast<float>(kOffsetRampFrames);
+      in_[2 * i] *= g;
+      in_[2 * i + 1] *= g;
+    }
+    if (found < kMaxStops) {
+      stops_[found++] = t;
+    }
+    t += kOffsetSilenceFrames - 1; // the next stop needs sound first
+  }
+  return found;
+}
+
 int64_t MixEngine::TargetFor(Channel &ch) noexcept {
   // The fill floor: the head age at which the fill averages 40 ms, i.e. 40 ms plus the newest frame's mean age (the
   // packets' lag behind the mix plus half a packet, capture_ring.h). The target holds L unless that leaves less fill.
@@ -374,7 +411,12 @@ void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
     }
   }
   if (!done) {
-    const uint32_t n = ring.Peek(in_, kPeekFrames);
+    const uint32_t n = ring.Peek(in_, kLookFrames);
+    for (uint32_t i = 0; i < n; ++i) {
+      in_silent_[i] = IsSilentFrame(in_[2 * i], in_[2 * i + 1]);
+    }
+    // The tail fade (dsp.h) on the stream's input, before the resampler, for the reason given below for the onset.
+    const uint32_t stops = TailFade(n);
     // The onset fade (§9.5) on the stream's input, before the resampler: sound after at least 50 ms of digital
     // silence is ramped in over 5 ms. (After the resampler it would come too late: speexdsp's 80-tap filter turns a
     // waveform that starts mid-cycle into a band-limited step that rings for 40 frames on either side, and a ramp
@@ -383,8 +425,7 @@ void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
     uint32_t sf = ch.silent_frames_, op = ch.onset_pos_;
     for (uint32_t i = 0; i < n; ++i) {
       float *f = in_ + 2 * static_cast<std::size_t>(i);
-      const bool quiet = IsSilentFrame(f[0], f[1]);
-      in_silent_[i] = quiet;
+      const bool quiet = in_silent_[i];
       if (quiet) {
         sf = sf < kOnsetSilenceFrames ? sf + 1 : sf;
       } else {
@@ -402,9 +443,21 @@ void MixEngine::Render(uint32_t slot, Channel &ch, int64_t tick_ns) noexcept {
       onset_op_[i] = op;
     }
     uint32_t used = 0;
-    ch.resampler_->Process(in_, n, out_, kChunkFrames, &used, &made);
+    ch.resampler_->Process(in_, std::min(n, kPeekFrames), out_, kChunkFrames, &used, &made);
     (void)ring.Consume(used);
     consumed = used;
+    // A stop counts at the tick that consumes its last sound frame (t - 1 < used), so each counts once.
+    for (uint32_t k = 0; k < stops; ++k) {
+      if (stops_[k] <= used) {
+        Count(tail_fades_);
+        AddRelaxed<uint64_t>(ch.tail_fades_, 1);
+        if (!ch.tail_evented_ || tick_ns - ch.tail_event_ns_ >= kNsPerSecond) {
+          ch.tail_evented_ = true;
+          ch.tail_event_ns_ = tick_ns;
+          PushEvent(tick_ns, MixEventCode::kTailFade, ch.tag_);
+        }
+      }
+    }
     if (used > 0) {
       ch.silent_frames_ = onset_sf_[used - 1];
       ch.onset_pos_ = onset_op_[used - 1];
