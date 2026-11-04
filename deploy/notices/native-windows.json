@@ -12,5 +12,7 @@
   {"name": "nv-codec-headers", "version": "12.1.14.1", "license": "MIT",
    "linking": "headers, inside avcodec", "licenseFiles": ["nv-codec-headers/LICENSE"]},
   {"name": "AMD AMF headers", "version": "1.5.3", "license": "MIT",
-   "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]}
+   "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]},
+  {"name": "C++/WinRT", "license": "MIT",
+   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["cppwinrt/LICENSE"]}
 ]

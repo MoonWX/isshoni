@@ -1,6 +1,15 @@
 // The capture area's entry points behind the exports (docs/m2/04-windows-engine.md §7; README WA50 the picker and
-// WGC, WA60 Desktop Duplication and im_list_sources). capture_stub.cpp is the skeleton's version, replaced by those
-// slices. Arguments arrive checked (src/api/validate.h); failures set the thread's detail (im::abi::Fail).
+// WGC, WA60 Desktop Duplication and im_list_sources). Arguments arrive checked (src/api/validate.h); failures set the
+// thread's detail (im::abi::Fail).
+//
+// The area's parts:
+//   picker.h             the picker's STA thread (§7.2 steps 1–3)
+//   window_match.h       what a pick is: window identity, kind, self (§7.2 step 4, §7.6); plain C++, unit-tested
+//   window_system_win.h  the Win32 queries behind it
+//   picked_item.h        what a pick token holds (session::SourceSpec::item)
+//   wgc_capture.h        WGC for one session into its frame slots (§7.3, §7.7, §7.8)
+//   source_watch.h       resize debounce and minimize edges for the session's supervisor (§7.6, §7.7)
+//   winrt_support.h      C++/WinRT, ApiInformation checks, borderless access, HRESULT mapping
 #pragma once
 
 #include <cstdint>
@@ -11,21 +20,28 @@
 
 namespace im::capture {
 
-// im_list_sources, on the engine worker (bound::kListSources): the 04 §5.6 sources document.
+// im_list_sources, on the engine worker (bound::kListSources): the 04 §5.6 sources document. README WA60.
 im_status ListSources(uint32_t flags, std::string &json);
 
 // im_pick_source, on the caller's thread: shows the OS picker on the picker's STA thread and blocks until the user
 // picks, cancels or params.timeout_ms passes (0 = 120 000, at most 600 000). out is zeroed with struct_size =
-// sizeof(im_source_info).
+// sizeof(im_source_info). A pick is stored under a new token (session::Sources().AddPick, §7.2's token rules) and
+// described in out: kind, id, name, size, capture path, IM_SRCF_OS_BORDER / IM_SRCF_SELF, pid and window.
 im_status PickSource(const im_pick_params &params, im_source_info &out);
 
-// im_cancel_pick: a blocked PickSource returns IM_ERR_CANCELLED.
+// im_cancel_pick: a blocked PickSource returns IM_ERR_CANCELLED; IM_OK (nothing to do) when none is open.
 im_status CancelPick();
 
-// im_release_source: forgets an unused pick token; unknown ids are ignored.
+// im_release_source: forgets an unused pick token at once (session::Sources().Release); unknown ids are ignored.
 void ReleaseSource(std::string_view id) noexcept;
 
-// im_shutdown: cancels an open pick and forgets every token.
+// im_shutdown: cancels an open pick, ends the picker thread and forgets every token.
 void Shutdown() noexcept;
+
+// The capture part of im_caps.os_flags, asked from Windows itself (for the probe, on the engine worker):
+// IM_OS_WGC and IM_OS_WGC_PICKER (GraphicsCaptureSession::IsSupported()), IM_OS_WGC_CURSOR_TOGGLE,
+// IM_OS_WGC_MIN_INTERVAL and IM_OS_WGC_SECONDARY_WINDOWS (the properties are present), IM_OS_WGC_BORDERLESS
+// (IsBorderRequired present and GraphicsCaptureAccess allows borderless, §7.1).
+uint32_t OsFlags() noexcept;
 
 } // namespace im::capture
