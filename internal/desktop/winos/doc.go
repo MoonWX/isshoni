@@ -5,9 +5,12 @@
 // relaunch. darwin and linux get stubs (oshooks_other.go and the *_other.go files), so the package builds and its
 // tests run on every OS.
 //
-// What is real so far (README WA41): single instance (03 §13.3; the mutex and pipe of 03 §3.2's W6 fallback),
-// the running mutex (§13.4 step 4), the registry values (§13.2, §14.2), the AppUserModelID and OSBuild. The other
-// OSHooks methods return "not implemented" on Windows until their slices (WA68, WA80, WA84) fill them.
+// What is real so far: single instance (03 §13.3; the mutex and pipe of 03 §3.2's W6 fallback), the running mutex
+// (§13.4 step 4), the registry values (§13.2, §14.2), the AppUserModelID and OSBuild (README WA41); the winos
+// thread with its hidden window (§4.3: hotkey registration and WM_HOTKEY, lock and unlock, suspend and resume, the
+// end of the session with its 2 s handshake, display changes), keep-awake on that thread, WDA_EXCLUDEFROMCAPTURE
+// and its reset, the OS settings pages and OpenPath (README WA68). The pill (WA80) is a no-op and autostart (WA84)
+// returns "not implemented" on Windows until their slices.
 //
 // Names (README §4 "Naming"): the single-instance id io.isshoni.desktop, the running mutex
 // Local\io.isshoni.desktop.running, the registry key HKCU\Software\isshoni.

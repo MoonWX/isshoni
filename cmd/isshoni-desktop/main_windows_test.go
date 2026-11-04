@@ -68,6 +68,8 @@ func testChild(role string) int {
 		return exitLoaded
 	case "first", "second", "oneshot":
 		return childStart(role)
+	case "toast":
+		return childToast(os.Getenv(idEnv))
 	}
 	return 2
 }
