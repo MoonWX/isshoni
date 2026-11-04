@@ -1116,6 +1116,12 @@ const (
 	maxGOP = 10 * time.Second
 )
 
+// GOPOf is the per-layer GOP that opts set, by rid (nil when none does), with the last WithGOP of a rid winning as
+// in StartWith; it does not check the range. It lets callers that build options test what they pass.
+func GOPOf(opts ...StartOption) map[string]time.Duration {
+	return collectOptions(opts).gop
+}
+
 func collectOptions(opts []StartOption) startOptions {
 	var o startOptions
 	for _, opt := range opts {

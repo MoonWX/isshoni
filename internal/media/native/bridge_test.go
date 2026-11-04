@@ -623,6 +623,16 @@ func TestStartOneSessionAtATime(t *testing.T) {
 // TestStartWithGOP: WithGOP reaches im_layer_config.gop_ms through StartWith and StartExtra (whole milliseconds, by
 // rid; the other layers keep 0, the engine's default), a Reconfigure keeps it, and a bad value or rid is CodeInvalid
 // without an im_start call.
+func TestGOPOf(t *testing.T) {
+	if g := GOPOf(); g != nil {
+		t.Errorf("GOPOf() = %v, want nil", g)
+	}
+	g := GOPOf(WithGOP("f", 3*time.Second), nil, WithGOP("q", 2*time.Second), WithGOP("f", 10*time.Second))
+	if len(g) != 2 || g["f"] != 10*time.Second || g["q"] != 2*time.Second {
+		t.Errorf("GOPOf = %v, want f 10s (the last WithGOP of f) and q 2s", g)
+	}
+}
+
 func TestStartWithGOP(t *testing.T) {
 	sf := newSessionFake(t)
 	e := openFake(t, sf.f, Options{})

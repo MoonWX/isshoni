@@ -46,9 +46,9 @@ inline constexpr uint32_t kTestFps = 60;
 inline constexpr uint32_t kTestBitrate = 8'000'000;
 // After this much probe time (from the probe's start), the encoders not yet tested are reported as timed out
 // (IM_ERR_TIMEOUT, engine_timeout) instead of opened, and a started encoder skips its trial CB open, its 720p retry
-// and its live-bitrate check: one open (at most kSlowOpenUs before slow_open) and the test IDR can still follow, so
-// the whole probe stays near 04 §9.10's 2 s and well inside the worker's bound (04 §5.3: 2 s, posted with 1 s of
-// slack, engine.h bound::kProbeFull).
+// and its live-bitrate check: one open (marked slow_open past kSlowOpenUs, but not interrupted) and the test IDR can
+// still follow. The typical probe stays near 04 §9.10's 2 s; with opens of at most 1 s the worst case (about 2.75 s,
+// probe.cpp) stays inside the worker's bound (04 §5.3: 2 s, posted with 1 s of slack, engine.h bound::kProbeFull).
 inline constexpr uint32_t kEncoderBudgetMs = 1500;
 
 } // namespace im::encode

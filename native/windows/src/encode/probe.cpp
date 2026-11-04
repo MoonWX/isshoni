@@ -54,16 +54,18 @@ constexpr uint32_t kBuild24H2 = 26100;         // MinUpdateInterval, IncludeSeco
 int64_t NowNs() noexcept { return engine::os::QpcNs(); }
 
 // The encoder budget against the worker's bound for a full im_probe (04 §5.3, §9.10): no open or check starts after
-// kEncoderBudgetMs, so the last one to start may still open for up to kSlowOpenUs (a longer open marks the encoder
-// slow_open) and encode its test IDR (a few frames, kMaxDelayFrames below); the rest (the close, the audio flags,
-// which only post to 05's watcher) is quick. All of it must fit in bound::kProbeFull, so im_probe never times out
-// for the encoders' sake. The usual probe (opens of tens of ms) ends well under 04 §9.10's 2 s.
+// kEncoderBudgetMs, so the last one to start may still open for up to kSlowOpenUs and encode its test IDR (a few
+// frames, kMaxDelayFrames below); the rest (the close, the audio flags, which only post to 05's watcher) is quick.
+// kSlowOpenUs is not a cap: avcodec_open2 can't be interrupted, so an open that takes longer still runs to its end
+// and is only marked slow_open afterwards. The assert below therefore holds for opens of at most 1 s: then the worst
+// case, budget + one slow open + its IDR (about 2.75 s), fits in bound::kProbeFull and im_probe never times out for
+// the encoders' sake. 04 §9.10's 2 s is the typical probe on the owner's PC (E7, opens of tens of ms), not a bound
+// this budget enforces.
 constexpr std::chrono::milliseconds kAfterLastOpen{250}; // the test IDR, the close, the audio flags
 static_assert(std::chrono::milliseconds(kEncoderBudgetMs) + std::chrono::microseconds(kSlowOpenUs) + kAfterLastOpen <=
                   engine::bound::kProbeFull,
-              "a full probe's encoder budget must keep im_probe inside the worker's bound");
-static_assert(std::chrono::milliseconds(kEncoderBudgetMs) < std::chrono::milliseconds(2000),
-              "04 §9.10: the encoders start within the whole probe's 2 s");
+              "no encoder work starts after the budget; with opens of at most kSlowOpenUs, the worst case (budget + "
+              "one slow open + its IDR, about 2.75 s) must keep im_probe inside the worker's bound");
 
 // ---------------------------------------------------------------------------------------------------- 1. the OS
 

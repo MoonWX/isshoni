@@ -298,6 +298,15 @@ type reportLayer struct {
 	LatencyP99  string  `json:"captureToPacketP99"`
 }
 
+// captureStartOptions is the native start options of a capture run: -bitrate-steps runs f with stepsGOP (10 s,
+// 04 §14), so no periodic IDR falls between the steps; any other run takes the engine's default GOPs.
+func captureStartOptions(o captureOptions) []native.StartOption {
+	if len(o.steps) > 0 {
+		return []native.StartOption{native.WithGOP("f", stepsGOP)}
+	}
+	return nil
+}
+
 // captureRun is capture and bench: start a session, read it for -seconds while the control goroutine requests
 // keyframes or steps the bitrate, stop, then check 04 §14's assertions (capture) or print the numbers (bench).
 func captureRun(ctx context.Context, g *globals, o captureOptions) int {
@@ -352,11 +361,7 @@ func captureRun(ctx context.Context, g *globals, o captureOptions) int {
 	}
 	cpu0 := processCPU()
 	wall0 := time.Now()
-	var opts []native.StartOption
-	if len(o.steps) > 0 {
-		opts = append(opts, native.WithGOP("f", stepsGOP))
-	}
-	s, err := e.StartWith(ctx, cfg, opts...)
+	s, err := e.StartWith(ctx, cfg, captureStartOptions(o)...)
 	if err != nil {
 		fmt.Fprintf(g.stderr, "%s: start: %v\n", name, err)
 		if sk != nil {
