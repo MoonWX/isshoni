@@ -35,7 +35,7 @@ void RefreshOpenH264(im_caps &caps) noexcept {
   const uint32_t n = std::min<uint32_t>(caps.encoder_count, IM_MAX_ENCODERS);
   for (uint32_t i = 0; i < n; ++i) {
     if (caps.encoders[i].kind == IM_ENC_OPENH264) {
-      ProbeOpenH264(false, caps.encoders[i]);
+      ProbeOpenH264(false, kNoProbeDeadline, caps.encoders[i]);
     }
   }
 }

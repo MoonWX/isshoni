@@ -49,6 +49,8 @@
 
 #include "encode/openh264_api.h"
 #include "encode/openh264_pin.h"
+#include "encode/selector.h"
+#include "engine/os.h"
 #include "gpu/cpu_model.h"
 #include "gpu/pattern_layout.h"
 #include "im/h264/nal.h"
@@ -610,6 +612,53 @@ TEST_F(OpenH264, FullProbeTestsIt) {
       EXPECT_NE(quick.encoders[i].flags & IM_ENCF_AVAILABLE, 0u);
     }
   }
+}
+
+// 04 §9.10 "As built": past the encoders' budget OpenH264's test encode doesn't start either.
+TEST_F(OpenH264, FullProbePastTheBudgetDoesNotTest) {
+  TurnOn();
+  im_encoder_info e{};
+  e.kind = IM_ENC_OPENH264;
+  im::encode::ProbeOpenH264(true, im::engine::os::QpcNs() - 1, e);
+  EXPECT_EQ(e.status, IM_ERR_TIMEOUT);
+  EXPECT_STREQ(e.reason, "engine_timeout");
+  EXPECT_EQ(e.flags & IM_ENCF_AVAILABLE, 0u);
+  EXPECT_EQ(e.test_encode_us, 0u);
+  // Nothing was recorded: a quick read still says untested (IM_OK without IM_ENCF_AVAILABLE).
+  im_encoder_info quick{};
+  quick.kind = IM_ENC_OPENH264;
+  im::encode::ProbeOpenH264(false, im::encode::kNoProbeDeadline, quick);
+  EXPECT_EQ(quick.status, IM_OK) << quick.reason;
+  EXPECT_EQ(quick.flags & IM_ENCF_AVAILABLE, 0u);
+}
+
+// im_shutdown forgets im_set_openh264_path's setting and unloads the DLL: the next im_init without openh264_path
+// reports OpenH264 as disabled (03's "Turn on OpenH264"), not as the old file.
+TEST_F(OpenH264, ShutdownForgetsTheSetting) {
+  TurnOn();
+  EXPECT_NE(BuildInfo().find("\"openh264\":{\"loaded\":true"), std::string::npos) << BuildInfo();
+  im_shutdown();
+  initialized_ = false;
+  im_init_params p{};
+  p.struct_size = sizeof p;
+  p.abi_version = IM_ABI_VERSION;
+  p.flags = IM_INIT_NO_AUDIO;
+  p.log_level = IM_LOG_DEBUG;
+  ASSERT_EQ(im_init(&p), IM_OK) << LastError();
+  initialized_ = true;
+  EXPECT_NE(BuildInfo().find("\"openh264\":{\"loaded\":false"), std::string::npos) << BuildInfo();
+  im_caps caps{};
+  caps.struct_size = sizeof caps;
+  ASSERT_EQ(im_probe(IM_PROBE_QUICK, &caps), IM_OK) << LastError();
+  bool seen = false;
+  for (uint32_t i = 0; i < caps.encoder_count; ++i) {
+    if (caps.encoders[i].kind == IM_ENC_OPENH264) {
+      seen = true;
+      EXPECT_EQ(caps.encoders[i].status, IM_ERR_DEPENDENCY);
+      EXPECT_STREQ(caps.encoders[i].reason, "disabled");
+    }
+  }
+  EXPECT_TRUE(seen);
 }
 
 TEST_F(OpenH264, SessionEncodesThePattern) {

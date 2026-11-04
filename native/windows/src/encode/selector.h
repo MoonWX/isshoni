@@ -55,8 +55,12 @@ std::vector<session::EncoderEntry> CatalogEntries();
 // while it is off or its file doesn't load (disabled, missing, version, blocked_by_policy); a full probe test-encodes
 // it (04 §9.10, with the live-bitrate check) and a quick one (full false) reports the last full probe's result for the
 // same library, or IM_OK without IM_ENCF_AVAILABLE when none ran since it was loaded. CatalogEntries and StoredProbe
-// read the entry again, so a changed setting takes effect at the next start and quick probe (04 §5.3).
-void ProbeOpenH264(bool full, im_encoder_info &info) noexcept;
+// read the entry again, so a changed setting takes effect at the next start and quick probe (04 §5.3). deadline_ns
+// (engine::os::QpcNs) is the probe's encoder budget (probe.h kEncoderBudgetMs, 04 §9.10 "As built") and matters only
+// when full: past it the test encode doesn't start (IM_ERR_TIMEOUT, engine_timeout), and a test encode past it after
+// its IDR skips the live-bitrate check (the table's flag kept, logged). kNoProbeDeadline: no budget.
+inline constexpr int64_t kNoProbeDeadline = INT64_MAX;
+void ProbeOpenH264(bool full, int64_t deadline_ns, im_encoder_info &info) noexcept;
 im_status OpenOpenH264(const session::EncoderParams &params, std::unique_ptr<session::VideoEncoder> *out) noexcept;
 
 } // namespace im::encode

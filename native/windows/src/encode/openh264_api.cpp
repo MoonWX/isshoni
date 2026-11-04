@@ -51,11 +51,10 @@ struct Expected {
 
 struct State {
   std::mutex mu;
-  // im_set_openh264_path's setting (see openh264_api.h): set means it overrides im_init's openh264_path, as long as
-  // that is still init_path (the value in force when the setting was made).
+  // im_set_openh264_path's setting (see openh264_api.h): set means it overrides im_init's openh264_path until
+  // im_shutdown (ForgetOpenH264Setting).
   bool overridden = false;
   std::optional<std::string> override_path;
-  std::optional<std::string> init_path;
   // The loaded library of the setting in force and the path it came from.
   std::shared_ptr<const Library> lib;
   std::string lib_path;
@@ -69,14 +68,20 @@ State &TheState() noexcept {
 }
 
 // The path in force; mu held.
-std::optional<std::string> EffectivePathLocked(State &s) {
-  std::optional<std::string> init = engine::CurrentOptions().openh264_path;
-  if (s.overridden && s.init_path == init) {
+std::optional<std::string> EffectivePathLocked(const State &s) {
+  if (s.overridden) {
     return s.override_path;
   }
-  s.overridden = false; // another im_init's configuration
+  return engine::CurrentOptions().openh264_path;
+}
+
+// Forgets the setting and the loaded library; mu held. The expected version (a test hook) stays.
+void ForgetLocked(State &s) noexcept {
+  s.overridden = false;
   s.override_path.reset();
-  return init;
+  s.lib.reset();
+  s.lib_path.clear();
+  s.record = TestRecord{};
 }
 
 template <class Fn> bool Resolve(HMODULE m, const char *name, Fn &out) noexcept {
@@ -205,12 +210,7 @@ void ResetForTest() noexcept {
   State &s = TheState();
   std::lock_guard<std::mutex> lock(s.mu);
   s.expected = Expected{};
-  s.overridden = false;
-  s.override_path.reset();
-  s.init_path.reset();
-  s.lib.reset();
-  s.lib_path.clear();
-  s.record = TestRecord{};
+  ForgetLocked(s);
 }
 #endif
 
@@ -220,11 +220,9 @@ namespace {
 im_status SetPath(const std::optional<std::string> &path) {
   State &s = TheState();
   std::lock_guard<std::mutex> lock(s.mu);
-  std::optional<std::string> init = engine::CurrentOptions().openh264_path;
   if (!path) {
     s.overridden = true;
     s.override_path.reset();
-    s.init_path = std::move(init);
     if (s.lib) {
       log::Info("encode", "openh264 turned off");
     }
@@ -241,7 +239,6 @@ im_status SetPath(const std::optional<std::string> &path) {
   }
   s.overridden = true;
   s.override_path = *path;
-  s.init_path = std::move(init);
   if (s.lib != lib) {
     s.lib = lib;
     s.lib_path = *path;
@@ -263,6 +260,15 @@ im_status SetOpenH264Path(const std::optional<std::string> &path) {
   } catch (...) {
     return abi::Fail(IM_ERR_INTERNAL, {}, "im_set_openh264_path: out of memory");
   }
+}
+
+void ForgetOpenH264Setting() noexcept {
+  openh264::State &s = openh264::TheState();
+  std::lock_guard<std::mutex> lock(s.mu);
+  if (s.lib) {
+    log::Info("encode", "openh264 unloaded");
+  }
+  openh264::ForgetLocked(s);
 }
 
 OpenH264Info GetOpenH264Info() {

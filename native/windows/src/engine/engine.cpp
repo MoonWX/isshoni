@@ -8,6 +8,7 @@
 #include "audio/mixer.h"
 #include "audio_bridge/audio_bridge.h"
 #include "capture/capture.h"
+#include "encode/encode.h"
 #include "engine/os.h"
 #include "im/abi/status.h"
 #include "im/log/ring.h"
@@ -103,6 +104,7 @@ void Shutdown() noexcept {
     });
   });
   s.worker.Stop(bound::kWorkerExit);
+  api::Guard("im_shutdown: encode", [] { encode::ForgetOpenH264Setting(); });
   api::Guard("im_shutdown: options", [&] {
     std::lock_guard<std::mutex> olock(s.options_mu);
     s.options = Options{};

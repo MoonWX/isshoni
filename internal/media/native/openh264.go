@@ -55,7 +55,8 @@ const (
 // The Reasons of the OpenH264 helpers' errors (Go only, like self_window; the engine's own failures keep 04 §5.7's
 // tokens: missing, version, blocked_by_policy).
 const (
-	// reasonDownload: the download failed (network, an HTTP status other than 200); trying again may help.
+	// reasonDownload: the download failed (network, an HTTP status other than 200, a body cut off before its
+	// Content-Length); trying again may help.
 	reasonDownload = "download"
 	// reasonCorrupt: the bytes are not the pinned release: the compressed body is over its limit, the bzip2 stream is
 	// damaged, the file is shorter or longer than the pinned size, or its SHA-256 differs.
@@ -71,8 +72,8 @@ var errCompressedTooLarge = errors.New("the compressed body is over 10 MiB")
 // failure nothing is left in dir. dir is %LOCALAPPDATA%\isshoni\codecs (03 passes it); it is created when missing.
 // c nil means a client of its own. The whole download has 60 s. The result is the installed file's absolute path,
 // which SetOpenH264Path takes. Errors: *media.Error with Op "install_openh264": dependency/download (network or HTTP
-// status), dependency/corrupt (limits, bzip2, size or hash), cancelled or timeout (ctx), invalid (dir), internal
-// (the file system).
+// status, a body that broke off), dependency/corrupt (limits, bzip2, size or hash), cancelled or timeout (ctx),
+// invalid (dir), internal (the file system).
 func InstallOpenH264(ctx context.Context, c *http.Client, dir string) (path string, err error) {
 	return installOpenH264(ctx, c, dir, OpenH264, nil)
 }
@@ -138,7 +139,12 @@ func installOpenH264(ctx context.Context, c *http.Client, dir string, pin OpenH2
 			return "", downloadError(ctx, op, err)
 		case errors.Is(err, errCompressedTooLarge):
 			return "", codeError(media.CodeDependency, op, reasonCorrupt, "%v", err)
+		case body.err != nil, resp.ContentLength > 0 && body.n < resp.ContentLength:
+			// The transfer broke off (net/http says io.ErrUnexpectedEOF for a body shorter than its
+			// Content-Length, which bzip2 passes on): the network's fault, so trying again may help.
+			return "", downloadError(ctx, op, fmt.Errorf("the body broke off after %d bytes: %w", body.n, err))
 		case errors.As(err, &se), errors.Is(err, io.ErrUnexpectedEOF):
+			// A damaged stream, or one that really ends early (the body arrived whole).
 			return "", codeError(media.CodeDependency, op, reasonCorrupt, "the bzip2 stream: %v", err)
 		default:
 			var pe *fs.PathError
@@ -186,11 +192,12 @@ func downloadError(ctx context.Context, op string, err error) error {
 }
 
 // cappedReader reads r and fails with errCompressedTooLarge once more than max bytes came through (it reads at most
-// max + 1).
+// max + 1). n counts the bytes that came through; err is r's own first error other than io.EOF (a broken transfer).
 type cappedReader struct {
 	r   io.Reader
 	max int64
 	n   int64
+	err error
 }
 
 func (c *cappedReader) Read(p []byte) (int, error) {
@@ -202,6 +209,9 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	}
 	n, err := c.r.Read(p)
 	c.n += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) && c.err == nil {
+		c.err = err
+	}
 	if c.n > c.max {
 		return 0, errCompressedTooLarge
 	}

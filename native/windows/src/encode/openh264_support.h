@@ -16,10 +16,10 @@
 #if defined(_MSC_VER)
 #pragma warning(push, 0) // Cisco's headers are not ours: /W4 /WX stays off them
 #endif
-#include "codec_api.h"
-#include "codec_app_def.h"
-#include "codec_def.h"
-#include "codec_ver.h"
+#include "openh264/codec_api.h"
+#include "openh264/codec_app_def.h"
+#include "openh264/codec_def.h"
+#include "openh264/codec_ver.h"
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif

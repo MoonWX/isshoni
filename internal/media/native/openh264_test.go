@@ -255,6 +255,47 @@ func TestInstallOpenH264Context(t *testing.T) {
 	wantError(t, err, media.CodeInvalid, "", "install_openh264")
 }
 
+// TestInstallOpenH264CutOff: a body that breaks off before its Content-Length (the connection closed mid-transfer)
+// is a failed download (trying again may help), while a body that arrives whole but holds a stream that ends early
+// is corrupt; both leave the folder empty.
+func TestInstallOpenH264CutOff(t *testing.T) {
+	good, pin := fixture(t, "good.dll.bz2")
+	half := good[:len(good)/2]
+	cases := []struct {
+		name          string
+		contentLength bool
+		reason        string
+	}{
+		{"cut off before Content-Length", true, reasonDownload},
+		{"whole body, stream ends early", false, reasonCorrupt},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if c.contentLength {
+					// More than is sent: the server closes the connection when the handler returns short.
+					w.Header().Set("Content-Length", strconv.Itoa(len(good)))
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(half)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}))
+			t.Cleanup(srv.Close)
+			p := pin
+			p.URL = srv.URL + "/x.bz2"
+			dir := t.TempDir()
+			path, err := installOpenH264(context.Background(), nil, dir, p, nil)
+			if path != "" {
+				t.Errorf("path %q on failure", path)
+			}
+			wantError(t, err, media.CodeDependency, c.reason, "install_openh264")
+			wantEmpty(t, dir)
+		})
+	}
+}
+
 // TestInstallOpenH264ReplacesOld: a second install over an existing file replaces it.
 func TestInstallOpenH264ReplacesOld(t *testing.T) {
 	body, pin := fixture(t, "good.dll.bz2")

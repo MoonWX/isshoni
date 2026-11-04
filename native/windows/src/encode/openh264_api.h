@@ -8,9 +8,9 @@
 //   functions, and requires WelsGetCodecVersionEx (WelsGetCodecVersion when the Ex form is missing) to report the
 //   pinned version (openh264_pin.h).
 // - The setting in force: the last successful im_set_openh264_path of this im_init, else im_init's openh264_path.
-//   im_set_openh264_path(NULL) turns OpenH264 off. A failed im_set_openh264_path changes nothing. The setting of an
-//   im_set_openh264_path outlives an im_shutdown only until an im_init whose openh264_path differs from the one in
-//   force when it was made (the encode area sees no im_init; the comparison is how it tells a new configuration).
+//   im_set_openh264_path(NULL) turns OpenH264 off. A failed im_set_openh264_path changes nothing. im_shutdown forgets
+//   the setting and drops the library (encode.h ForgetOpenH264Setting), so each im_init starts from its own
+//   openh264_path.
 // - Lifetime: the loaded library is shared by the setting and by every open encoder (std::shared_ptr). Turning
 //   OpenH264 off or switching files drops the setting's reference; the DLL is unloaded (FreeLibrary) when the last
 //   encoder using it closes, so 03 can delete the file after turning it off (04 §9.9: "turning it off deletes the

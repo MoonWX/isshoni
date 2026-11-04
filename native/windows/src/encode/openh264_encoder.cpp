@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "encode/selector.h"
+#include "engine/os.h"
 #include "im/abi/status.h"
 #include "im/abi/utf8.h"
 #include "im/encpolicy/candidates.h"
@@ -73,8 +74,10 @@ AuTypes TypesOf(std::span<const uint8_t> au) noexcept {
 
 // 04 §9.10 step 3 for OpenH264: open at 1920×1080 (30 fps, the cap), one mid-gray IDR that must carry SPS, PPS and an
 // IDR slice, then the live-bitrate check (two P frames, a 50 % bitrate change, two more frames: an IDR among those
-// clears the live flag). The record goes with the library (openh264_api.h).
-openh264::TestRecord TestEncode(const std::shared_ptr<const openh264::Library> &lib) noexcept {
+// clears the live flag). The record goes with the library (openh264_api.h). Past deadline_ns (the probe's encoder
+// budget, engine::os::QpcNs) after the IDR, the live-bitrate check is skipped and the table's flag kept (04 §9.10
+// "As built"), as probe.cpp's TestEncoder does.
+openh264::TestRecord TestEncode(const std::shared_ptr<const openh264::Library> &lib, int64_t deadline_ns) noexcept {
   openh264::TestRecord r;
   r.tested = true;
   const int64_t t0 = NowUs();
@@ -117,6 +120,10 @@ openh264::TestRecord TestEncode(const std::shared_ptr<const openh264::Library> &
         "encode", "probe: OpenH264's test IDR lacks SPS, PPS or an IDR slice",
         {{"sps", first.sps}, {"pps", first.pps}, {"idr", first.idr}, {"bytes", static_cast<uint64_t>(au.size())}});
     return done(IM_ERR_NO_ENCODER, abi::token::kTestEncodeFailed);
+  }
+  if (engine::os::QpcNs() > deadline_ns) {
+    log::Info("encode", "probe: over budget, live-bitrate check skipped", {{"encoder", "openh264"}});
+    return done(IM_OK, {});
   }
   for (int i = 1; i <= 4; ++i) {
     if (i == 3 && core->SetBitrate(s.bitrate_bps / 2) != IM_OK) {
@@ -332,7 +339,7 @@ im_status OpenH264Encoder::SetBitrate(uint32_t bps) noexcept { return core_->Set
 
 // ---------------------------------------------------------------------------------------------- the selector's entry
 
-void ProbeOpenH264(bool full, im_encoder_info &info) noexcept {
+void ProbeOpenH264(bool full, int64_t deadline_ns, im_encoder_info &info) noexcept {
   info.adapter_index = encpolicy::kNoAdapter;
   abi::CopyFixed(info.codec, "openh264");
   info.flags = IM_ENCF_FORCED_IDR | IM_ENCF_LIVE_BITRATE | IM_ENCF_CB; // 04 §9.1: software, live, CB only
@@ -348,8 +355,15 @@ void ProbeOpenH264(bool full, im_encoder_info &info) noexcept {
     return;
   }
   openh264::TestRecord rec = openh264::TestRecordOf(lib.get());
+  if (full && engine::os::QpcNs() > deadline_ns) {
+    // 04 §9.10 "As built": past the encoders' budget no encoder starts. The stored record stays as it was.
+    log::Info("encode", "probe: over budget, encoder not tested", {{"encoder", "openh264"}});
+    info.status = IM_ERR_TIMEOUT;
+    abi::CopyFixed(info.reason, abi::token::kEngineTimeout);
+    return;
+  }
   if (full) {
-    rec = TestEncode(lib);
+    rec = TestEncode(lib, deadline_ns);
     openh264::StoreTestRecord(lib.get(), rec);
     log::Info("encode", "encoder probed",
               {{"encoder", "openh264"},
