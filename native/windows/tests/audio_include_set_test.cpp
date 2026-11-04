@@ -5,10 +5,12 @@
 //   joins in Preroll; the planner never activates an INCLUDE stream on a tree that already holds a kept-out process;
 // - a kept-out process that appears in the 40 ms preroll window removes the stream without output, and one that
 //   appears while it runs fades it out within 10 ms;
-// - an activation that never completes times out (the pool's timeout), counts activationFailures, is retried after
-//   the reopen delays and, after the third failure, makes the target capture_failed;
+// - an activation that never completes times out (the pool's timeout), counts activationFailures, is reopened after
+//   100 ms, 500 ms and 2 s and, when the third reopen fails too, makes the target capture_failed;
+// - a covered stream fades once its own coverer runs, whatever other streams still activate;
+// - the formats tried before the one that worked go into the stream_opened event;
 // - held handles: a pid that is another process now opens nothing, a refused handle activates anyway with the note
-//   no_handle, and an exited process removes its stream at once.
+//   no_handle (a mismatch asks for a new plan), and an exited process removes its stream at once.
 // Portable: no OS call, so it also builds and runs on the Mac. Simulated time drives the mixer; the activator threads
 // are real, so every wait for their results is bounded (README §4 "Testing").
 #include <gtest/gtest.h>
@@ -46,6 +48,7 @@ using audiopolicy::Verdict;
 
 constexpr int64_t kMs = 1'000'000;
 constexpr int32_t kTimeoutHr = static_cast<int32_t>(0x800705B4u);
+constexpr int32_t kUnsupportedFormatHr = static_cast<int32_t>(0x88890008u); // AUDCLNT_E_UNSUPPORTED_FORMAT
 
 class FakeClient final : public CaptureClient {
 public:
@@ -61,7 +64,7 @@ public:
   OpenResult Open(const OpenRequest &req, ActivationContext &ctx) override {
     opened.fetch_add(1);
     auto c = std::make_shared<Completion>();
-    if (!never.load()) {
+    if (!never.load() && req.pid != never_pid.load()) {
       c->Complete();
     }
     OpenResult r;
@@ -69,7 +72,9 @@ public:
     const WaitResult w = ctx.Wait(c);
     if (w == WaitResult::kDone) {
       r.client = std::make_unique<FakeClient>();
-      r.format = "float32";
+      r.format = failed_attempts.load() > 0 ? "pcm16" : "float32";
+      r.failed_attempts = failed_attempts.load();
+      r.last_failure = r.failed_attempts > 0 ? kUnsupportedFormatHr : 0;
     } else {
       r.hr = kTimeoutHr;
       r.timed_out = w == WaitResult::kTimeout;
@@ -78,6 +83,8 @@ public:
     return r;
   }
   std::atomic<bool> never{false};
+  std::atomic<uint32_t> never_pid{0}; // only this pid's activations never complete
+  std::atomic<uint32_t> failed_attempts{0};
   std::atomic<int> opened{0};
 };
 
@@ -198,15 +205,18 @@ public:
 
   void AddDiscordUnderGame() { procs.push_back(Proc(200, 100, 2000, "discord.exe", "C:\\Apps\\Discord")); }
 
-  // One reconcile: a plan over procs and the game's render session, acted on.
+  // One reconcile: a plan over procs and the render sessions of playing (the game's), acted on.
   audiopolicy::Plan Reconcile() {
     const audiopolicy::ProcessTable table(procs);
-    audiopolicy::Session s;
-    s.pid = 100;
-    s.state = audiopolicy::SessionState::kActive;
-    s.playing = true;
-    s.last_active_ns = now;
-    std::vector<audiopolicy::Session> sessions{s};
+    std::vector<audiopolicy::Session> sessions;
+    for (const uint32_t pid : playing) {
+      audiopolicy::Session s;
+      s.pid = pid;
+      s.state = audiopolicy::SessionState::kActive;
+      s.playing = true;
+      s.last_active_ns = now;
+      sessions.push_back(s);
+    }
     const std::vector<audiopolicy::LiveStream> streams = set->Inputs();
     const std::vector<ProcessKey> failed = set->CaptureFailed();
     audiopolicy::PlanInput in;
@@ -223,6 +233,11 @@ public:
         [&](const ProcessKey &k) {
           const auto i = table.Find(k);
           return i ? plan.processes[*i].app_id : std::string();
+        },
+        [&](const ProcessKey &anc, const ProcessKey &desc) {
+          const auto a = table.Find(anc);
+          const auto d = table.Find(desc);
+          return a && d && *a != *d && table.InTree(*d, *a, false);
         },
         now);
     return plan;
@@ -262,14 +277,15 @@ public:
     }
   }
 
-  SessionStream GameStream() const {
+  SessionStream StreamOf(uint32_t pid) const {
     for (const StreamView &v : set->Views()) {
-      if (v.target.pid == 100) {
+      if (v.target.pid == pid) {
         return v.stream;
       }
     }
     return SessionStream::kNone;
   }
+  SessionStream GameStream() const { return StreamOf(100); }
 
   std::shared_ptr<FakeOpener> opener = std::make_shared<FakeOpener>();
   std::unique_ptr<ActivatorPool> pool;
@@ -280,11 +296,21 @@ public:
   audiopolicy::Planner planner;
   std::unique_ptr<StreamSet> set;
   std::vector<ProcessEntry> procs;
+  std::vector<uint32_t> playing{100};
   int64_t now = 0;
   int commits = 0;
 };
 
 const audiopolicy::SessionResult &GameSession(const audiopolicy::Plan &p) { return p.sessions.at(0); }
+
+// Waits (bounded) until the activator answered as many requests as given, pumping meanwhile.
+void PumpUntilOpened(Rig &r, int opened) {
+  const auto end = std::chrono::steady_clock::now() + 10s;
+  while (r.opener->opened.load() < opened && std::chrono::steady_clock::now() < end) {
+    r.Pump();
+    std::this_thread::sleep_for(1ms);
+  }
+}
 
 // ------------------------------------------------------------------------------------------------- the commit check
 
@@ -412,8 +438,9 @@ TEST(AudioIncludeSet, AnExcludedProcessUnderARunningTargetFadesItOut) {
 
 // ------------------------------------------------------------------------------------------- activation failures
 
-// An activation that never completes ends at the pool's timeout (05 §8.1), counts, and is retried after 100 ms and
-// 500 ms; the third failure makes the target capture_failed (05 §8.5) until a device or session event.
+// An activation that never completes ends at the pool's timeout (05 §8.1), counts, and is reopened after 100 ms,
+// 500 ms and 2 s; when the third reopen fails too the target is capture_failed (05 §8.5) until a device or session
+// event.
 TEST(AudioIncludeSet, AnActivationTimeoutCountsRetriesAndThenGivesUp) {
   Rig r(100ms);
   r.opener->never = true;
@@ -438,6 +465,16 @@ TEST(AudioIncludeSet, AnActivationTimeoutCountsRetriesAndThenGivesUp) {
   r.PumpUntilActivated();
   EXPECT_EQ(r.opener->opened.load(), 3);
   EXPECT_EQ(r.set->counters().activation_failures, 3u);
+  EXPECT_EQ(r.GameStream(), SessionStream::kActivating) << "one more reopen, after 2 s";
+  EXPECT_TRUE(r.set->CaptureFailed().empty());
+  EXPECT_EQ(r.set->NextDeadline(), r.now + kReopenDelaysNs[2]);
+  r.now += kReopenDelaysNs[2] - 1;
+  r.PumpUntilActivated();
+  EXPECT_EQ(r.opener->opened.load(), 3) << "not before the delay";
+  r.now += 1;
+  r.PumpUntilActivated();
+  EXPECT_EQ(r.opener->opened.load(), 4);
+  EXPECT_EQ(r.set->counters().activation_failures, 4u);
   EXPECT_TRUE(r.set->Views().empty());
   ASSERT_EQ(r.set->CaptureFailed().size(), 1u);
   const auto plan = r.Reconcile();
@@ -465,6 +502,11 @@ TEST(AudioIncludeSet, AStreamThatCannotJoinIsRetriedThenGivenUp) {
   r.PumpUntilActivated();
   EXPECT_EQ(r.opener->opened.load(), 3);
   EXPECT_EQ(r.set->counters().activation_failures, 3u);
+  EXPECT_FALSE(r.set->Views().empty()) << "one more reopen, after 2 s";
+  r.now += kReopenDelaysNs[2];
+  r.PumpUntilActivated();
+  EXPECT_EQ(r.opener->opened.load(), 4);
+  EXPECT_EQ(r.set->counters().activation_failures, 4u);
   EXPECT_TRUE(r.set->Views().empty());
   EXPECT_EQ(GameSession(r.Reconcile()).reason, Reason::kCaptureFailed);
   r.Run(50);
@@ -494,16 +536,115 @@ TEST(AudioIncludeSet, AFailedStreamFadesOutAndReopens) {
   EXPECT_EQ(r.GameStream(), SessionStream::kPreroll);
 }
 
+// ------------------------------------------------------------------------------------------- covered streams
+
+// 05 §6.2 step 4: a child's stream runs; its parent starts playing, so the plan opens the parent's stream and removes
+// the child's as covered. The child fades once the parent's stream runs, not later because an unrelated app's
+// activation hangs meanwhile (it would be heard twice), and not earlier (it would leave a gap).
+TEST(AudioIncludeSet, ACoveredStreamFadesOnceItsOwnCovererRuns) {
+  Rig r;
+  r.procs.push_back(Proc(300, 100, 3000, "helper.exe", "C:\\Games\\Game")); // the game's child
+  r.procs.push_back(Proc(500, 4, 4000, "music.exe", "C:\\Apps\\Music"));    // unrelated
+  r.playing = {300};
+  ASSERT_EQ(r.Reconcile().activate.size(), 1u);
+  r.PumpUntilActivated();
+  r.Run(100);
+  ASSERT_EQ(r.StreamOf(300), SessionStream::kRunning);
+
+  r.opener->never_pid = 500; // its activation hangs until the pool's 3 s timeout
+  r.playing = {300, 100, 500};
+  const auto plan = r.Reconcile();
+  ASSERT_EQ(plan.activate.size(), 2u);
+  ASSERT_EQ(plan.remove.size(), 1u);
+  EXPECT_EQ(plan.remove[0].reason, audiopolicy::RemovalReason::kCovered);
+  PumpUntilOpened(r, 3);
+  ASSERT_EQ(r.opener->opened.load(), 3);
+  // The game's activation completed; music's hangs.
+  const auto end = std::chrono::steady_clock::now() + 10s;
+  while (r.GameStream() != SessionStream::kPreroll && std::chrono::steady_clock::now() < end) {
+    r.Pump();
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(r.GameStream(), SessionStream::kPreroll);
+  ASSERT_EQ(r.StreamOf(500), SessionStream::kActivating);
+  int64_t running_at = -1;
+  int64_t faded_at = -1;
+  for (int k = 0; k < 20 && faded_at < 0; ++k) {
+    if (running_at < 0) {
+      EXPECT_EQ(r.StreamOf(300), SessionStream::kRunning) << "no gap: it plays until the game's stream runs";
+    }
+    r.Run(10);
+    if (running_at < 0 && r.GameStream() == SessionStream::kRunning) {
+      running_at = r.now;
+    }
+    const SessionStream child = r.StreamOf(300);
+    if (child == SessionStream::kFading || child == SessionStream::kNone) {
+      faded_at = r.now;
+    }
+  }
+  ASSERT_GE(running_at, 0) << "the game's stream runs";
+  ASSERT_GE(faded_at, 0) << "the child's stream fades though music's activation still hangs";
+  EXPECT_LE(faded_at - running_at, 20 * kMs);
+  EXPECT_EQ(r.StreamOf(500), SessionStream::kActivating);
+  r.Run(30);
+  EXPECT_EQ(r.StreamOf(300), SessionStream::kNone) << "gone once the mixer let go of it";
+  EXPECT_EQ(r.GameStream(), SessionStream::kRunning);
+}
+
+// A covered stream whose only coverer goes away keeps playing: nothing else captures it.
+TEST(AudioIncludeSet, ACoveredStreamWithoutARunningCovererKeepsPlaying) {
+  Rig r;
+  r.procs.push_back(Proc(300, 100, 3000, "helper.exe", "C:\\Games\\Game"));
+  r.playing = {300};
+  r.Reconcile();
+  r.PumpUntilActivated();
+  r.Run(100);
+  ASSERT_EQ(r.StreamOf(300), SessionStream::kRunning);
+  r.opener->never_pid = 100; // the game's activation hangs
+  r.playing = {300, 100};
+  ASSERT_EQ(r.Reconcile().remove.size(), 1u);
+  r.Run(200);
+  EXPECT_EQ(r.StreamOf(300), SessionStream::kRunning);
+  EXPECT_GT(r.sink.peaks.back(), 0.49f);
+}
+
+// 05 §8.2: the formats that failed before the one that worked go into the stream_opened event.
+TEST(AudioIncludeSet, TheFailedFormatAttemptsGoIntoTheOpenedEvent) {
+  Rig r;
+  r.opener->failed_attempts = 2;
+  r.Reconcile();
+  r.PumpUntilActivated();
+  ASSERT_EQ(r.GameStream(), SessionStream::kPreroll);
+  ASSERT_EQ(r.set->Views().size(), 1u);
+  EXPECT_EQ(r.set->Views()[0].format, "pcm16");
+  bool opened = false;
+  for (const auto &e : r.set->TakeEvents()) {
+    opened = opened || (e.code == audiomix::ReportEventCode::kStreamOpened && e.detail == "fallback:2");
+  }
+  EXPECT_TRUE(opened);
+}
+
 // --------------------------------------------------------------------------------------------- held handles
 
 TEST(AudioIncludeSet, APidThatIsAnotherProcessNowOpensNothing) {
   Rig r;
   r.gate.status = HoldStatus::kMismatch;
   r.Reconcile();
+  EXPECT_TRUE(r.Pump()) << "a mismatch asks for a new plan at once (05 §5.7)";
+  EXPECT_FALSE(r.Pump()) << "once";
   r.PumpUntilActivated();
   EXPECT_EQ(r.gate.holds, 1);
   EXPECT_EQ(r.opener->opened.load(), 0);
   EXPECT_TRUE(r.set->Views().empty());
+  // The new plan on a fresh snapshot meets the same mismatch: it waits for the next poll instead of planning again.
+  r.Reconcile();
+  EXPECT_EQ(r.gate.holds, 2);
+  EXPECT_FALSE(r.Pump());
+  // The snapshot caught up: the target holds now and activates.
+  r.gate.status = HoldStatus::kHeld;
+  r.Reconcile();
+  r.PumpUntilActivated();
+  EXPECT_EQ(r.GameStream(), SessionStream::kPreroll);
 }
 
 TEST(AudioIncludeSet, ARefusedHandleActivatesAnywayWithTheNoteNoHandle) {

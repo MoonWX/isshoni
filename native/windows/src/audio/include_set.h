@@ -4,11 +4,11 @@
 //
 // Life of a stream (one Entry):
 //   1. a plan activates a target: a SYNCHRONIZE handle is taken first (process_hold.h; a pid that is another process
-//      now asks for a new plan, a refused handle activates anyway with the note no_handle), then the request goes to
-//      the activator threads (activator.h), at most 8 in flight, the rest waiting here;
-//   2. the activation's result comes back: a failure or a 3 s timeout counts activationFailures and retries after
-//      100 ms, 500 ms, then 2 s; after the third failure the target is capture_failed until the next device or session
-//      event (05 §8.5);
+//      now asks for a new plan at once (05 §5.7), a refused handle activates anyway with the note no_handle), then the
+//      request goes to the activator threads (activator.h), at most 8 in flight, the rest waiting here;
+//   2. the activation's result comes back: a failure or a 3 s timeout counts activationFailures and is reopened after
+//      100 ms, 500 ms, then 2 s; when the third reopen fails too the target is capture_failed until the next device or
+//      session event (05 §8.5);
 //   3. the commit check (05 §6.2 step 5): right before the join, on a fresh snapshot, the planner re-checks the target
 //      (Planner::CommitCheck: still the planned process, heard, no launcher, no kept-out process in its OS tree). A
 //      refused stream never joins, and the watcher plans again;
@@ -16,8 +16,9 @@
 //      in Preroll, dropping the ring's backlog, so nothing it captured is heard for the next 40 ms; a reconcile in that
 //      window that finds the target unsafe removes it without output (05 §9.2);
 //   5. a removal fades it out over 10 ms of its buffer (05 §9.4), at once except for a covered stream, which waits
-//      until its coverer runs (05 §6.2 steps 3-4); a failed stream fades out too and reopens after the same delays as
-//      a failed activation (05 §8.5); a held process that exits is removed at once (05 §5.7);
+//      until one of its own coverers (a stream on the same target or on an OS ancestor of it) runs (05 §6.2 steps
+//      3-4); a failed stream fades out too and reopens after the same delays as a failed activation (05 §8.5); a held
+//      process that exits is removed at once (05 §5.7);
 //   6. once the mixer let go of the channel the capture thread drops the stream and the entry goes.
 // Every stream counts in the planner's input from step 1 until it is gone (PlanInput::streams).
 //
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -46,10 +48,10 @@
 
 namespace im::audio {
 
-// The delays before a failed stream or activation is opened again, and how many failures make it capture_failed
-// (05 §8.5).
+// The delays before a failed stream or activation is opened again, and how many failures in a row make it
+// capture_failed (05 §8.5): the first failure and the three reopens after 100 ms, 500 ms and 2 s.
 inline constexpr int64_t kReopenDelaysNs[] = {100'000'000, 500'000'000, 2'000'000'000};
-inline constexpr uint32_t kFailuresBeforeGivingUp = 3;
+inline constexpr uint32_t kFailuresBeforeGivingUp = static_cast<uint32_t>(std::size(kReopenDelaysNs)) + 1;
 
 struct StreamSetDeps {
   ActivatorPool *pool = nullptr; // started and stopped by the owner
@@ -82,6 +84,8 @@ class StreamSet {
 public:
   using CommitFn = std::function<audiopolicy::CommitResult(const audiopolicy::Activation &)>;
   using AppOf = std::function<std::string(const audiopolicy::ProcessKey &)>;
+  // Whether desc lies in the strict OS tree of anc, anc != desc (ProcessTable::InTree on the plan's table).
+  using Below = std::function<bool(const audiopolicy::ProcessKey &anc, const audiopolicy::ProcessKey &desc)>;
 
   explicit StreamSet(const StreamSetDeps &deps);
   ~StreamSet(); // Detach
@@ -103,11 +107,13 @@ public:
   void ForgetFailures();
 
   // Acts on a plan made with the last Inputs(): opens the include activations (app_of names their apps), removes the
-  // streams of plan.remove. Not attached: nothing to do.
-  void Apply(const audiopolicy::Plan &plan, const AppOf &app_of, int64_t now_ns);
+  // streams of plan.remove. A stream removed as covered waits for its own coverers: the other include streams on its
+  // target or, by below, on an OS ancestor of it. Not attached: nothing to do.
+  void Apply(const audiopolicy::Plan &plan, const AppOf &app_of, const Below &below, int64_t now_ns);
   // Moves the streams on (results, commit checks, joins, failures, exits, releases, reopen delays). commit runs the
   // commit check for one activation (the caller takes the fresh snapshot once per Pump, lazily). Returns whether the
-  // watcher must plan again: a stream left, a commit check refused, a held process exited, a key mismatch.
+  // watcher must plan again: a stream left, a commit check refused, a held process exited, a key mismatch (also one
+  // the last Apply met).
   bool Pump(int64_t now_ns, const CommitFn &commit);
   // The earliest reopen delay that ends, or INT64_MAX.
   int64_t NextDeadline() const noexcept;
@@ -138,10 +144,13 @@ private:
     int64_t retry_at = 0;
     std::unique_ptr<CaptureClient> client; // kCommit
     std::string format;
+    uint32_t failed_attempts = 0;          // Initialize attempts that failed before the format that worked (05 §8.2)
+    int32_t last_failure = 0;              // the HRESULT of the last of them
     std::shared_ptr<CaptureStream> stream; // kJoined, kRemoving
     std::unique_ptr<audiomix::Channel> channel;
-    bool covered_wait = false; // removed as covered: fades once its coverer runs
-    bool reopen = false;       // kRemoving after a failure: opens again after the delay
+    bool covered_wait = false;      // removed as covered: fades once one of its coverers runs
+    std::vector<uint64_t> coverers; // covered_wait: the ids of the entries that cover it
+    bool reopen = false;            // kRemoving after a failure: opens again after the delay
   };
 
   Entry *Find(uint64_t id);
@@ -168,6 +177,8 @@ private:
   StreamCounters counters_;
   std::vector<audiomix::ReportEvent> events_;
   int64_t now_ns_ = 0;
+  bool replan_ = false;                             // Apply met a key mismatch: the next Pump asks for a plan
+  std::vector<audiopolicy::ProcessKey> mismatched_; // the targets the last Apply met a mismatch on
 };
 
 } // namespace im::audio

@@ -78,6 +78,12 @@ public:
       if (next == 0) {
         return S_OK;
       }
+      // The frames buffered now, this packet's included, and when: the fallback timestamp below (05 §8.3).
+      UINT32 padding = 0;
+      if (FAILED(client_->GetCurrentPadding(&padding))) {
+        padding = 0; // the packet's own length then
+      }
+      const int64_t now = engine::os::QpcNs();
       BYTE *data = nullptr;
       UINT32 frames = 0;
       DWORD flags = 0;
@@ -89,12 +95,12 @@ public:
       if (FAILED(hr)) {
         return static_cast<int32_t>(hr);
       }
-      const int64_t now = engine::os::QpcNs();
       // The QPC time the audio engine mixed the packet's first frame (100 ns units); without one, the read time minus
-      // the packet's length (05 §8.3).
+      // the frames already buffered (05 §8.3): this packet and the ones behind it, so a backlog drained in one wake-up
+      // keeps the older packets' earlier times.
       int64_t qpc = static_cast<int64_t>(qpc100) * 100;
       if (qpc100 == 0 || (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0) {
-        qpc = now - FramesNs(frames);
+        qpc = now - FramesNs(std::max(padding, frames));
       }
       if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
         ++discontinuities_;
@@ -192,6 +198,7 @@ public:
       if (FAILED(hr)) {
         last = hr;
         ++r.failed_attempts;
+        r.last_failure = static_cast<int32_t>(hr);
         continue;
       }
       win::Handle event(CreateEventW(nullptr, FALSE, FALSE, nullptr));

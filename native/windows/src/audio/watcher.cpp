@@ -740,6 +740,11 @@ private:
             const auto i = table.Find(k);
             return i ? plan.processes[*i].app_id : std::string();
           },
+          [&](const audiopolicy::ProcessKey &anc, const audiopolicy::ProcessKey &desc) {
+            const auto a = table.Find(anc);
+            const auto d = table.Find(desc);
+            return a && d && *a != *d && table.InTree(*d, *a, false);
+          },
           now);
     }
 

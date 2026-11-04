@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <string>
 #include <utility>
 
 #include "im/audiopolicy/types.h"
@@ -46,6 +47,8 @@ void StreamSet::Detach() noexcept {
   input_ids_.clear();
   engine_ = nullptr;
   counters_.streams = 0;
+  replan_ = false;
+  mismatched_.clear();
 }
 
 StreamSet::Entry *StreamSet::Find(uint64_t id) {
@@ -85,16 +88,18 @@ void StreamSet::Event(int64_t t, ReportEventCode code, const std::string &app, s
   events_.push_back(audiomix::ReportEvent{t, code, app, std::move(detail)});
 }
 
-void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, int64_t now_ns) {
+void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, const Below &below, int64_t now_ns) {
   now_ns_ = now_ns;
   if (engine_ == nullptr) {
     return;
   }
   for (auto &e : entries_) {
     e->covered_wait = false; // each plan names the covered streams that still wait
+    e->coverers.clear();
   }
   // Removals first: they index into the input of this plan.
   std::vector<uint64_t> drop;
+  std::vector<uint64_t> covered;
   for (const audiopolicy::Removal &r : plan.remove) {
     if (r.stream >= input_ids_.size()) {
       continue;
@@ -108,6 +113,7 @@ void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, int64_
       // other engine to wait for in this slice (the fast path and the endpoint engine are README WA53's): with sound
       // off it fades at once (05 §6.5).
       e->covered_wait = true;
+      covered.push_back(e->id);
       continue;
     }
     if (e->phase == Phase::kJoined) {
@@ -128,6 +134,7 @@ void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, int64_
     }
   }
 
+  std::vector<audiopolicy::ProcessKey> mismatched;
   for (const audiopolicy::Activation &a : plan.activate) {
     if (a.kind != StreamKind::kInclude) {
       // The fast path's EXCLUDE stream and the endpoint stream (README WA53). The watcher plans with the fast path
@@ -149,7 +156,14 @@ void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, int64_
     // The handle before the activation (05 §5.7): the pid can't be reused while it is held.
     const HoldStatus hs = deps_.gate != nullptr ? deps_.gate->Hold(a.target, &e->hold) : HoldStatus::kNoHandle;
     if (hs == HoldStatus::kMismatch) {
-      continue; // the process is gone or the pid is another process's now: the next plan sees it
+      // The process is gone or the pid is another process's now: the plan is recomputed (05 §5.7) on a fresh
+      // snapshot right after this one, once per target in a row, so a snapshot that keeps disagreeing with the
+      // process waits for the next poll instead of planning on every pump.
+      if (std::find(mismatched_.begin(), mismatched_.end(), a.target) == mismatched_.end()) {
+        replan_ = true;
+      }
+      mismatched.push_back(a.target);
+      continue;
     }
     e->has_handle = hs == HoldStatus::kHeld;
     if (!e->has_handle) {
@@ -158,6 +172,26 @@ void StreamSet::Apply(const audiopolicy::Plan &plan, const AppOf &app_of, int64_
     e->phase = Phase::kWaiting;
     e->retry_at = now_ns;
     entries_.push_back(std::move(e));
+  }
+  mismatched_ = std::move(mismatched);
+
+  // Each covered stream's coverers, now that this plan's activations are entries too (05 §6.2 step 4): the include
+  // streams that stay, on its own target (a second stream on it) or on an OS ancestor of it. Pump fades it once one of
+  // them runs; with none (its ancestor's activation met a key mismatch, or its coverers went) it keeps playing, alone,
+  // until a plan decides again, so its sound has no gap and is never heard twice.
+  for (const uint64_t id : covered) {
+    Entry *c = Find(id);
+    if (c == nullptr) {
+      continue;
+    }
+    for (const auto &o : entries_) {
+      if (o.get() == c || o->act.kind != StreamKind::kInclude || o->covered_wait || o->phase == Phase::kRemoving) {
+        continue;
+      }
+      if (o->act.target == c->act.target || (below && below(o->act.target, c->act.target))) {
+        c->coverers.push_back(o->id);
+      }
+    }
   }
   SubmitWaiting(now_ns);
 }
@@ -187,10 +221,12 @@ bool StreamSet::Backoff(Entry &e, int64_t now_ns) {
     return false;
   }
   e.phase = Phase::kWaiting;
-  e.retry_at = now_ns + kReopenDelaysNs[std::min<std::size_t>(f.count - 1, std::size(kReopenDelaysNs) - 1)];
+  e.retry_at = now_ns + kReopenDelaysNs[f.count - 1]; // count < kFailuresBeforeGivingUp: a delay for each reopen
   e.activated_filetime = 0;
   e.client.reset();
   e.format.clear();
+  e.failed_attempts = 0;
+  e.last_failure = 0;
   return true;
 }
 
@@ -283,6 +319,8 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
       }
       e->client = std::move(r.client);
       e->format = std::move(r.format);
+      e->failed_attempts = r.failed_attempts;
+      e->last_failure = r.last_failure;
       e->activated_filetime = deps_.filetime_now != nullptr ? deps_.filetime_now() : 0;
       if (e->activated_filetime == 0) {
         e->activated_filetime = 1; // completed: no longer "still activating" for the planner
@@ -324,22 +362,29 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
       ++i;
       continue;
     }
-    Event(now_ns, ReportEventCode::kStreamOpened, e.app_id);
+    if (e.failed_attempts > 0) {
+      // The formats tried before the one that worked (05 §8.2): in the event and the log.
+      Event(now_ns, ReportEventCode::kStreamOpened, e.app_id, "fallback:" + std::to_string(e.failed_attempts));
+      log::Info("audio", "capture stream opened after failed formats",
+                {{"format", e.format},
+                 {"failed_attempts", static_cast<int64_t>(e.failed_attempts)},
+                 {"hr", static_cast<int64_t>(e.last_failure)}});
+    } else {
+      Event(now_ns, ReportEventCode::kStreamOpened, e.app_id);
+    }
     ++i;
   }
 
   // Joined and removing streams: exits, failures, covered waits, releases.
-  bool pending_include = false; // an include stream that doesn't run yet (a coverer may be among them)
-  for (const auto &e : entries_) {
-    if (e->act.kind != StreamKind::kInclude || e->covered_wait) {
-      continue;
+  const auto coverer_runs = [&](const Entry &e) {
+    for (const uint64_t id : e.coverers) {
+      const Entry *o = Find(id);
+      if (o != nullptr && o->phase == Phase::kJoined && o->channel && o->channel->state() == StreamState::kRunning) {
+        return true;
+      }
     }
-    if (e->phase == Phase::kWaiting || e->phase == Phase::kActivating || e->phase == Phase::kCommit) {
-      pending_include = true;
-    } else if (e->phase == Phase::kJoined && e->channel && e->channel->state() != StreamState::kRunning) {
-      pending_include = true;
-    }
-  }
+    return false;
+  };
   for (std::size_t i = 0; i < entries_.size();) {
     Entry &e = *entries_[i];
     if (e.hold && e.hold->exited() && e.phase != Phase::kRemoving) {
@@ -364,7 +409,7 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
         e.phase = Phase::kRemoving;
         e.reopen = true;
         e.channel->Fail(); // fades out over 10 ms (05 §8.5)
-      } else if (e.covered_wait && !pending_include) {
+      } else if (e.covered_wait && coverer_runs(e)) {
         StartRemoval(e); // its coverer runs: fade it out now (05 §6.2 step 4)
       } else if (e.channel->state() == StreamState::kRunning) {
         failures_.erase(e.act.target); // running again: the failures in a row start over
@@ -398,7 +443,7 @@ bool StreamSet::Pump(int64_t now_ns, const CommitFn &commit) {
     joined += e->stream ? 1u : 0u;
   }
   counters_.streams = joined;
-  return replan;
+  return replan || std::exchange(replan_, false);
 }
 
 int64_t StreamSet::NextDeadline() const noexcept {

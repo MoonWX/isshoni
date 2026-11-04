@@ -70,6 +70,7 @@ struct OpenResult {
   bool aborted = false;   // the pool stopped (or the request was cancelled) first
   std::string format;     // "float32" or "pcm16", the format Initialize took (05 §8.2, the report's sessions[].format)
   uint32_t failed_attempts = 0; // Initialize attempts that failed before the one that worked (05 §8.2)
+  int32_t last_failure = 0;     // the HRESULT of the last of them, 0 without one
   std::unique_ptr<CaptureClient> client;
 };
 
