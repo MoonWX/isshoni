@@ -540,19 +540,27 @@ func (r *run) checkKeyframe(t *testing.T) {
 	if !quiet() && !r.until(t, 2*time.Second, func(rec) bool { return quiet() }) && !quiet() {
 		t.Fatal("no keyframe on f to wait from")
 	}
-	asked := r.mark()
+	asked, at := r.mark(), r.sess.Now()
 	r.sess.RequestKeyframe("f")
 	frames, key := 0, false
 	r.until(t, 2*time.Second, func(rc rec) bool {
 		if rc.pkt.Kind != media.KindVideo || rc.pkt.Layer != "f" || rc.seq <= asked {
 			return false
 		}
+		if rc.pkt.Keyframe {
+			key = true
+			return true
+		}
+		// A frame captured before the request may still be queued in the session when it is pulled (a slow
+		// runner); the two frames are counted from the first one captured after the request.
+		if rc.pkt.CaptureNS < at {
+			return false
+		}
 		frames++
-		key = rc.pkt.Keyframe
-		return key || frames == 2
+		return frames == 2
 	})
 	if !key {
-		t.Errorf("no keyframe among f's %d frames after RequestKeyframe, want one within 2 frames", frames)
+		t.Errorf("no keyframe among f's %d frames captured after RequestKeyframe, want one within 2 frames", frames)
 	}
 }
 

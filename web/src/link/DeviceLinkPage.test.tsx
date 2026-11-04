@@ -125,7 +125,10 @@ describe('DeviceLinkPage: enter', () => {
 
     await confirmCard();
     expect(asked).toEqual([{ userCode: 'WDJBMJHT' }]);
-    expect(screen.getByRole('heading', { level: 1, name: CONFIRM_HEADING })).toHaveFocus();
+    // The page moves the focus in an effect after the commit that shows the heading.
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { level: 1, name: CONFIRM_HEADING })).toHaveFocus();
+    });
   });
 
   it('takes a pasted code with spaces and lower case', async () => {
@@ -246,7 +249,9 @@ describe('DeviceLinkPage: deciding', () => {
     await user.click(linkButton());
     const heading = await screen.findByRole('heading', { level: 1, name: 'Linked' });
     expect(screen.getByText('Go back to the app; it continues by itself.')).toBeInTheDocument();
-    expect(heading).toHaveFocus();
+    await waitFor(() => {
+      expect(heading).toHaveFocus();
+    });
     expect(services.ui.getState().announcements.polite?.text).toBe('Go back to the app; it continues by itself.');
     // No deviceName: the app's own proposal stays.
     expect(decided).toEqual([{ userCode: 'WDJBMJHT', approve: true }]);
@@ -399,7 +404,9 @@ describe('DeviceLinkPage: the lookup’s other answers', () => {
     const heading = await screen.findByRole('heading', { level: 1, name: "This code doesn't work" });
     const text = 'This code is wrong, was already used or has expired. Start again in the app.';
     expect(screen.getByText(text)).toBeInTheDocument();
-    expect(heading).toHaveFocus();
+    await waitFor(() => {
+      expect(heading).toHaveFocus();
+    });
     expect(services.ui.getState().announcements.polite?.text).toBe(text);
 
     const user = userEvent.setup();
