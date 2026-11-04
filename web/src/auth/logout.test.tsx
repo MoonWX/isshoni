@@ -392,8 +392,10 @@ describe('logout and the tabs', () => {
         session.me = null;
         return noContent();
       });
+      // A week from the test clock's now: the invite is good whenever the test runs.
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
       onPost('/api/v1/auth/invite/check', () =>
-        HttpResponse.json({ serverName: 'Test server', expiresAt: '2026-10-15T12:00:00.000Z', usesLeft: 1 }),
+        HttpResponse.json({ serverName: 'Test server', expiresAt, usesLeft: 1 }),
       );
       const a = openTab('/account');
       const b = openTab('/invite', { 'isshoni.invite': 'EXAMPLEinviteTOKEN0123456789abcd' });
@@ -403,9 +405,13 @@ describe('logout and the tabs', () => {
 
       await user.click(await tabA.findByRole('button', { name: 'Sign out' }));
 
-      // The invite page stays where it is and now offers its form.
-      expect(await tabB.findByRole('heading', { name: "You're invited to Test server" })).toBeInTheDocument();
-      expect(await tabB.findByLabelText('Username')).toBeInTheDocument();
+      // The invite page stays where it is and now offers its form. While the check runs, the "checking the link"
+      // state shows a heading with the same name, which the form's page then replaces: wait for the heading and the
+      // form together, so the assertion never holds on to the checking state's heading after it has gone.
+      await waitFor(() => {
+        expect(tabB.getByRole('heading', { name: "You're invited to Test server" })).toBeInTheDocument();
+        expect(tabB.getByLabelText('Username')).toBeInTheDocument();
+      });
       expect(b.router.state.location.pathname).toBe('/invite');
     });
   });
