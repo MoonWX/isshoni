@@ -20,14 +20,19 @@ isshoni is not installed, in this order:
      registry value, and a start through the registered protocol command exits 0 within 10 s, leaves no isshoni.exe
      running, never creates Local\io.isshoni.desktop.running and writes PendingServer and PendingRoom;
   6. during a /S /UPDATE run the installer's own process holds the installing mutex, and after it exits it is gone;
-  7. a helper holding the running mutex makes /S /UPDATE exit 3 after 60 s;
-  8. -NewerSetup over -Setup, then -Setup exits 4, then -Setup /ALLOWDOWNGRADE installs;
-  9. the keep-data uninstall and 10. the /PURGE uninstall, each after seeding a Credential Manager entry, the toast
+  7. while a helper keeps the list's last PE file open without FILE_SHARE_DELETE (so it can't be moved aside),
+     /S /UPDATE exits 6 and puts back the files it had already renamed to .old: the tree is the stage's, with no
+     .old file, and --version and --self-check still work;
+  8. /SERVER=https://... writes PendingServer and drops a stale PendingRoom; a /SERVER=http:// that isn't loopback
+     is ignored and the install still exits 0;
+  9. a helper holding the running mutex makes /S /UPDATE exit 3 after 60 s;
+ 10. -NewerSetup over -Setup, then -Setup exits 4, then -Setup /ALLOWDOWNGRADE installs;
+ 11. the keep-data uninstall and 12. the /PURGE uninstall, each after seeding a Credential Manager entry, the toast
      keys the app writes (an AppUserModelId key whose CustomActivator names a CLSID key with LocalServer32 in
      InstallDir, and a foreign CLSID key), a NotificationCategories subkey and a Run value: no isshoni:v1: credential,
      no AUMID key, no matching CLSID key, no Software\isshoni, the foreign CLSID key kept; the data root kept by the
      first and removed by the second, which leaves nothing of 06 sections 2.2 and 2.3;
- 11. /D= into a folder with a foreign file, then an uninstall: the foreign file and the folder stay.
+ 13. /D= into a folder with a foreign file, then an uninstall: the foreign file and the folder stay.
 
 -Mode release (verify-windows, README WA81) and -Mode update (the updater e2e, README WA88) are declared here and
 filled by those slices.
@@ -163,9 +168,10 @@ function Get-WorkDir {
 }
 
 # The helper process: holds a named mutex (and optionally maps DLLs as images, the way an exiting app still maps
-# them) until its release file appears, then keeps the DLLs mapped for -KeepMappedSec more seconds.
+# them, or keeps a file open without FILE_SHARE_DELETE, which no rename gets past) until its release file appears,
+# then keeps the DLLs mapped for -KeepMappedSec more seconds.
 $script:HelperSource = @'
-param([string]$Name, [string]$Ready, [string]$Release, [string]$Dlls, [int]$KeepMappedSec)
+param([string]$Name, [string]$Ready, [string]$Release, [string]$Dlls, [int]$KeepMappedSec, [string]$Lock)
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"
 using System;
@@ -186,17 +192,22 @@ if ($Dlls) {
         $mapped += $h
     }
 }
+$locked = $null
+if ($Lock) {
+    $locked = [IO.File]::Open($Lock, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+}
 $mutex = New-Object -TypeName System.Threading.Mutex -ArgumentList $false, $Name
 Set-Content -LiteralPath $Ready -Value 'ready'
 $deadline = (Get-Date).AddMinutes(10)
 while (-not (Test-Path -LiteralPath $Release) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
 $mutex.Dispose()
+if ($null -ne $locked) { $locked.Dispose() }
 if ($mapped.Count -gt 0) { Start-Sleep -Seconds $KeepMappedSec }
 foreach ($h in $mapped) { $null = [SmokeImage]::FreeLibrary($h) }
 '@
 
 function Invoke-Helper {
-    param([string]$Name, [string[]]$Dlls = @(), [int]$KeepMappedSec = 0)
+    param([string]$Name, [string[]]$Dlls = @(), [int]$KeepMappedSec = 0, [string]$Lock = '')
     $dir = Get-WorkDir
     $id = [guid]::NewGuid().ToString('N')
     $helperFile = Join-Path -Path $dir -ChildPath 'mutex-helper.ps1'
@@ -207,6 +218,7 @@ function Invoke-Helper {
     $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$helperFile`"",
         '-Name', $Name, '-Ready', "`"$ready`"", '-Release', "`"$release`"", '-KeepMappedSec', $KeepMappedSec)
     if ($Dlls.Count -gt 0) { $arguments += @('-Dlls', "`"$($Dlls -join '|')`"") }
+    if ($Lock) { $arguments += @('-Lock', "`"$Lock`"") }
     $p = Start-Process -FilePath $shell -ArgumentList $arguments -PassThru -WindowStyle Hidden
     $deadline = (Get-Date).AddSeconds(60)
     while (-not (Test-Path -LiteralPath $ready)) {
@@ -573,7 +585,31 @@ function Invoke-CiMode {
     Confirm-That $held 'the installer did not hold Local\io.isshoni.desktop.installing'
     Confirm-That (-not (Test-Mutex $script:InstallingMutex)) 'the installing mutex is left after the installer exited'
 
-    Write-Step '7. a running app makes /S /UPDATE exit 3 after 60 s'
+    Write-Step '7. a PE file that cannot be moved aside: exit 6, and the files already moved are put back'
+    $images = @(Get-FileList -Dir $dir | Where-Object { $_ -like '*.dll' -or $_ -like '*.exe' })
+    Confirm-That ($images.Count -ge 2) "install-files.txt lists $($images.Count) PE files, too few for this case"
+    $locked = Join-Path -Path $dir -ChildPath $images[-1]
+    $helper = Invoke-Helper -Name 'Local\io.isshoni.smoke.lock' -Lock $locked
+    $elapsed = 0.0
+    $code = Invoke-Setup -Path $script:SetupPath -Arguments @('/S', '/UPDATE') -Elapsed ([ref]$elapsed)
+    Stop-Helper -Helper $helper
+    Confirm-That ($code -eq 6) "/S /UPDATE with $($images[-1]) locked exited $code, not 6"
+    Confirm-That ($elapsed -ge 9) "/S /UPDATE gave up on the locked file after $([int]$elapsed) s, not 10"
+    Test-InstalledTree -InstallDir $dir
+    Test-InstalledRegistry -InstallDir $dir -Ver $Version
+    Test-AppMode -InstallDir $dir -Ver $Version
+
+    Write-Step '8. /SERVER=: PendingServer written, a stale PendingRoom dropped; a non-loopback http:// ignored'
+    Write-RegString -Key $script:AppKey -Name 'PendingRoom' -Value 'stale'
+    Invoke-Install -Path $script:SetupPath -Arguments @('/SERVER=https://smoke.invalid')
+    Confirm-That ((Get-RegValue $script:AppKey 'PendingServer') -ceq 'https://smoke.invalid') "/SERVER=: PendingServer is '$(Get-RegValue $script:AppKey 'PendingServer')'"
+    Confirm-That (-not (Test-RegValue $script:AppKey 'PendingRoom')) '/SERVER= left the stale PendingRoom'
+    Clear-RegValue $script:AppKey 'PendingServer'
+    Invoke-Install -Path $script:SetupPath -Arguments @('/SERVER=http://smoke.invalid')
+    Confirm-That (-not (Test-RegValue $script:AppKey 'PendingServer')) 'a non-loopback /SERVER=http:// was written'
+    Test-InstalledRegistry -InstallDir $dir -Ver $Version
+
+    Write-Step '9. a running app makes /S /UPDATE exit 3 after 60 s'
     $helper = Invoke-Helper -Name $script:RunningMutex
     $elapsed = 0.0
     $code = Invoke-Setup -Path $script:SetupPath -Arguments @('/S', '/UPDATE') -Elapsed ([ref]$elapsed)
@@ -581,7 +617,7 @@ function Invoke-CiMode {
     Confirm-That ($code -eq 3) "/S /UPDATE with isshoni running exited $code, not 3"
     Confirm-That ($elapsed -ge 55) "/S /UPDATE gave up after $([int]$elapsed) s, not 60"
 
-    Write-Step '8. downgrade: exit 4, then /ALLOWDOWNGRADE'
+    Write-Step '10. downgrade: exit 4, then /ALLOWDOWNGRADE'
     Invoke-Install -Path $newer
     $newerVersion = [string](Get-RegValue $script:AppKey 'Version')
     Confirm-That ($newerVersion -cne $Version) 'the newer build did not change Version'
@@ -591,18 +627,18 @@ function Invoke-CiMode {
     Test-InstalledRegistry -InstallDir $dir -Ver $Version
     Test-InstalledTree -InstallDir $dir
 
-    Write-Step '9. uninstall keeping the data: sign-ins and toast keys gone, the data root kept'
+    Write-Step '11. uninstall keeping the data: sign-ins and toast keys gone, the data root kept'
     Initialize-UninstallSeed -InstallDir $dir
     Invoke-Uninstall -InstallDir $dir
     Test-Uninstalled -InstallDir $dir -Purged $false
 
-    Write-Step '10. uninstall with /PURGE: the data root gone too, nothing of 06 sections 2.2 and 2.3 left'
+    Write-Step '12. uninstall with /PURGE: the data root gone too, nothing of 06 sections 2.2 and 2.3 left'
     Invoke-Install -Path $script:SetupPath
     Initialize-UninstallSeed -InstallDir $dir
     Invoke-Uninstall -InstallDir $dir -Arguments @('/PURGE')
     Test-Uninstalled -InstallDir $dir -Purged $true
 
-    Write-Step '11. /D= into a folder with a foreign file, then uninstall: the foreign file and the folder stay'
+    Write-Step '13. /D= into a folder with a foreign file, then uninstall: the foreign file and the folder stay'
     $custom = Join-Path -Path (Get-WorkDir) -ChildPath 'custom dir'
     $null = New-Item -ItemType Directory -Force -Path $custom
     $foreign = Join-Path -Path $custom -ChildPath 'foreign.txt'

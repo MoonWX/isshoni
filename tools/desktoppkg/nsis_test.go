@@ -134,13 +134,32 @@ func TestMakensisBuilds(t *testing.T) {
 		}
 	}
 
-	// The same inputs give the same installer (06 §6.2: the stage's mtimes are the commit time).
+	// The same inputs give the same installer (06 §6.2: the stage's mtimes are the commit time), also when the
+	// bootstrapper and the prebuilt uninstaller are copies with other mtimes (CI downloads the bootstrapper anew).
 	again := filepath.Join(dir, "again.exe")
 	time.Sleep(1100 * time.Millisecond) // a second later, so a build time would show
-	run("-version", "0.2.0", "-stage", o.out, "-webview2", webview2, "-out", again)
-	a, _ := os.ReadFile(plain)
-	b, _ := os.ReadFile(again)
-	if !slices.Equal(a, b) {
-		t.Error("two builds of the installer from the same stage differ")
+	webview2b := filepath.Join(dir, "webview2-copy", "MicrosoftEdgeWebview2Setup.exe")
+	genb := filepath.Join(dir, "gen-copy", "uninst-gen.exe")
+	other := time.Now().Add(-37 * time.Hour)
+	for _, c := range [][2]string{{webview2, webview2b}, {gen, genb}} {
+		if err := os.MkdirAll(filepath.Dir(c[1]), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := copyStaged(c[0], c[1], other); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("-version", "0.2.0", "-stage", o.out, "-webview2", webview2b, "-out", again)
+	prebuiltAgain := filepath.Join(dir, "prebuilt-again.exe")
+	run("-version", "0.2.0", "-stage", o.out, "-webview2", webview2b, "-out", prebuiltAgain, "-prebuilt-uninstaller", genb)
+	for _, pair := range [][2]string{{plain, again}, {prebuilt, prebuiltAgain}} {
+		a, _ := os.ReadFile(pair[0])
+		b, _ := os.ReadFile(pair[1])
+		if !slices.Equal(a, b) {
+			t.Errorf("two builds from the same stage differ: %s, %s", filepath.Base(pair[0]), filepath.Base(pair[1]))
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(root, "dist-desktop", ".build", "nsis-inputs-*")); len(left) > 0 {
+		t.Errorf("the pinned copies are left: %v", left)
 	}
 }

@@ -946,7 +946,10 @@ tasks:
             mkdir -p "$build/uninst"
             go -C tools run ./desktoppkg nsis -uninstaller-generator -version "$v" -makensis "$makensis" \
               -out "$build/uninst/uninst-gen.exe"
-            "$build/uninst/uninst-gen.exe" /S
+            "$build/uninst/uninst-gen.exe" /S || {
+              echo "desktop:package:windows: the uninstaller generator exited $?" >&2
+              exit 1
+            }
             if [ ! -f "$build/uninst/uninstall.exe" ]; then
               echo 'desktop:package:windows: the uninstaller generator wrote no uninstall.exe' >&2
               exit 1

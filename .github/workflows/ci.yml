@@ -2245,8 +2245,8 @@ jobs:
         run: |
           # 06 §16: an older build whose install-files.txt lists an extra (fake) avcodec-00.dll, for the stale-file
           # case, and a newer one, for the downgrade cases. Both pack the same stage otherwise, with the same
-          # prebuilt uninstaller. 0.0.0-smoke.1 has the winver 0.0.0.0, at most CI's 0.0.0.<run>; 0.0.1-smoke.1 has
-          # 0.0.1.1, above it.
+          # prebuilt uninstaller. 0.0.0-smoke's last identifier is no number, so its winver is 0.0.0.0, never above
+          # CI's 0.0.0.<run_number mod 65000> (desktoppkg winver, 06 §5.3); 0.0.1-smoke.1 has 0.0.1.1, above it.
           $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
           $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/.build/uninst/uninstall.exe'
           $webview2 = Join-Path $env:NATIVE 'MicrosoftEdgeWebview2Setup.exe'
@@ -2256,7 +2256,7 @@ jobs:
           Copy-Item -LiteralPath $stage -Destination $old -Recurse
           [IO.File]::WriteAllText((Join-Path $old 'avcodec-00.dll'), "fake avcodec-00.dll for the smoke`r`n")
           [IO.File]::AppendAllText((Join-Path $old 'install-files.txt'), "avcodec-00.dll`r`n")
-          foreach ($b in @(@('0.0.0-smoke.1', $old, 'old.exe'), @('0.0.1-smoke.1', $stage, 'newer.exe'))) {
+          foreach ($b in @(@('0.0.0-smoke', $old, 'old.exe'), @('0.0.1-smoke.1', $stage, 'newer.exe'))) {
             go -C tools run ./desktoppkg nsis -version $b[0] -stage $b[1] -out (Join-Path $out $b[2]) `
               -webview2 $webview2 -prebuilt-uninstaller $uninstaller -makensis $env:MAKENSIS
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

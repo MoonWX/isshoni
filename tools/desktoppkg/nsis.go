@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // `desktoppkg nsis` (06 §6.2, §6.9) runs makensis -WX on deploy/windows/nsis/installer.nsi with the defines of
@@ -118,9 +119,50 @@ func runNSIS(ctx context.Context, e *env, args []string) error {
 		if err := checkStageForNSIS(defs["STAGE"]); err != nil {
 			return err
 		}
+		// makensis records each File's mtime: the bootstrapper (downloaded on every CI run) and the prebuilt
+		// uninstaller are packed from copies with the stage's mtime, so the same commit gives the same installer
+		// (06 §6.2).
+		fi, err := os.Stat(filepath.Join(defs["STAGE"], installFilesName))
+		if err != nil {
+			return err
+		}
+		tmp, err := pinnedInputs(filepath.Join(e.root, "dist-desktop", ".build"), defs, fi.ModTime())
+		if err != nil {
+			return err
+		}
+		defer func() { _ = os.RemoveAll(tmp) }()
 	}
 	argv = makensisArgs(defs, filepath.Join(dir, installerScript))
 	return runMakensis(ctx, e, *makensis, argv, defs["OUTFILE"], *printOnly)
+}
+
+// pinnedInputs copies WEBVIEW2_SETUP and PREBUILT_UNINSTALLER (when set) into a new folder under parent, with
+// mtime as their modification time, and points defs at the copies. It returns the folder for the caller to remove.
+func pinnedInputs(parent string, defs map[string]string, mtime time.Time) (string, error) {
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		return "", err
+	}
+	tmp, err := os.MkdirTemp(parent, "nsis-inputs-")
+	if err != nil {
+		return "", err
+	}
+	for _, name := range []string{"WEBVIEW2_SETUP", "PREBUILT_UNINSTALLER"} {
+		src, ok := defs[name]
+		if !ok {
+			continue
+		}
+		dst := filepath.Join(tmp, strings.ToLower(name), filepath.Base(src))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+			_ = os.RemoveAll(tmp)
+			return "", err
+		}
+		if err := copyStaged(src, dst, mtime); err != nil {
+			_ = os.RemoveAll(tmp)
+			return "", fmt.Errorf("%s: %w", strings.ToLower(name), err)
+		}
+		defs[name] = dst
+	}
+	return tmp, nil
 }
 
 // makensisArgs is makensis' command line: -WX (warnings are errors, 06 §6.1), -INPUTCHARSET UTF8, -NOCONFIG (no

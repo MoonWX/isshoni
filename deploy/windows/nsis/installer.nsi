@@ -66,6 +66,8 @@ Var Fh2
 Var Line2
 Var Found
 Var Tries
+Var Fh3              ; moved-files.txt while MoveAsideImages writes it
+Var MovedAside       ; 1 from the first rename to <file>.old until the new tree is written
 
 ; ---- pages (06 section 6.3); in /UPDATE mode only the progress page shows (and only without /S) ----
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipInUpdate
@@ -305,8 +307,14 @@ Function FilterServer
   ${EndIf}
 FunctionEnd
 
-; Fail: exit with code $R9 after the message $R8 (interactive only); the banner goes first.
+; Fail: exit with code $R9 after the message $R8 (interactive only); the banner goes first. An exit 6 while images are
+; moved aside (a rename that timed out, or a new tree that could not be written) first puts the previous files back,
+; so the updater's next attempt (06 section 6.7) still finds an install that starts.
 Function Fail
+  ${If} $MovedAside = 1
+  ${AndIf} $R9 = ${EXIT_WRITE}
+    Call RestoreAsideImages
+  ${EndIf}
   Call BannerOff
   MessageBox MB_OK|MB_ICONSTOP "$R8" /SD IDOK
   SetErrorLevel $R9
@@ -540,12 +548,21 @@ FunctionEnd
 
 ; MoveAsideImages (06 section 6.7): every PE file of the previous install-files.txt that this install overwrites is renamed
 ; to <file>.old, retried every 250 ms for up to 10 s (a mapped image can be renamed but not overwritten); a rename
-; that still fails exits 6.
+; that still fails exits 6. Each rename is recorded in $PLUGINSDIR\moved-files.txt for RestoreAsideImages.
 Function MoveAsideImages
+  Delete "$PLUGINSDIR\moved-files.txt"
   ClearErrors
   FileOpen $Fh "$PLUGINSDIR\old-files.txt" r
   ${If} ${Errors}
     Return
+  ${EndIf}
+  ClearErrors
+  FileOpen $Fh3 "$PLUGINSDIR\moved-files.txt" w
+  ${If} ${Errors}
+    FileClose $Fh
+    StrCpy $R9 ${EXIT_WRITE}
+    StrCpy $R8 "$(WriteFailed)"
+    Call Fail
   ${EndIf}
   ${Do}
     ClearErrors
@@ -579,11 +596,14 @@ Function MoveAsideImages
       ClearErrors
       Rename "$INSTDIR\$Line" "$INSTDIR\$Line.old"
       ${IfNot} ${Errors}
+        FileWrite $Fh3 "$Line$\r$\n"
+        StrCpy $MovedAside 1
         ${ExitDo}
       ${EndIf}
       IntOp $Tries $Tries + 1
       ${If} $Tries >= ${RENAME_POLLS}
         FileClose $Fh
+        FileClose $Fh3
         StrCpy $R9 ${EXIT_WRITE}
         StrCpy $R8 "$(WriteFailed)"
         Call Fail
@@ -592,6 +612,40 @@ Function MoveAsideImages
     ${Loop}
   ${Loop}
   FileClose $Fh
+  FileClose $Fh3
+FunctionEnd
+
+; RestoreAsideImages: every file MoveAsideImages renamed in this run goes back from <file>.old; a new copy that was
+; already written in its place is deleted first, so the previous version's exe and DLLs stay together. Only Fail
+; calls it, before its Quit.
+Function RestoreAsideImages
+  ClearErrors
+  FileOpen $Fh "$PLUGINSDIR\moved-files.txt" r
+  ${If} ${Errors}
+    Return
+  ${EndIf}
+  ${Do}
+    ClearErrors
+    FileRead $Fh $Line
+    ${If} ${Errors}
+      ${ExitDo}
+    ${EndIf}
+    Push $Line
+    Call TrimLine
+    Pop $Line
+    ${If} $Line == ""
+    ${OrIfNot} ${FileExists} "$INSTDIR\$Line.old"
+      ${Continue}
+    ${EndIf}
+    Delete "$INSTDIR\$Line"
+    ClearErrors
+    Rename "$INSTDIR\$Line.old" "$INSTDIR\$Line"
+    ${If} ${Errors}
+      DetailPrint "$(RestoreFailed)"
+    ${EndIf}
+  ${Loop}
+  FileClose $Fh
+  StrCpy $MovedAside 0
 FunctionEnd
 
 ; RemoveStale (06 section 6.6): after the new files are written, every file of the previous list that the new one doesn't
@@ -714,7 +768,10 @@ Function MakeShortcut
   Pop $R7
 FunctionEnd
 
+; WriteRegistry: every value of 06 section 2.3, then one check of the error flag (exit 2). ${GetSize} goes first: it
+; clears the error flag itself.
 Function WriteRegistry
+  ${GetSize} "$INSTDIR" "/S=0K" $R0 $R1 $R2
   ClearErrors
   WriteRegStr HKCU "${REG_APP}" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "${REG_APP}" "Version" "${VERSION}"
@@ -723,7 +780,6 @@ Function WriteRegistry
   WriteRegDWORD HKCU "${REG_APP}" "UpdateChecks" $UpdateChecks
   ${If} $PendingServer != ""
     WriteRegStr HKCU "${REG_APP}" "PendingServer" "$PendingServer"
-    DeleteRegValue HKCU "${REG_APP}" "PendingRoom"
   ${EndIf}
 
   WriteRegStr HKCU "${REG_UNINST}" "DisplayName" "${PRODUCT}"
@@ -737,7 +793,6 @@ Function WriteRegistry
   WriteRegStr HKCU "${REG_UNINST}" "HelpLink" "${SITE}/download#windows"
   WriteRegDWORD HKCU "${REG_UNINST}" "NoModify" 1
   WriteRegDWORD HKCU "${REG_UNINST}" "NoRepair" 1
-  ${GetSize} "$INSTDIR" "/S=0K" $R0 $R1 $R2
   WriteRegDWORD HKCU "${REG_UNINST}" "EstimatedSize" $R0
 
   ; isshoni:// (02 section 12.2, 03 section 13.1): --open-url takes exactly the next argument and honours no other flag.
@@ -749,6 +804,10 @@ Function WriteRegistry
     StrCpy $R9 ${EXIT_OTHER}
     StrCpy $R8 "$(RegistryFailed)"
     Call Fail
+  ${EndIf}
+  ; After the check: DeleteRegValue sets the error flag when there is no PendingRoom, the usual case.
+  ${If} $PendingServer != ""
+    DeleteRegValue HKCU "${REG_APP}" "PendingRoom"
   ${EndIf}
 FunctionEnd
 
@@ -790,6 +849,8 @@ Section "-isshoni"
     StrCpy $R8 "$(WriteFailed)"
     Call Fail
   ${EndIf}
+  ; The new tree is complete: from here on RemoveStale deletes the .old files, and nothing is put back.
+  StrCpy $MovedAside 0
   Call RemoveStale
   ClearErrors
   File "${STAGE}/${FILE_LIST}"

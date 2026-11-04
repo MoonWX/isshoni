@@ -131,6 +131,33 @@ Function un.RemoveListed
   FileClose $R5
 FunctionEnd
 
+; un.DataRootOverlapsInstDir: push 1 when $LOCALAPPDATA\isshoni is $INSTDIR, lies inside it or holds it (NSIS's == is
+; case-insensitive, as Windows paths are), else 0.
+Function un.DataRootOverlapsInstDir
+  Push $0
+  Push $1
+  Push $2
+  StrCpy $0 "$LOCALAPPDATA\isshoni"
+  StrCpy $2 0
+  ${If} $INSTDIR == $0
+    StrCpy $2 1
+  ${EndIf}
+  StrLen $1 "$0\"
+  StrCpy $1 $INSTDIR $1
+  ${If} $1 == "$0\"
+    StrCpy $2 1
+  ${EndIf}
+  StrLen $1 "$INSTDIR\"
+  StrCpy $1 $0 $1
+  ${If} $1 == "$INSTDIR\"
+    StrCpy $2 1
+  ${EndIf}
+  StrCpy $0 $2
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
 Section "Uninstall"
   Call un.WaitForApp
 
@@ -148,10 +175,17 @@ Section "Uninstall"
       DetailPrint "$(UnForgetFailed)"
     ${EndIf}
   ${EndIf}
-  ; The data root of 06 section 2.2 is never $INSTDIR: when --purge-data couldn't remove it, the uninstaller does.
+  ; When --purge-data couldn't remove the data root of 06 section 2.2, the uninstaller does, unless it overlaps $INSTDIR
+  ; (a /D= of the data root, a folder inside it, or one holding it): never RMDir /r in $INSTDIR (06 section 6.6).
   ${If} $Purge = 1
   ${AndIf} ${FileExists} "$LOCALAPPDATA\isshoni\*.*"
-    RMDir /r "$LOCALAPPDATA\isshoni"
+    Call un.DataRootOverlapsInstDir
+    Pop $R2
+    ${If} $R2 = 1
+      DetailPrint "$(UnDataRootKept)"
+    ${Else}
+      RMDir /r "$LOCALAPPDATA\isshoni"
+    ${EndIf}
   ${EndIf}
 
   ; 3. The files, never recursively.
