@@ -59,7 +59,7 @@ SilentActions SilentStreamCheck::Sample(int64_t now_ns, std::span<const SilentSa
 }
 
 ExclusiveSilentAction ExclusiveSilentCheck::Sample(int64_t now_ns, float heard_meter_db,
-                                                  const audiomix::LevelsSnapshot &levels, uint64_t tag) {
+                                                   const audiomix::LevelsSnapshot &levels, uint64_t tag) {
   SilentSample s{"exclude", heard_meter_db, false, true};
   for (uint32_t i = 0; tag != 0 && i < levels.count && i < audiomix::kMaxMixChannels; ++i) {
     const audiomix::ChannelLevel &ch = levels.channels[i];
