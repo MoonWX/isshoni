@@ -18,6 +18,7 @@ namespace im::audio {
 namespace {
 
 constexpr DWORD kWaitMs = 20;                        // 05 §8.4
+constexpr DWORD kPollMs = 5;                         // with a polled stream (the endpoint engine's, 05 §8.2)
 constexpr std::chrono::milliseconds kJoinWait{2000}; // 05 §10.5
 
 } // namespace
@@ -59,12 +60,18 @@ struct CaptureThread::Shared {
       Commands(streams);
       DWORD n = 0;
       handles[n++] = control.get();
+      bool polled = false; // the endpoint stream has no event: it is drained every 5 ms (05 §8.2)
       for (const auto &s : streams) {
-        if (n < MAXIMUM_WAIT_OBJECTS && !s->failed.load(std::memory_order_relaxed) && s->client->event() != nullptr) {
+        if (s->failed.load(std::memory_order_relaxed)) {
+          continue;
+        }
+        if (s->client->event() == nullptr) {
+          polled = true;
+        } else if (n < MAXIMUM_WAIT_OBJECTS) {
           handles[n++] = static_cast<HANDLE>(s->client->event());
         }
       }
-      WaitForMultipleObjects(n, handles, FALSE, kWaitMs);
+      WaitForMultipleObjects(n, handles, FALSE, polled ? kPollMs : kWaitMs);
       if (stop.load(std::memory_order_acquire)) {
         break;
       }

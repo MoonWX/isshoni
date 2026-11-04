@@ -7,8 +7,12 @@
 // include set's streams (include_set.h) with their activator threads (activator.h), the capture thread
 // (capture_thread.h) and the held process handles (process_hold.h), feeding the share's mixer engine (live_mix.h).
 // While no share runs, or while its sound is off, the plan is the include set's prediction with engine "none" (05
-// §6.5). The fast path, the endpoint engine, the startup probe and the sound check are README WA53's: until then the
-// watcher plans without the fast path and as if process loopback works.
+// §6.5). README WA53 adds the other engines: the fast path (one EXCLUDE stream while no voice app runs, left at once
+// on a kept-out process's session event, without the debounce and with the retroactive cut, 05 §6.4) and the endpoint
+// engine (Windows 10 builds, a failed startup probe, process loopback failing twice in 10 s: engine_gate.h), the
+// startup probe at each audio start (startup_probe.h), the endpoint stream following default-device changes (05 §7.5)
+// and the silent-stream check (silent_check.h, 05 §8.5). The fast path follows the rules' IM_EXCLF_FAST_PATH, which Go
+// sets from the settings key audio.fastPath (the kill switch).
 //
 // Every method may be called from any thread, concurrently. Calls that need the thread's COM work post a request and
 // wait at most kWatcherWait, then fail with IM_ERR_TIMEOUT (05 §4.3); none calls CoInitializeEx on the caller's

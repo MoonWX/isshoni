@@ -22,7 +22,15 @@
 //   6. once the mixer let go of the channel the capture thread drops the stream and the entry goes.
 // Every stream counts in the planner's input from step 1 until it is gone (PlanInput::streams).
 //
-// The fast path's EXCLUDE stream and the endpoint stream are README WA53's: their activations are not opened here.
+// The exclusive streams (README WA53) live here too: the fast path's EXCLUDE stream on the tree of R (05 §6.4) and the
+// endpoint stream (05 §6.1), each in its own mixer group (audiomix::kGroupExcludeSelf, kGroupEndpoint). An engine
+// switch (05 §6.5) opens the new engine's stream with a 20 ms crossfade and lets the old engine's streams wait
+// (RemovalReason::kEngine) until the mixer's takeover fades them out, with two exceptions: sound off fades everything
+// at once, and the fast path's exit cuts the EXCLUDE stream's ring retroactively at C - 20 ms (05 §6.4, Apply's
+// reveal_ns). A default-device change reopens the endpoint stream on the new default (ReopenEndpoint, 05 §7.5), the
+// old one fading once the new one runs. An exclusive stream that fails is reopened after the same delays, the last
+// one repeating, and never given up on (the planner has no capture_failed for it). The silent-stream check (05 §8.5,
+// silent_check.h) reopens an app's include streams (ReopenApp) or gives up on them (GiveUpApp).
 //
 // Portable C++ (no OS header), owned by the watcher thread, not thread-safe. Its tests run with fakes for the
 // activator, the capture thread and the process handles, and the real planner
@@ -66,11 +74,15 @@ struct StreamCounters {
   uint64_t commit_refusals = 0;     // refused by the commit check (logged)
   uint64_t stream_failures = 0;     // joined streams that failed (05 §8.5)
   uint64_t discontinuities = 0;     // of the streams gone; Views' streams add theirs
-  uint32_t streams = 0;             // streams joined to the mixer now (counters.streams)
+  uint64_t fastpath_cuts = 0;       // EXCLUDE streams cut at the fast path's exit (05 §6.4)
+  uint64_t loopback_failures = 0; // pumps in which process loopback as a whole failed (05 §6.5: "twice in 10 s"; Pump)
+  uint64_t silent_reopens = 0;    // include and EXCLUDE streams the silent-stream check reopened (05 §7.5, §8.5)
+  uint32_t streams = 0;           // streams joined to the mixer now (counters.streams)
 };
 
 // One stream as the report shows it (05 §12.1 sessions[].stream, .format, .note).
 struct StreamView {
+  audiopolicy::StreamKind kind = audiopolicy::StreamKind::kInclude; // only include streams belong to a session
   audiopolicy::ProcessKey target;
   audiomix::SessionStream stream = audiomix::SessionStream::kNone;
   std::string format;
@@ -106,10 +118,29 @@ public:
   // A device or session event: targets given up on are tried again (05 §8.5).
   void ForgetFailures();
 
-  // Acts on a plan made with the last Inputs(): opens the include activations (app_of names their apps), removes the
-  // streams of plan.remove. A stream removed as covered waits for its own coverers: the other include streams on its
-  // target or, by below, on an OS ancestor of it. Not attached: nothing to do.
-  void Apply(const audiopolicy::Plan &plan, const AppOf &app_of, const Below &below, int64_t now_ns);
+  // Acts on a plan made with the last Inputs(): opens the activations (app_of names the include streams' apps),
+  // removes the streams of plan.remove. A stream removed as covered waits for its own coverers: the other include
+  // streams on its target or, by below, on an OS ancestor of it. A stream removed for an engine switch (kEngine,
+  // kTarget) waits for the new engine's streams to run (the mixer's crossfade takes it over), except with engine none
+  // (sound off: it fades at once) and for the EXCLUDE stream when the fast path exits into the include set: its ring is
+  // cut at reveal_ns - kFastPathCutLeadNs, reveal_ns being the QPC time of the event that revealed the kept-out process
+  // (0: now_ns, a poll's). Not attached: nothing to do.
+  void Apply(const audiopolicy::Plan &plan, const AppOf &app_of, const Below &below, int64_t now_ns,
+             int64_t reveal_ns = 0);
+  // A default render device change (05 §7.5): a running endpoint stream reopens on the new default, the old one fading
+  // out once the new one runs. Returns whether it did (the watcher then plans).
+  bool ReopenEndpoint(int64_t now_ns);
+  // The silent-stream check (05 §8.5): app_id's joined include streams fade out and open again at once (no failure
+  // counted). Returns how many.
+  uint32_t ReopenApp(const std::string &app_id, int64_t now_ns);
+  // The same for the fast path's EXCLUDE stream (05 §7.5, §8.5): a joined one fades out and opens again at once.
+  // Returns whether it did.
+  bool ReopenExclusive(int64_t now_ns);
+  // The joined EXCLUDE stream's channel tag (0: none), for the silent-stream check.
+  uint64_t ExclusiveTag() const noexcept;
+  // ...or app_id's include targets become capture_failed (until the next device or session event, ForgetFailures) and
+  // their streams go. Returns how many targets.
+  uint32_t GiveUpApp(const std::string &app_id);
   // Moves the streams on (results, commit checks, joins, failures, exits, releases, reopen delays). commit runs the
   // commit check for one activation (the caller takes the fresh snapshot once per Pump, lazily). Returns whether the
   // watcher must plan again: a stream left, a commit check refused, a held process exited, a key mismatch (also one
@@ -148,9 +179,11 @@ private:
     int32_t last_failure = 0;              // the HRESULT of the last of them
     std::shared_ptr<CaptureStream> stream; // kJoined, kRemoving
     std::unique_ptr<audiomix::Channel> channel;
-    bool covered_wait = false;      // removed as covered: fades once one of its coverers runs
-    std::vector<uint64_t> coverers; // covered_wait: the ids of the entries that cover it
+    bool covered_wait = false;      // removed as covered, or for an engine switch: fades once a coverer runs
+    std::vector<uint64_t> coverers; // covered_wait: the ids of the entries that cover (or replace) it
     bool reopen = false;            // kRemoving after a failure: opens again after the delay
+    bool reopen_now = false;        // kRemoving for the silent-stream check: opens again at once
+    bool crossfade = false;         // joined for an engine switch: its channel takes over from the other groups
   };
 
   Entry *Find(uint64_t id);
@@ -160,6 +193,7 @@ private:
   void StartRemoval(Entry &e);
   void Drop(std::size_t i);
   bool Join(Entry &e, OpenResult &&r);
+  void RemoveAt(std::size_t i, bool cancel);
   void Event(int64_t t, audiomix::ReportEventCode code, const std::string &app, std::string detail = {});
 
   StreamSetDeps deps_;
