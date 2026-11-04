@@ -2296,6 +2296,14 @@ The component the client core owns, capture → last packet sent, is measured on
   per encoder the probe lists as `Tested` (forced with `Options.Encoder`).
 - `mediatest.Conformance` with the real DLL (§6.4).
 
+As built (WA69, group 12; README §3 item 73): `capture_hw_test.go` is constrained to `isshoni_hw && windows` (it needs
+the native engine and Win32 calls). The 30 s are three back-to-back 10 s windows of `publish`'s `CaptureToSend` summary
+(the core keeps only a rolling 10 s summary), each within both bounds, which is at least as strict as one 30 s figure.
+The share's audio is the engine's test tone, so the run needs no audio device; the monitor capture is real. Measuring
+starts once the ramp reaches 8 Mbit/s and the full layer runs at 1080p (the load of the Go-only CI latency test, §14's
+case D16, §12.4 item 1), and the test fails if the primary monitor is smaller than 1080p. It needs `mon:` source ids,
+which come with WA60 (04 §7.5); until then `TestCaptureToSend` fails with the engine's error on the owner's PC.
+
 ### 12.4 CI proxies (every PR)
 
 1. **Go pipeline latency** (`internal/server/itest/desktop_latency_test.go`, ubuntu, macos, windows): `fake.Engine`

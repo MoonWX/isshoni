@@ -634,6 +634,15 @@ unknown keys are kept, and the defaults apply under the saved values (§14.2). `
 `OwnConnections`; `OpenLogsFolder` and `OpenNotices` return `ErrNotImplemented` until their slices); `Shell` has no
 `SetTray` until WA68's tray package.
 
+As built (WA68, group 12; README §3 item 72): `SetTray` is not on `app.Shell` but on a separate interface,
+`app.TrayShell` (`shell.go`), which the app finds by a type assertion; a shell without it draws no tray. Adding a
+method to `Shell` would have broken `internal/desktop/e2ehost`'s recorder, which group 12's integration then made a
+`TrayShell` (`/__e2e/state`'s `tray`). Three more OS hooks are optional interfaces found the same way, since the
+recorder implements `OSHooks`: `IncludeInCapture` (the main window back to `WDA_NONE` when `hideFromCapture` is off,
+§11.5), `EndSessionHandled` (the `WM_QUERYENDSESSION` 2 s handshake, §11.6) and `OpenPath` (`OpenLogsFolder`,
+`OpenNotices`); `winos` implements all three. `OpenLogsFolder` and `OpenNotices` are real, and their failures wrap
+`app.ErrIO`, which the bridge maps to `io_error` (§6.4; group 12's integration).
+
 ### 6.2 Bound services (`internal/desktop/bridge`)
 
 The only app services that page script can call. The pinned Wails runtime serves its own objects (`Browser`,
@@ -1790,6 +1799,21 @@ func Render(s State, t *i18n.Catalog) View
 | Suspend (`PBT_APMSUSPEND`) | stop (`system`); after resume a toast "Sharing stopped because your PC went to sleep" | C2 and C1 reconnect after resume (01) |
 | End of session (`WM_QUERYENDSESSION`) | stop within 2 s (`share.stop`, close 1000), then allow | close sockets with 1000 |
 | Keep awake | `KeepAwake(true)` from `live` to the end, except while a lock pause holds it released (above): the PC and the display don't sleep while sharing | off |
+
+As built (WA68, group 12; README §3 item 72): the lock-pause state machine (both bounds, the "Resume sharing?" prompt
+and its toast, the lock-stop toast) lives in `internal/desktop/app` on top of the share controller's `SetPaused` and
+`Stop`; the panel's "Resume sharing?" bar and the pill's state need WA80 (a `ShareView` field and the pill). The
+close-to-tray toast shows at most once per run, and never once `tips.trayNoticeShown` is set: a strict once-ever needs
+the window notice that sets the flag (WA80). End of session stops the share, acknowledges `winos` and then quits the
+app, so a shutdown the user cancels leaves isshoni closed. `-Embedding` waits up to 4 s for the toast activation by
+registering Wails' activator over an application that never runs; whether COM delivers it without a message loop is
+checked by M-DESK-5. The W8 registry test runs under a random `io.isshoni.test.<hex>` id in a child process (one
+Wails application per process, and the real id would point the installed app's `LocalServer32` at the test binary);
+`TestAppOptions` still asserts `io.isshoni.desktop`. `desktop-system.spec` covers a short lock and a suspend with the
+harness's default bounds; group 12's integration passes `-lock-resume`/`-lock-stop` into `app.Deps`, and the
+long-lock cases need `web/e2e/fixtures.ts`'s `lockResumeMs`/`lockStopMs` (WF13) and WA80's bar. Left to WF13 (group
+13): the SPA's `App.Heartbeat` (W17's watchdog never arms without it), those fixtures, e2ehost's
+`end-session-confirmed` event and removing toasts that no longer apply from Action Center (§15).
 
 Quit always stops a share first (`core.Share.Stop`: `share.stop`, engine stop, `room.leave`; then
 `audio.OnShareStopped()`), closes C2 (`core.Client.Close`, 1000) and C1 (1000), calls `audio.Service.Close()`,

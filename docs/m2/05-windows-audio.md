@@ -257,7 +257,14 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
   `im_init`: `im_shutdown` clears it.
 - **State.** Neither watching nor live: `im_audio_levels_get` → `IM_ERR_BAD_STATE`. No running audio session:
   `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE` (before WA45 added capture no audio session could
-  run, so they always answered it; since WA45 they set the live mix's sound-off and mute flags, §9.6). A watcher thread
+  run, so they always answered it; since WA45 they set the live mix's sound-off and mute flags, §9.6).
+  `im_audio_set_muted` also covers the **test tone** (04 §8.5, §10.3; group 12's integration, README §3 item 70): it
+  sets the tone's own user mute (`session::SetToneMuted`, the effective mute is that flag OR pause, as on the mix bus,
+  and only this call clears it, so `im_set_paused(s, 0)` keeps it) beside `AudioEngine::SetMuted`, and answers `IM_OK`
+  when either took it, so a test-tone session gets `IM_OK` also after `IM_INIT_NO_AUDIO`, where the `AudioEngine`
+  answers `IM_ERR_BAD_STATE`; with neither a test-tone session nor an audio session running it answers the
+  `AudioEngine`'s status and detail (`IM_ERR_BAD_STATE`). `session_pause_test`'s `ResumeKeepsTheUserMuteOfTheTone`
+  checks it through the export. A watcher thread
   that failed to start in `im_init` leaves the audio calls answering as after `IM_INIT_NO_AUDIO`. Until WA53 built the
   sound check (group 11, §11.3), `im_audio_sound_check` answered `IM_ERR_NOT_IMPLEMENTED`; it still answers
   `IM_ERR_BAD_STATE` after `IM_INIT_NO_AUDIO`.
@@ -275,9 +282,10 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
     process; a programming error, the v1 UI runs one share);
   - after `im_init` with `IM_INIT_NO_AUDIO`, `mode = IM_AUDIO_MODE_EXCLUDE_APPS` → `IM_ERR_BAD_STATE` (README §3 item
     35). `IM_AUDIO_MODE_TEST_TONE` (100) still starts and plays: the tone is 04's own source and touches no audio API
-    (04 §10.3), so video-only tools and CI runners without audio keep their A/V checks. Until the session makes this
-    check (README WA52's row), such an `im_start` answers `IM_OK` and runs the share without audio packets (audio
-    state off); `audio_bridge_test` pins only what both readings share: neither `SetRules` nor `NewMixer` is called.
+    (04 §10.3), so video-only tools and CI runners without audio keep their A/V checks. As built (WA52, group 12)
+    the session makes this check (`im_start: audio is off (IM_INIT_NO_AUDIO)`) before any audio call; before WA52 such
+    an `im_start` answered `IM_OK` and ran the share without audio packets. `audio_bridge_test` pins what both
+    readings share: neither `SetRules` nor `NewMixer` is called.
 
   Device loss, audio-service restarts, a missing render endpoint and stream failures are handled inside (§7.5, §8.5)
   and appear in the report (`state`, `events`); an audio-only config on a machine without a render endpoint starts in
