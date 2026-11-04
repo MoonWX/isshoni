@@ -287,8 +287,21 @@ Unknown keys:
   matches 06's list; a new non-key `ISSHONI_*` name must be added to both: `ISSHONI_CONFIG`, `ISSHONI_VERSION`
   (install.sh target version and the Vite build version), `ISSHONI_YES`, `ISSHONI_NO_FIREWALL`,
   `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_INSTALL_SOURCED`, `ISSHONI_INSTALLER_VERSION`, `ISSHONI_SNAPSHOT_VERSION`,
-  `ISSHONI_BIN`, `ISSHONI_DEV_SERVER`, `ISSHONI_LOADTEST_PASSWORD` (02's `isshoni-loadtest`). The env-only switches of
-  §4.3 are read, not ignored.
+  `ISSHONI_BIN`, `ISSHONI_DEV_SERVER`, `ISSHONI_LOADTEST_PASSWORD` (02's `isshoni-loadtest`). M2 adds, in this order
+  (`docs/m2/06-windows-release.md` §7.3): `install-desktop.ps1`'s `ISSHONI_NO_UPDATE_CHECKS`, `ISSHONI_NO_LAUNCH`,
+  `ISSHONI_ALLOW_DOWNGRADE` (`ISSHONI_VERSION` and `ISSHONI_DOWNLOAD_BASE` also serve it); the updater's test builds'
+  `ISSHONI_UPDATE_TEST_BASE`, `ISSHONI_UPDATE_TEST_SIGNERS`; the engine DLL of the Go tests and the compat job,
+  `ISSHONI_TEST_ENGINE_DLL`, `ISSHONI_COMPAT_SERVER_URL`, `ISSHONI_COMPAT_ADMIN_FILE`; the release notes'
+  `ISSHONI_DESKTOP_MIN_VERSION`, `ISSHONI_FFMPEG_VERSION`; M2's dev, e2e, task and test names
+  `ISSHONI_DESKTOP_DEV_URL`, `ISSHONI_FAKE_AUDIO`, `ISSHONI_E2E_CDP_PORT`, `ISSHONI_E2E_DATA_DIR`,
+  `ISSHONI_DESKTOP_EXE`, `ISSHONI_CDP_ENDPOINT`, `ISSHONI_NATIVE_PRESETS`, `ISSHONI_NATIVE_TEST`,
+  `ISSHONI_NATIVE_BUILD_PS1`, `ISSHONI_FFMPEG_BUILD_PS1`, `ISSHONI_CHECKLIST_OUT`, `ISSHONI_CHECKLIST_W19_PORT`,
+  `ISSHONI_CHECKLIST_W19_PIPE`, `ISSHONI_DESKTOP_TEST_CHILD`, `ISSHONI_DESKTOP_TEST_ID`,
+  `ISSHONI_DESKTOP_TEST_RUNNING`, `ISSHONI_DESKTOP_TEST_OUT`, `ISSHONI_WINOS_TEST_CHILD`, `ISSHONI_WINOS_TEST_ID`,
+  `ISSHONI_WINOS_TEST_OUT`, `ISSHONI_APPLOG_CRASH_CHILD`, `ISSHONI_MEDIATEST_MUTANT`, `ISSHONI_ENGINETEST_TEST_CHILD`;
+  and the native encoder tests' FFmpeg folder `ISSHONI_TEST_FFMPEG_DIR`. Exact names, never prefixes; a repository
+  test (`TestRepoEnvNamesReserved`) fails on an `ISSHONI_*` name the repository reads that is neither a key, reserved
+  nor env-only. The env-only switches of §4.3 are read, not ignored.
 
 ### 4.3 Key reference
 

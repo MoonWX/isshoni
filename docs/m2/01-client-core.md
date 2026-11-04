@@ -733,7 +733,9 @@ type Options struct {
    average (a static desktop may legitimately send fewer frames: the check is skipped below 5 frames per second);
    audio packets every 20 ms ± 5 ms on average; every video `Data` starts with an Annex B start code.
 4. Wait until ≥ 250 ms have passed since `f`'s previous keyframe, then `RequestKeyframe("f")` → a keyframe on `f`
-   within 2 frames.
+   within 2 frames, counted from the first frame captured after the request: a frame captured before it may still be
+   queued in the session when the reader pulls it (group 10's CI fix, after a slow `desktop-macos` runner failed the
+   check that way).
 5. `SetBitrate("f", 1_000_000)` → when `f`'s `EventLayer.LiveBitrate` is false, wait for its `Reinit` keyframe
    (≤ 11 s, 04 §9.5 defers re-inits up to 10 s); then `f`'s bitrate over the next 4 s within 50–150 % of the target
    (skipped with `o.SkipBitrate`: the fake in Decodable mode).
@@ -2452,10 +2454,10 @@ server.
 **Windows**
 - CI windows-2025 (06): `windows-go` runs `go test -race` (MinGW), then `CGO_ENABLED=0 go test` (the shipped mode),
   of `./internal/client/...` with the fake engine; `windows-desktop` runs 04's binding tests (04 §18.2) with the DLL
-  built in the same workflow, and `mediatest.Conformance` on the `win-x64-ci` DLL with
-  `test:pattern` and `{Listed, TestTone, Encoder: "fake"}` (checks 5 and 7 run: 04 §18.2 specifies IM_ENC_FAKE's
-  output; until WA44's `im_probe`, through 04 §9.1's `probeFallback`). Until WA72's `windows-desktop` exists,
-  `windows-native` runs these DLL tests (06 R3a).
+  built in the same workflow, and `mediatest.Conformance` on the `win-x64-ci` DLL with `test:pattern` and `{Listed,
+  TestTone, Encoder: "fake"}` (checks 5 and 7 run: 04 §18.2 specifies IM_ENC_FAKE's output; before WA44's `im_probe`,
+  through 04 §9.1's `probeFallback`, which WF10 removes). Until WA72's `windows-desktop` exists, `windows-native` runs
+  these DLL tests (06 R3a).
 - Owner's PC, self-hosted runner, tag `isshoni_hw` (`CGO_ENABLED=0`, no `-race`): Conformance with a real monitor
   (`Listed`) per probed encoder; `TestCaptureToSend` (§12.3).
 - Owner's PC, manual: g2g on Win11 and Win10 (§12.2, the exit gate: the `gate` run with sound on and cuts, plus the

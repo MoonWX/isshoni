@@ -256,10 +256,10 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
   `im_start` (unless that start passes its own `exclusions`) and returns `IM_OK`. The stored set belongs to one
   `im_init`: `im_shutdown` clears it.
 - **State.** Neither watching nor live: `im_audio_levels_get` → `IM_ERR_BAD_STATE`. No running audio session:
-  `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE` (until WA45 adds capture no audio session can run,
-  so they always answer it). A watcher thread that failed to start in `im_init` leaves the audio calls answering as
-  after `IM_INIT_NO_AUDIO`. Until WA53 builds the sound check, `im_audio_sound_check` answers
-  `IM_ERR_NOT_IMPLEMENTED` (`IM_ERR_BAD_STATE` after `IM_INIT_NO_AUDIO`).
+  `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE` (before WA45 added capture no audio session could
+  run, so they always answered it; since WA45 they set the live mix's sound-off and mute flags, §9.6). A watcher thread
+  that failed to start in `im_init` leaves the audio calls answering as after `IM_INIT_NO_AUDIO`. Until WA53 builds the
+  sound check, `im_audio_sound_check` answers `IM_ERR_NOT_IMPLEMENTED` (`IM_ERR_BAD_STATE` after `IM_INIT_NO_AUDIO`).
 - **Silence flags.** The mix bus is silent while any of three flags is set: **paused** (04's `im_set_paused`, which
   reaches `Mixer::SetPaused`, §10.5), **muted** (`im_audio_set_muted`: the mute 01's core sets with the pause, 01 D14),
   or **mode off** (`im_audio_set_mode(IM_AUDIO_MODE_OFF)`: the per-share "Share sound" switch). Each flag is set and
@@ -1237,6 +1237,7 @@ banner `viewer-muted` explains it.
 | `apps[].reason` | kept out: `builtin`, `user`, `mic`, `viewer`, `isshoni`. Not captured: `launcher`, `tree`, `pid_reuse` (blocked only through a loose PID link, §5.2), `limit`, `capture_failed`. Heard: `""` |
 | `apps[].detail` | for `tree` and `pid_reuse`: the kept-out app's name; else `""` |
 | `apps[].warnings` | `shared_app_uses_mic`, `shared_app_kept_out`, `included_uses_mic`, `multi_process_session` |
+| `warnings[]` (top level) | `{code, app}`: `multi_process_session` (also on the row, `app` = its id) and `instance_gone` (an `IM_RULE_INSTANCE` whose pid doesn't exist, §5.3; `app` = the rule's app id), which appears only here, never in a row's `warnings` (`im_audiomix`'s `AppWarning::kInstanceGone`, added by WA45) |
 | `apps[].playing` | session active within the last 2 s, or its activity meter above −70 dBFS within the last 2 s |
 | `sessions[].created` | FILETIME as a decimal string (JSON numbers lose precision above 2^53) |
 | `sessions[].stream` | `none`, `activating`, `preroll`, `running`, `fading` |
@@ -1245,22 +1246,27 @@ banner `viewer-muted` explains it.
 
 `counters` are the mixer's; packets dropped after the mixer are 04's (`im_get_stats` `audio.drops`). The tail fade
 (§9.5, README §3 item 53) adds the counter `tailFades` and the event code `tail_fade`, additive like any later field.
-Caps: `apps` ≤ 128 rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary),
-and the first 128 top-level `warnings`, so the report stays within §17's 256 KiB (WA36's writer caps `warnings`;
-WA35's interim writer doesn't, see "The writer" below). Rows: apps with a session,
-plus running processes matched by a built-in rule (so "Discord · kept out" shows while Discord is silent), plus the
-shared app. `seq` increases whenever anything except levels, counters, `qpcNs` and `events` changes. Unknown fields are
-ignored by Go (additive changes only).
+Caps: `apps` ≤ 128 rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary), and
+the first 128 top-level `warnings`, so the report stays within §17's 256 KiB (`im_audiomix`'s writer, the one kept, caps
+`warnings`; see "The writer" below). Rows: apps with a session, plus running processes matched by a built-in rule (so
+"Discord · kept out" shows while Discord is silent), plus the shared app. `seq` increases whenever anything except
+levels, counters, `qpcNs` and `events` changes. Unknown fields are ignored by Go (additive changes only).
 
 **The one-shot snapshot** (state `stopped`, the watcher not watching) is planned on the watcher thread with the
 remembered mic roots and lineage (§5.6, §5.7) and kept for 1 s, so the snprintf retry with a larger buffer gets the
-same document; applying rules, a watch or an unwatch drops it. Until WA45 adds capture, every report is the
+same document; applying rules, a watch or an unwatch drops it. Before WA45 added capture, every report was the
 watcher's prediction: mode `exclude-apps`, engine `none`, `live` false, `probe.result` `pending` with an active render
-endpoint and `skipped` without, `probe.format` `""`, every `sessions[].stream` `none` with format `""`.
+endpoint and `skipped` without, `probe.format` `""`, every `sessions[].stream` `none` with format `""`. As built
+(WA45, group 10): while a share's mix runs, the report is `live`, `engine` is the plan's, `mode` follows the share's
+(`off` or `exclude-apps`), `muted` and `paused` are the mixer's, and each session whose process is an include target
+carries its stream's state and format; `probe.result` stays `pending` (with a render endpoint) or `skipped` until
+WA53's startup probe (§11.2).
 
-**The writer.** Two C++ writers produce this JSON byte for byte against the same goldens after group 4: WA35's
-`native/windows/src/audio/report.cpp` (the watcher landed first) and WA36's `im_audiomix` writer (05 A4). WA45 keeps
-one of them with its golden test and removes the other (README §3 item 36).
+**The writer.** Two C++ writers produced this JSON byte for byte against the same goldens after group 4: WA35's
+`native/windows/src/audio/report.cpp` (the watcher landed first) and WA36's `im_audiomix` writer (05 A4). WA45 kept
+`im_audiomix`'s (`native/common/audiomix/src/report.cpp`, golden test `mix_report_test`) and removed WA35's;
+`audio/report.cpp` now only maps the planner's vocabulary to the report's model (`audio_report_test`) (README §3 items
+36 and 57).
 
 ### 12.2 Levels
 
