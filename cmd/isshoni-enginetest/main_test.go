@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -204,6 +205,7 @@ func TestOggOpus(t *testing.T) {
 	b := buf.Bytes()
 	var pages, packets int
 	var lastGranule int64
+	var granules []int64
 	for seq := uint32(0); len(b) > 0; seq++ {
 		if len(b) < 27 || string(b[:4]) != "OggS" {
 			t.Fatalf("page %d: no capture pattern", seq)
@@ -232,6 +234,7 @@ func TestOggOpus(t *testing.T) {
 			t.Errorf("page 1: %q", page[28:36])
 		}
 		lastGranule = int64(binary.LittleEndian.Uint64(page[6:])) //nolint:gosec // G115: small granules
+		granules = append(granules, lastGranule)
 		b = b[size:]
 		pages++
 		if b2 := len(b); b2 == 0 && page[5] != oggHeaderTypeEOS {
@@ -241,8 +244,13 @@ func TestOggOpus(t *testing.T) {
 	if packets != 2+120 {
 		t.Errorf("%d packets in %d pages, want 122", packets, pages)
 	}
-	if want := int64(oggPreSkip + 120*oggPacketSamples); lastGranule != want {
-		t.Errorf("last granule %d, want %d", lastGranule, want)
+	// RFC 7845 §4: the granule counts decoded samples including the pre-skip; the EOS page's is 960 × packets.
+	if want := int64(120 * oggPacketSamples); lastGranule != want {
+		t.Errorf("EOS granule %d, want %d (960 × 120 packets)", lastGranule, want)
+	}
+	if want := []int64{0, 0, 50 * oggPacketSamples, 100 * oggPacketSamples, 120 * oggPacketSamples}; !slices.Equal(
+		granules, want) {
+		t.Errorf("granules %v, want %v", granules, want)
 	}
 }
 

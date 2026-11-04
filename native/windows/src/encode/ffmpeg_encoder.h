@@ -32,6 +32,7 @@
 // without the context lock held (FFmpeg and the readback take it themselves).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -76,6 +77,13 @@ public:
 
   bool zero_copy() const noexcept { return zero_copy_; }
 
+  // 04 §9.2's pts → capture-time table: the capture time (EncodeInput.ts_ns) of the frame the last Encode's AU came
+  // from, found by the first packet's pts among the last kPtsRing frames sent; 0 when that Encode produced no AU.
+  // An encoder with frames of delay emits an AU for an earlier frame than the one just sent. session::EncodedAu has
+  // no field for it yet (session/, outside README WA44): until it does, the session stamps each AU with the frame it
+  // just sent, and the integrator's change is EncodedAu.capture_ts_ns = this value.
+  int64_t au_capture_ts_ns() const noexcept { return au_ts_ns_; }
+
   // The probe's test picture (04 §9.10): mid-gray (Y 128, Cb/Cr 128) written into target, which NextTarget handed
   // out. Takes the context lock itself.
   im_status FillGray(const gpu::Nv12Target &target) noexcept;
@@ -97,6 +105,15 @@ private:
   uint32_t bitrate_ = 0;
   int64_t last_pts_ = INT64_MIN; // the last AVFrame.pts sent (they must increase)
   double vbv_s_ = 1.0;
+  // The pts → capture-time ring (au_capture_ts_ns).
+  static constexpr std::size_t kPtsRing = 8;
+  struct PtsTs {
+    int64_t pts = INT64_MIN;
+    int64_t ts_ns = 0;
+  };
+  PtsTs pts_ring_[kPtsRing];
+  std::size_t pts_next_ = 0;
+  int64_t au_ts_ns_ = 0;
 #if IM_ENCODE_FFMPEG
   const ffmpeg::Api *api_ = nullptr;
   const AVCodec *codec_ = nullptr;

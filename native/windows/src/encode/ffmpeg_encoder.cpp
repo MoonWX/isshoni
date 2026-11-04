@@ -542,6 +542,18 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
   }
   last_pts_ = pts;
   frame->pts = pts;
+  pts_ring_[pts_next_] = PtsTs{pts, in.ts_ns};
+  pts_next_ = (pts_next_ + 1) % kPtsRing;
+  au_ts_ns_ = 0;
+  bool au_ts_set = false;
+  const auto capture_time = [&](int64_t packet_pts) noexcept {
+    for (const PtsTs &e : pts_ring_) {
+      if (e.pts == packet_pts) {
+        return e.ts_ns;
+      }
+    }
+    return in.ts_ns; // no pts (AV_NOPTS_VALUE) or one older than the ring: the frame just sent
+  };
   frame->pict_type = in.idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
   if (in.idr) {
     frame->flags |= AV_FRAME_FLAG_KEY;
@@ -566,6 +578,10 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
         return AVERROR(ENOMEM);
       }
       keyframe = keyframe || (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
+      if (!au_ts_set) {
+        au_ts_ns_ = capture_time(pkt_->pts); // the AU's first packet
+        au_ts_set = true;
+      }
       api_->av_packet_unref(pkt_);
     }
   };

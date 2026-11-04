@@ -19,6 +19,7 @@ namespace {
 struct Cache {
   std::mutex mu;
   std::optional<im_caps> caps; // the last full probe
+  bool complete = false;       // caps came from im_probe(IM_PROBE_FULL), the OS and audio flags included
   std::string ffmpeg_dir;      // the FFmpeg folder it ran with: another im_init's folder needs a new probe
 };
 
@@ -44,12 +45,13 @@ session::OpenEncoderFn OpenFunctionFor(uint32_t kind) noexcept {
   }
 }
 
-void StoreProbe(const im_caps &caps) noexcept {
+void StoreProbe(const im_caps &caps, bool complete) noexcept {
   Cache &c = TheCache();
   try {
     std::string dir = ffmpeg::DefaultDir();
     std::lock_guard<std::mutex> lock(c.mu);
     c.caps = caps;
+    c.complete = complete;
     c.ffmpeg_dir = std::move(dir);
   } catch (...) {
     std::lock_guard<std::mutex> lock(c.mu);
@@ -61,6 +63,16 @@ void ForgetProbe() noexcept {
   Cache &c = TheCache();
   std::lock_guard<std::mutex> lock(c.mu);
   c.caps.reset();
+}
+
+std::optional<StoredCaps> StoredProbe() {
+  const std::string dir = ffmpeg::DefaultDir();
+  Cache &c = TheCache();
+  std::lock_guard<std::mutex> lock(c.mu);
+  if (!c.caps || session::ProbeCacheStale() || c.ffmpeg_dir != dir) {
+    return std::nullopt;
+  }
+  return StoredCaps{*c.caps, c.complete};
 }
 
 std::vector<session::EncoderEntry> CatalogEntries() {
@@ -78,7 +90,7 @@ std::vector<session::EncoderEntry> CatalogEntries() {
     // any im_probe. The encoders are probed again here, on the worker, before this start relies on them.
     im_caps fresh{};
     if (ProbeForCatalog(fresh) == IM_OK) {
-      StoreProbe(fresh);
+      StoreProbe(fresh, false);
       session::ResetProbeCacheStale();
       caps = fresh;
     } else {

@@ -339,7 +339,8 @@ func reinitSchedule(base int, steps []action) []appliedStep {
 
 // -bitrate-steps on layer f (04 §9.5, §14): for a live encoder, no KEYFRAME or REINIT from the first step until 2 s
 // after the last (a periodic GOP IDR, which carries no REINIT and comes a whole GOP after the previous keyframe, is
-// tolerated: media.Config can't set f's GOP to 10 s), and the rate within ±25 % of each target over the 2 s after its
+// tolerated: media.Config can't set f's GOP to 10 s; a deviation from 04 §14 that report.json lists, see
+// gopDeviation), and the rate within ±25 % of each target over the 2 s after its
 // step; for a re-init encoder, exactly one REINIT|KEYFRAME per applied step (the deferred ones included) and the rate
 // within ±25 % over the 2 s after each REINIT.
 func checkBitrateSteps(l *runLog) []string {

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -162,7 +163,8 @@ bool DuplicationWorks(std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept 
   return false;
 }
 
-uint32_t OsFlags(uint32_t build, std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept {
+// The flags the build alone decides (cheap: a quick probe re-reads them).
+uint32_t BuildFlags(uint32_t build) noexcept {
   uint32_t f = 0;
   if (build >= kMinSupportedBuild) {
     f |= IM_OS_SUPPORTED;
@@ -179,6 +181,14 @@ uint32_t OsFlags(uint32_t build, std::span<const ComPtr<IDXGIAdapter1>> adapters
     f |= IM_OS_WGC_MIN_INTERVAL | IM_OS_WGC_SECONDARY_WINDOWS;
   }
   // IM_OS_WGC_BORDERLESS needs RequestAccessAsync(Borderless) (C++/WinRT): README WA50.
+  return f;
+}
+
+// The flags that need trials (a D3D11 device per adapter, MFStartup): a full probe's, kept by a quick one.
+constexpr uint32_t kTrialOsFlags = IM_OS_DESKTOP_DUPLICATION | IM_OS_MEDIA_FOUNDATION;
+
+uint32_t OsFlags(uint32_t build, std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept {
+  uint32_t f = BuildFlags(build);
   if (DuplicationWorks(adapters)) {
     f |= IM_OS_DESKTOP_DUPLICATION;
   }
@@ -384,17 +394,24 @@ private:
   std::vector<std::vector<uint8_t>> aus_;
 };
 
+// The test encode's sizes, in order: 04 §9.10's 1920×1080, then 1280×720 for an encoder whose maximum is smaller.
+struct TestSize {
+  uint32_t width;
+  uint32_t height;
+};
+constexpr TestSize kTestSizes[] = {{kTestWidth, kTestHeight}, {kTestFallbackWidth, kTestFallbackHeight}};
+
 // The most frames an encoder may hold back before its first AU (some MF and QSV configurations hold one).
 constexpr int kMaxDelayFrames = 3;
 
-session::EncoderParams TestParams(uint32_t kind, uint32_t profile, gpu::Device *device) noexcept {
+session::EncoderParams TestParams(uint32_t kind, uint32_t profile, const TestSize &size, gpu::Device *device) noexcept {
   session::EncoderParams p;
   p.layer = 0;
   p.rid = 'f';
   p.kind = kind;
   p.profile = profile;
-  p.width = kTestWidth;
-  p.height = kTestHeight;
+  p.width = size.width;
+  p.height = size.height;
   p.fps = kTestFps;
   p.bitrate_bps = kTestBitrate;
   p.content_hint = IM_CONTENT_AUTO;
@@ -403,24 +420,52 @@ session::EncoderParams TestParams(uint32_t kind, uint32_t profile, gpu::Device *
   return p;
 }
 
-// Step 3 for one libavcodec encoder on its device: the test encode, the trial opens and the live-bitrate check.
-void TestEncoder(im_encoder_info &info, gpu::Device &device) noexcept {
+// Whether the probe's encoder budget (kEncoderBudgetMs from the probe's start) is spent.
+bool OverBudget(int64_t deadline_ns) noexcept { return NowNs() > deadline_ns; }
+
+// Step 3 for one libavcodec encoder on its device: the test encode, the trial opens and the live-bitrate check. Past
+// deadline_ns no further open or check starts: the trial CB open is skipped (IM_ENCF_CB stays clear) and the live
+// check too (the table's IM_ENCF_LIVE_BITRATE stays), each logged, so a started encoder can't push im_probe past its
+// bound (04 §5.3, §9.10: the whole probe under 2 s).
+void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns) noexcept {
   const encpolicy::EncoderTraits &traits = encpolicy::Traits(info.kind);
+  const std::string_view name = encpolicy::EncoderToken(info.kind);
   const int64_t t0 = NowNs();
   std::unique_ptr<FfmpegEncoder> enc;
   OpenFacts facts;
   uint32_t profile = IM_PROFILE_HIGH;
-  im_status st = FfmpegEncoder::Create(TestParams(info.kind, profile, &device), &enc, &facts);
-  if (st != IM_OK && st != IM_ERR_DEPENDENCY && st != IM_ERR_LIMIT && st != IM_ERR_ENCODER_LOST && traits.cb) {
-    // An encoder that can't do High may still do CB (04 §9.6: the session then runs CB).
-    abi::ClearLastError();
-    profile = IM_PROFILE_CB;
-    st = FfmpegEncoder::Create(TestParams(info.kind, profile, &device), &enc, &facts);
+  TestSize size = kTestSizes[0];
+  im_status st = IM_ERR_NO_ENCODER;
+  // 04 §9.10: 1920×1080, "or the adapter's maximum if smaller": an encoder that can't open 1080p is tried once more
+  // at 1280×720 before it is marked unavailable.
+  for (std::size_t i = 0; i < std::size(kTestSizes); ++i) {
+    if (i > 0) {
+      if (st != IM_ERR_NO_ENCODER || DetailToken() != abi::token::kOpenFailed) {
+        break; // not a size problem: a missing dependency, a session limit, a lost device
+      }
+      if (OverBudget(deadline_ns)) {
+        log::Info("encode", "probe: over budget, smaller size not tried", {{"encoder", name}});
+        break;
+      }
+      abi::ClearLastError();
+    }
+    size = kTestSizes[i];
+    profile = IM_PROFILE_HIGH;
+    st = FfmpegEncoder::Create(TestParams(info.kind, profile, size, &device), &enc, &facts);
+    if (st != IM_OK && st != IM_ERR_DEPENDENCY && st != IM_ERR_LIMIT && st != IM_ERR_ENCODER_LOST && traits.cb &&
+        !OverBudget(deadline_ns)) {
+      // An encoder that can't do High may still do CB (04 §9.6: the session then runs CB).
+      abi::ClearLastError();
+      profile = IM_PROFILE_CB;
+      st = FfmpegEncoder::Create(TestParams(info.kind, profile, size, &device), &enc, &facts);
+    }
+    if (st == IM_OK) {
+      break;
+    }
   }
   if (st != IM_OK) {
     const std::string_view token = DetailToken();
-    log::Info("encode", "probe open failed",
-              {{"encoder", encpolicy::EncoderToken(info.kind)}, {"status", st}, {"detail", abi::LastErrorText()}});
+    log::Info("encode", "probe open failed", {{"encoder", name}, {"status", st}, {"detail", abi::LastErrorText()}});
     SetStatus(info, st, token.empty() ? abi::token::kOpenFailed : token);
     abi::ClearLastError();
     return;
@@ -428,8 +473,12 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device) noexcept {
   if (facts.open_us > kSlowOpenUs) {
     enc.reset();
     SetStatus(info, IM_ERR_NO_ENCODER, abi::token::kSlowOpen);
-    log::Info("encode", "probe: slow open", {{"encoder", encpolicy::EncoderToken(info.kind)}, {"us", facts.open_us}});
+    log::Info("encode", "probe: slow open", {{"encoder", name}, {"us", facts.open_us}});
     return;
+  }
+  if (size.width != kTestSizes[0].width) {
+    log::Info("encode", "probe: tested below 1080p",
+              {{"encoder", name}, {"width", size.width}, {"height", size.height}});
   }
   if (facts.zero_copy) {
     info.flags |= IM_ENCF_ZERO_COPY;
@@ -448,7 +497,7 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device) noexcept {
   const AuFacts first = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
   if (!ok || !first.sps || !first.pps || !first.idr) {
     log::Info("encode", "probe: test encode failed",
-              {{"encoder", encpolicy::EncoderToken(info.kind)},
+              {{"encoder", name},
                {"ok", ok},
                {"aus", run.aus().size()},
                {"sps", first.sps},
@@ -462,7 +511,9 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device) noexcept {
 
   // 04 §9.10's live-bitrate check: two P frames, a 50 % change as §9.5 applies it, two more frames (plus the
   // encoder's delay, so their AUs come out); an IDR in either of those AUs makes it a re-init encoder.
-  if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0) {
+  if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && OverBudget(deadline_ns)) {
+    log::Info("encode", "probe: over budget, live-bitrate check skipped", {{"encoder", name}});
+  } else if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0) {
     bool live_ok = run.Frame(false, &produced) && run.Frame(false, &produced);
     const std::size_t before = run.aus().size();
     live_ok = live_ok && enc->SetBitrate(kTestBitrate / 2) == IM_OK;
@@ -480,16 +531,18 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device) noexcept {
     }
     info.flags = encpolicy::ApplyLiveBitrateCheck(info.flags, idr_after);
     if (idr_after) {
-      log::Info("encode", "live_bitrate_idr", {{"encoder", encpolicy::EncoderToken(info.kind)}, {"ok", live_ok}});
+      log::Info("encode", "live_bitrate_idr", {{"encoder", name}, {"ok", live_ok}});
     }
   }
   enc.reset();
   info.test_encode_us = static_cast<uint32_t>(std::clamp<int64_t>((NowNs() - t0) / 1000, 0, UINT32_MAX));
 
-  // The other profile, by a trial open (04 §9.10: "High and CB from trial opens").
-  if (profile == IM_PROFILE_HIGH && traits.cb) {
+  // The other profile, by a trial open (04 §9.10: "High and CB from trial opens"), at the size that opened.
+  if (profile == IM_PROFILE_HIGH && traits.cb && OverBudget(deadline_ns)) {
+    log::Info("encode", "probe: over budget, CB trial open skipped", {{"encoder", name}});
+  } else if (profile == IM_PROFILE_HIGH && traits.cb) {
     std::unique_ptr<FfmpegEncoder> cb;
-    if (FfmpegEncoder::Create(TestParams(info.kind, IM_PROFILE_CB, &device), &cb, nullptr) == IM_OK) {
+    if (FfmpegEncoder::Create(TestParams(info.kind, IM_PROFILE_CB, size, &device), &cb, nullptr) == IM_OK) {
       info.flags |= IM_ENCF_CB;
     }
     abi::ClearLastError();
@@ -512,6 +565,7 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
   std::array<std::unique_ptr<gpu::Device>, IM_MAX_ADAPTERS> devices;
   std::unique_ptr<gpu::Device> default_device;
   bool timed_out = false;
+  const int64_t deadline_ns = start_ns + static_cast<int64_t>(kEncoderBudgetMs) * 1'000'000;
 
   caps.encoder_count = 0;
   for (const Planned &p : plan) {
@@ -559,7 +613,7 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
       info.flags |= (traits.high ? IM_ENCF_HIGH : 0u) | (traits.cb ? IM_ENCF_CB : 0u);
       continue;
     }
-    if (timed_out || (NowNs() - start_ns) / 1'000'000 > kEncoderBudgetMs) {
+    if (timed_out || OverBudget(deadline_ns)) {
       timed_out = true;
       SetStatus(info, IM_ERR_TIMEOUT, abi::token::kEngineTimeout);
       continue;
@@ -577,7 +631,7 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
         continue;
       }
     }
-    TestEncoder(info, **slot);
+    TestEncoder(info, **slot, deadline_ns);
     const int64_t adapter = p.adapter == encpolicy::kNoAdapter ? -1 : static_cast<int64_t>(p.adapter);
     log::Info("encode", "encoder probed",
               {{"encoder", encpolicy::EncoderToken(p.kind)},
@@ -589,9 +643,31 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
   }
 }
 
+// IM_PROBE_QUICK after a full im_probe (04 §5.3: "cached until the next full probe; a quick probe re-reads OS flags
+// only", < 100 ms): the stored adapters, encoders and audio flags; the OS version, the build's flags and HDR read
+// again, the trial flags (duplication, Media Foundation) kept. False when no complete, current probe is stored.
+bool QuickFromStored(im_caps &caps, int64_t t0) {
+  const std::optional<StoredCaps> stored = StoredProbe();
+  if (!stored || !stored->complete) {
+    return false;
+  }
+  caps = stored->caps;
+  caps.struct_size = sizeof caps;
+  const OsVersion v = ReadOsVersion();
+  caps.os_build = v.build;
+  caps.os_ubr = v.ubr;
+  caps.os_flags = BuildFlags(v.build) | (stored->caps.os_flags & kTrialOsFlags) |
+                  (AdvancedColorOn() ? static_cast<uint32_t>(IM_OS_HDR_DISPLAY) : 0u);
+  caps.probe_ms = static_cast<uint32_t>(std::clamp<int64_t>((NowNs() - t0) / 1'000'000, 0, UINT32_MAX));
+  return true;
+}
+
 im_status ProbeAll(uint32_t flags, im_caps &caps, bool os_and_audio) {
   const int64_t t0 = NowNs();
   const bool full = (flags & IM_PROBE_FULL) != 0;
+  if (!full && os_and_audio && QuickFromStored(caps, t0)) {
+    return IM_OK;
+  }
   caps = im_caps{};
   caps.struct_size = sizeof caps;
   std::vector<ComPtr<IDXGIAdapter1>> adapters = ProbeAdapters(caps);
@@ -623,7 +699,7 @@ im_status Probe(uint32_t flags, im_caps &caps) {
     }
     const bool full = (flags & IM_PROBE_FULL) != 0;
     if (full) {
-      StoreProbe(caps);
+      StoreProbe(caps, true);
       session::ResetProbeCacheStale();
     }
     uint32_t available = 0;

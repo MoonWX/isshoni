@@ -20,7 +20,8 @@ func init() {
 // Asserts: a full probe takes less than 2 s, and every encoder has a status.
 func cmdProbe(_ context.Context, g *globals, args []string) int {
 	fs := newFlags(g, "probe", "[-quick] [-out DIR]")
-	quick := fs.Bool("quick", false, "IM_PROBE_QUICK: which encoders the build has, no test encodes")
+	quick := fs.Bool("quick", false,
+		"IM_PROBE_QUICK, no test encodes: the engine's stored full probe with the OS re-read, else which encoders the build has")
 	out := fs.String("out", ".", "write probe.json into `DIR`")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code

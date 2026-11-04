@@ -70,7 +70,8 @@ func newOggOpus(w io.Writer, channels uint8) *oggWriter {
 	copy(tags[12:], vendor)
 	// no user comments
 	o.page([][]byte{tags}, 0, 0)
-	o.granule = oggPreSkip
+	// RFC 7845 §4: the granule position counts every decoded sample, the pre-skip ones included (the playable length
+	// is granule - pre-skip), so it starts at 0 and a page after N packets carries N × 960.
 	return o
 }
 

@@ -18,8 +18,10 @@
 //   - dll_search_test's vendor-runtime and libvpl part (04 §18.2): in a child process whose current directory and one
 //     PATH entry hold marker DLLs named nvEncodeAPI64.dll, nvcuda.dll, amfrt64.dll, libmfx64-gen.dll and
 //     libmfxhw64.dll, with ONEVPL_SEARCH_PATH and ONEVPL_PRIORITY_PATH pointed at the marker folder and no process
-//     default set, im_init and a full im_probe load none of them: no marker file appears and EnumProcessModules lists
-//     none. A failure of the libvpl names is 04 §17's libvpl risk, not a flake.
+//     default set, im_init, a full im_probe and an open of each vendor encoder (h264_nvenc, h264_qsv, h264_amf on a
+//     default device: the probe plans none of them on a GPU-less runner, so the child forces the loads; each open must
+//     show in FFmpeg's log that it reached its runtime or libvpl's dispatcher) load none of them: no marker file
+//     appears and EnumProcessModules lists none. A failure of the libvpl names is 04 §17's libvpl risk, not a flake.
 //
 // The cases run in this order in one process: FFmpeg, once loaded, stays loaded (04 §9.2), so the cases that need it
 // not loaded come first and skip themselves if it already is (a shuffled run).
@@ -48,6 +50,8 @@
 #include "audio/mixer.h"
 #include "audio_bridge/audio_bridge.h"
 #include "encode/ffmpeg_api.h"
+#include "encode/selector.h"
+#include "gpu/device.h"
 #include "im/encpolicy/encoders.h"
 #include "isshoni_media.h"
 
@@ -424,16 +428,38 @@ TEST(FfmpegLoad, PinnedBuildLoadsAndProbes) {
   }
   std::printf("os build %u.%u flags 0x%x, probe %u ms\n", caps.os_build, caps.os_ubr, caps.os_flags, caps.probe_ms);
 
-  // A quick probe: no test encodes, nothing marked tested.
+  // A quick probe after the full one (04 §5.3: "cached until the next full probe; a quick probe re-reads OS flags
+  // only", < 100 ms): the full probe's adapters, encoders and audio flags, the OS read again.
   const im_caps quick = Probe(IM_PROBE_QUICK);
-  EXPECT_EQ(quick.encoder_count, caps.encoder_count);
+  EXPECT_LT(quick.probe_ms, 100u) << "04 §5.3: a quick probe takes under 100 ms";
+  EXPECT_EQ(quick.os_build, caps.os_build);
+  EXPECT_EQ(quick.os_flags, caps.os_flags);
+  EXPECT_EQ(quick.audio_flags, caps.audio_flags);
+  ASSERT_EQ(quick.adapter_count, caps.adapter_count);
+  for (uint32_t i = 0; i < quick.adapter_count; ++i) {
+    EXPECT_EQ(quick.adapters[i].luid, caps.adapters[i].luid) << i;
+  }
+  ASSERT_EQ(quick.encoder_count, caps.encoder_count);
   for (uint32_t i = 0; i < quick.encoder_count; ++i) {
     EXPECT_EQ(quick.encoders[i].kind, caps.encoders[i].kind) << i;
-    if (quick.encoders[i].kind != IM_ENC_FAKE) {
-      EXPECT_EQ(quick.encoders[i].flags & IM_ENCF_AVAILABLE, 0u) << i;
-      EXPECT_EQ(quick.encoders[i].test_encode_us, 0u) << i;
+    EXPECT_EQ(quick.encoders[i].status, caps.encoders[i].status) << i;
+    EXPECT_EQ(quick.encoders[i].flags, caps.encoders[i].flags) << i;
+    EXPECT_STREQ(quick.encoders[i].reason, caps.encoders[i].reason) << i;
+    EXPECT_EQ(quick.encoders[i].test_encode_us, caps.encoders[i].test_encode_us) << i;
+  }
+
+  // With nothing stored, a quick probe only says which encoders the build has: no test encodes, nothing tested.
+  im::encode::ForgetProbe();
+  const im_caps listed = Probe(IM_PROBE_QUICK);
+  EXPECT_EQ(listed.encoder_count, caps.encoder_count);
+  for (uint32_t i = 0; i < listed.encoder_count; ++i) {
+    EXPECT_EQ(listed.encoders[i].kind, caps.encoders[i].kind) << i;
+    if (listed.encoders[i].kind != IM_ENC_FAKE) {
+      EXPECT_EQ(listed.encoders[i].flags & IM_ENCF_AVAILABLE, 0u) << i;
+      EXPECT_EQ(listed.encoders[i].test_encode_us, 0u) << i;
     }
   }
+  EXPECT_EQ(listed.audio_flags, 0u) << "no stored probe: a quick probe asks 05 nothing";
 }
 
 // ------------------------------------------------------------- dll_search_test's vendor-runtime and libvpl part
@@ -457,6 +483,50 @@ TEST(FfmpegLoadChild, Run) {
     ASSERT_EQ(engine.status(), IM_OK) << LastError();
     (void)Probe(IM_PROBE_FULL);
     ASSERT_NE(im::encode::ffmpeg::Loaded(), nullptr) << "the probe must have loaded FFmpeg for this check to count";
+
+    // On a GPU-less runner the probe plans no vendor encoder (no hardware adapter), so nothing above tried the vendor
+    // runtimes or libvpl's dispatcher. Open each vendor encoder here on a default device (the Basic Render Driver or
+    // WARP): NVENC loads nvcuda.dll and nvEncodeAPI64.dll, AMF amfrt64.dll (through FFmpeg's win32_dlopen), and QSV's
+    // derived device runs MFXLoad, which reads ONEVPL_* and searches for libmfx64-gen.dll / libmfxhw64.dll. They are
+    // expected to fail; each must have got as far as that load, which FFmpeg's log of the open shows.
+    std::unique_ptr<im::gpu::Device> device;
+    ASSERT_EQ(im::gpu::Device::Create(im::gpu::DeviceRequest{}, &device), IM_OK) << LastError();
+    struct VendorOpen {
+      uint32_t kind;
+      const char *codec;
+      std::vector<std::string_view> needles; // one must be in FFmpeg's log of the open (compared without case)
+    };
+    const VendorOpen opens[] = {
+        {IM_ENC_NVENC, "h264_nvenc", {"nvcuda", "nvEncodeAPI"}},
+        {IM_ENC_QSV, "h264_qsv", {"mfx", "vpl"}},
+        {IM_ENC_AMF, "h264_amf", {"amfrt64"}},
+    };
+    for (const VendorOpen &v : opens) {
+      const im::session::OpenEncoderFn open = im::encode::OpenFunctionFor(v.kind);
+      ASSERT_NE(open, nullptr) << v.codec;
+      im::session::EncoderParams p;
+      p.kind = v.kind;
+      p.width = 1920;
+      p.height = 1080;
+      p.fps = 60;
+      p.bitrate_bps = 8'000'000;
+      p.device = device.get();
+      std::unique_ptr<im::session::VideoEncoder> enc;
+      im::encode::ffmpeg::LogCapture capture;
+      const im_status st = open(p, &enc);
+      const std::string detail = LastError();
+      enc.reset();
+      std::printf("vendor open %s: status %d, detail '%s'\n", v.codec, st, detail.c_str());
+      ASSERT_EQ(detail.find("the FFmpeg build has no"), std::string::npos)
+          << "the pinned FFmpeg build must have " << v.codec << " for this check to count: " << detail;
+      bool attempted = st == IM_OK; // an open that worked loaded its runtime from where it may
+      for (const std::string_view needle : v.needles) {
+        attempted = attempted || capture.Contains(needle);
+      }
+      EXPECT_TRUE(attempted) << v.codec << " did not get as far as loading its runtime, so this check proves nothing; "
+                             << "status " << st << ", detail '" << detail << "', FFmpeg's log:\n"
+                             << capture.text();
+    }
   }
   std::string loaded;
   std::vector<HMODULE> modules(1024);

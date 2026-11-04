@@ -91,7 +91,9 @@ struct Api {
   std::string ErrorText(int err) const;
 };
 #else
-struct Api {};
+// Declared only: a translation unit built without FFmpeg's headers (the tests include this file without them) must
+// not define a second, different Api next to the engine's (one definition rule); nothing here uses its members.
+struct Api;
 #endif
 
 // Why a load failed (or IM_OK): the status, the 04 §5.7 token and a detail for im_last_error and the log. The detail

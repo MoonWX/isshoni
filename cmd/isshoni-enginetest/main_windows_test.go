@@ -78,6 +78,10 @@ func withoutEnv(env []string, name string) []string {
 func TestDLLSearchMarker(t *testing.T) {
 	gcc, err := exec.LookPath("gcc")
 	if err != nil {
+		if os.Getenv("CI") == "true" {
+			// The acceptance's "Go process-default check in CI" must not pass by skipping (ffmpeg_load_test's rule).
+			t.Fatal("no gcc on PATH in CI: the Windows jobs put MinGW-w64's there to build the marker DLL")
+		}
 		t.Skip("no gcc to build the marker DLL: windows-native puts MinGW-w64's on PATH; elsewhere this test can't run")
 	}
 	dll := filepath.Join(t.TempDir(), "im-marker.dll")

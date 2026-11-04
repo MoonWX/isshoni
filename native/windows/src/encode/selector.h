@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -31,8 +32,16 @@ namespace im::encode {
 // the test hooks open that one).
 session::OpenEncoderFn OpenFunctionFor(uint32_t kind) noexcept;
 
-// Stores a full probe's result (caps.encoders[] and caps.adapters[]' LUIDs) for CatalogEntries.
-void StoreProbe(const im_caps &caps) noexcept;
+// Stores a full probe's result (caps.encoders[] and caps.adapters[]' LUIDs) for CatalogEntries. complete: caps is
+// im_probe(IM_PROBE_FULL)'s whole answer (the OS and audio flags too), not ProbeForCatalog's encoders only.
+void StoreProbe(const im_caps &caps, bool complete) noexcept;
+
+// The stored full probe when it is still current (same FFmpeg folder, cache not stale), for IM_PROBE_QUICK.
+struct StoredCaps {
+  im_caps caps{};
+  bool complete = false; // see StoreProbe
+};
+std::optional<StoredCaps> StoredProbe();
 
 // Forgets the stored probe (im_shutdown, tests): the next CatalogEntries probes again.
 void ForgetProbe() noexcept;
