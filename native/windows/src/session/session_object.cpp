@@ -48,21 +48,6 @@ template <class F> std::string EventJson(F &&fill) noexcept {
 
 bool ValidLayerBitrate(uint32_t layer, uint32_t bps) noexcept { return encpolicy::ValidVideoBitrate(layer, bps); }
 
-// The word that starts a failure's detail before ": " (a 04 §5.7 token, or the failing call's name such as
-// "im_set_exclusions"), or "" when it starts with none: lower-case letters and '_' only. The session logs
-// only this of a detail that 05's audio code wrote: such a text may name an app, an executable or a rule, and no log
-// record at any level may (04 §5.6, README §3 item 18).
-std::string_view DetailToken(std::string_view detail) noexcept {
-  std::size_t n = 0;
-  while (n < detail.size() && ((detail[n] >= 'a' && detail[n] <= 'z') || detail[n] == '_')) {
-    ++n;
-  }
-  if (n == 0 || n + 1 >= detail.size() || detail[n] != ':' || detail[n + 1] != ' ') {
-    return {};
-  }
-  return detail.substr(0, n);
-}
-
 } // namespace
 
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
@@ -554,7 +539,7 @@ im_status Session::SetContentHint(uint32_t hint) {
 }
 
 im_status Session::SetPaused(bool paused) {
-  paused_.store(paused, std::memory_order_release);
+  const bool old = paused_.exchange(paused, std::memory_order_acq_rel);
   // Audio first: the effective mute is the user's mute OR pause (04 §8.5); the tone fades in 10 ms.
   if (tone_) {
     tone_->tone().SetPaused(paused);
@@ -568,7 +553,18 @@ im_status Session::SetPaused(bool paused) {
   Command c;
   c.type = Command::Type::kPaused;
   c.value = paused ? 1u : 0u;
-  return Push(c);
+  const im_status st = Push(c);
+  if (st != IM_OK) {
+    // A failed call changes nothing (IM_ERR_LIMIT: the queue is full): the flag, the audio and the pacer agree again.
+    paused_.store(old, std::memory_order_release);
+    if (tone_) {
+      tone_->tone().SetPaused(old);
+    }
+    if (mixer_) {
+      mixer_->SetPaused(old);
+    }
+  }
+  return st;
 }
 
 bool Session::SetToneMuted(bool muted) noexcept {
@@ -641,8 +637,9 @@ void Session::VideoLoop() noexcept {
         ApplyRingRequests();
         if (!pacer_->paused() && !paused_.load(std::memory_order_acquire)) {
           // While paused the slots keep the frozen frame (§8.5): new frames wait in them, the newest is taken on
-          // resume. paused_ is set by im_set_paused itself, so no check made after the call takes a frame, also in
-          // the wake-up that was already past ApplyCommands when the call queued its command; resume still waits for
+          // resume. paused_ is set by im_set_paused itself, so no wake-up that checks it after the call takes a
+          // frame, also one that was already past ApplyCommands when the call queued its command; a wake-up already
+          // past this check may take one more frame, published no later than its TakeFrame. Resume still waits for
           // the command (Apply's kPaused takes the newest frame then, uncounted).
           TakeFrame(now, true);
         }

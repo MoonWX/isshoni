@@ -10,7 +10,7 @@
 // - the exclusion rules of im_start (an executable, its app id and its display name), which a fake AudioEngine
 //   (audio_bridge::SetEngineForTest, 04 §18.2) refuses with a detail that repeats them, as 05's text may;
 // - a Mixer whose Start fails with a detail that names another app's executable.
-// The session logs only the token of such a detail (session_object.cpp's DetailToken), so the check also finds the
+// The session logs only the token of such a detail (session.h's DetailToken), so the check also finds the
 // tokens the fake used ("set_rules", "missing") and the records that carry them.
 #include <gtest/gtest.h>
 

@@ -180,6 +180,17 @@ im_status SetToneMuted(bool muted) {
   return IM_OK;
 }
 
+std::string_view DetailToken(std::string_view detail) noexcept {
+  std::size_t n = 0;
+  while (n < detail.size() && ((detail[n] >= 'a' && detail[n] <= 'z') || detail[n] == '_')) {
+    ++n;
+  }
+  if (n == 0 || n + 1 >= detail.size() || detail[n] != ':' || detail[n + 1] != ' ') {
+    return {};
+  }
+  return detail.substr(0, n);
+}
+
 im_status GetStats(im_session s, std::string &json) {
   std::shared_ptr<Session> p;
   if (const im_status st = Find("im_get_stats", s, &p); st != IM_OK) {

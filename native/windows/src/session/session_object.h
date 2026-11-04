@@ -27,10 +27,11 @@
 // - test tone (MMCSS "Pro Audio", IM_AUDIO_MODE_TEST_TONE only): 04 §10.3's tone on an exact 10 ms grid into the
 //   Opus stage. With IM_AUDIO_MODE_EXCLUDE_APPS 05's mixer feeds the stage instead (audio::AudioEngine::NewMixer).
 //
-// Pause (§8.5; README WA52): im_set_paused sets paused_ at once, so no frame published after the call is taken (the
-// video thread checks it beside the pacer's own flag, which the queued command sets), fades the tone or 05's mix bus
-// out in 10 ms (TestTone::SetPaused, Mixer::SetPaused) and leaves the user's mute alone (im_audio_set_muted; for the
-// tone SetToneMuted): each flag is cleared only by its own call.
+// Pause (§8.5; README WA52): im_set_paused sets paused_ at once, so no wake-up of the video thread that checks it after
+// the call takes a frame (it is checked beside the pacer's own flag, which the queued command sets); a wake-up already
+// past the check may take one more frame, published no later than its TakeFrame. It fades the tone or 05's mix bus out
+// in 10 ms (TestTone::SetPaused, Mixer::SetPaused) and leaves the user's mute alone (im_audio_set_muted; for the tone
+// SetToneMuted): each flag is cleared only by its own call. A call whose command can't be queued changes nothing.
 //
 // Logs (§5.6 "Privacy"; README WA52): ids, sizes, tokens and codes, at every level; never a window title or the name of
 // an executable, a process or an app. A failure detail that 05's audio code wrote (SetRules, Mixer::Start) may name
