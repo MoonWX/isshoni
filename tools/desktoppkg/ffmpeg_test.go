@@ -106,13 +106,14 @@ func TestParsePins(t *testing.T) {
 }
 
 // TestInputsSHA256 pins the format of lock.json's inputsSha256 (06 §4.1) with a value computed by the shell:
-// for f in pins.json build.sh ffcheck.c; do printf '%s  native/ffmpeg/%s\n' "$(shasum -a 256 …/$f | cut -c1-64)" "$f"; done | shasum -a 256
+// for f in pins.json build.sh ffcheck.c patches/libvpl-no-exe-dir-or-path.patch; do
+// printf '%s  native/ffmpeg/%s\n' "$(shasum -a 256 …/$f | cut -c1-64)" "$f"; done | shasum -a 256
 func TestInputsSHA256(t *testing.T) {
 	got, err := inputsSHA256(filepath.Join("testdata", "inputs"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "d8e833b4d95f1245236aa7bfc92db5920d013a0051846130be239937d03951b1"; got != want {
+	if want := "f4973475477fc6cb1f03cf618567ff4088615b5f99e0e5d1b34eb97228ed4a21"; got != want {
 		t.Errorf("inputsSHA256 = %s, want %s", got, want)
 	}
 	if _, err := inputsSHA256(t.TempDir()); err == nil {
@@ -140,6 +141,33 @@ func TestInputsSHA256MatchesBuildScript(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(out)); got != want {
 		t.Errorf("build.sh says %s, desktoppkg %s", got, want)
+	}
+}
+
+// TestInputFilesListEveryPatch: every file in native/ffmpeg/patches/ is one of inputFiles, so none can sit there
+// unhashed (and unapplied: build.sh applies its libvpl_patches, which TestInputsSHA256MatchesBuildScript keeps equal
+// to inputFiles' patches), and every patch inputFiles names exists.
+func TestInputFilesListEveryPatch(t *testing.T) {
+	root := repoRoot(t)
+	entries, err := os.ReadDir(filepath.Join(root, "native", "ffmpeg", "patches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk, listed []string
+	for _, e := range entries {
+		onDisk = append(onDisk, "native/ffmpeg/patches/"+e.Name())
+	}
+	for _, f := range inputFiles {
+		if strings.HasPrefix(f, "native/ffmpeg/patches/") {
+			listed = append(listed, f)
+		}
+	}
+	slices.Sort(listed)
+	if !slices.Equal(onDisk, listed) {
+		t.Errorf("native/ffmpeg/patches/ holds %v, inputFiles lists %v", onDisk, listed)
+	}
+	if len(listed) == 0 {
+		t.Error("inputFiles lists no libvpl patch (native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch, 04 §17)")
 	}
 }
 
@@ -282,7 +310,8 @@ func TestBuildScriptRecords(t *testing.T) {
 		"nv_tag": "n12.1.14.1", "nv_tar": "nv-codec-headers-n12.1.14.1.tar.gz", "nv_sha": hash("c"),
 		"amf_tag": "v1.5.3", "amf_tar": "AMF-headers-v1.5.3.tar.gz", "amf_sha": hash("d"),
 		"vpl_tag": "v2.17.0", "vpl_tar": "libvpl-v2.17.0.tar.gz", "vpl_sha": hash("e"),
-		"toolset": "14.44.35207", "compiler": "19.44.35229", "linker": "14.44.35229.0", "sdk": "10.0.26100.0",
+		"vpl_patches": `"patches/libvpl-no-exe-dir-or-path.patch": "` + hash("f") + `"`, "sdk": "10.0.26100.0",
+		"toolset": "14.44.35207", "compiler": "19.44.35229", "linker": "14.44.35229.0",
 		"cmake_version": "4.1.2", "msys_pkgs": `"make": "4.4.1-3", "zip": "3.0-5"`,
 		"avcodec_major": "63", "avutil_major": "61", "avcodec_dll": "avcodec-63.dll", "avutil_dll": "avutil-61.dll",
 		"avcodec_sha": hash("1"), "avutil_sha": hash("2"), "zip_sha": hash("3"), "tar_sha": hash("4"),
@@ -314,6 +343,15 @@ func TestBuildScriptRecords(t *testing.T) {
 			for key, want := range map[string]string{"msvcToolset": "14.44.35207", "msvcCompiler": "19.44.35229", "msvcLinker": "14.44.35229.0"} {
 				if got := fields[key]; got != want {
 					t.Errorf("%s.json: %s is %v, want %q", name, key, got, want)
+				}
+			}
+			if name == "build-manifest" {
+				// Every input's SHA-256 (06 §4.3 step 6), the libvpl patches too.
+				inputs, _ := fields["inputs"].(map[string]any)
+				vpl, _ := inputs["libvpl"].(map[string]any)
+				patches, _ := vpl["patches"].(map[string]any)
+				if got := patches["patches/libvpl-no-exe-dir-or-path.patch"]; got != hash("f") {
+					t.Errorf("build-manifest.json: inputs.libvpl.patches is %v", vpl["patches"])
 				}
 			}
 			if name != "lock-candidate" {
@@ -401,6 +439,21 @@ func TestFFmpegInputsCommand(t *testing.T) {
 	writeFile(t, filepath.Join(root, lockPath), lock)
 	if code, stdout, stderr = runCmd(t, "-root", root, "ffmpeg-inputs", "-check"); code != 0 || strings.TrimSpace(stdout) != want {
 		t.Errorf("-check with a current lock: exit %d, %q, %q", code, stdout, stderr)
+	}
+
+	// A patch change without a new lock is stale too (the patches are inputs, 06 §4.1); restored, the lock is current.
+	patch := filepath.Join(root, "native", "ffmpeg", "patches", "libvpl-no-exe-dir-or-path.patch")
+	original, err := os.ReadFile(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, patch, string(original)+"\n")
+	if code, _, stderr = runCmd(t, "-root", root, "ffmpeg-inputs", "-check"); code != 1 || !strings.Contains(stderr, errStaleLock.Error()) {
+		t.Errorf("-check after a patch change: exit %d, %q", code, stderr)
+	}
+	writeFile(t, patch, string(original))
+	if code, _, stderr = runCmd(t, "-root", root, "ffmpeg-inputs", "-check"); code != 0 {
+		t.Errorf("-check with the patch restored: exit %d, %q", code, stderr)
 	}
 
 	// A pins.json change without a new lock: the consumers' stale failure, word for word (06 §4.1).
@@ -578,12 +631,17 @@ func sampleLock(inputs string) string {
 }
 
 // writeFFmpegInputs writes the inputs of inputsSha256 under root: goodPins as pins.json (not the committed pins, so
-// a bump of pins.json needs no test change) and the committed build.sh and ffcheck.c.
+// a bump of pins.json needs no test change) and the committed build.sh, ffcheck.c and patches.
 func writeFFmpegInputs(t *testing.T, root string) {
 	t.Helper()
 	writeFile(t, filepath.Join(root, pinsPath), goodPins)
-	copyTree(t, filepath.Join(repoRoot(t), "native", "ffmpeg"), filepath.Join(root, "native", "ffmpeg"),
-		"build.sh", "ffcheck.c")
+	var names []string
+	for _, f := range inputFiles {
+		if rel, ok := strings.CutPrefix(f, "native/ffmpeg/"); ok && rel != "pins.json" {
+			names = append(names, filepath.FromSlash(rel))
+		}
+	}
+	copyTree(t, filepath.Join(repoRoot(t), "native", "ffmpeg"), filepath.Join(root, "native", "ffmpeg"), names...)
 }
 
 // copyTree copies the named files of src into dst.

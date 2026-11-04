@@ -17,16 +17,21 @@
 //     hand-over of audio_bridge_test's ProbeFlags case, kept in this file with the probe it checks);
 //   - dll_search_test's vendor-runtime and libvpl part (04 §18.2): in a child process whose current directory and one
 //     PATH entry hold marker DLLs named nvEncodeAPI64.dll, nvcuda.dll, amfrt64.dll, libmfx64-gen.dll and
-//     libmfxhw64.dll, with ONEVPL_SEARCH_PATH and ONEVPL_PRIORITY_PATH pointed at the marker folder and no process
-//     default set, im_init, a full im_probe and an open of each vendor encoder (h264_nvenc, h264_qsv, h264_amf on a
-//     default device: the probe plans none of them on a GPU-less runner, so the child forces the loads; each open must
-//     show in FFmpeg's log that it reached its runtime or libvpl's dispatcher) load none of them: no marker file
-//     appears and EnumProcessModules lists none from the marker folders. On a device without video support (the
-//     runner's Basic Render Driver: no ID3D11VideoDevice) the engine's open stops at av_hwdevice_ctx_init(D3D11VA)
-//     before any runtime, so the child then opens each encoder without a device (system-memory NV12), which reaches
-//     the same loaders inside avcodec_open2, and says so in its output. There nvEncodeAPI64.dll is never asked for
-//     (FFmpeg loads nvcuda.dll first and stops when it is absent): the output says so, and a PC with an NVIDIA
-//     driver checks it. A failure of the libvpl names is 04 §17's libvpl risk, not a flake.
+//     libmfxhw64.dll, whose executable (a copy of this one) has libvpl's two names next to it, with ONEVPL_SEARCH_PATH
+//     and ONEVPL_PRIORITY_PATH pointed at the marker folders and no process default set, im_init, a full im_probe and
+//     an open of each vendor encoder (h264_nvenc, h264_qsv, h264_amf on a default device: the probe plans none of them
+//     on a GPU-less runner, so the child forces the loads; each open must show in FFmpeg's log that it reached its
+//     runtime or libvpl's dispatcher) load none of them: no marker file appears and EnumProcessModules lists none from
+//     the marker folders. On a device without video support (the runner's Basic Render Driver: no ID3D11VideoDevice)
+//     the engine's open stops at av_hwdevice_ctx_init(D3D11VA) before any runtime, so the child then opens each
+//     encoder without a device (system-memory NV12), which reaches the same loaders inside avcodec_open2, and says so
+//     in its output. There nvEncodeAPI64.dll is never asked for (FFmpeg loads nvcuda.dll first and stops when it is
+//     absent): the output says so, and a PC with an NVIDIA driver checks it. A failure of the libvpl names is 04 §17's
+//     libvpl risk, not a flake: r1's libvpl dispatcher loaded both from the PATH entry, and FFmpeg r2 patches it never
+//     to search the executable's folder, PATH or the ONEVPL_* paths (libvpl-no-exe-dir-or-path.patch in
+//     native/ffmpeg/patches). The executable's folder holds only libvpl's names: FFmpeg's own loader (win32_dlopen)
+//     takes the vendor runtimes from the application folder by design (04 §13.3 layer 4), so markers of theirs there
+//     would load and prove nothing.
 //
 // The cases run in this order in one process: FFmpeg, once loaded, stays loaded (04 §9.2), so the cases that need it
 // not loaded come first and skip themselves if it already is (a shuffled run).
@@ -88,6 +93,9 @@ constexpr wchar_t kPathMarkerDirVar[] = L"IM_FFMPEG_LOAD_PATH_MARKERS"; // the P
 // The vendor runtimes FFmpeg's encoders load (nvenc, nvcuda, AMF) and libvpl's runtimes (04 §13.3 layer 4).
 constexpr const wchar_t *kVendorDlls[] = {L"nvEncodeAPI64.dll", L"nvcuda.dll", L"amfrt64.dll", L"libmfx64-gen.dll",
                                           L"libmfxhw64.dll"};
+
+// libvpl's dispatcher (not FFmpeg's loaders) searches for the libmfx names itself (04 §13.3 layer 4).
+bool IsLibvplName(const wchar_t *name) { return std::wstring_view(name).starts_with(L"libmfx"); }
 
 std::optional<std::wstring> GetEnv(const wchar_t *name) {
   const DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
@@ -580,7 +588,11 @@ TEST(FfmpegLoadChild, Run) {
   // System32's nvcuda.dll or amfrt64.dll is where they belong, and is listed but not counted.
   const std::optional<std::wstring> path_marker_dir = GetEnv(kPathMarkerDirVar);
   ASSERT_TRUE(path_marker_dir.has_value()) << "the parent sets " << Utf8(kPathMarkerDirVar);
-  const std::vector<fs::path> marker_dirs = {fs::current_path(), fs::path(*path_marker_dir)};
+  wchar_t self[MAX_PATH] = {};
+  ASSERT_GT(GetModuleFileNameW(nullptr, self, MAX_PATH), 0u);
+  // The executable's folder holds libvpl's markers only (the parent's comment says why).
+  const std::vector<fs::path> marker_dirs = {fs::current_path(), fs::path(*path_marker_dir),
+                                             fs::path(self).parent_path()};
   const auto in_marker_dir = [&](const fs::path &module) {
     for (const fs::path &d : marker_dirs) {
       std::error_code ec;
@@ -627,12 +639,26 @@ TEST(FfmpegLoad, VendorRuntimesAndLibvplNeverLoadFromCwdOrPath) {
   TempDir root;
   const fs::path cwd = root.path() / L"cwd";
   const fs::path path_dir = root.path() / L"path";
+  const fs::path exe_dir = root.path() / L"exe";
   fs::create_directories(cwd);
   fs::create_directories(path_dir);
+  fs::create_directories(exe_dir);
   for (const wchar_t *name : kVendorDlls) {
     fs::copy_file(marker, cwd / name);
     fs::copy_file(marker, path_dir / name);
+    // Next to the child's executable, libvpl's names only: FFmpeg's win32_dlopen searches the application folder by
+    // design (04 §13.3 layer 4), libvpl's dispatcher must not (r2's patch).
+    if (IsLibvplName(name)) {
+      fs::copy_file(marker, exe_dir / name);
+    }
   }
+  // The child runs from a copy of this executable in exe_dir, so that folder is its application folder. The test
+  // binaries link the engine, GoogleTest and vcpkg's ports statically (x64-windows-static), so the copy needs nothing
+  // else next to it.
+  wchar_t self[MAX_PATH] = {};
+  ASSERT_GT(GetModuleFileNameW(nullptr, self, MAX_PATH), 0u);
+  const fs::path exe = exe_dir / fs::path(self).filename();
+  fs::copy_file(fs::path(self), exe);
   const fs::path result_file = root.path() / L"result.txt";
   DWORD exit_code = 0xFFFFFFFF;
   {
@@ -645,9 +671,7 @@ TEST(FfmpegLoad, VendorRuntimesAndLibvplNeverLoadFromCwdOrPath) {
     ScopedEnv search(L"ONEVPL_SEARCH_PATH", path_dir.wstring());
     ScopedEnv priority(L"ONEVPL_PRIORITY_PATH", cwd.wstring());
 
-    wchar_t exe[MAX_PATH] = {};
-    ASSERT_GT(GetModuleFileNameW(nullptr, exe, MAX_PATH), 0u);
-    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --gtest_filter=FfmpegLoadChild.Run";
+    std::wstring cmd = L"\"" + exe.wstring() + L"\" --gtest_filter=FfmpegLoadChild.Run";
     std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
     cmdline.push_back(L'\0');
     STARTUPINFOW si{};
@@ -657,7 +681,7 @@ TEST(FfmpegLoad, VendorRuntimesAndLibvplNeverLoadFromCwdOrPath) {
     si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
-    ASSERT_TRUE(CreateProcessW(exe, cmdline.data(), nullptr, nullptr, TRUE, 0, nullptr, cwd.c_str(), &si, &pi))
+    ASSERT_TRUE(CreateProcessW(exe.c_str(), cmdline.data(), nullptr, nullptr, TRUE, 0, nullptr, cwd.c_str(), &si, &pi))
         << "CreateProcessW failed (" << GetLastError() << ")";
     if (WaitForSingleObject(pi.hProcess, 120000) != WAIT_OBJECT_0) {
       TerminateProcess(pi.hProcess, 99);
@@ -677,11 +701,13 @@ TEST(FfmpegLoad, VendorRuntimesAndLibvplNeverLoadFromCwdOrPath) {
   EXPECT_EQ(result, "none") << "a vendor runtime or libvpl runtime loaded from a planted copy";
   for (const wchar_t *name : kVendorDlls) {
     const std::wstring flag = std::wstring(name) + L".loaded";
-    // libvpl's dispatcher (not FFmpeg's loaders) searches for the libmfx names itself (04 §13.3 layer 4).
-    const bool libvpl = std::wstring_view(name).starts_with(L"libmfx");
+    const bool libvpl = IsLibvplName(name);
     const char *whose = libvpl ? " (libvpl's dispatcher: 04 §17's libvpl risk)" : " (FFmpeg's loader)";
     EXPECT_FALSE(fs::exists(cwd / flag)) << Utf8(name) << " loaded from the current directory" << whose;
     EXPECT_FALSE(fs::exists(path_dir / flag)) << Utf8(name) << " loaded from the PATH entry" << whose;
+    if (libvpl) {
+      EXPECT_FALSE(fs::exists(exe_dir / flag)) << Utf8(name) << " loaded from the executable's folder" << whose;
+    }
   }
 }
 

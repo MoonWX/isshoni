@@ -21,9 +21,14 @@ import (
 
 // The FFmpeg build's files (06 §4.1), relative to the repository root.
 var (
-	pinsPath   = filepath.Join("native", "ffmpeg", "pins.json")
-	lockPath   = filepath.Join("native", "ffmpeg", "lock.json")
-	inputFiles = []string{"native/ffmpeg/pins.json", "native/ffmpeg/build.sh", "native/ffmpeg/ffcheck.c"}
+	pinsPath = filepath.Join("native", "ffmpeg", "pins.json")
+	lockPath = filepath.Join("native", "ffmpeg", "lock.json")
+	// inputFiles are the files inputsSha256 hashes, in order: build.sh's input_files (pins.json, build.sh, ffcheck.c,
+	// then its libvpl_patches in their order).
+	inputFiles = []string{
+		"native/ffmpeg/pins.json", "native/ffmpeg/build.sh", "native/ffmpeg/ffcheck.c",
+		"native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch",
+	}
 )
 
 // errStaleLock is the consumers' failure of 06 §4.1, word for word.
@@ -267,8 +272,8 @@ func decodeStrict(data []byte, v any) error {
 	return nil
 }
 
-// inputsSHA256 is lock.json's inputsSha256: the SHA-256 of the lines "<sha256>  <path>\n" for pins.json, build.sh
-// and ffcheck.c, in that order (06 §4.1; native/ffmpeg/build.sh computes the same).
+// inputsSHA256 is lock.json's inputsSha256: the SHA-256 of the lines "<sha256>  <path>\n" for inputFiles (pins.json,
+// build.sh, ffcheck.c and the libvpl patches), in that order (06 §4.1; native/ffmpeg/build.sh computes the same).
 func inputsSHA256(root string) (string, error) {
 	var lines bytes.Buffer
 	for _, rel := range inputFiles {

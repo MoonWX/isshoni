@@ -21,8 +21,10 @@ native/ffmpeg/build.sh. The configuration, as avcodec_configuration() reports it
 
 It is an LGPL build: no GPL, nonfree or version 3 parts, and no FFmpeg component other than the four hardware H.264
 encoders h264_amf, h264_mf, h264_nvenc and h264_qsv. Intel's libvpl dispatcher (MIT) is linked into the DLLs
-statically, and the NVIDIA and AMD headers (MIT) are compiled in; their licenses are in the folders libvpl,
-nv-codec-headers and amf next to this one.
+statically, with one change by the isshoni project: on Windows it looks for Intel's runtime only in the driver store,
+its registry keys and the Windows system folders, never in the program's folder, the PATH or the ONEVPL_* variables
+(native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch in the source archive). The NVIDIA and AMD headers (MIT) are
+compiled in. Their licenses are in the folders libvpl, nv-codec-headers and amf next to this one.
 
 
 The source code
@@ -35,7 +37,7 @@ release asset isshoni-desktop_<version>_ffmpeg-source.tar, where <version> is th
   https://github.com/MoonWX/isshoni/releases/tag/@TAG@
 
 It holds the source tarballs of FFmpeg, nv-codec-headers, the AMF headers and libvpl exactly as their projects
-publish them, the build script and the configuration above.
+publish them, the build script, the libvpl patch it applies and the configuration above.
 
 
 Replacing the DLLs
@@ -47,7 +49,7 @@ You may replace both DLLs with your own build of FFmpeg: an interface-compatible
 when it loads the DLLs and does not check their contents. An isshoni update installs the shipped DLLs again.
 
 To rebuild the shipped DLLs from the source archive: install MSYS2 (then, in its shell, run
-"pacman -S --needed make pkgconf diffutils zip") and Visual Studio 2022 17.14 or 2026 Build Tools with the MSVC
+"pacman -S --needed make pkgconf diffutils zip patch") and Visual Studio 2022 17.14 or 2026 Build Tools with the MSVC
 v14.44 x64 build tools and the Windows 11 SDK 10.0.26100; unpack the archive and run, in its top folder:
 
   powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe native/ffmpeg/build.sh

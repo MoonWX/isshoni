@@ -1,0 +1,79 @@
+libvpl v2.17.0: the dispatcher never searches the executable's folder, PATH or the ONEVPL_* paths on Windows.
+
+isshoni's FFmpeg build links libvpl's dispatcher statically into avcodec for h264_qsv (docs/m2/06-windows-release.md
+§4.3). Upstream, MFXLoad's search on Windows (LoaderCtxVPL::BuildListOfCandidateLibs) takes a runtime
+(libvpl*.dll, libmfx64-gen.dll, libmfxhw64.dll) from ONEVPL_PRIORITY_PATH, the driver store, the executable's
+folder, every PATH entry, ONEVPL_SEARCH_PATH, the legacy driver store, the dispatcher's registry keys and
+%windir%\system32 / syswow64, and loads each candidate it finds there by full path, so the process's DLL search
+settings (SetDefaultDllDirectories) don't apply. CI's ffmpeg_load_test saw r1's build load libmfx64-gen.dll and
+libmfxhw64.dll planted in a PATH entry (docs/m2/04-windows-engine.md §13.3 layer 4, §17).
+
+This patch drops the executable's folder, PATH, ONEVPL_SEARCH_PATH and ONEVPL_PRIORITY_PATH from that list on
+Windows. What is left is where Intel's drivers install the runtimes: the driver store of each Intel adapter (oneVPL
+and legacy Media SDK), the HKCU and HKLM dispatcher keys and %windir%\system32 / syswow64. The two variables go too,
+although the engine clears them before FFmpeg loads: without them the guarantee doesn't depend on the host (ffcheck,
+isshoni-enginetest, the test binaries) or on the order of its calls. Other platforms are unchanged. MFXLoad's
+low-latency path already searches the driver store and System32 only, and the 1.x MFXInit search (main.cpp) isn't
+used by FFmpeg's libvpl code (qsv.c and hwcontext_qsv.c call MFXLoad and MFXCreateSession).
+
+native/ffmpeg/build.sh applies it with `patch -p1 --fuzz=0` in the unpacked libvpl source and fails the build if it
+doesn't apply. It is an input of inputsSha256 (06 §4.1): changing it needs a new revision.
+
+--- a/libvpl/src/mfx_dispatcher_vpl_loader.cpp
++++ b/libvpl/src/mfx_dispatcher_vpl_loader.cpp
+@@ -473,6 +473,8 @@
+     // special case: ONEVPL_PRIORITY_PATH may be used to specify user-defined path
+     //   and bypass priority sorting (API >= 2.6)
+     searchDirList.clear();
++#if !defined(_WIN32) && !defined(_WIN64)
++    // isshoni: not on Windows (native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch)
+     ParseEnvSearchPaths(ONEVPL_PRIORITY_PATH_VAR, searchDirList);
+     it = searchDirList.begin();
+     while (it != searchDirList.end()) {
+@@ -483,6 +485,7 @@
+ 
+     if (searchDirList.size() > 0)
+         m_bPriorityPathEnabled = true;
++#endif
+ 
+ #if defined(_WIN32) || defined(_WIN64)
+     // retrieve list of DX11 graphics adapters (lightweight)
+@@ -504,35 +507,9 @@
+         it++;
+     }
+ 
+-    // second priority: path to current executable
+-    searchDirList.clear();
+-    GetSearchPathsCurrentExe(searchDirList);
+-    it = searchDirList.begin();
+-    while (it != searchDirList.end()) {
+-        STRING_TYPE nextDir = (*it);
+-        sts                 = SearchDirForLibs(nextDir, m_libInfoList, LIB_PRIORITY_02);
+-        it++;
+-    }
+-
+-    // third priority: PATH environment variable
+-    searchDirList.clear();
+-    ParseEnvSearchPaths(L"PATH", searchDirList);
+-    it = searchDirList.begin();
+-    while (it != searchDirList.end()) {
+-        STRING_TYPE nextDir = (*it);
+-        sts                 = SearchDirForLibs(nextDir, m_libInfoList, LIB_PRIORITY_04);
+-        it++;
+-    }
+-
+-    // fourth priority: ONEVPL_SEARCH_PATH environment variable
+-    searchDirList.clear();
+-    ParseEnvSearchPaths(L"ONEVPL_SEARCH_PATH", searchDirList);
+-    it = searchDirList.begin();
+-    while (it != searchDirList.end()) {
+-        STRING_TYPE nextDir = (*it);
+-        sts                 = SearchDirForLibs(nextDir, m_libInfoList, LIB_PRIORITY_05);
+-        it++;
+-    }
++    // isshoni: no search of the executable's folder, the PATH entries or ONEVPL_SEARCH_PATH (nor, above,
++    //   ONEVPL_PRIORITY_PATH): a runtime is loaded only from the driver store, the dispatcher's registry keys
++    //   and %windir%\system32 / syswow64, never from a folder a planted DLL can sit in.
+ 
+     // legacy MSDK installation: DriverStore has priority
+     searchDirList.clear();
