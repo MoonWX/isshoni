@@ -128,6 +128,10 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		return exitFailed
 	}
 
+	if flavor.err != nil {
+		log.Error("desktop: the e2e build's variables are unusable", "err", flavor.err)
+		return exitFailed
+	}
 	root, err := dataRoot()
 	if err != nil {
 		log.Error("desktop: no data folder", "err", err)
@@ -458,7 +462,7 @@ func appOptions(handler http.Handler, guard func(http.Handler) http.Handler, web
 		},
 		Windows: application.WindowsOptions{
 			WebviewUserDataPath:   webviewData,
-			AdditionalBrowserArgs: []string{autoplayArg},
+			AdditionalBrowserArgs: append([]string{autoplayArg}, flavor.browserArgs...),
 		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
