@@ -649,6 +649,37 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
   return IM_OK;
 }
 
+im_status FfmpegEncoder::Drain(std::vector<std::vector<uint8_t>> *aus) noexcept {
+  if (ctx_ == nullptr) {
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: the encoder is closed");
+  }
+  // h264_mf: the NULL frame sends MFT_MESSAGE_COMMAND_DRAIN, and from then on every receive calls ProcessOutput
+  // until the MFT says MF_E_TRANSFORM_NEED_MORE_INPUT (then AVERROR_EOF).
+  if (const int r = api_->avcodec_send_frame(ctx_, nullptr); r < 0 && r != AVERROR_EOF) {
+    return EncodeFail(r, "avcodec_send_frame(NULL)");
+  }
+  for (;;) {
+    const int r = api_->avcodec_receive_packet(ctx_, pkt_);
+    if (r == AVERROR_EOF) {
+      return IM_OK;
+    }
+    if (r == AVERROR(EAGAIN)) {
+      // Not EOF after a drain request: an encoder that won't finish draining (libavcodec says it can't happen).
+      return abi::Fail(IM_ERR_INTERNAL, {}, "encode: avcodec_receive_packet said EAGAIN while draining");
+    }
+    if (r < 0) {
+      return EncodeFail(r, "avcodec_receive_packet(drain)");
+    }
+    try {
+      aus->emplace_back(pkt_->data, pkt_->data + pkt_->size);
+    } catch (...) {
+      api_->av_packet_unref(pkt_);
+      return abi::Fail(IM_ERR_INTERNAL, {}, "encode: out of memory draining");
+    }
+    api_->av_packet_unref(pkt_);
+  }
+}
+
 im_status FfmpegEncoder::SetBitrate(uint32_t bps) noexcept {
   if (ctx_ == nullptr) {
     return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: the encoder is closed");
@@ -698,6 +729,10 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &, session::EncodedAu
 }
 
 im_status FfmpegEncoder::SetBitrate(uint32_t) noexcept {
+  return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: built without FFmpeg");
+}
+
+im_status FfmpegEncoder::Drain(std::vector<std::vector<uint8_t>> *) noexcept {
   return abi::Fail(IM_ERR_BAD_STATE, {}, "encode: built without FFmpeg");
 }
 

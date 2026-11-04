@@ -355,11 +355,19 @@ AuFacts Inspect(std::span<const uint8_t> au) noexcept {
 // One test session of an encoder: the frames it encoded and the AUs it produced, in order.
 class TestRun {
 public:
-  explicit TestRun(FfmpegEncoder &enc) noexcept : enc_(enc) {}
+  // paced: each frame after the first goes in no sooner than one frame interval (1/kTestFps) after the one before,
+  // as a session sends them (encpolicy::TestEncodePlan).
+  TestRun(FfmpegEncoder &enc, bool paced) noexcept : enc_(enc), paced_(paced) {}
 
   // Encodes one mid-gray frame; appends the AU when the encoder produced one. False on an error (detail set).
   bool Frame(bool idr, bool *produced) noexcept {
     *produced = false;
+    if (paced_ && index_ > 0) {
+      const int64_t due = last_send_ns_ + 1'000'000'000LL / kTestFps;
+      for (int64_t now = NowNs(); now < due; now = NowNs()) {
+        Sleep(static_cast<DWORD>((due - now + 999'999) / 1'000'000));
+      }
+    }
     gpu::Nv12Target t;
     if (enc_.NextTarget(&t) != IM_OK || enc_.FillGray(t) != IM_OK) {
       return false;
@@ -371,6 +379,7 @@ public:
     in.index = index_++;
     ts_ += 1'000'000'000LL / kTestFps;
     session::EncodedAu au;
+    last_send_ns_ = NowNs();
     if (enc_.Encode(in, &au) != IM_OK) {
       return false;
     }
@@ -385,10 +394,15 @@ public:
     return true;
   }
 
+  // End of stream: appends every AU the encoder still held. False on an error (detail set).
+  bool Drain() noexcept { return enc_.Drain(&aus_) == IM_OK; }
+
   const std::vector<std::vector<uint8_t>> &aus() const noexcept { return aus_; }
 
 private:
   FfmpegEncoder &enc_;
+  bool paced_ = false;
+  int64_t last_send_ns_ = 0;
   int64_t ts_ = 0;
   uint32_t index_ = 0;
   std::vector<std::vector<uint8_t>> aus_;
@@ -400,9 +414,6 @@ struct TestSize {
   uint32_t height;
 };
 constexpr TestSize kTestSizes[] = {{kTestWidth, kTestHeight}, {kTestFallbackWidth, kTestFallbackHeight}};
-
-// The most frames an encoder may hold back before its first AU (some MF and QSV configurations hold one).
-constexpr int kMaxDelayFrames = 3;
 
 session::EncoderParams TestParams(uint32_t kind, uint32_t profile, const TestSize &size, gpu::Device *device) noexcept {
   session::EncoderParams p;
@@ -485,14 +496,23 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
   }
   info.flags |= profile == IM_PROFILE_HIGH ? IM_ENCF_HIGH : IM_ENCF_CB;
 
-  // The IDR, allowing the encoder a few frames of delay before its first AU.
-  TestRun run(*enc);
+  // The IDR, allowing the encoder a few frames of delay before its first AU (encpolicy::TestEncodePlan: MF software's
+  // frames are paced, and what it still holds after them may be drained).
+  const encpolicy::TestEncodePlan plan = encpolicy::TestEncodePlanFor(info.kind);
+  TestRun run(*enc, plan.paced);
   bool produced = false;
   bool ok = run.Frame(true, &produced);
   int delay = 0;
-  while (ok && !produced && delay < kMaxDelayFrames) {
+  while (ok && !produced && delay < plan.max_delay_frames) {
     ++delay;
     ok = run.Frame(false, &produced);
+  }
+  bool drained = false;
+  if (ok && !produced && plan.drain) {
+    drained = true;
+    ok = run.Drain();
+    log::Info("encode", "probe: first AU only on drain",
+              {{"encoder", name}, {"frames", delay + 1}, {"ok", ok}, {"aus", run.aus().size()}});
   }
   const AuFacts first = run.aus().empty() ? AuFacts{} : Inspect(run.aus().front());
   if (!ok || !first.sps || !first.pps || !first.idr) {
@@ -500,6 +520,8 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
         "encode", "probe: test encode failed",
         {{"encoder", name},
          {"ok", ok},
+         {"frames", delay + 1},
+         {"drained", drained},
          {"aus", run.aus().size()},
          {"sps", first.sps},
          {"pps", first.pps},
@@ -515,7 +537,11 @@ void TestEncoder(im_encoder_info &info, gpu::Device &device, int64_t deadline_ns
 
   // 04 §9.10's live-bitrate check: two P frames, a 50 % change as §9.5 applies it, two more frames (plus the
   // encoder's delay, so their AUs come out); an IDR in either of those AUs makes it a re-init encoder.
-  if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && OverBudget(deadline_ns)) {
+  // A drained encoder takes no more frames; TestEncodePlan drains only a kind the table doesn't mark live.
+  if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && drained) {
+    info.flags = encpolicy::ApplyLiveBitrateCheck(info.flags, true);
+    log::Info("encode", "probe: drained, live-bitrate check not run", {{"encoder", name}});
+  } else if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0 && OverBudget(deadline_ns)) {
     log::Info("encode", "probe: over budget, live-bitrate check skipped", {{"encoder", name}});
   } else if ((info.flags & IM_ENCF_LIVE_BITRATE) != 0) {
     bool live_ok = run.Frame(false, &produced) && run.Frame(false, &produced);

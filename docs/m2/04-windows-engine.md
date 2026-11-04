@@ -1723,7 +1723,10 @@ with the session.
    version.
 3. Encoders in the order of §9.1: for each, create a device on its adapter, open the encoder at 1920×1080 (or the
    adapter's maximum if smaller), encode one mid-gray NV12 frame as an IDR, check the output has SPS, PPS and an IDR
-   slice, record `test_encode_us`, the flags (zero copy from the hardware config, live bitrate and forced IDR from
+   slice (the encoder may hold back up to 3 more frames before its first AU; for MF software those frames go in one
+   frame interval apart, and if none of the 4 brought an AU, a drain collects what the MFT still holds, since
+   `h264_mf` asks Microsoft's synchronous MFT for output only inside a send; no extra frame is sent), record
+   `test_encode_us`, the flags (zero copy from the hardware config, live bitrate and forced IDR from
    the table of §9.1, High and CB from trial opens) and close. **Live-bitrate check** (§9.5), for every encoder the
    table marks live: after the test IDR, encode two P frames, apply a 50 % bitrate change exactly as §9.5 does,
    encode two more frames; any IDR among those two clears `IM_ENCF_LIVE_BITRATE` for that encoder (logged at info,
