@@ -638,7 +638,7 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
     }
 
     if (p.kind == IM_ENC_OPENH264) {
-      ProbeOpenH264(full, info);
+      ProbeOpenH264(full, deadline_ns, info); // the budget below, applied inside (README WA51)
       continue;
     }
     if (p.kind == IM_ENC_FAKE) {

@@ -2,7 +2,8 @@
 // that maps each IM_ENC_* kind to its open function, and the probe's cached result as session::EncoderEntry values.
 //
 // - The table: the libavcodec kinds (NVENC, QSV, AMF, MF hardware and software) open through FfmpegEncoder::Open;
-//   OpenH264 through OpenOpenH264 (README WA51 replaces openh264_stub.cpp; until then its entry is "disabled").
+//   OpenH264 through OpenOpenH264 (openh264_encoder.cpp, README WA51; its entry is "disabled" until the user turns it
+//   on, im_set_openh264_path).
 // - The cache: the last full probe's encoders[] with the LUID of each one's adapter. CatalogEntries hands them to a
 //   session in the probe's order: FrameInput::kNv12, the device on the encoder's adapter (a software encoder on the
 //   default adapter), the open function of its kind. A session that ended on a removed device marks the cache stale
@@ -50,9 +51,16 @@ void ForgetProbe() noexcept;
 // the cache is stale.
 std::vector<session::EncoderEntry> CatalogEntries();
 
-// OpenH264 (README WA51 fills these in openh264_stub.cpp's place): its probe entry (status IM_ERR_DEPENDENCY
-// "disabled" while it is off) and its open function.
-void ProbeOpenH264(bool full, im_encoder_info &info) noexcept;
+// OpenH264 (openh264_encoder.cpp, README WA51): its probe entry and its open function. The entry is IM_ERR_DEPENDENCY
+// while it is off or its file doesn't load (disabled, missing, version, blocked_by_policy); a full probe test-encodes
+// it (04 §9.10, with the live-bitrate check) and a quick one (full false) reports the last full probe's result for the
+// same library, or IM_OK without IM_ENCF_AVAILABLE when none ran since it was loaded. CatalogEntries and StoredProbe
+// read the entry again, so a changed setting takes effect at the next start and quick probe (04 §5.3). deadline_ns
+// (engine::os::QpcNs) is the probe's encoder budget (probe.h kEncoderBudgetMs, 04 §9.10 "As built") and matters only
+// when full: past it the test encode doesn't start (IM_ERR_TIMEOUT, engine_timeout), and a test encode past it after
+// its IDR skips the live-bitrate check (the table's flag kept, logged). kNoProbeDeadline: no budget.
+inline constexpr int64_t kNoProbeDeadline = INT64_MAX;
+void ProbeOpenH264(bool full, int64_t deadline_ns, im_encoder_info &info) noexcept;
 im_status OpenOpenH264(const session::EncoderParams &params, std::unique_ptr<session::VideoEncoder> *out) noexcept;
 
 } // namespace im::encode
