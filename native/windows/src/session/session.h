@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "api/owned.h"
 #include "isshoni_media.h"
@@ -33,7 +34,9 @@ struct StartResult {
 
 // im_start: starts a session for req (copied, checked) and fills out. IM_ERR_LIMIT (session_limit) beyond 4 sessions
 // or a second one with audio; IM_ERR_SOURCE_GONE (pick_expired) for a used, expired or evicted pick token (which a
-// failed start never consumes); IM_ERR_NO_ENCODER (layer_failed, forced_failed) when a layer gets no encoder.
+// failed start never consumes); IM_ERR_NO_ENCODER (layer_failed, forced_failed) when a layer gets no encoder;
+// IM_ERR_BAD_STATE for IM_AUDIO_MODE_EXCLUDE_APPS after im_init(IM_INIT_NO_AUDIO) (README §3 item 35, 05 §4.3: the
+// test tone still starts).
 im_status Start(const api::StartRequest &req, StartResult &out);
 
 // im_get_session_info: info is zeroed with struct_size = sizeof(im_session_info).
@@ -52,6 +55,23 @@ im_status SetProfile(im_session s, uint32_t profile);                           
 im_status SetContentHint(im_session s, uint32_t hint);                           // IM_CONTENT_*
 im_status SetPaused(im_session s, bool paused);
 im_status SetAudioBitrate(im_session s, uint32_t bps); // 32 000..510 000; IM_ERR_INVALID_ARG without audio
+
+// The user's (pause) mute for the test tone (04 §8.5, §10.3: TestTone::SetMuted, effective mute = user mute OR pause,
+// as on 05's mix bus): im_audio_set_muted's half for a session with IM_AUDIO_MODE_TEST_TONE, whose sound 05's
+// AudioEngine never sees. Sets the flag of every running test-tone session (at most one: one audio session, §6.4);
+// only this call clears it, so im_set_paused(s, 0) keeps it. IM_ERR_BAD_STATE when no test-tone session runs (05
+// §4.3's answer without an audio session). Any thread. src/api/exports.cpp's im_audio_set_muted is to call it beside
+// audio_bridge::Engine().SetMuted and answer IM_OK when either does, also after IM_INIT_NO_AUDIO (where the
+// AudioEngine answers IM_ERR_BAD_STATE but a tone session runs); session_pause_test's
+// ResumeKeepsTheUserMuteOfTheTone then calls im_audio_set_muted (README WA52's hand-over to WA11's file).
+im_status SetToneMuted(bool muted);
+
+// The word that starts a failure's detail before ": " (a 04 §5.7 token, or the failing call's name such as
+// "im_set_exclusions"), or "" when it starts with none: lower-case letters and '_' only. A detail that 05's audio code
+// wrote may name an app, an executable or a rule, and no log record at any level may (04 §5.6, README §3 item 18): the
+// session logs only this of it (SetRules, Mixer::Start), and engine.cpp's "audio init failed" record is to do the same
+// (README WA52's hand-over to the integration step).
+std::string_view DetailToken(std::string_view detail) noexcept;
 
 // im_get_stats: the 04 §5.6 stats document of the session.
 im_status GetStats(im_session s, std::string &json);

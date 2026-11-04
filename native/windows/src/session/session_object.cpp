@@ -326,16 +326,17 @@ im_status Session::StartAudio(const im_start_config &cfg, uint32_t init_flags) {
     return IM_OK;
   }
 
-  // IM_AUDIO_MODE_EXCLUDE_APPS: 05's mixer feeds the stage (04 §10.2). Audio never fails a share (05 §4.3): without
-  // a mixer the session runs without audio packets and says so (audio state off).
+  // IM_AUDIO_MODE_EXCLUDE_APPS: 05's mixer feeds the stage (04 §10.2). After IM_INIT_NO_AUDIO the engine touches no
+  // audio API: session.cpp's Start refuses the mode before anything opens (README §3 item 35); this is its backstop.
+  // Otherwise audio never fails a share (05 §4.3): without a mixer the session runs without audio packets and says so
+  // (audio state off).
   if ((init_flags & IM_INIT_NO_AUDIO) != 0) {
-    audio_state_ = IM_AUDIO_STATE_OFF;
-    return IM_OK;
+    return abi::Fail(IM_ERR_BAD_STATE, {}, "im_start: audio is off (IM_INIT_NO_AUDIO)");
   }
   audio::AudioEngine &ae = audio_bridge::Engine();
   if (cfg.exclusions != nullptr) {
     if (const im_status st = ae.SetRules(cfg.exclusions); st != IM_OK) {
-      log::Warn("session", "audio rules not applied", {{"status", st}, {"detail", abi::LastErrorText()}});
+      log::Warn("session", "audio rules not applied", {{"status", st}, {"token", DetailToken(abi::LastErrorText())}});
       abi::ClearLastError();
     }
   }
@@ -347,7 +348,7 @@ im_status Session::StartAudio(const im_start_config &cfg, uint32_t init_flags) {
   }
   audio::MixerConfig mc{audio_mode_, cfg.audio.flags, stage_.get()};
   if (const im_status st = mixer->Start(mc); st != IM_OK) {
-    log::Warn("session", "audio mixer did not start", {{"status", st}, {"detail", abi::LastErrorText()}});
+    log::Warn("session", "audio mixer did not start", {{"status", st}, {"token", DetailToken(abi::LastErrorText())}});
     abi::ClearLastError();
     audio_state_ = IM_AUDIO_STATE_OFF;
     return IM_OK;
@@ -538,7 +539,7 @@ im_status Session::SetContentHint(uint32_t hint) {
 }
 
 im_status Session::SetPaused(bool paused) {
-  paused_.store(paused, std::memory_order_release);
+  const bool old = paused_.exchange(paused, std::memory_order_acq_rel);
   // Audio first: the effective mute is the user's mute OR pause (04 §8.5); the tone fades in 10 ms.
   if (tone_) {
     tone_->tone().SetPaused(paused);
@@ -552,7 +553,27 @@ im_status Session::SetPaused(bool paused) {
   Command c;
   c.type = Command::Type::kPaused;
   c.value = paused ? 1u : 0u;
-  return Push(c);
+  const im_status st = Push(c);
+  if (st != IM_OK) {
+    // A failed call changes nothing (IM_ERR_LIMIT: the queue is full): the flag, the audio and the pacer agree again.
+    paused_.store(old, std::memory_order_release);
+    if (tone_) {
+      tone_->tone().SetPaused(old);
+    }
+    if (mixer_) {
+      mixer_->SetPaused(old);
+    }
+  }
+  return st;
+}
+
+bool Session::SetToneMuted(bool muted) noexcept {
+  if (!tone_) {
+    return false;
+  }
+  // Its own flag beside the pause (04 §8.5): effective mute = user mute OR pause, each cleared only by its own call.
+  tone_->tone().SetMuted(muted);
+  return true;
 }
 
 im_status Session::SetAudioBitrate(uint32_t bps) {
@@ -614,9 +635,12 @@ void Session::VideoLoop() noexcept {
         CountCaptured(now);
         ApplyCommands(now);
         ApplyRingRequests();
-        if (!pacer_->paused()) {
+        if (!pacer_->paused() && !paused_.load(std::memory_order_acquire)) {
           // While paused the slots keep the frozen frame (§8.5): new frames wait in them, the newest is taken on
-          // resume.
+          // resume. paused_ is set by im_set_paused itself, so no wake-up that checks it after the call takes a
+          // frame, also one that was already past ApplyCommands when the call queued its command; a wake-up already
+          // past this check may take one more frame, published no later than its TakeFrame. Resume still waits for
+          // the command (Apply's kPaused takes the newest frame then, uncounted).
           TakeFrame(now, true);
         }
         for (uint32_t l = 0; l < layer_count_ && !ended_.load(std::memory_order_acquire); ++l) {
