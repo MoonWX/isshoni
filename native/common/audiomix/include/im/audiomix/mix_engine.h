@@ -72,7 +72,7 @@ enum class MixEventCode : uint8_t {
   kReanchor,        // reanchor (tag 0)
   kFastpathLateCut, // fastpath_late_cut
   kTailFade,        // tail_fade: a sound stopped into digital silence and was ramped out (dsp.h); at most once per
-                    // second per channel. Not one of the report's event codes (05 §12.1): the Windows engine logs it
+                    // second per channel, as the report's event code tail_fade (05 §12.1)
 };
 const char *MixEventName(MixEventCode code) noexcept;
 

@@ -238,10 +238,12 @@ Report ManyApps() {
   r.counters = Counters(48, 52, 87, 21.4);
   r.counters.underruns = 2;
   r.counters.trims = 1;
+  r.counters.tail_fades = 3; // the mixer's tail fade (05 §9.5): counted each time, one event per channel per second
   r.events = {Event(7197000000000, ReportEventCode::kUnderrun, "exe:app031.exe"),
               Event(7197500000000, ReportEventCode::kStreamRemoved, "exe:app044.exe"),
               Event(7197540000000, ReportEventCode::kStreamOpened, "exe:app052.exe"),
-              Event(7197580000000, ReportEventCode::kStreamRunning, "exe:app052.exe")};
+              Event(7197580000000, ReportEventCode::kStreamRunning, "exe:app052.exe"),
+              Event(7198000000000, ReportEventCode::kTailFade, "exe:app007.exe")};
   return r;
 }
 
@@ -465,6 +467,7 @@ TEST(ReportWriter, EverySpelling) {
                          "mixer_resync",
                          "underrun",
                          "trim",
+                         "tail_fade",
                          "silent_reopen",
                          "rules_changed",
                          "muted",

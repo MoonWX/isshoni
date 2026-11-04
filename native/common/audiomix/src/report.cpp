@@ -213,6 +213,8 @@ const char *ReportName(ReportEventCode v) noexcept {
     return "underrun";
   case ReportEventCode::kTrim:
     return "trim";
+  case ReportEventCode::kTailFade:
+    return "tail_fade";
   case ReportEventCode::kSilentReopen:
     return "silent_reopen";
   case ReportEventCode::kRulesChanged:
@@ -384,6 +386,7 @@ std::string WriteReportJson(const Report &r) {
   o.U("activationFailures", c.activation_failures);
   o.U("underruns", c.underruns);
   o.U("trims", c.trims);
+  o.U("tailFades", c.tail_fades);
   o.U("overflows", c.overflows);
   o.U("discontinuities", c.discontinuities);
   o.U("mixerResyncs", c.mixer_resyncs);

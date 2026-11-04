@@ -122,9 +122,12 @@ uint64_t FiletimeNow() {
 
 void WakeSignals(void *ctx) { static_cast<Signals *>(ctx)->waiter.Wake(); }
 
-// The mixer's events as the report spells them (05 §12.1). kTailFade is not one of them: the watcher logs it.
+// The mixer's events as the report spells them (05 §12.1). kTailFade arrives at most once per second per channel
+// (the mixer's limit, 05 §9.5), so the report's tail_fade has the same limit.
 ReportEventCode MixEventToReport(audiomix::MixEventCode c) {
   switch (c) {
+  case audiomix::MixEventCode::kTailFade:
+    return ReportEventCode::kTailFade;
   case audiomix::MixEventCode::kStreamRunning:
     return ReportEventCode::kStreamRunning;
   case audiomix::MixEventCode::kStreamRemoved:
@@ -138,7 +141,6 @@ ReportEventCode MixEventToReport(audiomix::MixEventCode c) {
   case audiomix::MixEventCode::kReanchor:
     return ReportEventCode::kReanchor;
   case audiomix::MixEventCode::kFastpathLateCut:
-  case audiomix::MixEventCode::kTailFade:
     break;
   }
   return ReportEventCode::kFastpathLateCut;
@@ -447,6 +449,7 @@ private:
     const audiomix::MixCounters mc = mix->engine().counters();
     mixer_base_.underruns += mc.underruns;
     mixer_base_.trims += mc.trims;
+    mixer_base_.tail_fades += mc.tail_fades;
     mixer_base_.overflows += mc.overflows;
     mixer_base_.mixer_resyncs += mc.mixer_resyncs;
     mixer_base_.fastpath_late_cuts += mc.fastpath_late_cuts;
@@ -514,8 +517,7 @@ private:
       const uint32_t n = live_->engine().DrainEvents(ev, 64);
       for (uint32_t i = 0; i < n; ++i) {
         if (ev[i].code == audiomix::MixEventCode::kTailFade) {
-          ++tails; // a sound stopped into digital silence and was ramped out (README WA09): logged, no app named
-          continue;
+          ++tails; // a sound stopped into digital silence and was ramped out (README §3 item 53)
         }
         Event(ev[i].t_ns, MixEventToReport(ev[i].code), ev[i].tag != 0 ? set_.AppOfTag(ev[i].tag) : std::string());
       }
@@ -836,6 +838,7 @@ private:
     c.discontinuities = sc.discontinuities;
     c.underruns = mixer_base_.underruns;
     c.trims = mixer_base_.trims;
+    c.tail_fades = mixer_base_.tail_fades;
     c.overflows = mixer_base_.overflows;
     c.mixer_resyncs = mixer_base_.mixer_resyncs;
     c.fastpath_late_cuts = mixer_base_.fastpath_late_cuts;
@@ -844,6 +847,7 @@ private:
       const audiomix::MixCounters mc = live_->engine().counters();
       c.underruns += mc.underruns;
       c.trims += mc.trims;
+      c.tail_fades += mc.tail_fades;
       c.overflows += mc.overflows;
       c.mixer_resyncs += mc.mixer_resyncs;
       c.fastpath_late_cuts += mc.fastpath_late_cuts;
