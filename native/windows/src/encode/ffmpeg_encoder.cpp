@@ -609,6 +609,7 @@ im_status FfmpegEncoder::Encode(const session::EncodeInput &in, session::Encoded
   }
   out->data = std::span<const uint8_t>(au_.data(), au_.size());
   out->keyframe = keyframe;
+  out->capture_ts_ns = au_ts_set ? au_ts_ns_ : 0; // 04 §9.2: the frame the AU came from (0 without an AU)
   return IM_OK;
 }
 

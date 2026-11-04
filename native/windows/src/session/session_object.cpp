@@ -249,15 +249,21 @@ im_status Session::StartVideo(const im_start_config &cfg) {
 }
 
 im_status Session::StartFrames() {
-  // The GPU path (§8; README WF2) when an encoder of the session takes pixels: one device per session, on the adapter
-  // of its first candidate that does (§8.1), created before any encoder opens, since FFmpeg wraps it (§9.2). Its
-  // later candidates use the same device (README WA44 decides a cross-adapter one's copy, §9.1 step 3).
+  // The GPU path (§8; README WF2) when the session's first candidate takes pixels: one device per session, on that
+  // candidate's adapter (§8.1), created before any encoder opens, since FFmpeg wraps it (§9.2). Its later candidates
+  // use the same device (README WA44 decides a cross-adapter one's copy, §9.1 step 3). A session whose first
+  // candidate takes nothing (the test hooks' IM_ENC_FAKE on a test: source, which the catalog lists
+  // before the probe's real encoders) gets no device: it stays off WARP like a session of fakes only (frames.h), and
+  // a later candidate that takes pixels fails to open in it (open_failed), so the fallback moves on.
   const EncoderEntry *pixels = nullptr;
   for (const encpolicy::Candidate &c : candidates_) {
-    if (c.probe_index < catalog_.size() && catalog_[c.probe_index].input == FrameInput::kNv12) {
-      pixels = &catalog_[c.probe_index];
-      break;
+    if (c.probe_index >= catalog_.size()) {
+      continue;
     }
+    if (catalog_[c.probe_index].input == FrameInput::kNv12) {
+      pixels = &catalog_[c.probe_index];
+    }
+    break;
   }
   if (pixels != nullptr) {
     if (const im_status st = gpu::Device::Create(pixels->device, &gpu_); st != IM_OK) {
@@ -1032,10 +1038,14 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     return;
   }
   L.last_ts = ts;
+  L.au_times.Sent(ts, e.refresh);
   L.encode_ns.Add(t1 - t0);
   if (au.data.empty()) {
-    return;
+    return; // the encoder holds the frame: its AU comes with a later Encode, stamped with this frame's time
   }
+  // 04 §9.2: the AU's own frame, which is an earlier one than the frame just sent when the encoder holds frames back
+  // (EncodedAu::capture_ts_ns); its capture time and refresh flag go on the packet.
+  const AuTimes::Stamp stamp = L.au_times.ForAu(au.capture_ts_ns, ts, e.refresh);
   h264::NormalizeOptions no;
   no.session_profile = L.profile;
   no.encoder_keyframe = au.keyframe ? 1 : 0;
@@ -1050,9 +1060,9 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     return;
   }
   ring::PacketMeta m;
-  m.flags = (info.keyframe ? IM_PKT_KEYFRAME : 0u) | (e.refresh ? IM_PKT_REFRESH : 0u) |
+  m.flags = (info.keyframe ? IM_PKT_KEYFRAME : 0u) | (stamp.refresh ? IM_PKT_REFRESH : 0u) |
             (L.reinit_next && info.keyframe ? IM_PKT_REINIT : 0u);
-  m.capture_ts_ns = ts;
+  m.capture_ts_ns = stamp.capture_ts_ns;
   m.width = info.width;
   m.height = info.height;
   m.profile = info.profile;
@@ -1060,6 +1070,7 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     return; // counted by the ring; DISCONTINUITY and the IDR follow (§6.2)
   }
   const int64_t pushed = QpcNs();
+  L.au_times.Pushed(m.capture_ts_ns);
   if ((m.flags & IM_PKT_REINIT) != 0) {
     L.reinit_next = false;
   }
@@ -1068,11 +1079,11 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     L.last_idr_bytes = static_cast<uint32_t>(norm.size());
     L.ring_idr_asked = false;
   }
-  if (e.refresh) {
+  if (stamp.refresh) {
     ++L.refreshes;
   }
   L.bytes.Add(pushed, static_cast<uint32_t>(norm.size()));
-  L.latency_ns.Add(pushed - ts);
+  L.latency_ns.Add(pushed - m.capture_ts_ns);
 }
 
 void Session::PublishLimits() {

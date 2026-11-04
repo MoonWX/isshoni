@@ -4,8 +4,9 @@
 // converters, session/frames.h) and the access-unit normalizer (§9.4); an encoder only turns one picture into one
 // Annex B access unit.
 //
-// Encoders today: IM_ENC_FAKE (src/testhooks/, IM_TEST_HOOKS builds only, 04 §18.2). README WA44 adds the libavcodec
-// encoders and the probe's list behind EncoderCatalog, README WA51 OpenH264; the session code does not change.
+// Encoders: the libavcodec ones (NVENC, QSV, AMF, MF hardware and software; src/encode/, README WA44) from the
+// probe's list (encode::CatalogEntries, README WF10 wired it into EncoderCatalog), OpenH264 behind the same entry
+// (README WA51), and IM_ENC_FAKE (src/testhooks/, IM_TEST_HOOKS builds only, 04 §18.2).
 //
 // The picture (04 §8.3, §9.2; README WF2). An encoder that takes pixels (FrameInput::kNv12: every real one) is opened
 // with the session's gpu::Device. Before each Encode the video thread asks it for the NV12 target of the next frame
@@ -80,6 +81,11 @@ struct EncodeInput {
 struct EncodedAu {
   std::span<const uint8_t> data; // Annex B; empty when the encoder buffered the frame
   bool keyframe = false;         // the encoder's own key flag (the normalizer only cross-checks it, §9.4)
+  // The EncodeInput::ts_ns of the frame this AU encodes (04 §9.2's pts → capture-time table): an encoder that holds
+  // frames back (some MF and QSV configurations) returns an earlier frame's AU than the one it was just given, and the
+  // packet carries that frame's time (session/au_times.h). 0: the frame just given (the fake encoder, any encoder
+  // without delay).
+  int64_t capture_ts_ns = 0;
 };
 
 class VideoEncoder {
@@ -119,16 +125,20 @@ struct EncoderEntry {
   gpu::DeviceRequest device;
 };
 
-// The encoders sessions choose from, in the probe's order (im_caps.encoders[]); encpolicy::BuildCandidates sorts
-// them per session. Until README WA44's probe exists this is the test hooks' IM_ENC_FAKE (and the fake-backed
-// fallback kinds a test asks for), all FrameInput::kNone, in IM_TEST_HOOKS builds, and empty in a release build,
-// where im_start then fails with IM_ERR_NO_ENCODER (layer_failed) for any video layer.
+// The encoders sessions choose from; encpolicy::BuildCandidates keeps those whose probe status is IM_OK and sorts them
+// per session into 04 §9.1's order (IM_ENC_AUTO), the catalog's order breaking ties. A release build lists the
+// probe's encoders (encode::CatalogEntries: the last full probe's, or a probe of the encoders run here, on the
+// worker, when none is stored or the cache is stale, 04 §9.8), in its order, all FrameInput::kNv12. An IM_TEST_HOOKS
+// build lists, in this order: SetCatalogPrefixForTest's entries, the test hooks' IM_ENC_FAKE and the fake-backed
+// fallback kinds a test asks for (all FrameInput::kNone), then the probe's encoders, so a fallback kind a test asked
+// for comes before the real encoder of the same kind. Without FFmpeg (the test executables' own folder) every real
+// entry has IM_ERR_DEPENDENCY and takes no part.
 std::vector<EncoderEntry> EncoderCatalog();
 
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
-// Test hooks (session_gpu_test): entries EncoderCatalog lists before the test hooks' fake encoders, for sessions
-// started from now on; an empty list removes them (testhooks::Reset doesn't: the test that sets them clears them).
-// An entry with FrameInput::kNv12 on a WARP device runs a session's GPU path before README WA44's encoders exist.
+// Test hooks (session_gpu_test, session_fake_test): entries EncoderCatalog lists before the test hooks' fake
+// encoders, for sessions started from now on; an empty list removes them (testhooks::Reset doesn't: the test that
+// sets them clears them). An entry with FrameInput::kNv12 on a WARP device runs a session's GPU path without FFmpeg.
 void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries);
 #endif
 

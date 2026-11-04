@@ -18,7 +18,9 @@
 //   table) that the build refuses fails the open; any other unknown option is skipped with a debug log.
 // - Encode (04 §9.2): avcodec_send_frame, then avcodec_receive_packet until EAGAIN; AVFrame.pts is the capture time in
 //   µs since epoch_ns; a forced IDR is pict_type I with the encoder's forced-IDR option on. The access unit is the
-//   packets' bytes as the encoder wrote them; the session's normalizer (04 §9.4) does the rest.
+//   packets' bytes as the encoder wrote them, with the capture time of the frame they came from (the first packet's
+//   pts looked up among the last frames sent: EncodedAu::capture_ts_ns); the session's normalizer (04 §9.4) does the
+//   rest.
 // - SetBitrate (live encoders, 04 §9.5): bit_rate, rc_max_rate and rc_buffer_size change before the next
 //   avcodec_send_frame (FFmpeg reconfigures NVENC and resets QSV). Re-init encoders (AMF, MF) are closed and opened
 //   again by the session.
@@ -79,9 +81,8 @@ public:
 
   // 04 §9.2's pts → capture-time table: the capture time (EncodeInput.ts_ns) of the frame the last Encode's AU came
   // from, found by the first packet's pts among the last kPtsRing frames sent; 0 when that Encode produced no AU.
-  // An encoder with frames of delay emits an AU for an earlier frame than the one just sent. session::EncodedAu has
-  // no field for it yet (session/, outside README WA44): until it does, the session stamps each AU with the frame it
-  // just sent, and the integrator's change is EncodedAu.capture_ts_ns = this value.
+  // An encoder with frames of delay emits an AU for an earlier frame than the one just sent: Encode also returns this
+  // value as EncodedAu::capture_ts_ns, and the session stamps the packet with it (session/au_times.h).
   int64_t au_capture_ts_ns() const noexcept { return au_ts_ns_; }
 
   // The probe's test picture (04 §9.10): mid-gray (Y 128, Cb/Cr 128) written into target, which NextTarget handed

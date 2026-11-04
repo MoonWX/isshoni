@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/media"
+	"github.com/MoonWX/isshoni/internal/media/native"
 )
 
 func init() {
@@ -54,16 +55,9 @@ const (
 	stepsFirstAt   = time.Second
 	stepsSpacing   = 2500 * time.Millisecond
 	keyframesFirst = time.Second
-	defaultGOPMS   = 4000 // the engine's default for f (04 §9.4)
+	// With -bitrate-steps f's GOP is 04 §6.4's maximum (04 §14), so every step falls before the first periodic IDR.
+	stepsGOP = 10 * time.Second
 )
-
-// gopDeviation is report.json's note for -bitrate-steps: 04 §14 sets f's GOP to 10 000 ms so every step falls before
-// the first periodic IDR, but media.Config and native.StartExtra carry no GOP (im_layer_config.gop_ms stays 0, the
-// engine's 4 s). Until internal/media/native maps an optional per-layer GOP to gop_ms (outside README WA44: the
-// integrator's change), f keeps 4 s, checkBitrateSteps tolerates a periodic IDR (no REINIT, a whole GOP after the
-// previous keyframe) between the steps, and a step's 2 s rate window that holds one counts the IDR's bytes.
-const gopDeviation = "-bitrate-steps: f's GOP is the engine's 4000 ms, not 04 §14's 10000 ms (media.Config has no " +
-	"GOP field); periodic IDRs between the steps are tolerated and counted in the rate windows"
 
 // parseBitrate reads "8M", "2.5M", "500k" or "800000".
 func parseBitrate(s string) (int, error) {
@@ -283,7 +277,6 @@ type report struct {
 	Stats        *media.EngineStats `json:"stats,omitempty"`
 	EncodeP95Max map[string]string  `json:"encodeP95Max,omitempty"`
 	CPUPercent   float64            `json:"cpuPercentOfOneCore"`
-	Deviations   []string           `json:"deviations,omitempty"` // where the run differs from 04 §14, and why
 	Failures     []string           `json:"failures"`
 	Pass         bool               `json:"pass"`
 }
@@ -303,6 +296,15 @@ type reportLayer struct {
 	LatencyP50  string  `json:"captureToPacketP50"`
 	LatencyP95  string  `json:"captureToPacketP95"`
 	LatencyP99  string  `json:"captureToPacketP99"`
+}
+
+// captureStartOptions is the native start options of a capture run: -bitrate-steps runs f with stepsGOP (10 s,
+// 04 §14), so no periodic IDR falls between the steps; any other run takes the engine's default GOPs.
+func captureStartOptions(o captureOptions) []native.StartOption {
+	if len(o.steps) > 0 {
+		return []native.StartOption{native.WithGOP("f", stepsGOP)}
+	}
+	return nil
 }
 
 // captureRun is capture and bench: start a session, read it for -seconds while the control goroutine requests
@@ -359,7 +361,7 @@ func captureRun(ctx context.Context, g *globals, o captureOptions) int {
 	}
 	cpu0 := processCPU()
 	wall0 := time.Now()
-	s, err := e.Start(ctx, cfg)
+	s, err := e.StartWith(ctx, cfg, captureStartOptions(o)...)
 	if err != nil {
 		fmt.Fprintf(g.stderr, "%s: start: %v\n", name, err)
 		if sk != nil {
@@ -369,7 +371,7 @@ func captureRun(ctx context.Context, g *globals, o captureOptions) int {
 	}
 	l := &runLog{
 		StartNS: s.Now(), Layers: cfg.Layers, Profile: profile, Test: strings.HasPrefix(cfg.Source, "test:"),
-		Tone: o.audio == "tone", GOPMS: defaultGOPMS, StepsBase: fBps, Steps: o.steps,
+		Tone: o.audio == "tone", StepsBase: fBps, Steps: o.steps,
 	}
 
 	// The control goroutine: keyframe requests or bitrate steps, at their times on the session clock.
@@ -456,9 +458,6 @@ func captureRun(ctx context.Context, g *globals, o captureOptions) int {
 		Command: name, Source: sourceKind, Seconds: o.seconds, Profile: profile, Preset: o.preset, Encoder: o.encoder,
 		Audio: o.audio, Actions: l.Actions, Stats: l.Stats, CPUPercent: cpuPct, EncodeP95Max: map[string]string{},
 		Failures: []string{},
-	}
-	if len(o.steps) > 0 {
-		rep.Deviations = append(rep.Deviations, gopDeviation)
 	}
 	for rid, d := range statsMax {
 		rep.EncodeP95Max[rid] = d.String()

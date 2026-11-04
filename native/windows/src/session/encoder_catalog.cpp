@@ -1,8 +1,10 @@
 #include "session/encoder.h"
 
+#include <iterator>
 #include <mutex>
 #include <utility>
 
+#include "encode/selector.h"
 #include "im/abi/status.h"
 #include "im/encpolicy/encoders.h"
 #include "testhooks/fake_encoder.h"
@@ -58,8 +60,11 @@ std::vector<EncoderEntry> EncoderCatalog() {
     }
   }
 #endif
-  // README WA44: the probe's encoders (libavcodec, MF; README WA51 OpenH264), in its order, with their open
-  // functions, FrameInput::kNv12 and the device request of their adapter.
+  // The probe's encoders (libavcodec: NVENC, QSV, AMF, MF hardware and software; README WA51 OpenH264), in its order
+  // (04 §9.1), with their open functions, FrameInput::kNv12 and the device request of their adapter. This may run the
+  // encoder probe (on the worker: im_start) when none is stored or the cache is stale (04 §9.8).
+  std::vector<EncoderEntry> real = encode::CatalogEntries();
+  out.insert(out.end(), std::make_move_iterator(real.begin()), std::make_move_iterator(real.end()));
   return out;
 }
 

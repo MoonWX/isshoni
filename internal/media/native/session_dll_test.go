@@ -30,31 +30,10 @@ var sessionEngine = func(t *testing.T) *Engine {
 // testPattern is the listed test source of the win-x64-ci DLL.
 var testPattern = media.Source{ID: "test:pattern", Kind: media.SourceScreen, Capture: "test"}
 
-// probeFallback is the engine Conformance runs: until README WA44's probe exists, im_probe answers
-// not_implemented, and the fake encoder the session core uses (04 §18.2) is what a test:pattern session gets with
-// IM_ENC_AUTO, so check 1 is given the probe the win-x64-ci DLL will report for it: IM_ENC_FAKE, tested, live
-// bitrate, both profiles. Everything else is the engine's.
-type probeFallback struct{ *Engine }
-
-func (p probeFallback) Probe(ctx context.Context, refresh bool) (media.Probe, error) {
-	pr, err := p.Engine.Probe(ctx, refresh)
-	var me *media.Error
-	if !errors.As(err, &me) || me.Reason != reasonNotImplemented {
-		return pr, err
-	}
-	return media.Probe{
-		OS: media.OSInfo{Name: "windows", Supported: true},
-		Encoders: []media.EncoderInfo{{Name: "fake", Adapter: -1, Tested: true, LiveBitrate: true,
-			Profiles: []string{profileHigh, profileCB}}},
-		Capture: media.CaptureCaps{MaxFPS: 60},
-		Audio:   media.AudioCapsFromFlags(0),
-	}, nil
-}
-
 // TestDLLConformance is 01 §6.4's suite on the native engine: test:pattern, {Listed, TestTone, Encoder: "fake"},
 // checks 5 (the fake's bitrate follows its target) and 7 (Constrained Baseline) included.
 func TestDLLConformance(t *testing.T) {
-	mediatest.Conformance(t, func(t *testing.T) media.Engine { return probeFallback{sessionEngine(t)} }, testPattern,
+	mediatest.Conformance(t, func(t *testing.T) media.Engine { return sessionEngine(t) }, testPattern,
 		mediatest.Options{Listed: true, TestTone: true, Encoder: "fake"})
 }
 
