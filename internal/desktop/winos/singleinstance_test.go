@@ -234,22 +234,34 @@ var ciPipeLike = regexp.MustCompile(`GetFiles\('\\\\\.\\pipe\\'\) \| Where-Objec
 
 // TestSingleInstanceNames: the mutex and the pipe have the same scope, the user (03 §13.3; README WF19). Both are in
 // a namespace every session shares (Global\ and \\.\pipe\) and carry the user's SID, so each user gets one pair and
-// two users two. The workflows' cleanup pattern still matches the pipe.
+// two users two. The fallback for a squatted mutex (README §3 item 117) is per session in both names: Local\ is the
+// session's own namespace, and the pipe carries the session's number. The workflows' cleanup pattern matches every
+// pipe.
 func TestSingleInstanceNames(t *testing.T) {
 	const sid = "S-1-5-21-1004336348-1177238915-682003330-1001"
-	mutex, pipe := singleInstanceNames(InstanceID, sid)
-	if want := `Global\io.isshoni.desktop.v1.` + sid; mutex != want {
-		t.Errorf("mutex %q, want %q", mutex, want)
+	user, session := singleInstanceNames(InstanceID, sid, 2)
+	want := lockNames{mutex: `Global\io.isshoni.desktop.v1.` + sid, pipe: `\\.\pipe\io.isshoni.desktop.v1.` + sid}
+	if user != want {
+		t.Errorf("per user %+v, want %+v", user, want)
 	}
-	if want := `\\.\pipe\io.isshoni.desktop.v1.` + sid; pipe != want {
-		t.Errorf("pipe %q, want %q", pipe, want)
+	want = lockNames{
+		mutex: `Local\io.isshoni.desktop.v1.` + sid,
+		pipe:  `\\.\pipe\io.isshoni.desktop.v1.` + sid + ".session2",
 	}
-	otherMutex, otherPipe := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002")
-	if otherMutex == mutex || otherPipe == pipe {
-		t.Errorf("two users share the mutex %q or the pipe %q", mutex, pipe)
+	if session != want {
+		t.Errorf("per session %+v, want %+v", session, want)
 	}
-	if tm, tp := singleInstanceNames("io.isshoni.test-1", sid); tm == mutex || tp == pipe {
-		t.Errorf("another id shares the mutex %q or the pipe %q", tm, tp)
+	if u3, s3 := singleInstanceNames(InstanceID, sid, 3); u3 != user || s3.pipe == session.pipe {
+		t.Errorf("session 3: per user %+v (want the same), per-session pipe %q (want another)", u3, s3.pipe)
+	}
+	other, otherSession := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002", 2)
+	if other.mutex == user.mutex || other.pipe == user.pipe || otherSession.mutex == session.mutex ||
+		otherSession.pipe == session.pipe {
+		t.Errorf("two users share a name: %+v %+v", other, otherSession)
+	}
+	if tu, ts := singleInstanceNames("io.isshoni.test-1", sid, 2); tu.mutex == user.mutex || tu.pipe == user.pipe ||
+		ts.mutex == session.mutex || ts.pipe == session.pipe {
+		t.Errorf("another id shares a name: %+v %+v", tu, ts)
 	}
 
 	// The cleanup's pattern, as PowerShell's -like applies it to GetFiles' full names (no '/' in them, so path.Match's
@@ -268,9 +280,60 @@ func TestSingleInstanceNames(t *testing.T) {
 			t.Errorf("%s: the pipe filter is %q, want %q", wf, m[0][1], ciPipePattern)
 		}
 	}
-	for _, p := range []string{pipe, otherPipe} {
+	for _, p := range []string{user.pipe, session.pipe, other.pipe, otherSession.pipe} {
 		if ok, err := path.Match(ciPipePattern, p); !ok || err != nil {
 			t.Errorf("%q doesn't match the cleanup's %q: %v", p, ciPipePattern, err)
+		}
+	}
+}
+
+// TestStateOf: only a mutex this user owns is the user's; a mutex of another owner, one whose owner can't be read,
+// one the user may not open and another kind of object of the name are all squatted (03 §13.3; README §3 item 117).
+func TestStateOf(t *testing.T) {
+	for _, c := range []struct {
+		o           createOutcome
+		ownerIsUser bool
+		want        mutexState
+	}{
+		{createdNew, false, mutexCreated},
+		{openedExists, true, mutexOfThisUser},
+		{openedExists, false, mutexOfOtherAccount},
+		{deniedAccess, false, mutexOfOtherAccount},
+		{otherObject, false, mutexOfOtherAccount},
+	} {
+		if got := stateOf(c.o, c.ownerIsUser); got != c.want {
+			t.Errorf("stateOf(%d, %v) = %d, want %d", c.o, c.ownerIsUser, got, c.want)
+		}
+	}
+}
+
+// TestDecideLock: the per-user pair unless another account squats its mutex; then the per-session pair; with both
+// squatted, no lock and a first instance. A squatted name never makes a launch a second instance, which would exit.
+func TestDecideLock(t *testing.T) {
+	all := []mutexState{mutexCreated, mutexOfThisUser, mutexOfOtherAccount}
+	for _, user := range all {
+		for _, session := range all {
+			scope, first := decideLock(user, session)
+			var wantScope lockScope
+			var wantFirst bool
+			switch {
+			case user == mutexCreated: // the session's state is never read then
+				wantScope, wantFirst = scopeUser, true
+			case user == mutexOfThisUser:
+				wantScope, wantFirst = scopeUser, false
+			case session == mutexCreated:
+				wantScope, wantFirst = scopeSession, true
+			case session == mutexOfThisUser:
+				wantScope, wantFirst = scopeSession, false
+			default:
+				wantScope, wantFirst = scopeNone, true
+			}
+			if scope != wantScope || first != wantFirst {
+				t.Errorf("decideLock(%d, %d) = %d, %v; want %d, %v", user, session, scope, first, wantScope, wantFirst)
+			}
+			if !first && (user == mutexOfOtherAccount && session == mutexOfOtherAccount) {
+				t.Errorf("decideLock(%d, %d): a second instance of squatted names", user, session)
+			}
 		}
 	}
 }

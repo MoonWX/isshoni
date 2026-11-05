@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 )
 
@@ -28,16 +29,93 @@ import (
 // decision 6, §6.2). The cost: a launch in a second session (fast user switching, RDP beside the console) forwards
 // into the instance of the session that started first, whose window the second session doesn't show.
 //
+// A shared namespace lets any local account create the name first (the SID in it is no secret), so the name alone
+// proves nothing (README §3 item 117). The mutex is created with an explicit security descriptor: owner the user's
+// SID (set, not defaulted: an elevated administrator's objects are otherwise owned by BUILTIN\Administrators), and a
+// DACL of the user and SYSTEM only. A launch that finds the name taken opens it for SYNCHRONIZE|READ_CONTROL only,
+// rights the no-write-up label never denies, so an elevated and a non-elevated instance of one user see each other;
+// the mutex is the user's only when its owner, read through that handle, is the user's SID. Anything else (another
+// owner, a mutex the user may not open, another kind of object) is squatted: the launch logs a warning and falls back
+// to the per-session pair, Local\<id>.v1.<SID> and \\.\pipe\<id>.v1.<SID>.session<N>, so another account can't keep
+// the app from starting (one instance per session while the squat lasts; a launch after the squat ends takes the
+// per-user pair beside a per-session instance still running, accepted). With that name squatted too (only a process
+// in the user's own session can), the launch starts with no lock (decideLock).
+//
 // The pipe accepts only the current user (its DACL) and no remote client; the first instance treats what arrives as
 // untrusted arguments (app.HandleArgs). The first instance creates the next pipe instance before it closes the one it
 // served, so the name is never free while it serves; a second launch connects at identification level only (the
 // server can't impersonate it) and forwards nothing to a server that runs as another account.
 
+// lockNames is one pair of single-instance names: the mutex and the pipe the holder of the mutex serves.
+type lockNames struct {
+	mutex, pipe string
+}
+
 // singleInstanceNames derives the single-instance names of id (InstanceID; tests use their own) for the user whose
-// SID is sid: the mutex Global\<id>.v1.<sid> and the pipe \\.\pipe\<id>.v1.<sid>, both in the namespace every session
-// shares.
-func singleInstanceNames(id, sid string) (mutex, pipe string) {
-	return `Global\` + id + ".v1." + sid, `\\.\pipe\` + id + ".v1." + sid
+// SID is sid, in the session numbered session: the per-user pair, Global\<id>.v1.<sid> and \\.\pipe\<id>.v1.<sid>,
+// both in a namespace every session shares, and the per-session fallback for a squatted per-user mutex,
+// Local\<id>.v1.<sid> (the session's own namespace) and \\.\pipe\<id>.v1.<sid>.session<session>.
+func singleInstanceNames(id, sid string, session uint32) (user, perSession lockNames) {
+	base := id + ".v1." + sid
+	sessionPipe := `\\.\pipe\` + base + ".session" + strconv.FormatUint(uint64(session), 10)
+	user = lockNames{mutex: `Global\` + base, pipe: `\\.\pipe\` + base}
+	return user, lockNames{mutex: `Local\` + base, pipe: sessionPipe}
+}
+
+// createOutcome is how creating a single-instance mutex's name ended (CreateMutexExW).
+type createOutcome int
+
+const (
+	createdNew   createOutcome = iota // the name was free: this process created the mutex
+	openedExists                      // ERROR_ALREADY_EXISTS: a handle to the existing mutex
+	deniedAccess                      // ERROR_ACCESS_DENIED: a mutex of that name this user may not open
+	otherObject                       // ERROR_INVALID_HANDLE: another kind of object has the name
+)
+
+// mutexState is whom a single-instance mutex's name belongs to.
+type mutexState int
+
+const (
+	mutexCreated        mutexState = iota // this process created it and holds it now
+	mutexOfThisUser                       // another instance of this user holds it
+	mutexOfOtherAccount                   // squatted: anything that isn't provably this user's
+)
+
+// stateOf classifies a creation's outcome; ownerIsUser reports whether an existing mutex's owner, read through the
+// handle, is this user's SID (false when it can't be read). Only a mutex owned by the user is the user's: the
+// instances set that owner explicitly, and no other account can (03 §13.3).
+func stateOf(o createOutcome, ownerIsUser bool) mutexState {
+	switch {
+	case o == createdNew:
+		return mutexCreated
+	case o == openedExists && ownerIsUser:
+		return mutexOfThisUser
+	default:
+		return mutexOfOtherAccount
+	}
+}
+
+// lockScope is the pair of names a launch ended up with.
+type lockScope int
+
+const (
+	scopeUser    lockScope = iota // the per-user pair (the normal case)
+	scopeSession                  // the per-session pair: another account squats the per-user mutex
+	scopeNone                     // both mutexes squatted: no lock, the launch starts as a first instance
+)
+
+// decideLock is Acquire's decision from the per-user mutex's state and, read only when that one is squatted, the
+// per-session mutex's: which pair the launch uses and whether it is the first instance there. A squatted name never
+// makes a launch a second instance, so another account can't keep this user's app from starting.
+func decideLock(user, session mutexState) (scope lockScope, first bool) {
+	switch {
+	case user != mutexOfOtherAccount:
+		return scopeUser, user == mutexCreated
+	case session != mutexOfOtherAccount:
+		return scopeSession, session == mutexCreated
+	default:
+		return scopeNone, true
+	}
 }
 
 // ForwardTimeout bounds a second instance's forward (03 §13.3, §20).

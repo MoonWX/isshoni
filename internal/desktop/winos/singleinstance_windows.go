@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -33,16 +34,18 @@ var (
 
 // SingleInstance is the single-instance lock and its pipe. Safe for concurrent use.
 type SingleInstance struct {
-	mutexName string
-	pipeName  string
-	sid       string
-	log       *slog.Logger
+	userNames    lockNames // the per-user pair (03 §13.3)
+	sessionNames lockNames // the fallback while another account squats the per-user mutex
+	sid          string
+	log          *slog.Logger
 
-	mu     sync.Mutex
-	mutex  windows.Handle // held by the first instance until Close
-	stop   windows.Handle // Serve's stop event
-	done   chan struct{}
-	closed bool
+	mu        sync.Mutex
+	mutexName string         // the pair Acquire took: userNames until it falls back to sessionNames
+	pipeName  string         // the pipe of that pair, which Serve serves and Forward connects to
+	mutex     windows.Handle // held by the first instance until Close
+	stop      windows.Handle // Serve's stop event
+	done      chan struct{}
+	closed    bool
 }
 
 // NewSingleInstance prepares the lock for id (InstanceID; tests use their own). log nil means slog.Default().
@@ -54,37 +57,109 @@ func NewSingleInstance(id string, log *slog.Logger) (*SingleInstance, error) {
 	if err != nil {
 		return nil, fmt.Errorf("winos: the user's SID: %w", err)
 	}
+	var session uint32
+	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil {
+		return nil, fmt.Errorf("winos: the session: %w", err)
+	}
 	sid := u.User.Sid.String()
-	mutex, pipe := singleInstanceNames(id, sid)
+	user, perSession := singleInstanceNames(id, sid, session)
 	return &SingleInstance{
-		mutexName: mutex,
-		pipeName:  pipe,
-		sid:       sid,
-		log:       log.With("component", "winos"),
+		userNames:    user,
+		sessionNames: perSession,
+		mutexName:    user.mutex,
+		pipeName:     user.pipe,
+		sid:          sid,
+		log:          log.With("component", "winos"),
 	}, nil
 }
 
 // Acquire takes the lock: first is true when no other instance of this user, in any of the user's sessions, holds it.
-// A second instance calls Forward and exits.
+// A second instance calls Forward and exits. A per-user mutex that another account squats never makes this launch a
+// second instance: it falls back to the per-session pair (03 §13.3), and with that squatted too it returns an error,
+// so the caller starts as the first instance without a lock.
 func (s *SingleInstance) Acquire() (first bool, err error) {
-	name, err := windows.UTF16PtrFromString(s.mutexName)
+	sa, err := s.mutexSecurity()
 	if err != nil {
 		return false, err
 	}
-	h, err := windows.CreateMutex(nil, false, name)
-	switch {
-	case errors.Is(err, windows.ERROR_ALREADY_EXISTS):
-		_ = windows.CloseHandle(h) // the first instance holds the name; this process needn't
-		return false, nil
-	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
-		return false, nil // a mutex of the same name we may not open: another instance (elevated) holds it
-	case err != nil:
-		return false, fmt.Errorf("winos: the single-instance mutex: %w", err)
+	userState, h, err := s.createLock(s.userNames.mutex, sa)
+	if err != nil {
+		return false, err
+	}
+	sessionState := mutexOfOtherAccount
+	if userState == mutexOfOtherAccount {
+		// The name with the SID spelled out would put the SID in the log; the pattern says which one it is.
+		s.log.Warn("winos: another account holds this user's single-instance mutex name; "+
+			"one instance per session until it lets go",
+			"name", strings.TrimSuffix(s.userNames.mutex, s.sid)+"<user SID>")
+		if sessionState, h, err = s.createLock(s.sessionNames.mutex, sa); err != nil {
+			return false, err
+		}
+	}
+	scope, first := decideLock(userState, sessionState)
+	names := s.userNames
+	switch scope {
+	case scopeSession:
+		names = s.sessionNames
+	case scopeNone:
+		return false, errors.New("winos: another account holds both single-instance mutex names")
 	}
 	s.mu.Lock()
-	s.mutex = h
+	s.mutexName, s.pipeName = names.mutex, names.pipe
+	if first {
+		s.mutex = h
+	}
 	s.mu.Unlock()
-	return true, nil
+	return first, nil
+}
+
+// mutexSecurity is the mutex's security descriptor: owned by the user (explicitly, so an elevated instance's mutex
+// isn't owned by BUILTIN\Administrators), and open to the user and SYSTEM only.
+func (s *SingleInstance) mutexSecurity() (*windows.SecurityAttributes, error) {
+	sd, err := windows.SecurityDescriptorFromString("O:" + s.sid + "D:P(A;;GA;;;" + s.sid + ")(A;;GA;;;SY)")
+	if err != nil {
+		return nil, fmt.Errorf("winos: the mutex's security descriptor: %w", err)
+	}
+	sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
+	sa.Length = uint32(unsafe.Sizeof(*sa))
+	return sa, nil
+}
+
+// lockAccess is what a launch asks of a mutex it finds: to hold a handle and read the owner. Both are outside the
+// write rights that an elevated instance's mutex label would deny a non-elevated one.
+const lockAccess = windows.SYNCHRONIZE | windows.READ_CONTROL
+
+// createLock creates the mutex name with sa, or finds whom an existing one belongs to. It returns the handle only
+// when this process created the mutex (mutexCreated); a handle to an existing one is closed here.
+func (s *SingleInstance) createLock(name string, sa *windows.SecurityAttributes) (mutexState, windows.Handle, error) {
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return 0, 0, err
+	}
+	h, err := windows.CreateMutexEx(sa, p, 0, lockAccess)
+	switch {
+	case err == nil:
+		return stateOf(createdNew, false), h, nil
+	case errors.Is(err, windows.ERROR_ALREADY_EXISTS):
+		defer func() { _ = windows.CloseHandle(h) }()
+		return stateOf(openedExists, s.ownedByUser(h)), 0, nil
+	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
+		return stateOf(deniedAccess, false), 0, nil
+	case errors.Is(err, windows.ERROR_INVALID_HANDLE):
+		return stateOf(otherObject, false), 0, nil
+	default:
+		return 0, 0, fmt.Errorf("winos: the single-instance mutex: %w", err)
+	}
+}
+
+// ownedByUser reports whether the kernel object h's owner is this user's SID; false when it can't be read.
+func (s *SingleInstance) ownedByUser(h windows.Handle) bool {
+	sd, err := windows.GetSecurityInfo(h, windows.SE_KERNEL_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return false
+	}
+	owner, _, err := sd.Owner()
+	return err == nil && owner != nil && owner.String() == s.sid
 }
 
 // Serve delivers each forwarded command line to onArgs, one at a time, on a goroutine of its own, until Close. Only
@@ -109,7 +184,7 @@ func (s *SingleInstance) Serve(onArgs func(args []string)) error {
 	}
 	s.stop = stop
 	s.done = make(chan struct{})
-	go s.serve(onArgs, sa)
+	go s.serve(onArgs, sa, s.pipeName)
 	return nil
 }
 
@@ -124,9 +199,9 @@ func (s *SingleInstance) pipeSecurity() (*windows.SecurityAttributes, error) {
 	return sa, nil
 }
 
-func (s *SingleInstance) serve(onArgs func([]string), sa *windows.SecurityAttributes) {
+func (s *SingleInstance) serve(onArgs func([]string), sa *windows.SecurityAttributes, pipeName string) {
 	defer close(s.done)
-	name, err := windows.UTF16PtrFromString(s.pipeName)
+	name, err := windows.UTF16PtrFromString(pipeName)
 	if err != nil {
 		return
 	}
@@ -280,7 +355,10 @@ func (s *SingleInstance) Forward(args []string) error {
 		return err
 	}
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(asfwAny))
-	name, err := windows.UTF16PtrFromString(s.pipeName)
+	s.mu.Lock()
+	pipeName := s.pipeName
+	s.mu.Unlock()
+	name, err := windows.UTF16PtrFromString(pipeName)
 	if err != nil {
 		return err
 	}

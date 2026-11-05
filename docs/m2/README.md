@@ -1241,8 +1241,27 @@ the named sections)
      (`isshoni_hw`, then `isshoni_hw production`), M-DESK-12's budgets (§8) (03 §3.2, §20).
 116. **Group 18 as run**: one fix slice, WF19 (the CDP spec's annotations printed and in the job summary, its results
      uploaded on success too, one scope for the single-instance mutex and pipe; items 113–115), and WB16 (group 17's
-     and PR #56's write-backs, items 110–115). WA89 (the owner's M-DA runs) can run on the owner's PC; WA90 and WA91
-     come last. §7 question 11 stays open.
+     and PR #56's write-backs, items 110–115); the integration then closed the squatting hole WF19 opened (item 117).
+     WA89 (the owner's M-DA runs) can run on the owner's PC; WA90 and WA91 come last. §7 question 11 stays open.
+117. **The single-instance mutex can't be squatted by another account** (group 18's integration, after WF19): WF19's
+     per-user `Global\io.isshoni.desktop.v1.<SID>` was created with `CreateMutexW(nil, …)`, so any other local account
+     could create the name first (the SID is no secret), and this user's every start took it for a first instance,
+     forwarded into nothing and exited: a denial of service across accounts that the per-session `Local\` name had not
+     allowed across sessions. Decided: one instance per user stays (item 115's reasons: one data root, one set of device
+     credentials), and the name is trusted only when it is provably the user's. `winos` creates the mutex with
+     `CreateMutexExW` and `O:<SID>D:P(A;;GA;;;<SID>)(A;;GA;;;SY)` (the owner set explicitly: an elevated administrator's
+     objects default to `BUILTIN\Administrators`, and no other account can make the user's SID an owner); a launch that
+     finds the name opens it for `SYNCHRONIZE | READ_CONTROL` only (never denied by the no-write-up label, so an
+     elevated and a non-elevated instance of one user see each other) and is a second instance only when the owner is
+     the user's SID. Anything else (another owner, `ERROR_ACCESS_DENIED`, another kind of object) is squatted: a warning
+     naming the squatted name's pattern (no SID), and the per-session pair `Local\io.isshoni.desktop.v1.<SID>` with
+     `\\.\pipe\io.isshoni.desktop.v1.<SID>.session<N>`, so the app starts; with that squatted too, no lock. Rejected:
+     deciding by whether the per-user pipe answers (the owner check is conclusive and needs no 2 s wait), and a private
+     namespace with a boundary of the user's SID (its scope across sessions and its lifetime would need Windows runs to
+     establish; the owner check uses only documented object security). Accepted: one instance per session while a squat
+     lasts, and a start after the squat ends beside a per-session instance still running. 03 §13.3 and the W6 rows of 03
+     §3.2 say it; the Windows half (`TestSingleInstanceMutexOwner`, `TestSingleInstanceSquatted`) is to be read from the
+     next `windows-go` run.
 
 **Re-cut in this plan**
 - 04 E1 splits into the header and native skeleton (WA03) and the binding's pure Go half, which joins E2's Go loader

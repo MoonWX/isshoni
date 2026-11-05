@@ -8,14 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -160,6 +163,203 @@ func TestSingleInstanceNamesOfThisUser(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// TestSingleInstanceMutexOwner: the first instance's mutex is owned by this user's SID, set explicitly (an elevated
+// process, as on CI, would otherwise give it BUILTIN\Administrators), and open to the user and SYSTEM only; a second
+// instance of the user reads that owner through a SYNCHRONIZE|READ_CONTROL handle and is a second instance of the
+// per-user pair (03 §13.3; README §3 item 117).
+func TestSingleInstanceMutexOwner(t *testing.T) {
+	a, b := serving(t, func([]string) {})
+	p, err := windows.UTF16PtrFromString(a.userNames.mutex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.OpenMutex(windows.READ_CONTROL, false, p)
+	if err != nil {
+		t.Fatalf("OpenMutex(READ_CONTROL): %v", err)
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	sd, err := windows.GetSecurityInfo(h, windows.SE_KERNEL_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil || owner.String() != a.sid {
+		t.Errorf("the mutex's owner is %v (%v), want the user's SID", owner, err)
+	}
+	if got, want := daclSIDs(t, sd), []string{a.sid, "S-1-5-18"}; !slices.Equal(got, want) {
+		t.Errorf("the mutex's DACL allows %q, want %q (the user and SYSTEM)", got, want)
+	}
+	if !a.ownedByUser(h) {
+		t.Error("ownedByUser: false for this user's own mutex")
+	}
+	if first, err := b.Acquire(); err != nil || first {
+		t.Fatalf("second Acquire: %v %v", first, err)
+	}
+	if b.mutexName != a.userNames.mutex || b.pipeName != a.userNames.pipe {
+		t.Errorf("the second instance took %s and %s, want the per-user pair", b.mutexName, b.pipeName)
+	}
+}
+
+// daclSIDs lists the SIDs of sd's DACL's access-allowed ACEs, in order; it fails the test on any other kind of ACE.
+func daclSIDs(t *testing.T, sd *windows.SECURITY_DESCRIPTOR) []string {
+	t.Helper()
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		t.Fatalf("no DACL: %v", err)
+	}
+	var sids []string
+	for i := range uint32(dacl.AceCount) {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, i, &ace); err != nil {
+			t.Fatal(err)
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			t.Fatalf("ACE %d is of type %d", i, ace.Header.AceType)
+		}
+		sids = append(sids, (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String())
+	}
+	return sids
+}
+
+// lockedBuffer is a log destination for a logger that more than one goroutine writes to.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// squat takes name the way another account could, before this user's first launch, and returns the squatter's
+// handle: "denied", a mutex of a DACL that lets this user read its owner but not SYNCHRONIZE; "event", an event of
+// that name; "owner", a mutex open to everyone but owned by BUILTIN\Administrators, which only a process with that
+// group as an owner can create (an elevated one, as on CI; the test is skipped otherwise).
+func squat(t *testing.T, how, name string) windows.Handle {
+	t.Helper()
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs := func(sddl string) *windows.SecurityAttributes {
+		sd, err := windows.SecurityDescriptorFromString(sddl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
+		sa.Length = uint32(unsafe.Sizeof(*sa))
+		return sa
+	}
+	sid := mustSID(t)
+	var h windows.Handle
+	switch how {
+	case "denied":
+		h, err = windows.CreateMutexEx(attrs("D:P(A;;GA;;;SY)(A;;RC;;;"+sid+")"), p, 0, windows.READ_CONTROL)
+	case "event":
+		h, err = windows.CreateEvent(nil, 1, 0, p)
+	case "owner":
+		h, err = windows.CreateMutexEx(attrs("O:BAD:P(A;;GA;;;WD)"), p, 0, windows.SYNCHRONIZE)
+		if errors.Is(err, windows.ERROR_INVALID_OWNER) {
+			t.Skip("BUILTIN\\Administrators can't own this process's objects (not elevated)")
+		}
+	default:
+		t.Fatalf("squat %q", how)
+	}
+	if err != nil {
+		t.Fatalf("squatting %s (%s): %v", name, how, err)
+	}
+	t.Cleanup(func() { _ = windows.CloseHandle(h) })
+	return h
+}
+
+func mustSID(t *testing.T) string {
+	t.Helper()
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.User.Sid.String()
+}
+
+// TestSingleInstanceSquatted: another account that holds the per-user mutex's name (README §3 item 117) doesn't keep
+// this user's app from starting: the launch logs a warning that names the squatted name without the SID, falls back
+// to the per-session pair, and a second launch in the session forwards to it there. With the per-session name taken
+// too, Acquire fails, so main starts without a lock.
+func TestSingleInstanceSquatted(t *testing.T) {
+	for _, how := range []string{"denied", "event", "owner"} {
+		t.Run(how, func(t *testing.T) {
+			id := randomID(t)
+			var log lockedBuffer
+			a, err := NewSingleInstance(id, slog.New(slog.NewTextHandler(&log, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			squat(t, how, a.userNames.mutex)
+			first, err := a.Acquire()
+			if err != nil || !first {
+				t.Fatalf("Acquire with the per-user name squatted: %v %v", first, err)
+			}
+			t.Cleanup(func() { _ = a.Close() })
+			if a.mutexName != a.sessionNames.mutex || a.pipeName != a.sessionNames.pipe {
+				t.Errorf("took %s and %s, want the per-session pair %+v", a.mutexName, a.pipeName, a.sessionNames)
+			}
+			out := log.String() // the text handler quotes the name: its backslash is doubled
+			if !strings.Contains(out, "another account holds this user's single-instance mutex name") ||
+				!strings.Contains(out, "level=WARN") || !strings.Contains(out, `Global\\`+id+".v1.<user SID>") {
+				t.Errorf("no warning: %s", out)
+			}
+			if strings.Contains(out, a.sid) {
+				t.Errorf("the warning holds the SID: %s", out)
+			}
+			got := make(chan []string, 1)
+			if err := a.Serve(func(args []string) { got <- args }); err != nil {
+				t.Fatal(err)
+			}
+			b, err := NewSingleInstance(id, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first, err := b.Acquire(); err != nil || first {
+				t.Fatalf("second Acquire: %v %v", first, err)
+			}
+			if err := b.Forward([]string{"--open-url", "isshoni://watch.example.com/"}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case g := <-got:
+				if !slices.Equal(g, []string{"--open-url", "isshoni://watch.example.com/"}) {
+					t.Errorf("received %q", g)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("nothing received on the per-session pipe")
+			}
+		})
+	}
+	t.Run("both", func(t *testing.T) {
+		si, err := NewSingleInstance(randomID(t), slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatal(err)
+		}
+		squat(t, "event", si.userNames.mutex)
+		squat(t, "event", si.sessionNames.mutex)
+		if first, err := si.Acquire(); err == nil {
+			t.Errorf("Acquire with both names squatted: %v, want an error", first)
+		}
+		if err := si.Serve(func([]string) {}); !errors.Is(err, ErrNotFirst) {
+			t.Errorf("Serve without the lock: %v", err)
+		}
+	})
 }
 
 // TestSingleInstanceInProcess: the second holder of the lock forwards to the first, which receives the arguments
