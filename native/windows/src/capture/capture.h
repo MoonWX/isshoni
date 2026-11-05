@@ -57,8 +57,8 @@ void Shutdown() noexcept;
 // IM_OS_WGC and IM_OS_WGC_PICKER (GraphicsCaptureSession::IsSupported()), IM_OS_WGC_CURSOR_TOGGLE,
 // IM_OS_WGC_MIN_INTERVAL and IM_OS_WGC_SECONDARY_WINDOWS (the properties are present), IM_OS_WGC_BORDERLESS
 // (IsBorderRequired present and GraphicsCaptureAccess allows borderless, §7.1). borderless_wait_ms bounds the access
-// query (BorderlessAllowed); 0 asks nothing and uses the answer kept from an earlier query (a pick, a WGC start, a
-// full probe), as a quick probe must (< 100 ms).
+// query (BorderlessAllowed); 0 asks nothing and uses the answer kept from an earlier query (a pick or a full
+// probe), as a quick probe must (< 100 ms).
 uint32_t OsFlags(uint32_t borderless_wait_ms) noexcept;
 
 } // namespace im::capture

@@ -574,8 +574,9 @@ im_status DdCapture::Start(const DisplayOutput &output, gpu::FrameSlots &slots, 
     const uint32_t degrees = RotationDegrees(impl->dxgi_rotation);
     const bool interrupted = impl->start_interrupted;
     Impl *raw = impl.get();
-    impl->th = std::thread([raw] { raw->Run(); });
+    // The owner first: once the thread runs, every throw unwinds through ~DdCapture, whose Stop joins it.
     std::unique_ptr<DdCapture> cap(new DdCapture(std::move(impl)));
+    cap->impl_->th = std::thread([raw] { raw->Run(); });
     cap->size_ = size;
     log::Info("capture", "dd started",
               {{"w", size.width},

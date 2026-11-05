@@ -164,8 +164,9 @@ bool InstallVerified(std::span<const uint8_t> dll, const fs::path &dir, fs::path
   return true;
 }
 
-// GET url over WinHTTP into *body, at most kMaxCompressed bytes.
-bool Download(const char *url, std::vector<uint8_t> *body, std::string *why) {
+// GET url over WinHTTP into *body, at most kMaxCompressed bytes. *http_status is the response's status (0 without one).
+bool Download(const char *url, std::vector<uint8_t> *body, std::string *why, DWORD *http_status) {
+  *http_status = 0;
   const std::wstring wurl = Widen(url);
   URL_COMPONENTS uc{};
   uc.dwStructSize = sizeof uc;
@@ -210,6 +211,7 @@ bool Download(const char *url, std::vector<uint8_t> *body, std::string *why) {
   if (!WinHttpQueryHeaders(request.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) ||
       status != 200) {
+    *http_status = status;
     *why = "HTTP status " + std::to_string(status);
     return false;
   }
@@ -256,10 +258,24 @@ Fetched Fetch() {
     std::printf("openh264_test: the cached copy doesn't match the pin (%s); downloading again\n", why.c_str());
     fs::remove(cached, ec);
   }
+  // Three tries, 2 s then 5 s apart: one transient DNS, TLS, timeout or 5xx failure is not the PR's. A 4xx (a wrong
+  // pinned URL) won't heal by asking again.
   std::vector<uint8_t> bz;
-  if (!Download(pin::kOpenH264Url, &bz, &f.why)) {
-    f.network = false;
-    return f;
+  constexpr DWORD kRetryWaitMs[] = {2000, 5000};
+  for (int attempt = 1;; ++attempt) {
+    bz.clear();
+    DWORD status = 0;
+    if (Download(pin::kOpenH264Url, &bz, &f.why, &status)) {
+      f.why.clear();
+      break;
+    }
+    if (attempt > static_cast<int>(std::size(kRetryWaitMs)) || (status >= 400 && status < 500)) {
+      f.why += " (attempt " + std::to_string(attempt) + ")";
+      f.network = false;
+      return f;
+    }
+    std::printf("openh264_test: download attempt %d failed (%s); trying again\n", attempt, f.why.c_str());
+    Sleep(kRetryWaitMs[attempt - 1]);
   }
   // The decompressed bytes are bounded at the pinned size + 1, like the app's installer (04 §9.9 step 2).
   if (const Bzip2Result r = Bzip2Decompress(bz, &f.dll, pin::kOpenH264Size + 1); r != Bzip2Result::kOk) {

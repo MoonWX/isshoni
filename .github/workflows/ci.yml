@@ -1542,7 +1542,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run-windows-go == 'true'
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 30 # two go test runs of up to 12 m each
     defaults:
       run:
         shell: pwsh
@@ -1618,16 +1618,32 @@ jobs:
           CGO_ENABLED: '1'
           PKGS: ${{ steps.pkgs.outputs.race }}
         run: |
-          go test -race -count=1 -timeout 12m @(-split $env:PKGS)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # -v so the skips show: each "--- SKIP" and its reason also goes to the step summary.
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-race.log'
+          go test -v -race -count=1 -timeout 12m @(-split $env:PKGS) | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $skips = @(Select-String -LiteralPath $log -Pattern '^\s*--- SKIP: ' -Context 0, 2 | ForEach-Object {
+            "- $($_.Line.Trim()) $(@($_.Context.PostContext | ForEach-Object { $_.Trim() }) -join ' ')" })
+          "### go test -race: skipped tests ($($skips.Count))`n" >> $env:GITHUB_STEP_SUMMARY
+          if ($skips.Count -gt 0) { ($skips -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY }
+          if ($code -ne 0) { exit $code }
 
       - name: go test (CGO_ENABLED=0, as the app ships)
+        # Also after a failed gcc step or -race run: the mode the app ships in reports its own failures in the
+        # same round.
+        if: ${{ !cancelled() && steps.pkgs.outcome == 'success' }}
         env:
           CGO_ENABLED: '0'
           PKGS: ${{ steps.pkgs.outputs.nocgo }}
         run: |
-          go test -count=1 -timeout 12m @(-split $env:PKGS)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-nocgo.log'
+          go test -v -count=1 -timeout 12m @(-split $env:PKGS) | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $skips = @(Select-String -LiteralPath $log -Pattern '^\s*--- SKIP: ' -Context 0, 2 | ForEach-Object {
+            "- $($_.Line.Trim()) $(@($_.Context.PostContext | ForEach-Object { $_.Trim() }) -join ' ')" })
+          "### go test with CGO_ENABLED=0: skipped tests ($($skips.Count))`n" >> $env:GITHUB_STEP_SUMMARY
+          if ($skips.Count -gt 0) { ($skips -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY }
+          if ($code -ne 0) { exit $code }
 
   desktop-macos:
     # The Windows app's Go packages on macOS (M2 06 §10.1): the client core, the media packages,
@@ -1887,6 +1903,14 @@ jobs:
             if ($tool -eq 'cmake') { "ctest=$(Join-Path (Split-Path -Parent $path) 'ctest.exe')" >> $env:GITHUB_OUTPUT }
           }
 
+      - name: Cache openh264_test's verified download
+        # openh264_test downloads Cisco's OpenH264 once per runner; it re-checks a cached copy against the pinned
+        # size and SHA-256 (and downloads again when it differs), and the cache is saved only from a green job.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: native/build/win-x64-ci/windows/openh264
+          key: ${{ runner.os }}-openh264-${{ hashFiles('native/windows/src/encode/openh264_pin.h') }}
+
       - name: win-x64-ci - configure, build and test
         working-directory: native
         env:
@@ -1905,6 +1929,51 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:CTEST --preset win-x64-ci --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The native tests that skipped, and why
+        # ctest counts a binary whose cases all call GTEST_SKIP as passed and prints nothing of it: each test writes
+        # gtest's XML (native/windows/CMakeLists.txt, GTEST_OUTPUT), and this lists every skipped case with its
+        # reason. The skips this runner is known to take (no GPU, no audio device, Windows Server, a test's own
+        # child-process case) are notices; any other is a warning to look at.
+        if: always()
+        run: |
+          Set-StrictMode -Version 3
+          $expected = @(
+            # Windows Server: the H.264 encoder MFT refuses, or gives its AUs only on drain.
+            '^MfSoftware\.',
+            # No Desktop Duplication output on the runner's session.
+            '^Protect\.DesktopDuplicationLeavesTheWindowOut$',
+            # No process loopback (no audio device), or a kept-out app runs.
+            '^AudioLive\.TheFastPathRunsFromTheFirstPlan$',
+            # No render or capture endpoint.
+            '^AudioWatcher\.(OwnSessionKeptOutBeforeAnyRules|MicRootSurvivesUnwatch)$',
+            # A test's own child-process case, skipped when run directly.
+            '^(AudioWatcherChild|AudioProcessChild|DllSearchChild|FfmpegLoadChild)\.',
+            # Opt-in (IM_GPU_TEST_HARDWARE=1).
+            '^GpuHardware\.'
+          )
+          $files = @(Get-ChildItem -Path 'native/build/win-x64-ci' -Recurse -Filter '*.xml' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq 'gtest-xml' })
+          if ($files.Count -eq 0) {
+            '::warning::no gtest XML report was written (native/build/win-x64-ci/**/gtest-xml)'
+            exit 0
+          }
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($f in $files) {
+            $doc = [xml](Get-Content -Raw -LiteralPath $f.FullName)
+            foreach ($tc in @($doc.SelectNodes('//testcase'))) {
+              $skip = $tc.SelectSingleNode('skipped')
+              if ($tc.GetAttribute('result') -ne 'skipped' -and $null -eq $skip) { continue }
+              $name = '{0}.{1}' -f $tc.GetAttribute('classname'), $tc.GetAttribute('name')
+              $why = if ($null -ne $skip) { ($skip.GetAttribute('message') -replace '\s+', ' ').Trim() } else { '' }
+              $line = '{0} / {1}: {2}' -f $f.BaseName, $name, $why
+              $known = @($expected | Where-Object { $name -match $_ }).Count -gt 0
+              if ($known) { "::notice::skipped $line" } else { "::warning::skipped (not one this runner is known to take) $line" }
+              $lines.Add("- $(if ($known) { '' } else { '**unexpected** ' })$line")
+            }
+          }
+          "### Skipped native tests ($($lines.Count))`n" >> $env:GITHUB_STEP_SUMMARY
+          if ($lines.Count -gt 0) { ($lines -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY }
 
       - name: The delay-load helper and /DEPENDENTLOADFLAG (README WA11's verdict)
         if: always()
@@ -2150,6 +2219,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
+        id: go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -2171,17 +2241,20 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
 
       - name: Set up Task
+        id: task
         uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
         with:
           version: ${{ needs.changes.outputs.task-version }}
 
       - name: Download web/dist
+        id: webdist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: web-dist
           path: web/dist
 
       - name: Download windows-native
+        id: native
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-native
@@ -2362,7 +2435,11 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      # From here on the checks that don't need each other run each on its own prerequisites (not on every step
+      # before them), so one round reports every independent failure; the job still fails on any of them.
       - name: gcc for cgo (MinGW-w64, for the race detector)
+        id: gcc
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: |
           if (Get-Command gcc -ErrorAction SilentlyContinue) {
             gcc --version | Select-Object -First 1
@@ -2387,6 +2464,7 @@ jobs:
         # them from its own folder (04 §9.2). README WA44 adds isshoni-enginetest: its startup's process default (04
         # §13.3 layer 2, with the marker DLL built by the gcc above) and its probe against that DLL. 06 R5: the run
         # must contain TestNativeIntoPublisher's PASS (04 §18.2's milestone), not a skip.
+        if: ${{ !cancelled() && steps.gcc.outcome == 'success' && steps.native.outcome == 'success' }}
         env:
           CGO_ENABLED: '1'
           ISSHONI_TEST_ENGINE_DLL: ${{ runner.temp }}\windows-native\ci\isshoni-media.dll
@@ -2407,6 +2485,7 @@ jobs:
           "TestNativeIntoPublisher: $(@($lines -match '^\s*--- PASS: TestNativeIntoPublisher\b')[0].Trim())"
 
       - name: isshoni-audiotest selfcheck (the win-x64-ci DLL)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.native.outcome == 'success' }}
         run: |
           # 05 §18.2 (CI Windows runs it): the analyzer on synthetic signals, then native.Open of the DLL next to the
           # exe (im_version, every export, the im_test_* hooks of the ci\ build), the probe and a watcher start and
@@ -2426,6 +2505,7 @@ jobs:
         # M2 06 §16: deploy/test/install-desktop.Tests.ps1 under Windows PowerShell 5.1 (lint-deploy runs it under
         # pwsh). This step's shell is Windows PowerShell, and PSModulePath is the machine's: a powershell.exe started
         # from pwsh would inherit pwsh's module path and load PowerShell 7's modules.
+        if: ${{ !cancelled() && steps.task.outcome == 'success' }}
         shell: powershell
         run: |
           $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
@@ -2437,6 +2517,7 @@ jobs:
         # M2 06 §10.1, §16: every script that runs under Windows PowerShell 5.1 parses with its parser
         # ([System.Management.Automation.Language.Parser]::ParseFile under powershell.exe); lint:ps (PSScriptAnalyzer
         # with PSUseCompatibleSyntax) runs under pwsh in lint-deploy.
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 5) { throw "this is PowerShell $($PSVersionTable.PSVersion), not 5.1" }
@@ -2465,6 +2546,8 @@ jobs:
         # (ISSHONI_DOWNLOAD_BASE, ISSHONI_NO_LAUNCH=1; ISSHONI_VERSION is this workflow's), verifying with the inbox
         # ssh-keygen. A mirror with a changed installer and one whose checksums.txt is signed by another key are
         # refused first, with nothing installed; then the real one installs, and is uninstalled again (/PURGE).
+        # It refuses to start over an install a failed smoke left behind.
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         env:
           SETUP: ${{ steps.package.outputs.setup }}
           VERSION: ${{ env.ISSHONI_VERSION }}
@@ -2552,8 +2635,10 @@ jobs:
               $env:ISSHONI_NO_UPDATE_CHECKS = '1'
               $errFile = Join-Path $work "$Label.err"
               try {
+                # Progress off before anything loads: 5.1 with redirected output writes progress records to stderr.
                 $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `
-                  "Get-Content -Raw -LiteralPath '$ps1' | Invoke-Expression" 2>$errFile | Out-String
+                  "`$ProgressPreference = 'SilentlyContinue'; Get-Content -Raw -LiteralPath '$ps1' | Invoke-Expression" `
+                  2>$errFile | Out-String
                 $code = $LASTEXITCODE
               } finally {
                 $env:PSModulePath = $saved
@@ -2561,6 +2646,21 @@ jobs:
               }
               $err = ''
               if (Test-Path -LiteralPath $errFile) { $err = [IO.File]::ReadAllText($errFile) }
+              # A CLIXML block of progress records only (e.g. 5.1's 'Preparing modules for first use.') is not the
+              # script writing to stderr; anything else in it (an S="Error" record) still counts.
+              if ($err -match '^\s*#< CLIXML\s*(<Objs[\s\S]*</Objs>)\s*$') {
+                $records = $null
+                try {
+                  $x = [xml]('<r>' + $Matches[1] + '</r>') # one or more <Objs> blocks
+                  $records = @($x.SelectNodes('/r/*[local-name()="Objs"]/*'))
+                } catch {
+                  Write-Host "stderr's CLIXML doesn't parse: $($_.Exception.Message)"
+                }
+                if ($null -ne $records -and @($records | Where-Object { $_.GetAttribute('S') -ne 'progress' }).Count -eq 0) {
+                  Write-Host "stderr (progress records only, ignored): $err"
+                  $err = ''
+                }
+              }
               Write-Host "---- $Label ($Base): exit $code"
               Write-Host $out
               if ($err.Trim()) { Write-Host "stderr: $err" }
@@ -2622,6 +2722,8 @@ jobs:
           }
 
       - name: The WebView2 runtime (120.0 or newer) for the CDP spec
+        id: webview2
+        if: ${{ !cancelled() && steps.native.outcome == 'success' }}
         env:
           WEBVIEW2: ${{ runner.temp }}\windows-native\release\MicrosoftEdgeWebview2Setup.exe
         run: |
@@ -2653,6 +2755,7 @@ jobs:
 
       - name: The e2e isshoni.exe and the server (task desktop:exe:windows TAGS=e2e, go build ./cmd/isshoni)
         id: e2e-exe
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.task.outcome == 'success' && steps.native.outcome == 'success' && steps.webdist.outcome == 'success' }}
         env:
           VERSION: ${{ env.ISSHONI_VERSION }}
         run: |
@@ -2670,16 +2773,26 @@ jobs:
           "exe=$exe" >> $env:GITHUB_OUTPUT
 
       - name: The app's Go tests under -tags e2e (flavor_e2e.go's variables and credential prefix)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: |
           # Only -tags e2e compiles flavor_e2e.go and its tests (03 §22.4 B, README WA72): the refusals of malformed
           # ISSHONI_E2E_CDP_PORT and ISSHONI_E2E_DATA_DIR values and the isshoni-test:<random>: credential prefix
-          # (Credential Manager here) that the CDP spec's success path doesn't show. windows-go runs the package
-          # without the tag.
+          # (Credential Manager here) that the CDP spec's success path doesn't show. windows-go runs the package's
+          # other tests without the tag, so only flavor_e2e_test.go's run here, and each must PASS (a rename
+          # can't silently match nothing).
           $env:CGO_ENABLED = '0'
-          go test -count=1 -tags e2e ./cmd/isshoni-desktop/
+          $tests = 'TestE2ESettings', 'TestAppOptionsE2EPort', 'TestE2ECredentials'
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-e2e.log'
+          go test -v -count=1 -tags e2e -run "^($($tests -join '|'))`$" ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $lines = Get-Content -LiteralPath $log
+          foreach ($t in $tests) {
+            if (-not ($lines -match "^--- PASS: $t\b")) { throw "$t did not pass (no '--- PASS: $t' line)" }
+          }
 
       - name: Set up Node (version from .tool-versions)
+        id: node
+        if: ${{ !cancelled() && steps.e2e-exe.outcome == 'success' && steps.webview2.outcome == 'success' }}
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .tool-versions
@@ -2687,6 +2800,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: npm ci
+        id: npmci
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
         run: |
           npm ci --prefix web --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -2695,6 +2810,8 @@ jobs:
         # The real app over the Chrome DevTools Protocol of its own WebView2 (connectOverCDP: no browser download):
         # the fixture starts the e2e isshoni.exe with --relaunched, ISSHONI_E2E_CDP_PORT and a temporary
         # ISSHONI_E2E_DATA_DIR, and fails unless the app wrote into that folder.
+        id: cdp
+        if: ${{ !cancelled() && steps.npmci.outcome == 'success' }}
         working-directory: web
         env:
           ISSHONI_DESKTOP_EXE: ${{ steps.e2e-exe.outputs.exe }}
@@ -2703,13 +2820,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload the CDP spec's results (on failure)
-        if: failure()
+        # playwright.config.ts's outputDir is relative to web/e2e/cdp/; upload-artifact's path to the workspace.
+        if: ${{ failure() && steps.cdp.outcome == 'failure' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cdp-test-results
-          path: test-results/cdp/
+          path: web/test-results/cdp/
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
   ci-ok:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;

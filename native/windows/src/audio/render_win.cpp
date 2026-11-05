@@ -126,16 +126,24 @@ im_status RunOnMta(const char *name, const std::function<im_status(std::string *
   try {
     std::thread t([&] {
       const uintptr_t token = engine::os::EnterThread(name, engine::os::ThreadClass::kNormal);
+      bool threw = true;
       api::Guard(name, [&] {
         const win::ComApartment com;
         if (FAILED(com.hr())) {
           st = IM_ERR_INTERNAL;
           detail = "COM is not available on the audio thread (" + win::Hr(com.hr()) + ")";
+          threw = false;
           return;
         }
         detail.clear();
         st = fn(&detail);
+        threw = false;
       });
+      if (threw) {
+        // Guard kept the exception's detail in this thread's last error, which ends with the thread: carry it over.
+        st = IM_ERR_INTERNAL;
+        api::Guard(name, [&] { detail.assign(abi::LastErrorText()); });
+      }
       engine::os::LeaveThread(token);
     });
     t.join();

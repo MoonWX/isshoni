@@ -1270,8 +1270,9 @@ capture before `ReleaseVideo` frees the slots and the device; and `probe.cpp`'s 
 `wgc_capture.h`, which includes the file. In `IM_TEST_HOOKS` builds `SetCaptureFactoryForTest` installs a factory the
 session asks first, so `session_capture_test` checks the capture rules with a fake capture and no GPU; a capture
 without slots (that fake in an `IM_ENC_FAKE` session with no device) delivers only its frame times through
-`VideoFrames::PublishTime` (`session/frames.h`), a no-op when the session has a device. A WGC start, like the picker,
-waits up to 2 s for the borderless answer (`BorderlessAllowed`); only the probe bounds it lower (§9.10). When the
+`VideoFrames::PublishTime` (`session/frames.h`), a no-op when the session has a device. The picker waits up to 2 s for
+the borderless answer (`BorderlessAllowed`) and a full probe 250 ms (§9.10); a WGC start waits for none: it uses the
+answer the pick kept, and keeps the border when there is none (im_start's budget, and the border the pick reported). When the
 session ends (`ENDED`), the supervisor stops the capture at once, so nothing more is captured before `im_stop`
 (`im_stop` still calls `Stop` first; the second call returns at once). While a capture runs, the supervisor draws no
 test pattern, also for a test-source capture (the fake). DD sources (WA60) plug in as another factory.

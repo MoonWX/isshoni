@@ -19,7 +19,8 @@ import (
 // true: the caller exits 0. It reports false, nil when no relaunch is needed: args start with RelaunchedFlag, the
 // parent is gone or its PID was reused (it was created after this process), or it is Explorer or a launcher. Any
 // failure (ErrNoShell without a shell window, errShellElsewhere for a shell in another session or of another user,
-// access denied, CreateProcessW) is false with the error, and the start goes on in place (the caller logs a WARN).
+// access denied, CreateProcessW, errRelaunchDied for a relaunched process that exited at once with a nonzero code) is
+// false with the error, and the start goes on in place (the caller logs a WARN).
 // The caller skips it while the running mutex exists (this start only forwards). Nothing names an exe in its errors
 // or logs (README §4 "Logging").
 func RelaunchUnderShell(args []string) (bool, error) {
@@ -160,13 +161,38 @@ func startUnderShell(args []string) error {
 		return fmt.Errorf("winos: CreateProcessW: %w", err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
+	defer func() { _ = windows.CloseHandle(pi.Process) }()
 	// The new process shows the window; this one, which the user started, may hand it the foreground.
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(pi.ProcessId))
 	if f := AfterRelaunchForTest; f != nil {
 		f(pi.ProcessId, pi.Process)
 	}
-	_ = windows.CloseHandle(pi.Process)
-	return nil
+	return relaunchedLives(pi.Process)
+}
+
+// relaunchDeathWindowMs is how long startUnderShell watches the relaunched process before this start exits.
+const relaunchDeathWindowMs = 1500
+
+// errRelaunchDied: the relaunched process exited with a nonzero code within relaunchDeathWindowMs, so it will never
+// show the app; the start goes on in place. Exit code 0 is a normal end (it forwarded to a running instance).
+var errRelaunchDied = errors.New("winos: the relaunched process exited at once")
+
+// relaunchedLives waits up to relaunchDeathWindowMs for the relaunched process: nil while it runs or when it ended
+// with 0, errRelaunchDied (with its exit code) when it ended with another.
+// A process that can't be watched or read was started all the same, so that is nil too.
+func relaunchedLives(process windows.Handle) error {
+	ev, waitErr := windows.WaitForSingleObject(process, relaunchDeathWindowMs)
+	if waitErr != nil || ev != windows.WAIT_OBJECT_0 {
+		return nil //nolint:nilerr // still running (WAIT_TIMEOUT), or it can't be watched: it was started
+	}
+	var code uint32
+	if err := windows.GetExitCodeProcess(process, &code); err != nil {
+		return nil //nolint:nilerr // its exit code can't be read: it was started
+	}
+	if code == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w (0x%08x)", errRelaunchDied, code)
 }
 
 // AfterRelaunchForTest, when set (the relaunch test's helper only), gets the relaunched process's PID and handle

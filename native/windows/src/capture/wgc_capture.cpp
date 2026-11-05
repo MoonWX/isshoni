@@ -207,9 +207,11 @@ im_status WgcCapture::Start(const session::SourceSpec &source, gpu::FrameSlots &
     if (cursor_toggle) {
       impl->session.IsCursorCaptureEnabled(!options.hide_cursor);
     }
-    // §7.1: borderless only when the property exists, access is granted and the session reads it back.
+    // §7.1: borderless only when the property exists, access is granted and the session reads it back. Only the
+    // answer already kept (the pick's, or a full probe's) counts: im_start's 4 s must not wait on the access broker,
+    // and a pick that reported the border keeps it.
     bool borderless = false;
-    if (!options.keep_border && BorderlessAllowed()) {
+    if (!options.keep_border && BorderlessAllowed(0)) {
       try {
         impl->session.IsBorderRequired(false);
         borderless = !impl->session.IsBorderRequired();

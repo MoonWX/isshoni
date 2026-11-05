@@ -178,6 +178,9 @@ if(IM_BUILD_TESTS)
       PRIVATE "IM_NATIVE_DIR=\"${IM_NATIVE_DIR}\"" "IM_TESTDATA_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata\""
               "IM_TEST_DLL_DIR=\"${IM_TEST_DLL_DIR}\"" "IM_TEST_OUT_DIR=\"${CMAKE_CURRENT_BINARY_DIR}\"")
     add_test(NAME ${_name} COMMAND ${_name})
+    # Every run writes gtest's XML report (a binary whose cases all skip still exits 0, so ctest shows it as passed):
+    # CI lists each skipped case and its reason from these.
+    set_tests_properties(${_name} PROPERTIES ENVIRONMENT "GTEST_OUTPUT=xml:${CMAKE_CURRENT_BINARY_DIR}/gtest-xml/")
   endforeach()
 
   if(TARGET dll_search_test)

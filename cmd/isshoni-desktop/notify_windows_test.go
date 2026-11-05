@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
+	"github.com/MoonWX/isshoni/internal/desktop/winos"
 )
 
 // TestToastRegistryKeys is W8's registry half (03 §14.1, §22.2): after one toast with buttons, the three HKCU keys
@@ -82,7 +83,9 @@ func TestToastRegistryKeys(t *testing.T) {
 }
 
 // childToast is the toast child: an application named name, the toasts' service started, one toast with buttons (a
-// push that fails without a desktop session is only reported), and the service stopped, which saves the categories.
+// push that fails without a desktop session is only reported) and then removed from Action Center (deleting the
+// name's keys doesn't, and its buttons would point at a CLSID that is gone), and the service stopped, which saves
+// the categories.
 func childToast(name string) int {
 	_ = application.New(application.Options{Name: name, Logger: slog.New(slog.DiscardHandler)})
 	n := newNotifier(slog.New(slog.DiscardHandler))
@@ -95,6 +98,11 @@ func childToast(name string) int {
 			{ID: app.ToastResume, Title: "Resume"}, {ID: app.ToastStop, Title: "Stop"}}})
 	if err != nil {
 		fmt.Println("the toast wasn't delivered (no desktop session?):", err)
+	} else if err := winos.SetAppUserModelID(name); err != nil {
+		// The removal needs this process to own name (RemoveDeliveredToasts' contract); without it the toast stays.
+		fmt.Println("aumid:", err)
+	} else if _, err := winos.RemoveDeliveredToasts(name, func(winos.DeliveredToast) bool { return true }); err != nil {
+		fmt.Println("remove:", err)
 	}
 	n.stop()
 	return 0
