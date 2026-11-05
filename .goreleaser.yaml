@@ -123,10 +123,16 @@ nfpms:
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+  # The desktop app's assets (docs/m2/06 §2.1, §11.2), from release.yml's desktop-pkg job (or the stubs of `task
+  # release:snapshot`, which only stand in for them by name): the installer, its symbols, the SBOM of the staged
+  # tree, the FFmpeg source and the update manifest, and the stamped install-desktop.ps1. Not the manifest's
+  # signature, which the sign job adds later, as it adds checksums.txt.sig.
   extra_files:
     - glob: dist-extra/install.sh
     - glob: deploy/compose.yaml
     - glob: deploy/compose.host.yaml
+    - glob: dist-desktop/isshoni-desktop*
+    - glob: dist-desktop/install-desktop.ps1
 
 sboms:
   - id: archives
@@ -174,13 +180,20 @@ release:
     - glob: dist-extra/install.sh
     - glob: deploy/compose.yaml
     - glob: deploy/compose.host.yaml
+    - glob: dist-desktop/isshoni-desktop*
+    - glob: dist-desktop/install-desktop.ps1
   # The owner edits the TODOs on the draft; release.yml's publish job refuses a body that still has one. The line on
-  # the macOS and Windows archives is fixed: 06 §3 says the release notes always say so.
+  # the macOS and Windows archives is fixed: 06 §3 says the release notes always say so. The Windows app's lines are
+  # docs/m2/06 §11.7's; release.yml's build job exports ISSHONI_DESKTOP_MIN_VERSION (deploy/desktop/min-version) and
+  # ISSHONI_FFMPEG_VERSION (native/ffmpeg/pins.json) before goreleaser runs, and `task release:snapshot` does too.
   header: |
     ## isshoni {{ .Version }}
     **Upgrade:** run the installer again, or `docker compose pull && docker compose up -d`.
     **Database migration:** TODO yes/no   **Protocol:** v1 (TODO bump?)   **Security fixes:** TODO
-    **macOS and Windows archives** are experimental, untested server builds for LAN/dev use, with no installer; Linux (install.sh, deb, rpm, Docker) is the supported path.
+    **Windows app:** isshoni-desktop_{{ .Version }}_windows_amd64_setup.exe — install it from your isshoni server's Download page, or `irm https://<your server>/install-desktop.ps1 | iex`. 0.x builds are not code-signed yet: Windows may say "Windows protected your PC" (More info → Run anyway); see https://moonwx.github.io/isshoni/download#windows-smartscreen. PCs with Smart App Control turned on can't run unsigned apps.
+    **Desktop update floor:** {{ .Env.ISSHONI_DESKTOP_MIN_VERSION }} (TODO: raised in this release? yes/no)
+    **macOS and Windows archives** (`isshoni_*_darwin_*.tar.gz`, `isshoni_*_windows_*.zip`) are experimental server builds for LAN/dev use, not the app, with no installer; Linux (install.sh, deb, rpm, Docker) is the supported server path.
+    FFmpeg {{ .Env.ISSHONI_FFMPEG_VERSION }} (LGPL-2.1-or-later): source in isshoni-desktop_{{ .Version }}_ffmpeg-source.tar.
     <!-- TODO: keep the next line only for a security release; 04's release check reads it -->
     <!-- isshoni:security -->
     Verify downloads: https://moonwx.github.io/isshoni/security#verify

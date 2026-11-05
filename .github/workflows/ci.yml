@@ -2721,6 +2721,233 @@ jobs:
             if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
           }
 
+      - name: The server-rendered install-desktop.ps1 (isshoni serve, irm | iex under Windows PowerShell 5.1)
+        # M2 06 §16's server-rendered ps1 row (R13, README WA81): the script as a server serves it (§7.4), not the
+        # file. A CI build of the server (off mode on loopback, deploy/dev/isshoni.e2e.toml) embeds
+        # deploy/install-desktop.ps1 with a key of this run in its key block (as §11.4 replaces it), and serves
+        # /install-desktop.ps1 with its own origin as $IsshoniServer and, being a CI build, no version, so the
+        # script installs relserve's latest release (-latest, the CI installer signed by that key). Each case runs
+        # `powershell.exe -NoProfile -Command "irm <server>/install-desktop.ps1 | iex"`, Windows PowerShell 5.1,
+        # with ISSHONI_DOWNLOAD_BASE and ISSHONI_NO_LAUNCH=1, and must exit 0 with nothing on stderr (no error record
+        # escapes the script): a tampered installer and a checksums.txt signed by another key are refused, and so is
+        # an installer that is a text file, correctly listed in a correctly signed checksums.txt (Windows can't
+        # start it: the "isshoni: Windows blocked the installer (" line and "Nothing was installed."), each with
+        # nothing installed; then the release installs with PendingServer = the server's origin, and is uninstalled.
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        env:
+          SETUP: ${{ steps.package.outputs.setup }}
+          VERSION: ${{ env.ISSHONI_VERSION }}
+        run: |
+          # The workflow's ISSHONI_VERSION is not for the server (it reads ISSHONI_* names as its settings) nor for
+          # the script (it would pick the version itself): this step's process drops it.
+          Remove-Item Env:ISSHONI_VERSION -ErrorAction SilentlyContinue
+          $work = Join-Path $env:RUNNER_TEMP 'ps1-server'
+          $rel = Join-Path $work 'releases'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $name = "isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\isshoni'
+          $utf8 = New-Object Text.UTF8Encoding($false)
+          if (Test-Path -LiteralPath $installDir) { throw "$installDir exists before the test (left by an earlier step?)" }
+
+          $sk = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe'
+          if (-not (Test-Path -LiteralPath $sk -PathType Leaf)) { throw "this runner has no inbox $sk" }
+          foreach ($k in 'good', 'other') {
+            $key = Join-Path $work "key-$k"
+            & $sk -q -t ed25519 -N '' -C "isshoni-ci-ps1-server-$k" -f $key
+            if ($LASTEXITCODE -ne 0) { throw "ssh-keygen could not make the $k key" }
+            icacls $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict $key" }
+          }
+
+          # Four release roots (tools/relserve): the release, a changed installer, a checksums.txt signed by the
+          # other key, and a text file in the installer's place, listed with its own SHA-256 and signed by the key.
+          $notExe = Join-Path $work 'not-an-installer.txt'
+          [IO.File]::WriteAllText($notExe, "This is a text file, not an installer.`r`n", $utf8)
+          foreach ($root in @(@('', 'good', $env:SETUP, $false), @('tampered', 'good', $env:SETUP, $true),
+              @('wrongkey', 'other', $env:SETUP, $false), @('notexe', 'good', $notExe, $false))) {
+            $d = [IO.Path]::Combine($rel, $root[0], 'download', "v$($env:VERSION)")
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            Copy-Item -LiteralPath $root[2] -Destination (Join-Path $d $name)
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $root[2]).Hash.ToLowerInvariant()
+            if ($root[3]) { [IO.File]::AppendAllText((Join-Path $d $name), 'x') }
+            $sums = Join-Path $d 'checksums.txt'
+            [IO.File]::WriteAllText($sums, "$sha  $name`n", $utf8)
+            & $sk -Y sign -f (Join-Path $work "key-$($root[1])") -n isshoni-checksums $sums 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$sums.sig")) { throw "ssh-keygen -Y sign failed for $d" }
+          }
+
+          # The CI server with this run's key in the script it embeds (deploy.InstallDesktopPS1): the checkout's file
+          # is changed for the build only, and put back byte for byte.
+          $pub = (Get-Content -Raw -LiteralPath (Join-Path $work 'key-good.pub')).Trim()
+          $signer = "isshoni-release namespaces=`"isshoni-checksums`" $pub"
+          $srcPath = Join-Path $env:GITHUB_WORKSPACE 'deploy/install-desktop.ps1'
+          $original = [IO.File]::ReadAllBytes($srcPath)
+          $src = $utf8.GetString($original)
+          $m = [regex]::Match($src, '(?m)^(# BEGIN ALLOWED SIGNERS[^\n]*\n)(?:[^\n]*\n)*?(# END ALLOWED SIGNERS)')
+          if (-not $m.Success) { throw 'deploy/install-desktop.ps1 has no key block' }
+          $server = Join-Path $work 'isshoni.exe'
+          try {
+            [IO.File]::WriteAllText($srcPath, $src.Substring(0, $m.Index) + $m.Groups[1].Value + $signer + "`n" +
+              $m.Groups[2].Value + $src.Substring($m.Index + $m.Length), $utf8)
+            $env:CGO_ENABLED = '0'
+            go build -trimpath -ldflags "-X github.com/MoonWX/isshoni/internal/version.version=$($env:VERSION)" -o $server ./cmd/isshoni
+            if ($LASTEXITCODE -ne 0) { throw "go build ./cmd/isshoni exited $LASTEXITCODE" }
+          } finally {
+            [IO.File]::WriteAllBytes($srcPath, $original)
+          }
+
+          # Free ports for the server (HTTP, and ICE, which it binds too) and relserve's own.
+          function Get-FreePort {
+            $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+            $l.Start()
+            try { return $l.LocalEndpoint.Port } finally { $l.Stop() }
+          }
+          $httpPort = Get-FreePort
+          $icePort = Get-FreePort
+          $origin = "http://127.0.0.1:$httpPort"
+
+          $relserve = Join-Path $work 'relserve.exe'
+          go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') build -o $relserve ./relserve
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ca = Join-Path $work 'ca.pem'
+          $ready = Join-Path $work 'addr'
+          $rs = Start-Process -FilePath $relserve -PassThru -NoNewWindow `
+            -ArgumentList @('-dir', "`"$rel`"", '-latest', $env:VERSION, '-addr', '127.0.0.1:0', '-ca-out', "`"$ca`"",
+              '-ready-file', "`"$ready`"") `
+            -RedirectStandardOutput (Join-Path $work 'relserve.out') -RedirectStandardError (Join-Path $work 'relserve.err')
+          $srv = $null
+          $store = $null
+          $cert = $null
+          try {
+            # The server: off mode on loopback, a temporary data directory, its own admin socket.
+            $env:ISSHONI_DATA_DIR = Join-Path $work 'data'
+            $env:ISSHONI_ALLOW_EPHEMERAL_DATA = '1'
+            try {
+              $srv = Start-Process -FilePath $server -PassThru -NoNewWindow `
+                -ArgumentList @('serve', '--config', "`"$(Join-Path $env:GITHUB_WORKSPACE 'deploy/dev/isshoni.e2e.toml')`"",
+                  "--public-url=$origin", "--listen.http=127.0.0.1:$httpPort", "--listen.ice-udp=:$icePort",
+                  "--listen.ice-tcp=:$icePort", "--listen.admin-socket=`"$(Join-Path $work 'admin.sock')`"") `
+                -RedirectStandardOutput (Join-Path $work 'server.out') -RedirectStandardError (Join-Path $work 'server.err')
+            } finally {
+              Remove-Item Env:ISSHONI_DATA_DIR, Env:ISSHONI_ALLOW_EPHEMERAL_DATA -ErrorAction SilentlyContinue
+            }
+            $deadline = (Get-Date).AddSeconds(60)
+            $served = $null
+            while ($null -eq $served) {
+              if ($srv.HasExited) {
+                throw "isshoni serve exited ($($srv.ExitCode)): $(Get-Content -Raw (Join-Path $work 'server.out')) $(Get-Content -Raw (Join-Path $work 'server.err'))"
+              }
+              try { $served = Invoke-WebRequest -UseBasicParsing -Uri "$origin/install-desktop.ps1" } catch { Start-Sleep -Milliseconds 250 }
+              if ($null -eq $served -and (Get-Date) -gt $deadline) { throw "isshoni serve did not answer $origin/install-desktop.ps1 within 60 s" }
+            }
+            $script = [string]$served.Content
+            foreach ($want in @("`n`$IsshoniServer  = '$origin'`n", "`n`$IsshoniVersion = ''`n", "`n$signer`n")) {
+              if (-not $script.Contains($want)) { throw "the served script has no line $($want.Trim())" }
+            }
+            "$origin/install-desktop.ps1: $($served.Headers['Content-Type']), $($script.Length) bytes, pre-filled with $origin"
+
+            while (-not (Test-Path -LiteralPath $ready)) {
+              if ($rs.HasExited) { throw "relserve exited ($($rs.ExitCode)): $(Get-Content -Raw (Join-Path $work 'relserve.err'))" }
+              Start-Sleep -Milliseconds 200
+            }
+            $base = "https://$((Get-Content -Raw -LiteralPath $ready).Trim())"
+            $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ca)
+            $store = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+            $store.Open('ReadWrite')
+            $store.Add($cert)
+
+            # `irm <server>/install-desktop.ps1 | iex` in Windows PowerShell 5.1 (the machine's module path, not
+            # pwsh's); returns its exit code, stdout and stderr.
+            function Invoke-ServedScript {
+              param([string]$Base, [string]$Label)
+              $saved = $env:PSModulePath
+              $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+              $env:ISSHONI_DOWNLOAD_BASE = $Base
+              $env:ISSHONI_NO_LAUNCH = '1'
+              $errFile = Join-Path $work "$Label.err"
+              try {
+                $out = & powershell.exe -NoProfile -Command "irm $origin/install-desktop.ps1 | iex" 2>$errFile | Out-String
+                $code = $LASTEXITCODE
+              } finally {
+                $env:PSModulePath = $saved
+                Remove-Item Env:ISSHONI_DOWNLOAD_BASE, Env:ISSHONI_NO_LAUNCH -ErrorAction SilentlyContinue
+              }
+              $err = ''
+              if (Test-Path -LiteralPath $errFile) { $err = [IO.File]::ReadAllText($errFile) }
+              # A CLIXML block of progress records only (irm's progress, 5.1's 'Preparing modules for first use.') is
+              # not an error; any other record in it (S="Error") still counts.
+              if ($err -match '^\s*#< CLIXML\s*(<Objs[\s\S]*</Objs>)\s*$') {
+                $records = $null
+                try {
+                  $x = [xml]('<r>' + $Matches[1] + '</r>')
+                  $records = @($x.SelectNodes('/r/*[local-name()="Objs"]/*'))
+                } catch {
+                  Write-Host "stderr's CLIXML doesn't parse: $($_.Exception.Message)"
+                }
+                if ($null -ne $records -and @($records | Where-Object { $_.GetAttribute('S') -ne 'progress' }).Count -eq 0) {
+                  Write-Host "stderr (progress records only, ignored): $err"
+                  $err = ''
+                }
+              }
+              Write-Host "---- $Label ($Base): exit $code"
+              Write-Host $out
+              if ($err.Trim()) { Write-Host "stderr: $err" }
+              return [pscustomobject]@{ Code = $code; Out = $out; Err = $err }
+            }
+            function Confirm-Refused {
+              param($R, [string]$Why, [string]$Label)
+              if ($R.Code -ne 0 -or $R.Err.Trim()) { throw "${Label}: the irm | iex process exited $($R.Code) or wrote to stderr" }
+              if (-not $R.Out.Contains($Why)) { throw "${Label}: no '$Why' line" }
+              if (-not $R.Out.Contains('Nothing was installed.')) { throw "${Label}: no 'Nothing was installed.' line" }
+              if ($R.Out.Contains('is installed.') -or (Test-Path -LiteralPath $installDir)) { throw "${Label}: it installed" }
+            }
+
+            $r = Invoke-ServedScript -Base "$base/tampered" -Label 'served-tampered'
+            Confirm-Refused $r 'does not match checksums.txt' 'a tampered installer'
+            $r = Invoke-ServedScript -Base "$base/wrongkey" -Label 'served-wrongkey'
+            Confirm-Refused $r 'The signature of checksums.txt is not valid' 'checksums.txt signed by another key'
+            $r = Invoke-ServedScript -Base "$base/notexe" -Label 'served-notexe'
+            Confirm-Refused $r 'isshoni: Windows blocked the installer (' 'an installer that is not an executable'
+
+            $r = Invoke-ServedScript -Base $base -Label 'served-release'
+            if ($r.Code -ne 0 -or $r.Err.Trim()) { throw "the install exited $($r.Code) or wrote to stderr" }
+            if (-not ($r.Out -match '(?m)^Good "isshoni-checksums" signature for isshoni-release with ED25519 key SHA256:')) {
+              throw "the script printed no 'Good ... signature' line from ssh-keygen"
+            }
+            if (-not $r.Out.Contains("isshoni $($env:VERSION) is installed.")) { throw "no 'isshoni $($env:VERSION) is installed.' line" }
+            $pending = (Get-ItemProperty -LiteralPath 'HKCU:\Software\isshoni' -Name PendingServer -ErrorAction SilentlyContinue).PendingServer
+            if ([string]$pending -cne $origin) { throw "PendingServer is '$pending', not the server's origin $origin" }
+            "installed $($env:VERSION) from the served script; PendingServer = $pending"
+
+            # Uninstall (/PURGE): uninstall.exe copies itself to a ~nsu*.tmp folder and exits; the copy does the work.
+            $exe = Join-Path $installDir 'isshoni.exe'
+            $uninstaller = Join-Path $installDir 'uninstall.exe'
+            $u = Start-Process -FilePath $uninstaller -ArgumentList '/S', '/PURGE' -PassThru
+            $null = $u.Handle
+            $u.WaitForExit()
+            if ($u.ExitCode -ne 0) { throw "uninstall.exe /S /PURGE exited $($u.ExitCode)" }
+            $deadline = (Get-Date).AddSeconds(180)
+            do {
+              Start-Sleep -Milliseconds 250
+              $running = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ExecutablePath -like '*\~nsu*.tmp\*' })
+              if ((Get-Date) -gt $deadline) { throw 'the uninstaller did not finish within 180 s' }
+            } while ($running.Count -gt 0 -or (Test-Path -LiteralPath $uninstaller))
+            if (Test-Path -LiteralPath $exe) { throw "$exe is still there after the uninstall" }
+            if (Test-Path -LiteralPath 'HKCU:\Software\isshoni') { throw 'HKCU\Software\isshoni is left after the uninstall' }
+          } finally {
+            if ($null -ne $store) {
+              if ($null -ne $cert) { $store.Remove($cert) }
+              $store.Close()
+            }
+            foreach ($p in @($srv, $rs)) {
+              if ($null -ne $p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            }
+            if (Test-Path -LiteralPath (Join-Path $work 'server.out')) {
+              "---- isshoni serve's log (last 20 lines)"
+              Get-Content -LiteralPath (Join-Path $work 'server.out'), (Join-Path $work 'server.err') -Tail 20 -ErrorAction SilentlyContinue
+            }
+          }
+
       - name: The WebView2 runtime (120.0 or newer) for the CDP spec
         id: webview2
         if: ${{ !cancelled() && steps.native.outcome == 'success' }}

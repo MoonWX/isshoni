@@ -34,24 +34,38 @@ isshoni is not installed, in this order:
      first and removed by the second, which leaves nothing of 06 sections 2.2 and 2.3;
  13. /D= into a folder with a foreign file, then an uninstall: the foreign file and the folder stay.
 
--Mode release (verify-windows, README WA81) and -Mode update (the updater e2e, README WA88) are declared here and
-filled by those slices.
+-Mode release (README WA81: release.yml's desktop-pkg and verify-windows jobs, 06 sections 11.1 and 11.4) checks a
+release build as a user gets it, on a runner where only that build is installed:
+  1. with -Setup, a fresh silent install of it (desktop-pkg); without, the install that the released
+     install-desktop.ps1 made just before (verify-windows);
+  2. the installed tree against -Stage (every file and its SHA-256, nothing else), licenses\ complete
+     (THIRD_PARTY_NOTICES.txt and the FFmpeg LGPL files of 06 section 9.1, listed and installed);
+  3. the registry (06 section 2.3, a silent install's choices: no desktop shortcut, update checks on, no
+     PendingServer), the protocol command exactly "<InstallDir>\isshoni.exe" --open-url "%1", the Start menu
+     shortcut's AppUserModelID;
+  4. --version (-Version, engineAbi 1) and --self-check (ok, ffmpegLoaded, ffmpegLicense "LGPL version 2.1 or
+     later", testHooks false);
+  5. after seeding a Credential Manager entry and the toast keys (as -Mode ci's case 12), uninstall.exe /S /PURGE:
+     nothing of 06 sections 2.2 and 2.3 left, no isshoni:v1: credential.
+-Mode update (the updater e2e, README WA88) is declared here and filled by that slice.
 
 Exit status 0 when every case passed; a failed case throws (exit 1). Windows PowerShell 5.1 and PowerShell 7.
 
 .EXAMPLE
 pwsh -File deploy/test/windows/smoke.ps1 -Mode ci -Setup setup.exe -Version 0.0.0-ci.5 -OldSetup old.exe -NewerSetup newer.exe -Stage dist-desktop/stage
+.EXAMPLE
+pwsh -File deploy/test/windows/smoke.ps1 -Mode release -Version 0.2.0 -Stage stage
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('ci', 'release', 'update')]
     [string]$Mode,
-    # The installer under test and its version.
+    # The installer under test and its version (-Mode release: -Setup is optional, see above).
     [string]$Setup = '',
     [string]$Version = '',
     # -Mode ci: an older build whose install-files.txt lists an extra avcodec-00.dll, a newer build, and the staged
-    # tree the installer under test was built from.
+    # tree the installer under test was built from (-Stage, which -Mode release needs too).
     [string]$OldSetup = '',
     [string]$NewerSetup = '',
     [string]$Stage = '',
@@ -664,10 +678,60 @@ function Invoke-CiMode {
     Write-Step 'every -Mode ci case passed'
 }
 
+function Invoke-ReleaseMode {
+    param([string]$Setup, [string]$Version, [string]$Stage)
+    foreach ($p in @(@('-Version', $Version), @('-Stage', $Stage))) {
+        if (-not $p[1]) { throw "smoke: -Mode release needs $($p[0])" }
+    }
+    Confirm-That (Test-Path -LiteralPath (Join-Path -Path $Stage -ChildPath 'install-files.txt') -PathType Leaf) "$Stage has no install-files.txt"
+    $dir = $script:DefaultDir
+
+    if ($Setup) {
+        Write-Step "1. a fresh silent install of $(Split-Path -Leaf $Setup)"
+        Confirm-That (Test-Path -LiteralPath $Setup -PathType Leaf) "$Setup is missing"
+        Confirm-That (-not (Test-RegKey $script:AppKey)) 'isshoni is installed already: -Mode release -Setup needs a PC without it'
+        Confirm-That (-not (Test-Path -LiteralPath $dir)) "$dir exists already"
+        Invoke-Install -Path (Resolve-Path -LiteralPath $Setup).Path
+    } else {
+        Write-Step '1. the install that install-desktop.ps1 made'
+        Confirm-That (Test-RegKey $script:AppKey) 'isshoni is not installed (HKCU\Software\isshoni is missing)'
+    }
+    Confirm-That ((Get-RegValue $script:AppKey 'InstallDir') -eq $dir) "InstallDir is '$(Get-RegValue $script:AppKey 'InstallDir')', not $dir"
+
+    Write-Step '2. the installed files against the stage, and licenses\'
+    Test-InstalledTree -InstallDir $dir -Stage $Stage
+    $listed = Get-FileList -Dir $dir
+    foreach ($rel in @('licenses\THIRD_PARTY_NOTICES.txt', 'licenses\ffmpeg\COPYING.LGPLv2.1.txt', 'licenses\ffmpeg\LICENSE.md',
+            'licenses\ffmpeg\README-LGPL.txt')) {
+        Confirm-That ($listed -contains $rel) "install-files.txt doesn't list $rel"
+        Confirm-That (Test-Path -LiteralPath (Join-Path -Path $dir -ChildPath $rel) -PathType Leaf) "$rel is not installed"
+    }
+    $notices = [IO.File]::ReadAllText((Join-Path -Path $dir -ChildPath 'licenses\THIRD_PARTY_NOTICES.txt'))
+    Confirm-That ($notices.Contains('3. Native components')) 'licenses\THIRD_PARTY_NOTICES.txt has no native section'
+
+    Write-Step '3. registry, protocol command and the Start menu shortcut'
+    Test-InstalledRegistry -InstallDir $dir -Ver $Version -DesktopShortcut 0 -UpdateChecks 1
+    Confirm-That (-not (Test-RegValue $script:AppKey 'PendingServer')) "PendingServer is '$(Get-RegValue $script:AppKey 'PendingServer')', and nothing asked for one"
+    Test-InstalledShortcut -InstallDir $dir -Desktop $false
+
+    Write-Step '4. --version and --self-check'
+    Test-AppMode -InstallDir $dir -Ver $Version
+    $report = Get-Content -Raw -LiteralPath (Join-Path -Path (Get-WorkDir) -ChildPath 'self-check.json') | ConvertFrom-Json
+    Confirm-That ([string]$report.engine.ffmpegLicense -ceq 'LGPL version 2.1 or later') "--self-check: ffmpegLicense is '$($report.engine.ffmpegLicense)'"
+    Confirm-That (@(Get-AppProcess -InstallDir $dir).Count -eq 0) 'an isshoni.exe is left running'
+
+    Write-Step '5. uninstall /S /PURGE: sign-ins, toast keys and the data root gone, nothing of 06 sections 2.2 and 2.3 left'
+    Initialize-UninstallSeed -InstallDir $dir
+    Invoke-Uninstall -InstallDir $dir -Arguments @('/PURGE')
+    Test-Uninstalled -InstallDir $dir -Purged $true
+
+    Write-Step 'every -Mode release case passed'
+}
+
 try {
     switch ($Mode) {
         'ci' { Invoke-CiMode -Setup $Setup -Version $Version -OldSetup $OldSetup -NewerSetup $NewerSetup -Stage $Stage }
-        'release' { throw 'smoke: -Mode release is not implemented yet (README WA81, verify-windows)' }
+        'release' { Invoke-ReleaseMode -Setup $Setup -Version $Version -Stage $Stage }
         'update' { throw 'smoke: -Mode update is not implemented yet (README WA88, the updater e2e)' }
     }
 } finally {
