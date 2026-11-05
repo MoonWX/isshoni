@@ -135,6 +135,16 @@ func TestRelaunchUnderShell(t *testing.T) {
 	out := filepath.Join(dir, "relaunched.txt")
 	if err := exec.CommandContext(t.Context(), exe, out).Run(); err != nil {
 		b, _ := os.ReadFile(out) //nolint:gosec // G304: the helper's file in this test's temp dir
+		var exit *exec.ExitError
+		died := strings.HasPrefix(string(b), "error: "+errRelaunchDied.Error())
+		if errors.As(err, &exit) && exit.ExitCode() == 3 && died && os.Getenv("RUNNER_ENVIRONMENT") == "github-hosted" {
+			// GitHub's hosted image (UAC off, one full admin token) starts the child under its Explorer, which dies
+			// with STATUS_DLL_INIT_FAILED before main even on winsta0\default, in the same session, as the same user.
+			// What this checks here is the guard: the start saw the death and went on in place (exit 3), never exit
+			// 0 with no app. The explorer-parent half runs on a real desktop (the owner's PC).
+			t.Skipf("the relaunched process died at once on the hosted runner and the start went on in place: %s (%s)",
+				b, where)
+		}
 		t.Fatalf("relaunchee: %v, wrote %q (%s)", err, b, where)
 	}
 	got := readWhenWritten(t, out, func() string {
