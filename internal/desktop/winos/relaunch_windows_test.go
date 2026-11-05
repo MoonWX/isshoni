@@ -81,7 +81,7 @@ func processName(pid uint32) string {
 // TestRelaunchUnderShell is 03 §22.2's shell relaunch test. Started with --relaunched the helper stays in place,
 // under this test. Started from this test process (not a launcher) it relaunches under the shell, and the process
 // that stays sees explorer.exe as its parent. When the shell window's process is in another session or runs as
-// another user than this test, or this test is elevated and the shell is not (a CI runner's elevated job), the helper
+// another user than this test (a CI runner whose job doesn't run in Explorer's session or as its user), the helper
 // must refuse the relaunch instead (exit 3, the start goes on in place), and the explorer-parent half is skipped
 // with the reason; it runs on the owner's PC. Skipped when there is no shell window.
 func TestRelaunchUnderShell(t *testing.T) {

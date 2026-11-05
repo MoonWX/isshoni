@@ -142,8 +142,15 @@ func startUnderShell(args []string) error {
 		unsafe.Sizeof(parent)); err != nil {
 		return fmt.Errorf("winos: the parent attribute: %w", err)
 	}
+	// The shell's desktop, not this process's: the child takes the shell's token, and with lpDesktop unset it would
+	// open this process's window station and desktop, which that token may not use (a CI runner's job: the child
+	// died with STATUS_DLL_INIT_FAILED, 0xC0000142, before main).
+	desktop, err := windows.UTF16PtrFromString(`winsta0\default`)
+	if err != nil {
+		return err
+	}
 	si := &windows.StartupInfoEx{
-		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))},
+		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{})), Desktop: desktop},
 		ProcThreadAttributeList: attrs.List(),
 	}
 	var pi windows.ProcessInformation
@@ -166,10 +173,10 @@ func startUnderShell(args []string) error {
 // before the handle is closed, so the test can report how that process ended.
 var AfterRelaunchForTest func(pid uint32, process windows.Handle)
 
-// errShellElsewhere: the shell window's process is in another session or runs as another user, or this process is
-// elevated and the shell is not. The child would inherit its token (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the
-// parent's token, so its user, session and elevation), so the app would start out of sight, as someone else or not at
-// all while this start exits 0. The start goes on in place instead.
+// errShellElsewhere: the shell window's process is in another session or runs as another user. The child would
+// inherit its token (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the parent's token, so its user and session), so the app
+// would start out of sight or as someone else while this start exits 0. The start goes on in place instead. (An
+// elevated start under a shell that isn't elevated relaunches de-elevated, as the shell's token runs it.)
 var errShellElsewhere = errors.New("winos: the shell runs in another session or as another user")
 
 // shellProcessID is the PID owning GetShellWindow's window; ErrNoShell without one.
@@ -218,11 +225,6 @@ func shellIsOurs(pid uint32) error {
 	}
 	if !theirUser.User.Sid.Equals(myUser.User.Sid) {
 		return fmt.Errorf("%w (another user)", errShellElsewhere)
-	}
-	// An elevated start under a shell that isn't: the child would take the shell's lower token, and on a CI runner's
-	// elevated job such a child never came up while this start exited 0. Go on in place instead.
-	if windows.GetCurrentProcessToken().IsElevated() && !tok.IsElevated() {
-		return fmt.Errorf("%w (this process is elevated, the shell is not)", errShellElsewhere)
 	}
 	return nil
 }
