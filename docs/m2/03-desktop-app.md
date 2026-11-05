@@ -2065,8 +2065,9 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    `OpenProcess(PROCESS_CREATE_PROCESS)`; `CreateProcessW` of the same exe with `--relaunched` first and then the
    same arguments (quoted with `syscall.EscapeArg`), the same environment and working directory,
    `EXTENDED_STARTUPINFO_PRESENT` with `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` = the shell process; then
-   `AllowSetForegroundWindow(childPid)` and exit 0. On any failure (no shell window, a shell in another session or
-   of another user, access denied), log WARN and continue in place.
+   `AllowSetForegroundWindow(childPid)`, watch the child for 1.5 s, and exit 0. On any failure (no shell window, a
+   shell in another session or of another user, access denied, a child that exits within the 1.5 s with a nonzero
+   code; exit 0 is a normal end, e.g. a forward), log WARN and continue in place.
 2a. **Installer running** (06 §2.4, §8.7): `OpenMutexW(SYNCHRONIZE, FALSE, "Local\\io.isshoni.desktop.installing")`.
    When it succeeds (an installer runs right now: interactive, `/S`, or a start-time update), a start from
    `--open-url` writes the link's origin to `PendingServer` and its room id to `PendingRoom` (overwriting older
