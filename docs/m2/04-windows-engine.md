@@ -953,6 +953,71 @@ their values for S1 compatibility and for later engines.
 Go maps every status to a `*media.Error` with 01's code and this token as `Reason` (§12.3); 03 maps with `errors.Is`
 on 01's sentinels and reads `Reason`.
 
+### 5.8 The luma tap (`IM_PACKET_DEBUG`, test hooks only)
+
+**As built (WF16, group 15).** `IM_TEST_HOOKS` builds (`win-x64-ci`, `win-x64-asan`) have a luma tap, the video half
+of §14's `avsync` (05 §19.3) and of E14's pause check. It is asked for per session and never exists in a shipped DLL.
+
+- **Asking for it.** Bit `0x80000000` of `im_start_config.flags`, `IM_START_TEST_LUMA_TAP`. The public header doesn't
+  define it (the header changes only through the integrator, README §5's shared files): the engine's constant is
+  `native/windows/src/session/luma_sample.h`'s `luma::kStartFlag` and Go's is `internal/media/native/luma.go`'s
+  `startTestLumaTap`, and `TestLumaConstantsMatchTheEngine` checks that the two agree and that no `IM_START_*` of the
+  header shares the bit. A **release build refuses the bit** with `IM_ERR_INVALID_ARG` ("exists in IM_TEST_HOOKS builds
+  only"), so a shipped DLL never emits `IM_PACKET_DEBUG`. A test-hooks build also refuses it, with
+  `IM_ERR_INVALID_ARG`, for an audio-only session and for a session whose streams leave no room for the tap's ring:
+  its ring is one more stream of the pump, and three layers, Opus and the PCM tap already use all five.
+- **What it reads.** For every captured frame the session's video thread takes from its frame slots (§8.2), the mean
+  BT.709 luma `Y' = 0.2126 R' + 0.7152 G' + 0.0722 B'` of the slot's 8-bit gamma-encoded BGRA values, full range, over
+  a **fixed region**: the centered box of `min(256, side)` pixels on each side of the frame's content. A square box
+  reads the same whatever the frame's rotation. avsync's 1280×720 flash window covers it both as the picked window
+  and with `-source mon:<id>`, where avsync opens it centered on the captured monitor (whichever it is: the flash
+  helper gets the monitor's device name and centers on its `GetMonitorInfoW` rect), so the mean is the window's alone.
+  While paused the video thread takes no frame, so there is no reading.
+- **How.** `session/luma_tap.h`: the frame's box is copied into one of 8 staging textures behind an event query on the
+  session's device. The video thread maps the finished copies oldest first without waiting for the GPU (`GetData`
+  with `DONOTFLUSH`, `Map` with `DO_NOT_WAIT`) and polls every 2 ms while copies are in flight, so a static screen's
+  one frame gets its reading too. A frame that finds all 8 busy gets none and is counted in the next reading's
+  `missed`. The tap needs pixels, so the bit puts a `test:pattern` session (or a fake pick) on the GPU path even with
+  `IM_ENC_FAKE`, on the default adapter (WARP's Basic Render Driver on CI), and the GPU test pattern is drawn and read.
+  A test-hooks capture that writes no slots has no pixels and gives no readings. A D3D failure stops the tap (one warn
+  log); device loss is the session's to find (§9.8).
+- **The packet.** `kind` `IM_PACKET_DEBUG` (100), `layer` `IM_NO_LAYER`, `capture_ts_ns` the frame's capture time,
+  `flags` 0 or `DISCONTINUITY`. Its ring holds 64 readings (64 KiB) with the audio rings' overflow rule (the newest is
+  dropped and the next one that gets in carries `DISCONTINUITY`) and the pump's 1 s stale rule (§6.2). A reading the
+  ring dropped is not counted in `missed` (nor in a `RING_OVERFLOW` event): `DISCONTINUITY` alone tells of it. `data`
+  is 48 bytes, little endian:
+
+  | Offset | Size | Field | Meaning |
+  |---|---|---|---|
+  | 0 | 4 | `magic` | `0x414D554C`, "LUMA" in byte order |
+  | 4 | 4 | `version` | 1 |
+  | 8 | 8 | `capture_ts_ns` | int64, the frame's capture time on the engine clock, equal to the packet's |
+  | 16 | 4 | `mean` | the region's mean luma × 65535, rounded to nearest: 0 black, 65535 white |
+  | 20 | 4 | `source_width` | the frame's content in its slot, as captured (before any rotation) |
+  | 24 | 4 | `source_height` | |
+  | 28 | 4 | `region_x` | the region within the content: `(source_width − region_width) / 2` |
+  | 32 | 4 | `region_y` | `(source_height − region_height) / 2` |
+  | 36 | 4 | `region_width` | `min(256, source_width)` |
+  | 40 | 4 | `region_height` | `min(256, source_height)` |
+  | 44 | 4 | `missed` | captured frames since the previous reading that have none: the slots replaced them before the video thread took one, or the tap's 8 copies were busy |
+
+- **Go.** `native.WithLumaTap(fn func(native.LumaSample))` is a `StartOption` of `StartWith` and `StartExtra`. It sets
+  the bit and makes `Next` call `fn` with every reading, on the session clock (`CaptureNS = capture_ts_ns −
+  epoch_ns`, and `Discontinuity` the packet's `DISCONTINUITY`), on the goroutine that called `Next` and before `Next`
+  returns its next packet. `Next` itself never
+  returns a debug packet. A payload that isn't 48 bytes with the magic, version 1 and a mean of at most 65535, a
+  `capture_ts_ns` other than the packet's, or a time before the epoch is dropped with the warn log of §12.3. Against a
+  DLL whose build info says `testHooks: false`, the start is `media.CodeDependency` without a DLL call.
+  `native.LumaTapOf(opts...)` returns the function that options set, for tests and fakes. Without the option the
+  binding drops debug packets silently.
+- **Tests.** `native/windows/tests/luma_sample_test.cpp` (the box, the mean, the payload's bytes, which
+  `internal/media/native/luma_test.go` decodes from the same hex) and `session_luma_tap_test.cpp`: on the fake/WARP
+  path, every reading's time is a pattern frame's grid instant, its mean is the CPU model's (`PatternPixel`) for that
+  frame, a static screen gets its one reading, there are no debug packets without the bit, and the two refusals hold.
+  `luma_test.go` covers the option, the flag, the delivery, the drops and the dependency error, plus `TestDLLLumaTap`
+  against the `win-x64-ci` DLL on CI windows. `isshoni-enginetest`'s `TestRunAVSyncWithTheNativeTap` runs avsync with
+  the option on a fake engine that delivers readings as the binding does.
+
 ## 6. Threading, memory and the session state machine
 
 ### 6.1 Threads
@@ -2267,7 +2332,8 @@ Windows-only extras of §12.2, the OpenH264 helpers and 05's `AudioTest` (05 §1
 | `layout_test.go` | all | sizes and offsets of §5.4 via `unsafe.Sizeof`/`Offsetof` against the golden file |
 | `fakecaller_test.go` | all | the `fakeCaller` (§12.4); `open_test.go`, `logdrain_test.go`, `abi_test.go`, `errors_test.go`, `engine_other_test.go` and `main_test.go` (goleak) drive WA10's half with it |
 | `session_windows.go` | windows | `media.Source.Exe` of a window pick: the base name of `QueryFullProcessImageNameW` for its `PID` (WA23; everything else of `Pick` and the session is portable, in `bridge.go`) |
-| `bridge_test.go` | all | the session logic driven by the `fakeCaller` (§18.3; WA23) |
+| `luma.go` | all | the luma tap's Go side (§5.8; README WF16): `WithLumaTap`, `LumaTapOf`, `LumaSample`, the start flag's constant and the payload's decoding; `bridge.go`'s `Next` hands it the `IM_PACKET_DEBUG` packets |
+| `bridge_test.go`, `luma_test.go` | all | the session logic driven by the `fakeCaller` (§18.3; WA23); `luma_test.go` the luma tap's option, decoding and delivery (WF16) |
 | `dll_windows_test.go` | windows | tests against a real DLL (`ISSHONI_TEST_ENGINE_DLL`, set by CI and enginetest only) |
 | `session_dll_test.go`, `session_windows_test.go` | all; windows | the session tests against a real engine (§18.2's "Go on Windows": `TestDLLConformance`, `TestNativeIntoPublisher`, `TestDLLSession`, `TestDLLStartErrors`); `session_windows_test.go` opens the `ISSHONI_TEST_ENGINE_DLL` DLL for them, and they skip without it (WA23) |
 
@@ -2341,6 +2407,21 @@ func WithGOP(rid string, gop time.Duration) StartOption
 // GOPOf reads back the per-layer GOPs that opts set, by rid (nil when none), without the range check, so callers
 // that build options can test what they pass.
 func GOPOf(opts ...StartOption) map[string]time.Duration
+// WithLumaTap asks for the luma tap of an IM_TEST_HOOKS DLL (§5.8; README WF16): IM_START_TEST_LUMA_TAP, and Next
+// calls fn with every IM_PACKET_DEBUG reading before its next packet (never returning one). A DLL without test hooks
+// is CodeDependency without a DLL call; nil turns it off; the last one wins.
+func WithLumaTap(fn func(LumaSample)) StartOption
+// LumaTapOf is the luma-tap function that opts set (nil when none), for callers' tests and fakes of StartWith.
+func LumaTapOf(opts ...StartOption) func(LumaSample)
+// LumaSample is one reading of the luma tap (§5.8's payload).
+type LumaSample struct {
+	CaptureNS     int64           // the frame's capture time on the session clock
+	Mean          float64         // the region's mean BT.709 luma, 0 black to 1 white
+	Source        image.Point     // the frame's content size
+	Region        image.Rectangle // the centered box the mean is over
+	Missed        int             // captured frames since the previous reading that have none
+	Discontinuity bool            // IM_PKT_DISCONTINUITY: the debug ring dropped readings before this one
+}
 
 // SourceDetail holds only what im_source_info says beyond media.Source (README §3 item 29): monitor_id, capture_path
 // and IM_SRCF_OS_BORDER are media.Source's MonitorID, Capture and OSBorder (01 §5.1). Local data, never logged.
@@ -2498,7 +2579,8 @@ values (it would break A/V sync and the SR anchor).
     `*media.Error`), the binding calls `im_stop` itself (≤ 2 s) to free the session, and later calls return
     `media.ErrStopped`. An `IM_ENDED` return without a preceding `ENDED` event (defensive) takes the same path with
     `internal`.
-  - `IM_PACKET_DEBUG` (test hooks) → the test's luma-tap hook if set, else dropped.
+  - `IM_PACKET_DEBUG` (test hooks) → the test's luma-tap hook if set, else dropped. As built (WF16): the hook is
+    `WithLumaTap`'s function, and readings that aren't §5.8's payload are dropped with the warn log below.
 - **Copy and limits**: `Data` is a fresh `[]byte` copied from native memory before the next DLL call (no pooling,
   01 §7.4). Video ≤ 8 MiB (the `f` arena), audio ≤ 4096 B, PCM exactly 3840 B, event JSON ≤ 1 KiB. A packet over its
   limit, with an invalid kind or layer, or with a negative `CaptureNS`, is dropped with a warn log, and for video
@@ -2951,6 +3033,15 @@ one file each, README §5). Where the merged tool differs from the table:
   after N packets carries N × 960.
 - **The process-default check** (§18.3) fails instead of skipping in CI when `gcc` (MinGW-w64, which builds the marker
   DLL) is missing from `PATH`.
+
+**As built (WF16, group 15)**: `avsync`'s luma tap is §5.8's. The run passes `native.WithLumaTap` to `StartWith` and
+pairs the readings' rising edges through 50 % with the PCM tap's click onsets as WA76 wrote it. The tap's centered
+256-pixel box settles WA76's open point about `-source mon:<id>`, where the flash window covers only part of the
+monitor: avsync opens the window centered on the captured monitor (the flash helper's `-monitor` takes the id after
+`mon:`, a device name, and centers on that monitor's rect; the primary one for `-source pick`), so the box lies inside
+it on any monitor. A rising edge whose reading follows a lost one (`missed` > 0 or `DISCONTINUITY`) may be a frame
+late: avsync discards it (its flash goes unpaired) and counts it in `avsync.json`'s `edgesDiscarded`. A DLL without test hooks fails the start with `dependency`, exit 2. `-no-luma` stays as the diagnostic of the
+Windows half. The owner's first `avsync -dll ci` run on Windows 11 (M-AVSYNC's first record, §18.4) is still manual.
 
 ## 15. Glass-to-glass latency (M2 exit criterion)
 

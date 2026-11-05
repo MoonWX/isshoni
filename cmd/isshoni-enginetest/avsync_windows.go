@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -45,6 +46,8 @@ var (
 	procDispatchMessageW      = user32.NewProc("DispatchMessageW")
 	procDestroyWindow         = user32.NewProc("DestroyWindow")
 	procGetSystemMetrics      = user32.NewProc("GetSystemMetrics")
+	procEnumDisplayMonitors   = user32.NewProc("EnumDisplayMonitors")
+	procGetMonitorInfoW       = user32.NewProc("GetMonitorInfoW")
 	procLoadCursorW           = user32.NewProc("LoadCursorW")
 	procQueryPerformanceCount = kernel32.NewProc("QueryPerformanceCounter")
 	procQueryPerformanceFreq  = kernel32.NewProc("QueryPerformanceFrequency")
@@ -160,9 +163,12 @@ type winFlash struct {
 	done <-chan error
 }
 
-func (h *winHelpers) StartFlash(ctx context.Context) (flashProc, error) {
+func (h *winHelpers) StartFlash(ctx context.Context, monitor string) (flashProc, error) {
 	args := []string{"avsync", "-role", "flash", "-result", h.path("flash.json"), "-stop", h.path("flash.stop"),
 		"-ready", h.path("flash.ready"), "-life", avsyncFlashLifetime.String()}
+	if monitor != "" {
+		args = append(args, "-monitor", monitor)
+	}
 	cmd, done, err := h.start(ctx, args, "flash.log")
 	if err != nil {
 		return nil, err
@@ -415,9 +421,53 @@ func (w *flashWindow) close() {
 	}
 }
 
-// openFlashWindow creates the borderless, topmost 1280×720 window centered on the primary monitor and its
-// flip-model swap chain (FLIP_DISCARD, two BGRA buffers) on a hardware D3D11 device.
-func openFlashWindow() (*flashWindow, error) {
+// winRect is RECT.
+type winRect struct{ Left, Top, Right, Bottom int32 }
+
+// monitorInfoEx is MONITORINFOEXW.
+type monitorInfoEx struct {
+	Size    uint32
+	Monitor winRect
+	Work    winRect
+	Flags   uint32
+	Device  [32]uint16
+}
+
+// monitorRect is the desktop rect (physical pixels: the process is per-monitor DPI aware) of the monitor whose
+// device name is device (a mon:<id> source's id, e.g. \\.\DISPLAY2), or of the primary monitor when device is "".
+func monitorRect(device string) (winRect, error) {
+	if device == "" {
+		sw, _, _ := procGetSystemMetrics.Call(smCxScreen)
+		sh, _, _ := procGetSystemMetrics.Call(smCyScreen)
+		return winRect{Right: int32(sw), Bottom: int32(sh)}, nil //nolint:gosec // G115: a screen size
+	}
+	var found *winRect
+	cb := windows.NewCallback(func(hmon, _, _, _ uintptr) uintptr {
+		mi := monitorInfoEx{}
+		mi.Size = uint32(unsafe.Sizeof(mi))
+		if r, _, _ := procGetMonitorInfoW.Call(hmon, uintptr(unsafe.Pointer(&mi))); r != 0 &&
+			strings.EqualFold(windows.UTF16ToString(mi.Device[:]), device) {
+			rc := mi.Monitor
+			found = &rc
+			return 0 // stop
+		}
+		return 1
+	})
+	_, _, _ = procEnumDisplayMonitors.Call(0, 0, cb, 0)
+	if found == nil {
+		return winRect{}, fmt.Errorf("no attached monitor is %q", device)
+	}
+	return *found, nil
+}
+
+// openFlashWindow creates the borderless, topmost 1280×720 window centered on the monitor named device ("" = the
+// primary monitor; avsync passes the captured monitor of -source mon:<id>, so the tap's centered box, 04 §5.8, lies
+// inside the window) and its flip-model swap chain (FLIP_DISCARD, two BGRA buffers) on a hardware D3D11 device.
+func openFlashWindow(device string) (*flashWindow, error) {
+	mon, err := monitorRect(device)
+	if err != nil {
+		return nil, err
+	}
 	w := &flashWindow{}
 	if err := windows.GetModuleHandleEx(0, nil, &w.instance); err != nil {
 		return nil, fmt.Errorf("GetModuleHandleEx: %w", err)
@@ -437,12 +487,12 @@ func openFlashWindow() (*flashWindow, error) {
 		return nil, fmt.Errorf("RegisterClassExW: %w", e)
 	}
 	w.class = class
-	sw, _, _ := procGetSystemMetrics.Call(smCxScreen)
-	sh, _, _ := procGetSystemMetrics.Call(smCyScreen)
-	x := max(0, (int32(sw)-avsyncFlashW)/2) //nolint:gosec // G115: a screen size
-	y := max(0, (int32(sh)-avsyncFlashH)/2) //nolint:gosec // G115: a screen size
+	x := mon.Left + max(0, (mon.Right-mon.Left-avsyncFlashW)/2)
+	y := mon.Top + max(0, (mon.Bottom-mon.Top-avsyncFlashH)/2)
+	// x and y are negative on a monitor left of or above the primary: sign-extended, the int arguments read them back.
 	hwnd, _, e := procCreateWindowExW.Call(wsExTopmost, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)),
-		wsPopup|wsVisible, uintptr(x), uintptr(y), avsyncFlashW, avsyncFlashH, 0, 0, uintptr(w.instance), 0)
+		wsPopup|wsVisible, uintptr(x), uintptr(y), //nolint:gosec // G115: an int argument, sign-extended on purpose
+		avsyncFlashW, avsyncFlashH, 0, 0, uintptr(w.instance), 0)
 	if hwnd == 0 {
 		w.close()
 		return nil, fmt.Errorf("CreateWindowExW: %w", e)
@@ -547,7 +597,7 @@ func runFlashRole(ctx context.Context, o avsyncOptions, stderr io.Writer) int {
 	res := flashResult{FlashesNS: []int64{}}
 	code := exitPass
 	freq := qpcFreq()
-	w, err := openFlashWindow()
+	w, err := openFlashWindow(o.monitor)
 	switch {
 	case freq <= 0:
 		res.Error, code = "QueryPerformanceFrequency failed", exitEnv

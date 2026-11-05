@@ -44,6 +44,13 @@
 // - test tone (MMCSS "Pro Audio", IM_AUDIO_MODE_TEST_TONE only): 04 §10.3's tone on an exact 10 ms grid into the
 //   Opus stage. With IM_AUDIO_MODE_EXCLUDE_APPS 05's mixer feeds the stage instead (audio::AudioEngine::NewMixer).
 //
+// The luma tap (§5.8, §14 avsync; README WF16; IM_TEST_HOOKS builds only, luma_tap.h): a session started with
+// luma::kStartFlag (IM_START_TEST_LUMA_TAP) gets a debug ring (IM_PACKET_DEBUG: one more stream, so it needs a free
+// one of ring::kMaxStreams) and, on the GPU path, a LumaTap that reads the mean luma of a fixed region of every
+// frame the video thread takes, with the frame's capture time. The flag puts a test-pattern session on the GPU path
+// even when its encoders take nothing (IM_ENC_FAKE), so the pattern is drawn and read; a test-hooks capture that
+// writes no slots has no pixels and gives no readings. A release build refuses the flag (IM_ERR_INVALID_ARG).
+//
 // Pause (§8.5; README WA52): im_set_paused sets paused_ at once, so no wake-up of the video thread that checks it after
 // the call takes a frame (it is checked beside the pacer's own flag, which the queued command sets); a wake-up already
 // past the check may take one more frame, published no later than its TakeFrame. It fades the tone or 05's mix bus out
@@ -98,6 +105,8 @@
 #include "session/au_times.h"
 #include "session/encoder.h"
 #include "session/frames.h"
+#include "session/luma_sample.h"
+#include "session/luma_tap.h"
 #include "session/pattern_grid.h"
 #include "session/session.h"
 #include "session/sources.h"
@@ -112,6 +121,7 @@ inline constexpr int64_t kOverflowEventEveryNs = 1'000'000'000; // RING_OVERFLOW
 inline constexpr int64_t kStatsEveryNs = 250'000'000;           // the video thread's stats snapshot
 inline constexpr int64_t kRoomRetryNs = 5'000'000;              // a full ring's IDR waits for room (§6.2)
 inline constexpr int64_t kFlashEveryNs = 1'000'000'000;         // the test pattern's flash, the tone's beep (§10.3)
+inline constexpr int64_t kLumaPollNs = 2'000'000;               // the luma tap's copies in flight: polled this often
 // The least capture_ts_ns step between two access units of a layer: one 90 kHz RTP tick, ceil(1e9 / 90000) ns. The
 // pacer's own bump (§8.4) is 1 µs, and two AUs 1 µs apart share one RTP timestamp: the SFU and the viewer would take
 // a static IDR and the late new frame right after it for one frame, and the IDR would be lost.
@@ -256,6 +266,8 @@ private:
     bool started = false;
   };
 
+  // The luma tap's start flag (§5.8): sets luma_tap_, or refuses it (a release build; no video; no free stream).
+  im_status CheckLumaTap(const im_start_config &cfg);
   im_status StartVideo(const im_start_config &cfg);
   // The device (when an encoder takes pixels or the capture needs slots) and the frames, before the encoders open.
   im_status StartFrames();
@@ -327,6 +339,7 @@ private:
   bool gpu_path_ = false;
   uint32_t layer_count_ = 0;
   uint32_t audio_mode_ = IM_AUDIO_MODE_OFF;
+  bool luma_tap_ = false; // luma::kStartFlag (IM_TEST_HOOKS builds; a release build refuses it)
   std::vector<EncoderEntry> catalog_;
   std::vector<encpolicy::Candidate> candidates_;
 
@@ -337,6 +350,7 @@ private:
   std::array<std::unique_ptr<ring::PacketRing>, IM_MAX_LAYERS> video_rings_;
   std::unique_ptr<ring::PacketRing> opus_ring_;
   std::unique_ptr<ring::PacketRing> pcm_ring_;
+  std::unique_ptr<ring::PacketRing> debug_ring_; // the luma tap's (IM_PACKET_DEBUG), with luma_tap_ only
   std::unique_ptr<RingWriter> opus_writer_;
   std::unique_ptr<RingWriter> pcm_writer_;
   ring::PacketPump pump_;
@@ -355,6 +369,10 @@ private:
   // The running capture (declared after the frames: it goes first). Set by Start before any thread runs; stopped
   // first by Stop, freed with the frames once no session thread can call it.
   std::unique_ptr<capture::CaptureSource> capture_;
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  // The luma tap: the video thread's, on the device (declared after it, so it goes first); with luma_tap_ only.
+  std::unique_ptr<LumaTap> luma_;
+#endif
 
   // ---- the video thread's
   std::array<Layer, IM_MAX_LAYERS> layers_;

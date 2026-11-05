@@ -201,6 +201,9 @@ im_status Session::Start(const api::StartRequest &req, const SourceSpec *source,
   info_.epoch_ns = epoch_;
   info_.layer_count = layer_count_;
   info_.capture_path = has_video_ ? source_.capture_path : 0;
+  if (const im_status lst = CheckLumaTap(cfg); lst != IM_OK) {
+    return lst; // nothing opened yet
+  }
 
   im_status st = IM_OK;
   try {
@@ -246,6 +249,29 @@ im_status Session::Start(const api::StartRequest &req, const SourceSpec *source,
   return IM_OK;
 }
 
+im_status Session::CheckLumaTap(const im_start_config &cfg) {
+  if ((cfg.flags & luma::kStartFlag) == 0) {
+    return IM_OK;
+  }
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (!has_video_) {
+    return abi::Fail(IM_ERR_INVALID_ARG, {}, "im_start: the luma tap needs a video source");
+  }
+  // Its ring is one more stream for the pump: the layers, Opus and the PCM tap leave room for it unless all are used.
+  const bool audio = audio_mode_ != IM_AUDIO_MODE_OFF;
+  const uint32_t streams =
+      layer_count_ + (audio ? 1u : 0u) + (audio && (cfg.audio.flags & IM_AUDIOF_TAP_PCM) != 0 ? 1u : 0u);
+  if (streams >= ring::kMaxStreams) {
+    return abi::Failf(IM_ERR_INVALID_ARG, {}, "im_start: the luma tap needs a stream of its own (%u of %u in use)",
+                      static_cast<unsigned>(streams), static_cast<unsigned>(ring::kMaxStreams));
+  }
+  luma_tap_ = true;
+  return IM_OK;
+#else
+  return abi::Fail(IM_ERR_INVALID_ARG, {}, "im_start: the luma tap exists in IM_TEST_HOOKS builds only");
+#endif
+}
+
 im_status Session::StartVideo(const im_start_config &cfg) {
   for (uint32_t l = 0; l < layer_count_; ++l) {
     const im_layer_config &lc = cfg.layers[l];
@@ -274,6 +300,12 @@ im_status Session::StartVideo(const im_start_config &cfg) {
     pump_.AddStream(video_rings_[l].get(), IM_PACKET_VIDEO, l);
     L.norm.Reserve(ring::VideoRingConfig(l).arena_bytes / 2);
   }
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (luma_tap_) {
+    debug_ring_ = std::make_unique<ring::PacketRing>(kDebugRingConfig, &signal_);
+    pump_.AddStream(debug_ring_.get(), IM_PACKET_DEBUG, IM_NO_LAYER);
+  }
+#endif
 
   catalog_ = EncoderCatalog();
   std::vector<im_encoder_info> probe;
@@ -402,7 +434,10 @@ im_status Session::StartFrames() {
       break; // only the first candidate decides
     }
   }
-  if (pixels != nullptr || need_slots) {
+  // The luma tap reads the test pattern's pixels, so it asks for the device even when no candidate takes pixels; a
+  // test-hooks capture that writes no slots keeps going without one (it has no pixels to read).
+  const bool luma_pixels = luma_tap_ && !capture::Captures(source_);
+  if (pixels != nullptr || need_slots || luma_pixels) {
     gpu::DeviceRequest request = pixels != nullptr ? pixels->device : gpu::DeviceRequest{};
     if (const uint64_t luid = capture::OutputAdapterLuid(source_); luid != 0) {
       request.adapter = gpu::DeviceRequest::Adapter::kLuid;
@@ -424,10 +459,18 @@ im_status Session::StartFrames() {
   if (const im_status st = VideoFrames::Create(gpu_.get(), fc, &frames_); st != IM_OK) {
     return st;
   }
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (luma_tap_ && gpu_) {
+    if (const im_status st = LumaTap::Create(*gpu_, debug_ring_.get(), &luma_); st != IM_OK) {
+      return st;
+    }
+  }
+#endif
   static std::atomic<uint64_t> devices{0};
   device_ = devices.fetch_add(1, std::memory_order_relaxed) + 1; // every session opens its own device (§8.1)
   gpu_path_ = gpu_ != nullptr;
-  log::Info("session", "frames", {{"gpu", gpu_path_}, {"w", source_.width}, {"h", source_.height}});
+  log::Info("session", "frames",
+            {{"gpu", gpu_path_}, {"w", source_.width}, {"h", source_.height}, {"luma_tap", luma_tap_}});
   return IM_OK;
 }
 
@@ -753,6 +796,11 @@ int64_t Session::NextDeadline() const noexcept {
     }
   }
   at = std::min(at, next_stats_);
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (luma_ && luma_->pending()) {
+    at = std::min(at, QpcNs() + kLumaPollNs); // copies in flight: look again soon, also on a static screen
+  }
+#endif
   if (retry_at_ != kNever) {
     // A full ring's IDR waits for room (§6.2): the pacer keeps asking for it, so poll every kRoomRetryNs rather than
     // spin. New frames still wake the thread.
@@ -786,6 +834,11 @@ void Session::VideoLoop() noexcept {
           // the command (Apply's kPaused takes the newest frame then, uncounted).
           TakeFrame(now, true);
         }
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+        if (luma_) {
+          luma_->Poll(); // the readings whose copies finished (§5.8)
+        }
+#endif
         for (uint32_t l = 0; l < layer_count_ && !ended_.load(std::memory_order_acquire); ++l) {
           if (auto a = layers_[l].planner->Poll(now)) {
             Reinit(l, *a, now);
@@ -969,6 +1022,13 @@ void Session::TakeFrame(int64_t now, bool count_skipped) {
   }
   const auto skipped = count_skipped ? static_cast<uint32_t>(std::min<uint64_t>(t.skipped, 0xFFFFFFFFu)) : 0u;
   pacer_->OnFrame(t.capture_ts_ns, now, skipped);
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  if (luma_ && frames_->slots() != nullptr) {
+    if (const gpu::Slot *slot = frames_->slots()->current(); slot != nullptr) {
+      luma_->OnFrame(*slot, t.skipped); // every frame taken, also the one a resume takes uncounted
+    }
+  }
+#endif
 }
 
 void Session::ApplyRingRequests() {
@@ -1667,6 +1727,9 @@ void Session::ReleaseVideo() noexcept {
   }
   capture_.reset(); // stopped by Stop already; it holds the session's device through its frame pool
   log::Debug("session", "video released");
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  luma_.reset(); // the video thread's (gone): its staging textures go before the device
+#endif
   frames_.reset();
   gpu_.reset();
 }
