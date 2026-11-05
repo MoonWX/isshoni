@@ -1717,8 +1717,8 @@ tasks:
   release:desktop-stubs:
     desc: >-
       Write ISSHONI-DESKTOP-STUB stand-ins for the desktop files into dist-desktop/ (VERSION=<v>), for a goreleaser
-      snapshot without a Windows build; release:snapshot runs it, and nightly.yml's goreleaser-full until it has real
-      desktop files (README WA81, WA86)
+      snapshot without a Windows build; release:snapshot runs it, and so does nightly.yml's goreleaser-full on a
+      night when windows-full made no desktop files (README WA81, WA86)
     requires:
       vars: [VERSION]
     cmds:
@@ -1758,10 +1758,11 @@ tasks:
     # desktop-pkg job's files there, and `task release:snapshot` writes stubs (ISSHONI-DESKTOP-STUB) when there are
     # none, so that .goreleaser.yaml's desktop globs match. goreleaser lists them in checksums.txt either way, so
     # this task always checks their names and checksums; FULL=true refuses a stub, unless DESKTOP_STUBS=true:
-    # nightly.yml's goreleaser-full runs FULL=true over release:desktop-stubs' stubs until it builds real desktop
-    # files (README WA81 hands that to WA86). DESKTOP=true always refuses a stub, and (release.yml) also checks: the
-    # update manifest's version, channel, minVersion (deploy/desktop/min-version) and artifacts[0] against the
-    # installer and the tag; the FFmpeg source tar's SHA-256 against native/ffmpeg/lock.json; install-desktop.ps1
+    # nightly.yml's goreleaser-full runs DESKTOP=true over windows-full's real desktop files (and FULL=true
+    # DESKTOP_STUBS=true over stubs on a night when windows-full made none, then fails; README WA86). DESKTOP=true
+    # always refuses a stub, and (release.yml) also checks: the update manifest's version, channel, minVersion
+    # (deploy/desktop/min-version) and artifacts[0] against the installer and the tag; the FFmpeg source tar's
+    # SHA-256 against native/ffmpeg/lock.json; install-desktop.ps1
     # as deploy/install-desktop.ps1 stamped with <v>, with the production key block (and equal to PKG_PS1, the copy
     # the packaging job stamped, when given); the symbols zip's and the SBOM's contents; and the installer's file
     # list (7z l, which reads NSIS archives) against the stage's install-files.txt (dist-desktop/stage/). It needs jq,

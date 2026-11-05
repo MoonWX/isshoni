@@ -131,6 +131,11 @@ jobs:
             site:
               - 'docs/**'
               - 'web/src/conntest/codes.json'
+              # TestDocsAnchors' product-links scan (WA85) also reads the SPA's sources and
+              # .goreleaser.yaml; deploy/** already runs the site through the deploy filter.
+              - 'web/src/**/*.ts'
+              - 'web/src/**/*.tsx'
+              - '.goreleaser.yaml'
               - '!docs/PLAN.md'
               - '!docs/m1/**'
               - '!docs/m2/**'
@@ -392,7 +397,8 @@ jobs:
             web/package-lock.json deploy/install.sh deploy/test/distro-test.sh deploy/test/distro/Containerfile
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
           # 06 §8.2: the site on site or deploy changes (deploy covers this workflow and
-          # .tool-versions); the site filter has web/src/conntest/codes.json for the anchor test.
+          # .tool-versions); the site filter has web/src/conntest/codes.json, the SPA's sources and .goreleaser.yaml
+          # for the anchor test.
           decide site "$site_or_deploy" docs/package.json docs/package-lock.json .tool-versions go.mod
           # M2 06 §10.1: the client core (and, as they land, the updater, the media packages and the
           # app's own packages) on Windows and macOS, and the portable C++ on Linux and macOS. The
@@ -2208,7 +2214,8 @@ jobs:
     # is missing or older than 120.0) and 03's CDP spec (03 §22.4 B: the TAGS=e2e isshoni.exe, web/e2e/cdp). WA78 added
     # the desktop notices and the native license gate (06 §9.2-§9.3: tools/notices -native, before packaging) and
     # the check that the stage, so the installed tree, has them and 06 §9.1's LGPL files; R13 (WA81) adds the
-    # server-rendered ps1 test; WA88 the updater e2e.
+    # server-rendered ps1 test; WA84 the autostart round trip (TestAutostartRoundTrip, after the -tags e2e tests);
+    # WA88 the updater e2e.
     needs: [changes, web, windows-native]
     if: needs.changes.outputs.run-windows-desktop == 'true'
     runs-on: windows-2025
@@ -3021,6 +3028,21 @@ jobs:
           $lines = Get-Content -LiteralPath $log
           foreach ($t in $tests) {
             if (-not ($lines -match "^--- PASS: $t\b")) { throw "$t did not pass (no '--- PASS: $t' line)" }
+          }
+
+      - name: The autostart round trip (TestAutostartRoundTrip, 03 §16.1, README WA84)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        run: |
+          # The e2e build started as the Run value starts it (--autostart) shows no window, and a second launch shows
+          # one. It needs web/dist and a WebView2 runtime, both here; ISSHONI_REQUIRE_AUTOSTART_E2E=1 turns a missing
+          # prerequisite into a failure, and the test must PASS (not skip). It runs without -race (CGO_ENABLED=0).
+          $env:CGO_ENABLED = '0'
+          $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart.log'
+          go test -v -count=1 -run '^TestAutostartRoundTrip$' ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ((Get-Content -LiteralPath $log) -match '^--- PASS: TestAutostartRoundTrip\b')) {
+            throw "TestAutostartRoundTrip did not pass (no '--- PASS: TestAutostartRoundTrip' line)"
           }
 
       - name: Set up Node (version from .tool-versions)

@@ -890,8 +890,9 @@ jobs:
     # web/dist of this run's version 0.0.0-nightly.<run>: the desktop notices and the native license gate,
     # isshoni.exe, the stage and the installer, the smoke's installers and smoke.ps1 -Mode ci, the DLL-dependent Go
     # tests and isshoni-audiotest selfcheck, Pester and the grammar check under Windows PowerShell 5.1,
-    # install-desktop.ps1 against relserve, the server-rendered ps1 test, the WebView2 runtime, the -tags e2e tests
-    # and 03's CDP spec. The updater e2e runs here on every night (06 §16) once README WA88 adds it.
+    # install-desktop.ps1 against relserve, the server-rendered ps1 test, the WebView2 runtime, the -tags e2e tests,
+    # the autostart round trip (README WA84) and 03's CDP spec. The updater e2e runs here on every night (06 §16)
+    # once README WA88 adds it.
     # From the installer that passed the smoke it also makes the desktop release files of release.yml's desktop-pkg
     # (M2 06 §2.1): the update manifest, the symbols zip, the FFmpeg source tar and the stamped install-desktop.ps1
     # (artifact desktop-release, with the stage as desktop-stage), so that goreleaser-full's snapshot carries real
@@ -1794,6 +1795,21 @@ jobs:
           $lines = Get-Content -LiteralPath $log
           foreach ($t in $tests) {
             if (-not ($lines -match "^--- PASS: $t\b")) { throw "$t did not pass (no '--- PASS: $t' line)" }
+          }
+
+      - name: The autostart round trip (TestAutostartRoundTrip, 03 §16.1, README WA84)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        run: |
+          # The e2e build started as the Run value starts it (--autostart) shows no window, and a second launch shows
+          # one. It needs web/dist and a WebView2 runtime, both here; ISSHONI_REQUIRE_AUTOSTART_E2E=1 turns a missing
+          # prerequisite into a failure, and the test must PASS (not skip). It runs without -race (CGO_ENABLED=0).
+          $env:CGO_ENABLED = '0'
+          $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart.log'
+          go test -v -count=1 -run '^TestAutostartRoundTrip$' ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ((Get-Content -LiteralPath $log) -match '^--- PASS: TestAutostartRoundTrip\b')) {
+            throw "TestAutostartRoundTrip did not pass (no '--- PASS: TestAutostartRoundTrip' line)"
           }
 
       - name: Set up Node (version from .tool-versions)
