@@ -1,8 +1,14 @@
-// The capture area's entry points (README WA50): the picker and its tokens. im_list_sources stays README WA60's.
+// The capture area's entry points (README WA50: the picker and its tokens; WA60: im_list_sources, the listed monitors
+// and the Windows 10 monitor mapping).
 #include "capture/capture.h"
 
+#include <memory>
 #include <utility>
+#include <vector>
 
+#include "capture/outputs.h"
+#include "capture/outputs_win.h"
+#include "capture/picked_item.h"
 #include "capture/picker.h"
 #include "capture/window_match.h"
 #include "capture/winrt_support.h"
@@ -11,8 +17,36 @@
 
 namespace im::capture {
 
-im_status ListSources(uint32_t, std::string &) {
-  return abi::Fail(IM_ERR_NOT_IMPLEMENTED, {}, "im_list_sources: not implemented yet (README WA60)");
+im_status ListSources(uint32_t flags, std::string &json) {
+  if (flags != 0) {
+    return abi::Failf(IM_ERR_INVALID_ARG, {}, "im_list_sources: flags 0x%x are reserved (0)",
+                      static_cast<unsigned>(flags));
+  }
+  Win32Outputs outputs;
+  json = SourcesJson(outputs.Outputs());
+  return IM_OK;
+}
+
+im_status ResolveMonitor(std::string_view id, session::SourceSpec *out) {
+  Win32Outputs outputs;
+  const std::vector<DisplayOutput> list = outputs.Outputs();
+  const std::optional<std::size_t> i = FindMonitor(list, id);
+  if (!i) {
+    return abi::Fail(IM_ERR_SOURCE_GONE, {}, "im_start: no attached monitor has this id (im_list_sources lists them)");
+  }
+  const DisplayOutput &o = list[*i];
+  session::SourceSpec spec;
+  spec.kind = IM_SOURCE_MONITOR;
+  spec.capture_path = IM_CAPTURE_DD;
+  spec.width = static_cast<uint32_t>(o.size().width);
+  spec.height = static_cast<uint32_t>(o.size().height);
+  spec.flags = 0;
+  spec.test = false;
+  auto item = std::make_shared<PickedItem>();
+  item->output = o;
+  spec.item = std::move(item);
+  *out = std::move(spec);
+  return IM_OK;
 }
 
 im_status PickSource(const im_pick_params &params, im_source_info &out) {
@@ -23,14 +57,14 @@ im_status PickSource(const im_pick_params &params, im_source_info &out) {
   }
   const WindowIdentity id = r.picked ? r.picked->identity : WindowIdentity{};
 
+  // §7.1, §7.5 (outputs.h's PlanPick): WGC for windows and Windows 11 monitors, Desktop Duplication for a Windows 10
+  // monitor that mapped to an output, WGC with the border for one that didn't.
   session::SourceSpec spec;
   spec.kind = r.kind;
-  // §7.1: WGC for windows and, on Windows 11, monitors; README WA60 maps a Windows 10 monitor to Desktop Duplication
-  // (§7.5) and keeps WGC with the border when the mapping fails.
-  spec.capture_path = IM_CAPTURE_WGC;
+  spec.capture_path = r.plan.capture_path;
   spec.width = r.width;
   spec.height = r.height;
-  spec.flags = (r.borderless ? 0u : IM_SRCF_OS_BORDER) | (r.self ? IM_SRCF_SELF : 0u);
+  spec.flags = r.plan.flags;
   spec.test = false;
   spec.item = r.picked;
   const std::string token = session::Sources().AddPick(std::move(spec));
@@ -38,15 +72,15 @@ im_status PickSource(const im_pick_params &params, im_source_info &out) {
   out.kind = r.kind;
   CopyUtf8(token, out.id, sizeof out.id);
   CopyUtf8(r.name, out.name, sizeof out.name);
+  CopyUtf8(r.plan.monitor_id, out.monitor_id, sizeof out.monitor_id);
   out.width = r.width;
   out.height = r.height;
-  out.capture_path = IM_CAPTURE_WGC;
-  out.flags = (r.borderless ? 0u : IM_SRCF_OS_BORDER) | (r.self ? IM_SRCF_SELF : 0u);
+  out.capture_path = r.plan.capture_path;
+  out.flags = r.plan.flags;
   if (r.kind == IM_SOURCE_WINDOW) {
     out.pid = id.pid;
     out.window = id.window;
   }
-  // monitor_id stays "" until README WA60's im_list_sources ids exist.
   return IM_OK;
 }
 

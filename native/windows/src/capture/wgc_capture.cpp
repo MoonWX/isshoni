@@ -161,6 +161,9 @@ void WgcCapture::Impl::Stop() noexcept {
 }
 
 bool WgcCapture::Handles(const session::SourceSpec &source) noexcept {
+  if (source.capture_path != IM_CAPTURE_WGC) {
+    return false; // a Windows 10 monitor pick mapped to Desktop Duplication carries its item too (dd_capture.h)
+  }
   const std::shared_ptr<PickedItem> picked = PickedItemOf(source);
   return picked != nullptr && picked->item != nullptr;
 }

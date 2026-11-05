@@ -7,7 +7,8 @@
 //   Pick ── request ─────────────► GraphicsCapturePicker, IInitializeWithWindow::Initialize(parent or the owner
 //     │                              window), PickSingleItemAsync, pumping messages (MsgWaitForMultipleObjectsEx) until
 //     │                              it completes, Cancel() or the timeout (both call the operation's Cancel())
-//     │                            the item's identity (window_match.h) and the borderless answer (winrt_support.h)
+//     │                            the item's identity (window_match.h), the borderless answer (winrt_support.h)
+//     │                              and, for a monitor, its DXGI output (§7.5, outputs.h)
 //     ◄──────────────────── done ─ the result (status, detail and the PickedItem)
 //
 // One pick at a time: a second Pick while one is open is IM_ERR_LIMIT with token pick_busy (04 §5.3). The owner
@@ -41,6 +42,9 @@ struct PickResult {
   uint32_t width = 0;               // item.Size()
   uint32_t height = 0;
   std::string name; // DisplayName() in UTF-8 (shown locally, never logged)
+  // How it is captured (outputs.h's PlanPick over §7.5's mapping of a monitor, README WA60): the capture path, the
+  // IM_SRCF_* flags and monitor_id.
+  PickPlan plan;
 };
 
 class Picker {

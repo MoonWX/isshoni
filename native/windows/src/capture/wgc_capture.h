@@ -45,6 +45,8 @@ namespace im::capture {
 class WgcCapture final : public CaptureSource {
 public:
   // Whether source is a pick this area captures with WGC (capture_path IM_CAPTURE_WGC with a picked item).
+  // Start takes any source with a picked item: capture_source.cpp also starts WGC for a Windows 10 monitor pick whose
+  // Desktop Duplication can't run on the session's device (README WA60).
   static bool Handles(const session::SourceSpec &source) noexcept;
 
   // Starts capturing source into slots (whose device is the session's). On failure nothing runs and the thread's

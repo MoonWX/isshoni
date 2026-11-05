@@ -1311,6 +1311,42 @@ outputs if available, ideally two of the same model) next to each output's `Devi
 Unit tests (`monitor_map_test`) cover steps 2, 3 and 5 with fake outputs, including two identical monitors falling
 through to step 5.
 
+**As built (WA60, group 13)** (`src/capture/outputs.{h,cpp}`, `outputs_win.{h,cpp}`, `dd_capture.{h,cpp}`,
+`dd_policy.h`):
+- Step 1 is `Win32Outputs` (the probe's adapter order, attached outputs only; friendly names from `QueryDisplayConfig`
+  → `DISPLAYCONFIG_TARGET_DEVICE_NAME`, keyed by the source's GDI name), on a per-monitor-v2 thread. Steps 2, 3 and 5
+  are native/common's `MapMonitor` (`monitor_map_test`) run over those outputs by `MatchPickedMonitor`; `PlanPick`
+  turns the result into what the pick reports. The Windows half has its own test with fake outputs,
+  `native/windows/tests/dd_outputs_test.cpp` (CI windows): one size match, a name match among several, two identical
+  monitors falling through to WGC with the border, no size match, a rotated monitor matched by its upright size, the
+  plan per Windows version, the `mon:` ids, the §5.6 document and DD's timing rules.
+- A Windows 10 monitor pick that maps reports `IM_CAPTURE_DD`, `IM_SRCF_MAPPED` (no `IM_SRCF_OS_BORDER`) and
+  `monitor_id` = `"mon:"` + the output's `DeviceName` (the `im_list_sources` id); one that doesn't reports WGC with the
+  border, and the pick logs the outcome (`size`, `name`, `no_size_match`, `ambiguous`) and the match counts at info,
+  never a name. A Windows 11 monitor pick keeps WGC but also maps, for `monitor_id` and for §7.1's "DD on the same
+  output" when WGC fails to start (`IM_ERR_INTERNAL` only). A Windows 10 pick whose output isn't on the session's
+  adapter (§7.4) falls back to WGC with the border.
+- The DD thread blends the pointer into the slot copy itself, before the slot is published (`gpu::CursorOverlay`), and
+  publishes the frame with the pointer marked drawn; a pointer that moves over a static desktop is drawn into a copy of
+  the last desktop image, at most once per half frame interval. Rotation goes to the converter through
+  `FrameMeta::rotation`; slots hold the panel's orientation.
+- **Left to the session (outside WA60's paths, `session/`; the integrator or a fix slice)**: `SourceRegistry::Resolve`
+  still answers `mon:` ids with `IM_ERR_NOT_IMPLEMENTED` and is to call `capture::ResolveMonitor`; the session's
+  device is to be created on `capture::OutputAdapterLuid(source)`'s adapter for a DD source; and the session's sink is
+  to turn `CaptureSink::OnInterrupted` / `OnResumed` (empty defaults today) into `CAPTURE_INTERRUPTED` /
+  `CAPTURE_RESUMED`.
+
+**What `DisplayName()` returns for a monitor on Windows 10 22H2** (recorded with `isshoni-enginetest sources -name`
+and `pick -name -count 2`, picking each monitor; M-DD, §18.4):
+
+| Output | `DeviceName` | Friendly name | `DisplayName()` of its pick | Step 3 |
+|---|---|---|---|---|
+| 1 | pending (owner's PC) | pending | pending | pending |
+| 2 | pending (owner's PC) | pending | pending | pending |
+
+**Verdict**: pending the owner's Win10 run. Names unique → step 4 stays M5 (§16); names ambiguous for identical
+monitors → recorded here and the integrator adds a `WF` slice for step 4 (README §5).
+
 ### 7.6 Window identity, minimized windows, isshoni's own windows
 
 A picked window item carries no `HWND`. The engine identifies it once at pick time: enumerate visible top-level
