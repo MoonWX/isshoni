@@ -5,61 +5,56 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"time"
 )
 
-// Single instance (03 §13.3): one instance per Windows user on the PC, across all of that user's sessions. The first
-// instance holds a named mutex and serves a named pipe; a second launch finds the mutex, sends its arguments
-// (os.Args[1:], unchanged) through the pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback
-// (singleInstanceNames): the mutex Global\<id>.v1.<user SID> and the pipe \\.\pipe\<id>.v1.<user SID>, distinct
-// from the running mutex. The pinned Wails' own single-instance option can't be used: it acquires its lock inside
-// application.New, after 03 §13.4's steps 4–6, so a second instance would read and delete the Pending values and
-// take the running mutex's place in the order (README WA41's PR).
+// Single instance (03 §13.3): one instance per Windows user and data root on the PC, across all of that user's
+// sessions. The first instance holds a named mutex and serves a named pipe; a second launch finds the mutex, sends its
+// arguments (os.Args[1:], unchanged) through the pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback
+// (singleInstanceNames): the mutex Global\<id>.v1.<secret> and the pipe \\.\pipe\<id>.v1.<secret>, distinct from the
+// running mutex. The pinned Wails' own single-instance option can't be used: it acquires its lock inside
+// application.New, after 03 §13.4's steps 4–6, so a second instance would read and delete the Pending values and take
+// the running mutex's place in the order (README WA41's PR).
 //
-// Both names have one scope, the user (README WF19). The pipe's namespace, \\.\pipe\, is shared by every session,
-// and a Global\ mutex is too, so the user's SID in both names gives each user one pair, shared by the user's sessions.
-// (Until WF19 the mutex was Local\, per session, and the pipe per user: a second session of the same user took the
-// mutex as a first instance but couldn't create the pipe.) The scope is the user and not the session because what
-// the app keeps is per user: one data root, %LOCALAPPDATA%\isshoni (06 §2.2: settings.json, servers.json, the
-// WebView2 user data folder, logs, updates), and the device credentials in Credential Manager (02). Two instances of
-// one user would share all of it: settings.json's last writer would win, both WebView2 environments would use one
-// user data folder from two sessions, and both would refresh the same device's tokens, each from the copy it read at
-// start, so the later refresh presents a spent token and the server's reuse detection revokes the device (02 §1
-// decision 6, §6.2). The cost: a launch in a second session (fast user switching, RDP beside the console) forwards
-// into the instance of the session that started first, whose window the second session doesn't show.
+// Both names have one scope, the user's data root (README WF19, §3 item 118). The pipe's namespace, \\.\pipe\, is
+// shared by every session, and a Global\ mutex is too, so one secret gives each user one pair, shared by the user's
+// sessions. The scope is the user and not the session because what the app keeps is per user: one data root,
+// %LOCALAPPDATA%\isshoni (06 §2.2: settings.json, servers.json, the WebView2 user data folder, logs, updates), and the
+// device credentials in Credential Manager (02). Two instances of one user would share all of it: settings.json's last
+// writer would win, both WebView2 environments would use one user data folder from two sessions, and both would
+// refresh the same device's tokens, each from the copy it read at start, so the later refresh presents a spent token
+// and the server's reuse detection revokes the device (02 §1 decision 6, §6.2). The cost: a launch in a second session
+// (fast user switching, RDP beside the console) forwards into the instance of the session that started first, whose
+// window the second session doesn't show.
 //
-// A shared namespace lets any local account create the name first (the SID in it is no secret), so the name alone
-// proves nothing (README §3 item 117). The mutex is created with an explicit security descriptor: owner the user's
-// SID (set, not defaulted: an elevated administrator's objects are otherwise owned by BUILTIN\Administrators), and a
-// DACL of the user and SYSTEM only. A launch that finds the name taken opens it for SYNCHRONIZE|READ_CONTROL only,
-// rights the no-write-up label never denies, so an elevated and a non-elevated instance of one user see each other;
-// the mutex is the user's only when its owner, read through that handle, is the user's SID. Anything else (another
-// owner, a mutex the user may not open, another kind of object) is squatted: the launch logs a warning and falls back
-// to the per-session pair, Local\<id>.v1.<SID> and \\.\pipe\<id>.v1.<SID>.session<N>, so another account can't keep
-// the app from starting (one instance per session while the squat lasts; a launch after the squat ends takes the
-// per-user pair beside a per-session instance still running, accepted). With that name squatted too (only a process
-// in the user's own session can), the launch starts with no lock (decideLock).
+// The secret (instanceSecret, singleinstance_secret.go) is 16 random bytes in a file of the data root that only the
+// user and SYSTEM may open. Names derived from public data (the user's SID, README §3 item 117) let any local account
+// create them first, or a symbolic link at them, and so keep the user's every launch from starting or from forwarding;
+// another account can't read the secret, so it can't name, squat or link either object. The mutex keeps an explicit
+// security descriptor as defence in depth: owner the user's SID (set, not defaulted: an elevated administrator's
+// objects are otherwise owned by BUILTIN\Administrators), and a DACL of the user and SYSTEM only. A launch that finds
+// the name taken opens it for SYNCHRONIZE|READ_CONTROL only, rights the no-write-up label never denies, so an elevated
+// and a non-elevated instance of one user see each other; the mutex is the user's only when its owner, read through
+// that handle, is the user's SID. Anything else under the secret name means a corrupted or leaked secret: the launch
+// starts as the first instance without the lock (Acquire's error; main logs a warning), never as a second one.
 //
-// The pipe accepts only the current user (its DACL) and no remote client; the first instance treats what arrives as
-// untrusted arguments (app.HandleArgs). The first instance creates the next pipe instance before it closes the one it
-// served, so the name is never free while it serves; a second launch connects at identification level only (the
-// server can't impersonate it) and forwards nothing to a server that runs as another account.
+// The pipe is owned by the user (set explicitly, as the mutex) and accepts only the user (its DACL) and no remote
+// client; the first instance treats what arrives as untrusted arguments (app.HandleArgs). The first instance creates
+// the next pipe instance before it closes the one it served, so the name is never free while it serves; a second
+// launch connects at identification level only (the server can't impersonate it) and forwards nothing to a pipe that
+// another account owns (serverCheck).
 
 // lockNames is one pair of single-instance names: the mutex and the pipe the holder of the mutex serves.
 type lockNames struct {
 	mutex, pipe string
 }
 
-// singleInstanceNames derives the single-instance names of id (InstanceID; tests use their own) for the user whose
-// SID is sid, in the session numbered session: the per-user pair, Global\<id>.v1.<sid> and \\.\pipe\<id>.v1.<sid>,
-// both in a namespace every session shares, and the per-session fallback for a squatted per-user mutex,
-// Local\<id>.v1.<sid> (the session's own namespace) and \\.\pipe\<id>.v1.<sid>.session<session>.
-func singleInstanceNames(id, sid string, session uint32) (user, perSession lockNames) {
-	base := id + ".v1." + sid
-	sessionPipe := `\\.\pipe\` + base + ".session" + strconv.FormatUint(uint64(session), 10)
-	user = lockNames{mutex: `Global\` + base, pipe: `\\.\pipe\` + base}
-	return user, lockNames{mutex: `Local\` + base, pipe: sessionPipe}
+// singleInstanceNames derives the single-instance names of id (InstanceID; tests use their own) from the user's
+// instance secret: Global\<id>.v1.<secret> and \\.\pipe\<id>.v1.<secret>, both in a namespace every session shares.
+// The names hold the secret: they are never logged.
+func singleInstanceNames(id, secret string) lockNames {
+	base := id + ".v1." + secret
+	return lockNames{mutex: `Global\` + base, pipe: `\\.\pipe\` + base}
 }
 
 // createOutcome is how creating a single-instance mutex's name ended (CreateMutexExW).
@@ -76,9 +71,9 @@ const (
 type mutexState int
 
 const (
-	mutexCreated        mutexState = iota // this process created it and holds it now
-	mutexOfThisUser                       // another instance of this user holds it
-	mutexOfOtherAccount                   // squatted: anything that isn't provably this user's
+	mutexCreated mutexState = iota // this process created it and holds it now
+	mutexOfUser                    // another instance of this user holds it
+	mutexNotOurs                   // anything that isn't provably this user's: a corrupted or leaked secret
 )
 
 // stateOf classifies a creation's outcome; ownerIsUser reports whether an existing mutex's owner, read through the
@@ -89,33 +84,35 @@ func stateOf(o createOutcome, ownerIsUser bool) mutexState {
 	case o == createdNew:
 		return mutexCreated
 	case o == openedExists && ownerIsUser:
-		return mutexOfThisUser
+		return mutexOfUser
 	default:
-		return mutexOfOtherAccount
+		return mutexNotOurs
 	}
 }
 
-// lockScope is the pair of names a launch ended up with.
-type lockScope int
+// errServerNotUser: the pipe that answered isn't provably this user's; nothing was forwarded.
+var errServerNotUser = errors.New("winos: the pipe isn't served by this user; nothing was forwarded")
 
-const (
-	scopeUser    lockScope = iota // the per-user pair (the normal case)
-	scopeSession                  // the per-session pair: another account squats the per-user mutex
-	scopeNone                     // both mutexes squatted: no lock, the launch starts as a first instance
-)
-
-// decideLock is Acquire's decision from the per-user mutex's state and, read only when that one is squatted, the
-// per-session mutex's: which pair the launch uses and whether it is the first instance there. A squatted name never
-// makes a launch a second instance, so another account can't keep this user's app from starting.
-func decideLock(user, session mutexState) (scope lockScope, first bool) {
-	switch {
-	case user != mutexOfOtherAccount:
-		return scopeUser, user == mutexCreated
-	case session != mutexOfOtherAccount:
-		return scopeSession, session == mutexCreated
-	default:
-		return scopeNone, true
+// serverCheck is Forward's decision on the pipe's server (03 §13.3). owner is the pipe's owner SID, read through the
+// client's handle (ownerErr when it can't be read); the first instance sets it to the user's SID, which no other
+// account can, and reading it works whether or not the server runs elevated. Only when the owner can't be read is the
+// server's process token compared (token: its user's SID); a token that can't be opened (ERROR_ACCESS_DENIED for an
+// elevated server and a non-elevated client) leaves the server unproven.
+func serverCheck(sid, owner string, ownerErr error, token func() (string, error)) error {
+	if ownerErr == nil {
+		if owner == sid {
+			return nil
+		}
+		return errServerNotUser
 	}
+	tokenSID, err := token()
+	if err != nil {
+		return fmt.Errorf("%w (its owner: %w; its token: %w)", errServerNotUser, ownerErr, err)
+	}
+	if tokenSID != sid {
+		return errServerNotUser
+	}
+	return nil
 }
 
 // ForwardTimeout bounds a second instance's forward (03 §13.3, §20).

@@ -30,6 +30,7 @@ import (
 const (
 	childEnv   = "ISSHONI_DESKTOP_TEST_CHILD"
 	idEnv      = "ISSHONI_DESKTOP_TEST_ID"      // the single-instance id
+	rootEnv    = "ISSHONI_DESKTOP_TEST_ROOT"    // the data root whose instance secret names the single instance
 	runningEnv = "ISSHONI_DESKTOP_TEST_RUNNING" // the running mutex's name
 	outEnv     = "ISSHONI_DESKTOP_TEST_OUT"     // a file the child writes
 )
@@ -84,14 +85,15 @@ func testChild(role string) int {
 
 // childStart runs 03 §13.4's order with the real single instance and running mutex under test names.
 func childStart(role string) int {
-	id, running, out := os.Getenv(idEnv), os.Getenv(runningEnv), os.Getenv(outEnv)
+	id, root := os.Getenv(idEnv), os.Getenv(rootEnv)
+	running, out := os.Getenv(runningEnv), os.Getenv(outEnv)
 	s := &starter{
 		log:    slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		stdout: func() io.Writer { f, _ := os.Create(out); return f }, //nolint:gosec // G703: the parent test's temp file
 		// No installer runs for these children: the real installer's mutex is the app's, never a test's.
 		installerRunning: func() (bool, error) { return false, nil },
 		singleInstance: func() (instance, error) {
-			si, err := winos.NewSingleInstance(id, nil)
+			si, err := winos.NewSingleInstance(id, root, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -192,7 +194,8 @@ func TestSingleInstanceAndRunningMutex(t *testing.T) {
 	id := randomName(t)
 	running := `Local\` + randomName(t) + ".running"
 	out := filepath.Join(t.TempDir(), "received.json")
-	env := []string{idEnv + "=" + id, runningEnv + "=" + running, outEnv + "=" + out}
+	// Both launches share one data root, so one instance secret names their lock (03 §13.3).
+	env := []string{idEnv + "=" + id, rootEnv + "=" + t.TempDir(), runningEnv + "=" + running, outEnv + "=" + out}
 
 	first := childCmd(t, "first", env)
 	var firstErr bytes.Buffer
@@ -218,8 +221,8 @@ func TestSingleInstanceAndRunningMutex(t *testing.T) {
 	// A one-shot mode (its own names, so its mutex can't be the first's) creates no running mutex.
 	oneShotRunning := `Local\` + randomName(t) + ".running"
 	versionOut := filepath.Join(t.TempDir(), "version.json")
-	oneShot := childCmd(t, "oneshot", []string{idEnv + "=" + randomName(t), runningEnv + "=" + oneShotRunning,
-		outEnv + "=" + versionOut}, "--version")
+	oneShot := childCmd(t, "oneshot", []string{idEnv + "=" + randomName(t), rootEnv + "=" + t.TempDir(),
+		runningEnv + "=" + oneShotRunning, outEnv + "=" + versionOut}, "--version")
 	if code := exitCode(t, oneShot.Run()); code != 0 {
 		t.Fatalf("--version exited %d (%d: it created the running mutex)", code, exitMutexSeen)
 	}

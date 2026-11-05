@@ -94,7 +94,13 @@ func run(args []string) int {
 		dataRoot:         dataRoot,
 		removeAll:        os.RemoveAll,
 		singleInstance: func() (instance, error) {
-			si, err := winos.NewSingleInstance(winos.InstanceID, slog.Default())
+			// The names come from the user's instance secret in the data root (03 §13.3), so an e2e build with its
+			// own ISSHONI_E2E_DATA_DIR has its own.
+			root, err := dataRoot()
+			if err != nil {
+				return nil, err
+			}
+			si, err := winos.NewSingleInstance(winos.InstanceID, root, slog.Default())
 			if err != nil {
 				return nil, err
 			}

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"os"
 	"sync"
 	"time"
 	"unsafe"
@@ -34,95 +34,123 @@ var (
 
 // SingleInstance is the single-instance lock and its pipe. Safe for concurrent use.
 type SingleInstance struct {
-	userNames    lockNames // the per-user pair (03 §13.3)
-	sessionNames lockNames // the fallback while another account squats the per-user mutex
-	sid          string
-	log          *slog.Logger
+	names lockNames // from the user's instance secret (03 §13.3): never logged
+	sid   string
+	log   *slog.Logger
 
-	mu        sync.Mutex
-	mutexName string         // the pair Acquire took: userNames until it falls back to sessionNames
-	pipeName  string         // the pipe of that pair, which Serve serves and Forward connects to
-	mutex     windows.Handle // held by the first instance until Close
-	stop      windows.Handle // Serve's stop event
-	done      chan struct{}
-	closed    bool
+	mu     sync.Mutex
+	mutex  windows.Handle // held by the first instance until Close
+	stop   windows.Handle // Serve's stop event
+	done   chan struct{}
+	closed bool
 }
 
-// NewSingleInstance prepares the lock for id (InstanceID; tests use their own). log nil means slog.Default().
-func NewSingleInstance(id string, log *slog.Logger) (*SingleInstance, error) {
+// NewSingleInstance prepares the lock for id (InstanceID; tests use their own) and the data root root
+// (%LOCALAPPDATA%\isshoni, or the e2e build's own): it reads the user's instance secret there, creating it on the first
+// launch (instanceSecret). log nil means slog.Default().
+func NewSingleInstance(id, root string, log *slog.Logger) (*SingleInstance, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	log = log.With("component", "winos")
 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return nil, fmt.Errorf("winos: the user's SID: %w", err)
 	}
-	var session uint32
-	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil {
-		return nil, fmt.Errorf("winos: the session: %w", err)
-	}
 	sid := u.User.Sid.String()
-	user, perSession := singleInstanceNames(id, sid, session)
-	return &SingleInstance{
-		userNames:    user,
-		sessionNames: perSession,
-		mutexName:    user.mutex,
-		pipeName:     user.pipe,
-		sid:          sid,
-		log:          log.With("component", "winos"),
-	}, nil
+	secret, err := instanceSecret(root, osSecretFiles(sid), log)
+	if err != nil {
+		return nil, err
+	}
+	return &SingleInstance{names: singleInstanceNames(id, secret), sid: sid, log: log}, nil
 }
 
-// Acquire takes the lock: first is true when no other instance of this user, in any of the user's sessions, holds it.
-// A second instance calls Forward and exits. A per-user mutex that another account squats never makes this launch a
-// second instance: it falls back to the per-session pair (03 §13.3), and with that squatted too it returns an error,
-// so the caller starts as the first instance without a lock.
-func (s *SingleInstance) Acquire() (first bool, err error) {
-	sa, err := s.mutexSecurity()
-	if err != nil {
-		return false, err
-	}
-	userState, h, err := s.createLock(s.userNames.mutex, sa)
-	if err != nil {
-		return false, err
-	}
-	sessionState := mutexOfOtherAccount
-	if userState == mutexOfOtherAccount {
-		// The name with the SID spelled out would put the SID in the log; the pattern says which one it is.
-		s.log.Warn("winos: another account holds this user's single-instance mutex name; "+
-			"one instance per session until it lets go",
-			"name", strings.TrimSuffix(s.userNames.mutex, s.sid)+"<user SID>")
-		if sessionState, h, err = s.createLock(s.sessionNames.mutex, sa); err != nil {
-			return false, err
-		}
-	}
-	scope, first := decideLock(userState, sessionState)
-	names := s.userNames
-	switch scope {
-	case scopeSession:
-		names = s.sessionNames
-	case scopeNone:
-		return false, errors.New("winos: another account holds both single-instance mutex names")
-	}
-	s.mu.Lock()
-	s.mutexName, s.pipeName = names.mutex, names.pipe
-	if first {
-		s.mutex = h
-	}
-	s.mu.Unlock()
-	return first, nil
-}
+// Names returns the mutex's and the pipe's names (cmd/isshoni-desktop's TestAutostartRoundTrip checks that nothing
+// holds them). They hold the user's instance secret: never log them.
+func (s *SingleInstance) Names() (mutex, pipe string) { return s.names.mutex, s.names.pipe }
 
-// mutexSecurity is the mutex's security descriptor: owned by the user (explicitly, so an elevated instance's mutex
-// isn't owned by BUILTIN\Administrators), and open to the user and SYSTEM only.
-func (s *SingleInstance) mutexSecurity() (*windows.SecurityAttributes, error) {
-	sd, err := windows.SecurityDescriptorFromString("O:" + s.sid + "D:P(A;;GA;;;" + s.sid + ")(A;;GA;;;SY)")
+// userOnly is the security descriptor of the single-instance objects and the secret's files: owned by the user
+// (explicitly, so an elevated instance's object isn't owned by BUILTIN\Administrators), open to the user and, with
+// system, SYSTEM.
+func userOnly(sid string, system bool) (*windows.SecurityAttributes, error) {
+	sddl := "O:" + sid + "D:P(A;;GA;;;" + sid + ")"
+	if system {
+		sddl += "(A;;GA;;;SY)"
+	}
+	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
-		return nil, fmt.Errorf("winos: the mutex's security descriptor: %w", err)
+		return nil, fmt.Errorf("winos: a security descriptor: %w", err)
 	}
 	sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
 	sa.Length = uint32(unsafe.Sizeof(*sa))
 	return sa, nil
+}
+
+// osSecretFiles are the secret's files on Windows: created with CREATE_NEW and userOnly's security descriptor, and
+// published with MoveFileExW, which fails on an existing name unless asked to replace it (os.Rename does).
+func osSecretFiles(sid string) secretFiles {
+	return secretFiles{
+		createNew: func(path string) (*os.File, error) {
+			sa, err := userOnly(sid, true)
+			if err != nil {
+				return nil, err
+			}
+			p, err := windows.UTF16PtrFromString(path)
+			if err != nil {
+				return nil, err
+			}
+			h, err := windows.CreateFile(p, windows.GENERIC_WRITE, 0, sa, windows.CREATE_NEW,
+				windows.FILE_ATTRIBUTE_NORMAL, 0)
+			if err != nil {
+				return nil, &os.PathError{Op: "create", Path: path, Err: err} // ERROR_FILE_EXISTS is fs.ErrExist
+			}
+			return os.NewFile(uintptr(h), path), nil
+		},
+		publish: func(tmp, path string) error {
+			from, err := windows.UTF16PtrFromString(tmp)
+			if err != nil {
+				return err
+			}
+			to, err := windows.UTF16PtrFromString(path)
+			if err != nil {
+				return err
+			}
+			if err := windows.MoveFileEx(from, to, windows.MOVEFILE_WRITE_THROUGH); err != nil {
+				return &os.LinkError{Op: "move", Old: tmp, New: path, Err: err} // ERROR_ALREADY_EXISTS is fs.ErrExist
+			}
+			return nil
+		},
+		replace: os.Rename,
+	}
+}
+
+// errNotOurs is Acquire's error when an object under the secret name isn't this user's mutex.
+var errNotOurs = errors.New("winos: the single-instance mutex's name holds an object that isn't this user's " +
+	"(a corrupted or leaked instance secret)")
+
+// Acquire takes the lock: first is true when no other instance of this user and data root, in any of the user's
+// sessions, holds it. A second instance calls Forward and exits. An object under the name that isn't this user's
+// mutex never makes this launch a second instance: Acquire returns an error, so the caller starts as the first instance
+// without a lock (03 §13.3).
+func (s *SingleInstance) Acquire() (first bool, err error) {
+	sa, err := userOnly(s.sid, true)
+	if err != nil {
+		return false, err
+	}
+	state, h, err := s.createLock(s.names.mutex, sa)
+	switch {
+	case err != nil:
+		return false, err
+	case state == mutexCreated:
+		s.mu.Lock()
+		s.mutex = h
+		s.mu.Unlock()
+		return true, nil
+	case state == mutexOfUser:
+		return false, nil
+	default:
+		return false, errNotOurs
+	}
 }
 
 // lockAccess is what a launch asks of a mutex it finds: to hold a handle and read the owner. Both are outside the
@@ -130,11 +158,12 @@ func (s *SingleInstance) mutexSecurity() (*windows.SecurityAttributes, error) {
 const lockAccess = windows.SYNCHRONIZE | windows.READ_CONTROL
 
 // createLock creates the mutex name with sa, or finds whom an existing one belongs to. It returns the handle only
-// when this process created the mutex (mutexCreated); a handle to an existing one is closed here.
+// when this process created the mutex (mutexCreated); a handle to an existing one is closed here. Its errors never
+// hold the name.
 func (s *SingleInstance) createLock(name string, sa *windows.SecurityAttributes) (mutexState, windows.Handle, error) {
 	p, err := windows.UTF16PtrFromString(name)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, errors.New("winos: the single-instance mutex's name has a NUL")
 	}
 	h, err := windows.CreateMutexEx(sa, p, 0, lockAccess)
 	switch {
@@ -152,14 +181,26 @@ func (s *SingleInstance) createLock(name string, sa *windows.SecurityAttributes)
 	}
 }
 
-// ownedByUser reports whether the kernel object h's owner is this user's SID; false when it can't be read.
-func (s *SingleInstance) ownedByUser(h windows.Handle) bool {
+// ownerOf reads the owner SID of the kernel object or pipe h (a handle with READ_CONTROL).
+func ownerOf(h windows.Handle) (string, error) {
 	sd, err := windows.GetSecurityInfo(h, windows.SE_KERNEL_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
-		return false
+		return "", err
 	}
 	owner, _, err := sd.Owner()
-	return err == nil && owner != nil && owner.String() == s.sid
+	if err != nil {
+		return "", err
+	}
+	if owner == nil {
+		return "", errors.New("winos: the object has no owner")
+	}
+	return owner.String(), nil
+}
+
+// ownedByUser reports whether the kernel object h's owner is this user's SID; false when it can't be read.
+func (s *SingleInstance) ownedByUser(h windows.Handle) bool {
+	owner, err := ownerOf(h)
+	return err == nil && owner == s.sid
 }
 
 // Serve delivers each forwarded command line to onArgs, one at a time, on a goroutine of its own, until Close. Only
@@ -184,19 +225,13 @@ func (s *SingleInstance) Serve(onArgs func(args []string)) error {
 	}
 	s.stop = stop
 	s.done = make(chan struct{})
-	go s.serve(onArgs, sa, s.pipeName)
+	go s.serve(onArgs, sa, s.names.pipe)
 	return nil
 }
 
-// pipeSecurity allows the current user only.
+// pipeSecurity: owned by the user, set explicitly (Forward's serverCheck reads it), and open to the user only.
 func (s *SingleInstance) pipeSecurity() (*windows.SecurityAttributes, error) {
-	sd, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;" + s.sid + ")")
-	if err != nil {
-		return nil, fmt.Errorf("winos: the pipe's security descriptor: %w", err)
-	}
-	sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
-	sa.Length = uint32(unsafe.Sizeof(*sa))
-	return sa, nil
+	return userOnly(s.sid, false)
 }
 
 func (s *SingleInstance) serve(onArgs func([]string), sa *windows.SecurityAttributes, pipeName string) {
@@ -355,17 +390,15 @@ func (s *SingleInstance) Forward(args []string) error {
 		return err
 	}
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(asfwAny))
-	s.mu.Lock()
-	pipeName := s.pipeName
-	s.mu.Unlock()
-	name, err := windows.UTF16PtrFromString(pipeName)
+	name, err := windows.UTF16PtrFromString(s.names.pipe)
 	if err != nil {
-		return err
+		return errors.New("winos: the single-instance pipe's name has a NUL")
 	}
 	deadline := time.Now().Add(ForwardTimeout)
 	for {
-		// SECURITY_IDENTIFICATION: the server may learn who this is, but never act as this user.
-		h, err := windows.CreateFile(name, windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING,
+		// SECURITY_IDENTIFICATION: the server may learn who this is, but never act as this user. READ_CONTROL: to read
+		// the pipe's owner (serverCheck).
+		h, err := windows.CreateFile(name, windows.GENERIC_WRITE|windows.READ_CONTROL, 0, nil, windows.OPEN_EXISTING,
 			windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 		if err == nil {
 			defer func() { _ = windows.CloseHandle(h) }()
@@ -392,31 +425,35 @@ func (s *SingleInstance) Forward(args []string) error {
 	}
 }
 
-// checkServer makes sure that the pipe's server runs as this user: another account that created the name while no
-// first instance held it gets no command line.
+// checkServer makes sure that the pipe is this user's: its owner, which the first instance sets to the user's SID and
+// no other account can, or, when the owner can't be read, the server process's user (serverCheck, 03 §13.3).
 func (s *SingleInstance) checkServer(pipe windows.Handle) error {
+	owner, ownerErr := ownerOf(pipe)
+	return serverCheck(s.sid, owner, ownerErr, func() (string, error) { return serverUser(pipe) })
+}
+
+// serverUser is the SID of the user the pipe's server process runs as. Its token can't be opened from a non-elevated
+// client when the server runs elevated (ERROR_ACCESS_DENIED).
+func serverUser(pipe windows.Handle) (string, error) {
 	var pid uint32
 	if err := windows.GetNamedPipeServerProcessId(pipe, &pid); err != nil {
-		return fmt.Errorf("winos: the pipe's server: %w", err)
+		return "", err
 	}
 	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return fmt.Errorf("winos: the pipe's server: %w", err)
+		return "", err
 	}
 	defer func() { _ = windows.CloseHandle(p) }()
 	var tok windows.Token
 	if err := windows.OpenProcessToken(p, windows.TOKEN_QUERY, &tok); err != nil {
-		return fmt.Errorf("winos: the pipe's server: %w", err)
+		return "", err
 	}
 	defer func() { _ = tok.Close() }()
 	u, err := tok.GetTokenUser()
 	if err != nil {
-		return fmt.Errorf("winos: the pipe's server: %w", err)
+		return "", err
 	}
-	if u.User.Sid.String() != s.sid {
-		return errors.New("winos: the pipe is served by another account; nothing was forwarded")
-	}
-	return nil
+	return u.User.Sid.String(), nil
 }
 
 // Close stops serving and releases the lock. It waits at most closeWait for a forwarded command line that onArgs is

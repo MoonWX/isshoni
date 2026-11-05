@@ -38,7 +38,7 @@ func TestStubs(t *testing.T) {
 		t.Errorf("OpenSettingsPage: %v", err)
 	}
 
-	si, err := NewSingleInstance(InstanceID, nil)
+	si, err := NewSingleInstance(InstanceID, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,3 +90,6 @@ func TestStubs(t *testing.T) {
 		t.Errorf("ShowToast: %v", err)
 	}
 }
+
+// testSecretFiles are the instance secret's real files on this OS (singleinstance_secret_test.go).
+func testSecretFiles(*testing.T) secretFiles { return osSecretFiles() }

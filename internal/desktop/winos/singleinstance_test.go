@@ -232,36 +232,23 @@ const ciPipePattern = `*io.isshoni.desktop.*`
 // ciPipeLike matches the cleanup's pipe filter: GetFiles('\\.\pipe\') piped into Where-Object { $_ -like '<pattern>' }.
 var ciPipeLike = regexp.MustCompile(`GetFiles\('\\\\\.\\pipe\\'\) \| Where-Object \{ \$_ -like '([^']*)' \}`)
 
-// TestSingleInstanceNames: the mutex and the pipe have the same scope, the user (03 §13.3; README WF19). Both are in
-// a namespace every session shares (Global\ and \\.\pipe\) and carry the user's SID, so each user gets one pair and
-// two users two. The fallback for a squatted mutex (README §3 item 117) is per session in both names: Local\ is the
-// session's own namespace, and the pipe carries the session's number. The workflows' cleanup pattern matches every
+// TestSingleInstanceNames: the mutex and the pipe have the same scope, the user's data root (03 §13.3; README WF19,
+// §3 item 118). Both are in a namespace every session shares (Global\ and \\.\pipe\) and carry the user's instance
+// secret, never the SID, so each secret gets one pair and two secrets two. The workflows' cleanup pattern matches the
 // pipe.
 func TestSingleInstanceNames(t *testing.T) {
-	const sid = "S-1-5-21-1004336348-1177238915-682003330-1001"
-	user, session := singleInstanceNames(InstanceID, sid, 2)
-	want := lockNames{mutex: `Global\io.isshoni.desktop.v1.` + sid, pipe: `\\.\pipe\io.isshoni.desktop.v1.` + sid}
-	if user != want {
-		t.Errorf("per user %+v, want %+v", user, want)
+	const secret = "0123456789abcdef0123456789abcdef"
+	got := singleInstanceNames(InstanceID, secret)
+	want := lockNames{mutex: `Global\io.isshoni.desktop.v1.` + secret, pipe: `\\.\pipe\io.isshoni.desktop.v1.` + secret}
+	if got != want {
+		t.Errorf("names %+v, want %+v", got, want)
 	}
-	want = lockNames{
-		mutex: `Local\io.isshoni.desktop.v1.` + sid,
-		pipe:  `\\.\pipe\io.isshoni.desktop.v1.` + sid + ".session2",
+	other := singleInstanceNames(InstanceID, "fedcba9876543210fedcba9876543210")
+	if other.mutex == got.mutex || other.pipe == got.pipe {
+		t.Errorf("two secrets share a name: %+v %+v", other, got)
 	}
-	if session != want {
-		t.Errorf("per session %+v, want %+v", session, want)
-	}
-	if u3, s3 := singleInstanceNames(InstanceID, sid, 3); u3 != user || s3.pipe == session.pipe {
-		t.Errorf("session 3: per user %+v (want the same), per-session pipe %q (want another)", u3, s3.pipe)
-	}
-	other, otherSession := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002", 2)
-	if other.mutex == user.mutex || other.pipe == user.pipe || otherSession.mutex == session.mutex ||
-		otherSession.pipe == session.pipe {
-		t.Errorf("two users share a name: %+v %+v", other, otherSession)
-	}
-	if tu, ts := singleInstanceNames("io.isshoni.test-1", sid, 2); tu.mutex == user.mutex || tu.pipe == user.pipe ||
-		ts.mutex == session.mutex || ts.pipe == session.pipe {
-		t.Errorf("another id shares a name: %+v %+v", tu, ts)
+	if tn := singleInstanceNames("io.isshoni.test-1", secret); tn.mutex == got.mutex || tn.pipe == got.pipe {
+		t.Errorf("another id shares a name: %+v", tn)
 	}
 
 	// The cleanup's pattern, as PowerShell's -like applies it to GetFiles' full names (no '/' in them, so path.Match's
@@ -280,7 +267,7 @@ func TestSingleInstanceNames(t *testing.T) {
 			t.Errorf("%s: the pipe filter is %q, want %q", wf, m[0][1], ciPipePattern)
 		}
 	}
-	for _, p := range []string{user.pipe, session.pipe, other.pipe, otherSession.pipe} {
+	for _, p := range []string{got.pipe, other.pipe} {
 		if ok, err := path.Match(ciPipePattern, p); !ok || err != nil {
 			t.Errorf("%q doesn't match the cleanup's %q: %v", p, ciPipePattern, err)
 		}
@@ -288,7 +275,7 @@ func TestSingleInstanceNames(t *testing.T) {
 }
 
 // TestStateOf: only a mutex this user owns is the user's; a mutex of another owner, one whose owner can't be read,
-// one the user may not open and another kind of object of the name are all squatted (03 §13.3; README §3 item 117).
+// one the user may not open and another kind of object of the name are not (03 §13.3; README §3 item 118).
 func TestStateOf(t *testing.T) {
 	for _, c := range []struct {
 		o           createOutcome
@@ -296,10 +283,10 @@ func TestStateOf(t *testing.T) {
 		want        mutexState
 	}{
 		{createdNew, false, mutexCreated},
-		{openedExists, true, mutexOfThisUser},
-		{openedExists, false, mutexOfOtherAccount},
-		{deniedAccess, false, mutexOfOtherAccount},
-		{otherObject, false, mutexOfOtherAccount},
+		{openedExists, true, mutexOfUser},
+		{openedExists, false, mutexNotOurs},
+		{deniedAccess, false, mutexNotOurs},
+		{otherObject, false, mutexNotOurs},
 	} {
 		if got := stateOf(c.o, c.ownerIsUser); got != c.want {
 			t.Errorf("stateOf(%d, %v) = %d, want %d", c.o, c.ownerIsUser, got, c.want)
@@ -307,33 +294,36 @@ func TestStateOf(t *testing.T) {
 	}
 }
 
-// TestDecideLock: the per-user pair unless another account squats its mutex; then the per-session pair; with both
-// squatted, no lock and a first instance. A squatted name never makes a launch a second instance, which would exit.
-func TestDecideLock(t *testing.T) {
-	all := []mutexState{mutexCreated, mutexOfThisUser, mutexOfOtherAccount}
-	for _, user := range all {
-		for _, session := range all {
-			scope, first := decideLock(user, session)
-			var wantScope lockScope
-			var wantFirst bool
-			switch {
-			case user == mutexCreated: // the session's state is never read then
-				wantScope, wantFirst = scopeUser, true
-			case user == mutexOfThisUser:
-				wantScope, wantFirst = scopeUser, false
-			case session == mutexCreated:
-				wantScope, wantFirst = scopeSession, true
-			case session == mutexOfThisUser:
-				wantScope, wantFirst = scopeSession, false
-			default:
-				wantScope, wantFirst = scopeNone, true
-			}
-			if scope != wantScope || first != wantFirst {
-				t.Errorf("decideLock(%d, %d) = %d, %v; want %d, %v", user, session, scope, first, wantScope, wantFirst)
-			}
-			if !first && (user == mutexOfOtherAccount && session == mutexOfOtherAccount) {
-				t.Errorf("decideLock(%d, %d): a second instance of squatted names", user, session)
-			}
+// TestServerCheck: Forward trusts the pipe when its owner is the user's SID, whatever the server's token says (an
+// elevated server's can't be opened from a non-elevated client); it compares the token only when the owner can't be
+// read, and a token that can't be opened then leaves the server unproven (03 §13.3).
+func TestServerCheck(t *testing.T) {
+	const user, other = "S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002"
+	errDenied := errors.New("access denied")
+	errUnread := errors.New("the owner can't be read")
+	token := func(sid string, err error) func() (string, error) {
+		return func() (string, error) { return sid, err }
+	}
+	for _, c := range []struct {
+		name     string
+		owner    string
+		ownerErr error
+		token    func() (string, error)
+		ok       bool
+	}{
+		{"owner is the user, token denied (elevated server)", user, nil, token("", errDenied), true},
+		{"owner is the user, token of the user", user, nil, token(user, nil), true},
+		{"owner is another account", other, nil, token(user, nil), false},
+		{"owner unread, token of the user", "", errUnread, token(user, nil), true},
+		{"owner unread, token of another account", "", errUnread, token(other, nil), false},
+		{"owner unread, token denied", "", errUnread, token("", errDenied), false},
+	} {
+		err := serverCheck(user, c.owner, c.ownerErr, c.token)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %v, want ok %v", c.name, err, c.ok)
+		}
+		if err != nil && !errors.Is(err, errServerNotUser) {
+			t.Errorf("%s: %v isn't errServerNotUser", c.name, err)
 		}
 	}
 }

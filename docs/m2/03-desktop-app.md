@@ -106,7 +106,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
 | W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and the native `window.open(…)` (from a fresh frame) leave the page on the asset origin, the open returns `null` and no page appears; a browser-started navigation (CDP `Page.navigate`) to a foreign URL comes back to the asset origin by itself; `chrome.webview.postMessage` is still there under the CSP sandbox | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, the start page again. **Fails at beta.34, fallback taken**: Wails registers no `NewWindowRequested` handler (the COM types exist in `internal/webview2/pkg/webview2`, nothing subscribes), and its `NavigationStarting` callback drops the event's arguments (`edge/chromium.go`, `application/webview_window_windows.go`'s `navigationStarting`), so Go can cancel neither, and no Wails option or reachable WebView2 setting blocks them. The fallback, §5.5 layer 2: (1) `bridge.js`'s Navigation API `navigate` listener cancels a script's foreign navigation (§5.2); (2) the HTML response's header CSP ends with `sandbox allow-scripts allow-same-origin allow-forms`, no `allow-popups`, so Blink refuses every new window before WebView2 sees one (§5.3); (3) after each `WebViewNavigationCompleted`, Go asks the page where it is and loads the start page (`SetURL("/")`) when the browser-reported top-level source (`OriginInfo.TopOrigin`) is not the asset origin or no answer comes within 5 s once the runtime is up (`navguard.go`; a window that keeps leaving is sent back at most 3 times a minute). `Shell.Reload()` can't be the fallback: at beta.34 it is `location.reload()` of whatever page is showing, so the shell loads the start page instead when the window was last seen elsewhere, and W17's watchdog loads it after a reload that brought no beat back. The CDP check is written against the fallback, and PR #53's `windows-desktop` run passed it (README §3 item 92): it reaches the native `window.open` through a fresh `src`-less iframe's window (`DesktopPlatform` replaced `window.open` itself), asserts that it returns `null` with no new page, and asserts that a browser-started navigation really reached the foreign origin before it came back; `desktop-security.spec` checks (1) and (2) in Chrome too. Not covered: a new window the browser starts itself (the default context menu's "Open link in new window", on only in dev and e2e builds, §5.4), and a foreign page that loads runs until Go sends it back (layer 3 keeps it off `/wails/*`). Re-check at every bump; drop (3) and the sandbox once Wails can cancel |
-| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Global\io.isshoni.desktop.v1.<user SID>` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>` in `winos` (both per user, §13.3; distinct from the running mutex of §13.4). The mutex is created owned by the user, open to the user and SYSTEM only, and a name another account squats makes a launch fall back to a per-session pair instead of exiting (§13.3, README §3 item 117). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
+| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Global\io.isshoni.desktop.v1.<secret>` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<secret>` in `winos` (both per user and data root, §13.3; distinct from the running mutex of §13.4), where `<secret>` is the user's instance secret, 16 random bytes in the user-only file `instance.secret` of the data root, so another account can't know, squat or link the names (README §3 item 118). The mutex and the pipe are created owned by the user, the mutex open to the user and SYSTEM, the pipe to the user only; a launch is a second instance only when the mutex's owner is the user's SID, and forwards only when the pipe's owner is (§13.3). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
 | W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test. **Holds at beta.34** (PR #53's `windows-desktop` run; README §3 item 92; again in PR #56's green run, README §3 item 113): after `WM_CLOSE` (posted to the main window's HWND, as its close button sends it: the process's one enabled top-level window of Wails' class `WailsWebviewWindow`, since beta.34 also makes a hidden `WS_DISABLED` one of that class, `__wails_hidden_mainthread`, and .NET's `MainWindowHandle`/`CloseMainWindow()`, which PR #53's check used, take the first visible unowned window, the topmost Sharing pill while a share is live) the main HWND still exists (`IsWindow`) and is hidden (`IsWindowVisible` false), the page reports `document.visibilityState` `hidden`, and the process lives. The spec attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation keeps `visibilityState` `visible` whatever the window does, so without it the row could never see the hide. The two state polls are soft, so the row records the window's and the webview's state apart | Window option to hide on close, plus our own quit path from the tray |
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
 | W9 | WebView2 settings: DevTools off in production builds, default context menu off, zoom control off, browser accelerator keys off, general autofill and password save off, status bar off, swipe navigation off, external drop off | CDP e2e per setting where observable; else manual | The SPA-level mitigations of §5.4 |
@@ -143,7 +143,7 @@ W19) prints its rows the same way.
 | W3 | **Holds**: an injected inline script doesn't run and reports a `script-src` violation of the header policy (again in PR #56's green `windows-desktop` run) | CDP spec (as W1); `desktop-security.spec` in Chrome | `TestWailsChecklist`'s header-only page (`testdata/checklist/w3.html`) |
 | W4 | **Go half holds**: the Guard's tests (`internal/desktop/assets`, `TestGuard*`: foreign and missing `Origin`, the runtime's objects, chunked and oversized bodies, both request forms) pass (Mac, group 17); `desktop-security.spec` gets 403 for a foreign `Origin` through the real Guard in Chrome | Go tests; e2e | The real webview's half (the middleware sees the runtime's requests): `TestWailsChecklist`. The CDP spec can't send a foreign `Origin` to `wails.localhost`: nothing outside the webview reaches that host, and the page's CSP (`frame-src 'none'`) admits no other origin's frame |
 | W5 | **Fails; fallback taken and holds** (above; PR #53, README §3 item 92; the fallback passed again in PR #56's green `windows-desktop` run) | CDP spec | Re-check at every bump |
-| W6 | **Fallback taken (WA41)** (above): `winos`' mutex and pipe; `TestSingleInstanceAndRunningMutex` passed in PR #53's green `windows-go` run, and the forward held end to end in PR #56's green `windows-desktop` run (`TestAutostartRoundTrip`, twice, §16.1); the mutex/pipe scope mismatch found there is gone since WF19, which made both per user (§13.3, README §3 item 115); the per-user names are `winos`' `TestSingleInstanceNames` (Mac) and `TestSingleInstanceNamesOfThisUser` (`windows-go`, to be read from the next run); the squatting defence (README §3 item 117) is `TestStateOf` and `TestDecideLock` (Mac) and `TestSingleInstanceMutexOwner` and `TestSingleInstanceSquatted` (`windows-go`, to be read from the next run; its `owner` case runs only elevated, as on CI) | Windows Go test | — |
+| W6 | **Fallback taken (WA41)** (above): `winos`' mutex and pipe; `TestSingleInstanceAndRunningMutex` passed in PR #53's green `windows-go` run, and the forward held end to end in PR #56's green `windows-desktop` run (`TestAutostartRoundTrip`, twice, §16.1); the mutex/pipe scope mismatch found there is gone since WF19, which made both per user (§13.3, README §3 item 115); the names from the instance secret (README §3 item 118) are `winos`' `TestSingleInstanceNames`, `TestStateOf`, `TestServerCheck` and `TestInstanceSecret*` (Mac) and `TestSingleInstanceNamesFromSecret`, `TestSingleInstanceMutexOwner`, `TestInstanceSecretFileSecurity`, `TestSingleInstanceOldNamesIgnored` and `TestSingleInstanceNotOurs` (`windows-go`, to be read from the next run; `TestSingleInstanceNotOurs`' `owner` case runs only elevated, as on CI) | Windows Go test | — |
 | W7 | **Holds** (PR #53; again in PR #56's green `windows-desktop` run, with `WM_CLOSE` posted to the main window found by its class, README §3 item 113): hidden, not destroyed, `visibilityState` `hidden`, process alive; `TestWindowClosing` passes (Mac, group 17) | CDP spec; Go hook test | — |
 | W8 | Registry half **holds (windows-go, PR #53)**: `TestToastRegistryKeys` passed in PR #53's green `windows-go` run (made to run there by PR #53's lesson (c): the test process carries its random AppUserModelID, README §3 item 90) | Windows Go test | The buttons: M-DESK-5 on the owner's PC |
 | W9 | Zoom control (Ctrl + wheel, Ctrl+=, Ctrl+numpad +) and the browser accelerator keys (F5, Ctrl+R, Ctrl+P, Ctrl+F, Ctrl+U, Ctrl+Shift+I, F12): **the CDP-observable checks hold** (PR #56's green `windows-desktop` run): no zoom change, no reload, no `beforeprint`, no new DevTools or view-source target. CDP's key and wheel events enter at the renderer, so this says nothing about WebView2's own accelerator path (W16's lesson, README §3 item 113) | CDP spec (WA87) | Manual on the owner's PC with a production build and the real keyboard and mouse: the accelerators again (CDP's key events enter at the renderer's widget, not WebView2's own accelerator path), the default context menu (right-click outside a text field), DevTools (F12, Ctrl+Shift+I), the status bar (hover a link), autofill and password save (the link step's password form), swipe navigation and pinch zoom (touchpad), external drop (drag a file and a link onto the window) |
@@ -2270,49 +2270,73 @@ for it), so every later reload sends the page back to the setup page (WA83-R4).
 
 ### 13.3 Single instance
 
-- One instance per Windows user on the PC, across all of the user's sessions, through W6's fallback in `winos` (WA41;
-  §3.2 says why Wails' own option can't be used at beta.34): the first instance holds the mutex
-  `Global\io.isshoni.desktop.v1.<user SID>` and serves the pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>`, whose DACL
-  admits only the current user and no remote client. **Both have the same scope, the user** (README WF19): a `Global\`
-  mutex and `\\.\pipe\` are each one namespace for every session, and the SID in both names gives each user one pair.
-  (Until WF19 the mutex was `Local\io.isshoni.desktop.v1`, per session, while the pipe was per user: a second session of
-  the same user took the mutex as a first instance but couldn't create the pipe.) The scope is the user and not the
-  session because what the app keeps is per user: one data root (06 §2.2, `%LOCALAPPDATA%\isshoni` with `settings.json`,
-  `servers.json`, the WebView2 user data folder, logs and updates) and the device credentials in Credential Manager
-  (02). Two instances of one user in two sessions would share all of it: `settings.json`'s writes are atomic (§14.2), so
-  the last writer would silently win; both WebView2 environments would use one user data folder from two sessions; and
-  both would refresh the same device's tokens, each from the credential it read once at start (02's
-  `deviceauth.Manager`), so the later refresh presents a spent token and the server's reuse detection revokes the device
-  (02 §1 decision 6, §6.2). **Accepted cost**: a launch in a second session of the same user (fast user switching, RDP
-  beside the console) is a second instance; it forwards its arguments into the instance of the session that started
-  first and exits 0, so a link clicked there opens in a window the clicking session doesn't show (the user finds it on
-  switching back). The running mutex and the installer's mutex stay `Local\` (§13.4, 06 §2.4), accepted, so an installer
-  in one session doesn't wait for the app of another (06 §6.7's `.old` rename loop covers the files that app still
-  maps).
-- **Squatting** (README §3 item 117): in a namespace every session shares, any local account can create the mutex's
-  name first (the SID in it is no secret), so a name that exists proves nothing. The mutex is created with
-  `CreateMutexExW` and an explicit security descriptor, `O:<user SID>D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)`: the owner is
-  set, not defaulted, because an elevated administrator's objects are otherwise owned by `BUILTIN\Administrators`, and
-  no other account can make the user's SID an object's owner. A launch that finds the name taken opens it for
+- One instance per Windows user and data root on the PC, across all of the user's sessions, through W6's fallback in
+  `winos` (WA41; §3.2 says why Wails' own option can't be used at beta.34): the first instance holds the mutex
+  `Global\io.isshoni.desktop.v1.<secret>` and serves the pipe `\\.\pipe\io.isshoni.desktop.v1.<secret>`, where
+  `<secret>` is the user's **instance secret** (below; README §3 item 118). **Both have the same scope, the user's data
+  root** (README WF19): a `Global\` mutex and `\\.\pipe\` are each one namespace for every session, and one secret
+  gives each user one pair; another data root of the same user (the e2e build's `ISSHONI_E2E_DATA_DIR`, §22.4 B) has
+  its own secret and so its own pair. (Until WF19 the mutex was `Local\io.isshoni.desktop.v1`, per session, while the
+  pipe was per user: a second session of the same user took the mutex as a first instance but couldn't create the
+  pipe.) The scope is the user and not the session because what the app keeps is per user: one data root (06 §2.2,
+  `%LOCALAPPDATA%\isshoni` with `settings.json`, `servers.json`, the WebView2 user data folder, logs and updates) and
+  the device credentials in Credential Manager (02). Two instances of one user in two sessions would share all of it:
+  `settings.json`'s writes are atomic (§14.2), so the last writer would silently win; both WebView2 environments would
+  use one user data folder from two sessions; and both would refresh the same device's tokens, each from the credential
+  it read once at start (02's `deviceauth.Manager`), so the later refresh presents a spent token and the server's
+  reuse detection revokes the device (02 §1 decision 6, §6.2). **Accepted cost**: a launch in a second session of the
+  same user (fast user switching, RDP beside the console) is a second instance; it forwards its arguments into the
+  instance of the session that started first and exits 0, so a link clicked there opens in a window the clicking
+  session doesn't show (the user finds it on switching back). The running mutex and the installer's mutex stay
+  `Local\` (§13.4, 06 §2.4), accepted, so an installer in one session doesn't wait for the app of another (06 §6.7's
+  `.old` rename loop covers the files that app still maps).
+- **The instance secret** (README §3 items 117 and 118): names in a namespace every session shares can be created
+  first by any local account that knows them, as an object of its own or as a symbolic link to an object the user
+  owns. Names derived from public data (the user's SID, as WF19's were) let another account keep the user's every
+  launch from starting (a squatted mutex) or from forwarding (a squatted pipe), and an owner check alone doesn't stop
+  a symbolic link at the mutex's name that points to another mutex the user owns. So the names carry 16 random bytes
+  (`crypto/rand`, 32 lowercase hex digits) that only the user can read: the file `instance.secret` in the data root
+  (§14.1; per user and per PC, never roaming). The first launch creates it, as a temp file made with `CREATE_NEW` and
+  the security descriptor `O:<user SID>D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)` (the owner set explicitly, the DACL
+  protected from inheritance), then moved to its name with `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`: two
+  launches that create it at once end with one value, since the one whose move fails reads the other's complete file.
+  A file that can't be read or isn't a valid secret is regenerated (a temp file renamed over it) with a warning that
+  names neither value; launches then read the file again, so racing regenerations settle on the last one written (an
+  instance that still runs under the old value isn't found: accepted for a corrupted file). The secret and the names
+  are never logged. `--purge-data` deletes it with the data root; the next start makes a new one. What an attacker
+  gets: another standard account can't read the file, so it can't name, squat or link either object; whoever can read
+  the user's profile (the user's own processes, an administrator, SYSTEM) can already do anything the secret would
+  allow and more (stop the app, change `settings.json`, read the device credentials), so the secret needn't protect
+  anything from them.
+- **Defence in depth**: the mutex is created with `CreateMutexExW` and the same security descriptor as the file, owned
+  by the user (an elevated administrator's objects are otherwise owned by `BUILTIN\Administrators`, and no other
+  account can make the user's SID an object's owner). A launch that finds the name taken opens it for
   `SYNCHRONIZE | READ_CONTROL` only (rights that the no-write-up label of an elevated instance's object never denies,
   so an elevated and a non-elevated instance of one user see each other) and reads its owner
   (`GetSecurityInfo(SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION)`): the user's SID makes it a second instance;
   anything else (another owner, an owner that can't be read, `ERROR_ACCESS_DENIED`, or `ERROR_INVALID_HANDLE` for
-  another kind of object of that name) is squatted. A squatted name never makes a launch a second instance, which
-  would exit: it logs a warning naming the squatted name (`Global\io.isshoni.desktop.v1.<user SID>`, the pattern, so
-  the SID isn't logged) and falls back to a per-session pair, `Local\io.isshoni.desktop.v1.<user SID>` and
-  `\\.\pipe\io.isshoni.desktop.v1.<user SID>.session<N>` (the session's number), so the app starts and the
-  session's second launches forward there; one instance per session while the squat lasts, with §13.3's per-user
-  hazards for two sessions of the user. A launch after the squat ends takes the per-user pair even beside a
-  per-session instance that still runs (accepted: the squatter decides when that happens, and it needs a squat in the
-  first place). With the per-session name squatted too (only a process in the user's own session can), `Acquire`
-  fails and the start goes on as the first instance without a lock (step 3's existing rule). The pipe needs no such
-  defence: its DACL admits only the user, and a second launch forwards nothing to a server of another account; a
-  squatted pipe name costs the forwards, never the start. `winos`' `TestSingleInstanceNames`, `TestStateOf` and
-  `TestDecideLock` (every OS: the names, the classification and the decision; the workflows' cleanup pattern matches
-  every pipe) and `TestSingleInstanceNamesOfThisUser`, `TestSingleInstanceMutexOwner` and `TestSingleInstanceSquatted`
-  (Windows: the owner and DACL of the mutex an elevated CI process creates, and squats by a DACL that denies the user,
-  by an event of that name and, when elevated, by a mutex owned by `BUILTIN\Administrators`) check it.
+  another kind of object of that name) means a corrupted or leaked secret, and the launch starts as the first instance
+  without a lock (step 3's existing rule, with a warning that doesn't name the mutex), never as a second instance,
+  which would exit. The pipe is created owned by the user too (`O:<user SID>D:P(A;;GA;;;<user SID>)`, the user only,
+  no remote client); a second launch opens it for `GENERIC_WRITE | READ_CONTROL` and forwards only when the pipe's
+  owner is the user's SID. That works whether or not the first instance runs elevated; comparing the server process's
+  token, which a non-elevated client can't open for an elevated server (`ERROR_ACCESS_DENIED`), is only the fallback
+  when the owner can't be read, and a token that can't be opened then refuses the forward. `winos`'
+  `TestSingleInstanceNames`, `TestStateOf`, `TestServerCheck` and the `TestInstanceSecret*` tests (every OS: the names,
+  the classification, the pipe check, and the secret's creation, reuse, regeneration and racing creators, with its
+  value never logged) and `TestSingleInstanceNamesFromSecret`, `TestSingleInstanceMutexOwner`,
+  `TestInstanceSecretFileSecurity`, `TestSingleInstanceOldNamesIgnored` and `TestSingleInstanceNotOurs` (Windows: the
+  names from the secret, one pair per data root, the owner and DACL of the mutex, the pipe and the file, objects at the
+  SID-derived names of earlier builds ignored, and an object under the secret name that isn't the user's mutex) check
+  it.
+- **Builds before the secret** (beta builds of M2: the mutex `Local\io.isshoni.desktop.v1` or WF19's
+  `Global\io.isshoni.desktop.v1.<user SID>`, the pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>`) and this one
+  don't see each other. That is harmless across an update: the installer waits until the running mutex
+  `Local\io.isshoni.desktop.running`, which hasn't changed, is gone before it replaces the app (06 §6.7,
+  `installer.nsi`'s `WaitForApp`), every start exits while the installer's mutex exists (§13.4 step 2a), and the
+  installer's own app start comes after; so in the installer's session an old and a new instance never run together.
+  An old instance in another session of the user isn't waited for (the running mutex is `Local\`, the accepted cost
+  above) and runs beside a new one until it exits, as a WF19 instance beside a per-session one would have.
 - The first instance creates the next pipe instance before it closes the one it served, so the name is never free while
   it serves, and serving starts at §13.4 step 3, right after the mutex is taken; the first pipe instance is retried for
   up to 5 s. Command lines that arrive before `Boot` has run wait in a queue (at most 8), so a second click during a
@@ -2481,6 +2505,7 @@ Also part of the contract:
 | `HKCU\Software\isshoni\PendingServer`, `PendingRoom` (REG_SZ) | written by 06's installer (`/SERVER=`) or by 03 before a start-time update; read and deleted by the first instance at start (§13.2) | 06 / 03 |
 | `HKCU\Software\isshoni\UpdateChecks` (DWORD) | written by 06's installer; read once as the initial `updates.check` (§14.2) | 06 |
 | Notification registration, written by Wails' notifications service at runtime (beta.34, `pkg/services/notifications/notifications_windows.go`): `HKCU\Software\Classes\AppUserModelId\<Options.Name>` (value `CustomActivator` = a random GUID), `HKCU\Software\Classes\CLSID\{GUID}\LocalServer32` = `"<exe>" %1`, `HKCU\Software\<Options.Name>\NotificationCategories`; plus the toast icon `%TEMP%\<Options.Name>{GUID}.png` | the app writes them; 06's uninstaller removes them (§15) | this doc |
+| Single-instance secret | `%LOCALAPPDATA%\isshoni\instance.secret` (32 hex digits; owner the user, DACL the user and SYSTEM only; never logged): names the single-instance mutex and pipe (§13.3) | this doc |
 | Named mutex `Local\io.isshoni.desktop.running` | held by the first instance (§13.4) | this doc |
 
 Every per-PC file is under `%LOCALAPPDATA%\isshoni\`, which `--purge-data` removes (§13.4); nothing is in the
@@ -2665,9 +2690,10 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, which turns its skips into failures (06 §10.1).
 - As run (PR #56; README §3 item 114): the test checks each link of the chain on its own, since its first failure
   after the updater e2e only said "the window didn't open after a second launch": it refuses to start while anything
-  holds the running mutex, the user's single-instance mutex (`Global\io.isshoni.desktop.v1.<user SID>` since WF19) or the user's single-instance pipe
-  (listed through `FindFirstFile` on `\\.\pipe\`, where a missing name answers `ERROR_NO_MORE_FILES`, not
-  `ERROR_FILE_NOT_FOUND`); it fails when the first instance serves no pipe ("second launches can't reach this one"),
+  holds the running mutex, or the single-instance mutex or pipe of its temp data root (the pipe listed through
+  `FindFirstFile` on `\\.\pipe\`, where a missing name answers `ERROR_NO_MORE_FILES`, not `ERROR_FILE_NOT_FOUND`;
+  since README §3 item 118 both names come from the instance secret the test creates in that root first, as the app
+  derives them, and before it from the user's SID); it fails when the first instance serves no pipe ("second launches can't reach this one"),
   when the second launch logs a failed forward or step 2a's installer handover ("couldn't tell whether an installer
   runs" still forwards), and when the first instance exits while the window is awaited, and its timeout says whether
   `winos`' `serveLoop` logged the forward as arrived (it logs each delivered command line by its count only, never its

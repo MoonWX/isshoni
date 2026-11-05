@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,30 +58,31 @@ func TestAutostartRoundTrip(t *testing.T) {
 	if running, _ := winos.MutexExists(winos.RunningMutex); running {
 		skip("an isshoni app runs on this PC")
 	}
-	// The build uses the real single-instance names: anything that still holds them (a process an earlier step left
-	// in this session or another one; both names are per user, 03 §13.3) would take the second launch's forward, or
-	// keep the first instance from serving.
-	pipe := singleInstancePipe(t)
-	if held, _ := winos.MutexExists(`Global\` + pipe); held {
-		skip(`another process holds the single-instance mutex Global\` + pipe)
+	dir := t.TempDir()
+	data := filepath.Join(dir, "data")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The build uses the real single-instance id with this data root's names, derived as the app derives them: from the
+	// instance secret in its data root, ISSHONI_E2E_DATA_DIR\isshoni (dataRoot; 03 §13.3), which this creates and the
+	// app then reads. Anything that holds them (only a process that read this test's fresh secret could) would take the
+	// second launch's forward, or keep the first instance from serving.
+	mutex, pipe := singleInstanceNames(t, filepath.Join(data, "isshoni"))
+	if held, _ := winos.MutexExists(mutex); held {
+		skip("another process holds this data root's single-instance mutex")
 	}
 	if pipeExists(t, pipe) {
-		skip(`another process serves the single-instance pipe \\.\pipe\` + pipe)
+		skip("another process serves this data root's single-instance pipe")
 	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
 		skip("no go command on PATH")
 	}
-	dir := t.TempDir()
 	exe := filepath.Join(dir, "isshoni.exe")
 	build := exec.CommandContext(t.Context(), goTool, "build", "-buildvcs=false", "-tags", "e2e",
 		"-ldflags=-H=windowsgui", "-o", exe, ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	data := filepath.Join(dir, "data")
-	if err := os.Mkdir(data, 0o700); err != nil {
-		t.Fatal(err)
 	}
 	env := append(os.Environ(), "ISSHONI_E2E_DATA_DIR="+data)
 
@@ -214,21 +216,22 @@ func logFiles(dir string) string {
 	return b.String()
 }
 
-// singleInstancePipe is the name, below \\.\pipe\, of the single-instance pipe of this user, which is also the
-// single-instance mutex's name below Global\ (winos.NewSingleInstance's, 03 §13.3: <id>.v1.<user SID>).
-func singleInstancePipe(t *testing.T) string {
+// singleInstanceNames are the single-instance mutex's and pipe's names of the data root root, as the app derives them
+// (winos.NewSingleInstance with the real id: from the instance secret in root, created there when missing).
+func singleInstanceNames(t *testing.T, root string) (mutex, pipe string) {
 	t.Helper()
-	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	si, err := winos.NewSingleInstance(winos.InstanceID, root, slog.New(slog.DiscardHandler))
 	if err != nil {
-		t.Fatalf("the user's SID: %v", err)
+		t.Fatalf("the single-instance names: %v", err)
 	}
-	return winos.InstanceID + ".v1." + u.User.Sid.String()
+	return si.Names()
 }
 
-// pipeExists reports whether a pipe of that name exists, by listing \\.\pipe\ (opening it would take an instance).
+// pipeExists reports whether the pipe name (\\.\pipe\…) exists, by listing \\.\pipe\ (opening it would take an
+// instance).
 func pipeExists(t *testing.T, name string) bool {
 	t.Helper()
-	pattern, err := windows.UTF16PtrFromString(`\\.\pipe\` + name)
+	pattern, err := windows.UTF16PtrFromString(name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +243,7 @@ func pipeExists(t *testing.T, name string) bool {
 		return false
 	}
 	if err != nil {
-		t.Fatalf("listing the pipe %s: %v", name, err)
+		t.Fatalf("listing the single-instance pipe: %v", err)
 	}
 	_ = windows.FindClose(h)
 	return true
