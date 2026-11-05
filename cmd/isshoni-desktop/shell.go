@@ -60,6 +60,7 @@ type wailsShell struct {
 	// openURL opens a URL that passed validation in the system browser; nil means Wails' Browser.OpenURL.
 	openURL func(string) error
 	notes   notifier
+	nav     *navGuard // W5's fallback (navguard.go); nil until guardNavigation
 
 	target   atomic.Pointer[shellApp]
 	quitting atomic.Bool // Quit or Wails' shutdown began: a close is a close
@@ -155,7 +156,52 @@ func (s *wailsShell) SetFullscreen(on bool) {
 	}
 }
 
-func (s *wailsShell) Reload() { s.main.Reload() }
+// Reload reloads the SPA at its current address. When the window was last seen off the asset origin (navguard.go),
+// it loads the start page instead: Wails' Reload is location.reload() of whatever page is showing (beta.34).
+func (s *wailsShell) Reload() {
+	if s.nav != nil && !s.nav.atHome() {
+		s.ReturnHome()
+		return
+	}
+	s.main.Reload()
+}
+
+// The app's watchdog loads the start page through the shell (app's homeShell).
+var _ interface{ ReturnHome() } = (*wailsShell)(nil)
+
+// ReturnHome loads the start page: a navigation the browser starts, which works from any page, a foreign or hung one
+// included (W5's and W17's fallbacks, 03 §3.2).
+func (s *wailsShell) ReturnHome() { s.main.SetURL("/") }
+
+// guardNavigation lets nav watch the main window (W5's fallback, 03 §3.2, §5.5): it asks the page where it is after
+// every completed navigation (WebView2 only; WKWebView has no such event in Wails, and the macOS build is a dev
+// build) and sends the window home from anywhere but the asset origin. Call it before Run, with nav's answers wired
+// through navMessages.
+func (s *wailsShell) guardNavigation(nav *navGuard) {
+	s.nav = nav
+	nav.attach(s.main.ExecJS, func() { go s.ReturnHome() })
+	s.main.OnWindowEvent(events.Windows.WebViewNavigationCompleted, func(*application.WindowEvent) { nav.navigated() })
+	s.main.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { nav.runtimeReady() })
+}
+
+// navMessages is Options.RawMessageHandler: the main window's answers to the guard's question, with the browser's
+// top-level source (Wails passes every message without its "wails:" prefix here).
+func navMessages(nav *navGuard) func(application.Window, string, *application.OriginInfo) {
+	return func(w application.Window, msg string, info *application.OriginInfo) {
+		if w == nil || w.Name() != mainWindowName {
+			return
+		}
+		n, ok := whereReply(msg)
+		if !ok {
+			return
+		}
+		top := ""
+		if info != nil {
+			top = info.TopOrigin
+		}
+		nav.reported(n, top)
+	}
+}
 
 // MainWindowHandle is the main window's HWND on Windows (NSWindow* on macOS), 0 before it exists (W10).
 func (s *wailsShell) MainWindowHandle() uintptr { return uintptr(s.main.NativeWindow()) }

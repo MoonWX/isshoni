@@ -120,7 +120,7 @@ func TestDevServerIndex(t *testing.T) {
 		if strings.Contains(csp, "unsafe-") {
 			t.Errorf("GET %s: CSP %q", p, csp)
 		}
-		if m := metaCSP.FindStringSubmatch(page); m == nil || m[1] != csp {
+		if m := metaCSP.FindStringSubmatch(page); m == nil || m[1]+specSandbox != csp {
 			t.Errorf("GET %s: the <meta> CSP differs from the header", p)
 		}
 	}

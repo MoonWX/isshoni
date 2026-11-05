@@ -319,7 +319,7 @@ func (h *handler) config() BridgeConfig {
 }
 
 func (h *handler) serveBridge(w http.ResponseWriter, r *http.Request) {
-	body, err := BridgeJS(h.config())
+	body, err := bridgeBody(h.config())
 	if err != nil {
 		slog.Default().Error("desktop: bridge.js", "component", "assets", "err", err)
 		plainError(w, r, http.StatusInternalServerError)

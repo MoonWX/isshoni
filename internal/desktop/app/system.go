@@ -59,6 +59,14 @@ type watchdog struct {
 	last       time.Time // the last beat, or a grace that began then
 	ever       bool      // the page has beaten since the start
 	wasVisible bool
+	missed     int // reloads since the last beat
+}
+
+// homeShell is a shell that can load the start page whatever the window shows (the Wails shell's ReturnHome, a
+// navigation the browser starts). Its Reload runs in the page, which a hung page never does, and reloads a page that
+// isn't the app's as it is (W5, W17 at beta.34).
+type homeShell interface {
+	ReturnHome()
 }
 
 // endSessionAcker is the OS hooks' end-of-session handshake (winos): WM_QUERYENDSESSION waits, at most 2 s, until the
@@ -415,7 +423,7 @@ func (a *App) stopTimers() {
 // Heartbeat is the SPA's watchdog beat (W17's fallback, 03 §20): every 5 s.
 func (a *App) Heartbeat() {
 	a.mu.Lock()
-	a.beat.last, a.beat.ever = a.clock(), true
+	a.beat.last, a.beat.ever, a.beat.missed = a.clock(), true, 0
 	a.mu.Unlock()
 }
 
@@ -436,7 +444,8 @@ func (a *App) runWatchdog() {
 // watchdogTick reloads the page when a visible window had no heartbeat for HeartbeatTimeout. It arms only once the
 // page has beaten (a page that never calls Heartbeat is never reloaded); a hidden window isn't watched (WebView2
 // throttles a hidden page's timers), and one that was just shown gets a fresh HeartbeatTimeout. After a reload the
-// next one waits another HeartbeatTimeout.
+// next one waits another HeartbeatTimeout. When a reload brought no beat back, the next one loads the start page
+// instead, through a shell that can (homeShell).
 func (a *App) watchdogTick() {
 	visible := a.d.Shell.WindowVisible()
 	now := a.clock()
@@ -457,7 +466,15 @@ func (a *App) watchdogTick() {
 		return
 	}
 	w.last = now
+	w.missed++
+	again := w.missed > 1
 	a.mu.Unlock()
+	if h, ok := a.d.Shell.(homeShell); ok && again {
+		a.log.Warn("app: the page sent no heartbeat after a reload; loading the start page",
+			"after", HeartbeatTimeout.String())
+		h.ReturnHome()
+		return
+	}
 	a.log.Warn("app: the page sent no heartbeat; reloading it", "after", HeartbeatTimeout.String())
 	a.d.Shell.Reload()
 }
