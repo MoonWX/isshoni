@@ -41,13 +41,13 @@ func checkBundledSPA() error {
 }
 
 // openAppCredentials is the app's credential store as step 7 opens it: Credential Manager under isshoni:v1: on
-// Windows, the development file store in the data root on macOS.
+// Windows (an e2e build's own test prefix, flavor.credPrefix), the development file store in the data root on macOS.
 func openAppCredentials() (credstore.Store, error) {
 	root, err := dataRoot()
 	if err != nil {
 		return nil, err
 	}
-	return credstore.Open(credstore.Options{Dir: root, Logger: slog.Default()})
+	return credstore.Open(appCredentialOptions(root))
 }
 
 // openAppServers is 02's servers over store, from servers.json in the data root, as step 7 opens them (without
