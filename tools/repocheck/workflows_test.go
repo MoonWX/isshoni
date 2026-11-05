@@ -351,6 +351,18 @@ func checkAudiotest(w workflow) error {
 		fail("build must run on a GitHub-hosted runner and only without release_run_id")
 	}
 
+	// The environment job is the only guard against GitHub creating an unprotected audiotest environment.
+	if e, ok := w.Jobs["environment"]; !ok {
+		fail("no environment job (it checks that audiotest has the owner as required reviewer)")
+	} else {
+		if selfHosted(e) {
+			fail("environment must run on a GitHub-hosted runner")
+		}
+		if perms, _, _ := permissionMap(e.Permissions); perms["actions"] != "" {
+			fail("environment must not have actions permission: fetch is the only job with actions: read")
+		}
+	}
+
 	run, ok := w.Jobs["run"]
 	if !ok {
 		fail("no run job")
@@ -360,14 +372,16 @@ func checkAudiotest(w workflow) error {
 		"github.repository == 'MoonWX/isshoni'",
 		"github.actor == github.repository_owner",
 		"needs.build.result == 'success' || needs.fetch.result == 'success'",
+		"needs.environment.result == 'success'",
 	} {
 		if !strings.Contains(run.If, guard) {
 			fail("run's if: lacks %q", guard)
 		}
 	}
 	var needs []string
-	if err := run.Needs.Decode(&needs); err != nil || !slices.Contains(needs, "build") || !slices.Contains(needs, "fetch") {
-		fail("run must need build and fetch")
+	if err := run.Needs.Decode(&needs); err != nil || !slices.Contains(needs, "build") || !slices.Contains(needs, "fetch") ||
+		!slices.Contains(needs, "environment") {
+		fail("run must need environment, build and fetch")
 	}
 	wantLabels := []string{"self-hosted", "windows", "x64", "isshoni-audio", "${{ inputs.os }}"}
 	if got := runsOnLabels(run.RunsOn); !slices.Equal(got, wantLabels) {
@@ -449,6 +463,13 @@ const goodAudiotest = `on:
       release_run_id: {type: string, required: false}
 permissions: {contents: read}
 jobs:
+  environment:
+    if: github.repository == 'MoonWX/isshoni' && github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    permissions: {contents: read}
+    steps:
+      - run: gh api repos/x/environments/audiotest
+        env: {GH_TOKEN: "${{ github.token }}"}
   build:
     if: inputs.release_run_id == ''
     runs-on: windows-2025
@@ -468,10 +489,10 @@ jobs:
           run-id: ${{ inputs.release_run_id }}
           github-token: ${{ github.token }}
   run:
-    needs: [build, fetch]
+    needs: [environment, build, fetch]
     if: >-
       !cancelled() && github.repository == 'MoonWX/isshoni' && github.actor == github.repository_owner &&
-      (needs.build.result == 'success' || needs.fetch.result == 'success')
+      needs.environment.result == 'success' && (needs.build.result == 'success' || needs.fetch.result == 'success')
     runs-on: [self-hosted, windows, x64, isshoni-audio, "${{ inputs.os }}"]
     environment: audiotest
     permissions: {}
@@ -492,7 +513,7 @@ func TestCheckAudiotest(t *testing.T) {
 		{"pull_request", "on:\n  workflow_dispatch:", "on:\n  pull_request:\n  workflow_dispatch:", "want only workflow_dispatch"},
 		{"pull_request_target", "on:\n  workflow_dispatch:", "on:\n  pull_request_target:\n  workflow_dispatch:", "want only workflow_dispatch"},
 		{"workflow_run", "on:\n  workflow_dispatch:", "on:\n  workflow_run: {workflows: [CI]}\n  workflow_dispatch:", "want only workflow_dispatch"},
-		{"no repository guard", "github.repository == 'MoonWX/isshoni' && github.actor", "github.actor", "github.repository == 'MoonWX/isshoni'"},
+		{"no repository guard", "!cancelled() && github.repository == 'MoonWX/isshoni' && github.actor", "!cancelled() && github.actor", "github.repository == 'MoonWX/isshoni'"},
 		{"no actor guard", "github.actor == github.repository_owner &&", "", "github.actor == github.repository_owner"},
 		{"labels", "isshoni-audio, ", "", "run's runs-on"},
 		{"no environment", "    environment: audiotest\n", "", "environment must be audiotest"},
@@ -502,10 +523,15 @@ func TestCheckAudiotest(t *testing.T) {
 		{"run permissions", "    permissions: {}\n    steps:\n      - uses: actions/download", "    permissions: {contents: read}\n    steps:\n      - uses: actions/download", "permissions must be {}"},
 		{"actions read in build", "    runs-on: windows-2025\n    permissions: {contents: read}", "    runs-on: windows-2025\n    permissions: {contents: read, actions: read}", "only job with actions: read"},
 		{"fetch without actions read", "permissions: {actions: read}", "permissions: {contents: read}", "fetch must have actions: read"},
-		{"fetch self-hosted", "    runs-on: ubuntu-24.04", "    runs-on: [self-hosted, linux]", "GitHub-hosted"},
+		{"fetch self-hosted", "    runs-on: ubuntu-24.04\n    permissions: {actions: read}", "    runs-on: [self-hosted, linux]\n    permissions: {actions: read}", "fetch must run on a GitHub-hosted runner"},
 		{"no release_run_id", "      release_run_id: {type: string, required: false}\n", "", "release_run_id must be an optional string"},
 		{"write permission", "permissions: {actions: read}", "permissions: {actions: read, contents: write}", "no job of audiotest.yml writes"},
 		{"read-all", "permissions: {contents: read}\njobs:", "permissions: read-all\njobs:", "exactly {contents: read}"},
+		{"run doesn't need environment", "needs: [environment, build, fetch]", "needs: [build, fetch]", "run must need environment"},
+		{"run's if lacks the environment result", "needs.environment.result == 'success' && ", "", "needs.environment.result == 'success'"},
+		{"no environment job", "  environment:\n    if:", "  envcheck:\n    if:", "no environment job"},
+		{"environment self-hosted", "    runs-on: ubuntu-24.04\n    permissions: {contents: read}", "    runs-on: [self-hosted, linux]\n    permissions: {contents: read}", "environment must run on a GitHub-hosted runner"},
+		{"environment with actions read", "    runs-on: ubuntu-24.04\n    permissions: {contents: read}", "    runs-on: ubuntu-24.04\n    permissions: {contents: read, actions: read}", "environment must not have actions"},
 		{"run downloads another run", "with: {name: audiotest-tools}", "with: {name: audiotest-tools, run-id: \"1\"}", "downloads from another run"},
 	}
 	for _, tc := range cases {

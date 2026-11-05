@@ -15,11 +15,12 @@
 #   cgo) and the `task native:dist` zip (isshoni-native-tools.zip, for the hwcheck suite). Uploads them flat, with
 #   the FFmpeg DLLs and a native-manifest.json, as this run's artifact audiotest-tools. Suite release refuses to
 #   build: a report of a rebuild is diagnostic only and never gates a release (06 §10.4, 05 §18.10).
-# - fetch (ubuntu-24.04, actions: read; the only job with that permission and the only one that uses a token), only
-#   with release_run_id: checks that the run is a release.yml run of this repository, downloads its artifact
-#   isshoni-exit-tools (06 §11.1), fails unless isshoni-media.dll's and the FFmpeg DLLs' SHA-256s equal
-#   native-manifest.json's, and re-uploads the folder as this run's audiotest-tools. The token that reads another
-#   run stays on GitHub's runner.
+# - fetch (ubuntu-24.04, actions: read), only with release_run_id: the only job with actions: read and the only one
+#   that reads another run (environment reads this repository's environment with the read-only default token, or
+#   without a token if that one may not: the repository is public).
+#   Checks that the run is a release.yml run of this repository, downloads its artifact isshoni-exit-tools (06
+#   §11.1), fails unless isshoni-media.dll's and the FFmpeg DLLs' SHA-256s equal native-manifest.json's, and
+#   re-uploads the folder as this run's audiotest-tools. The token that reads another run stays on GitHub's runner.
 # - run (self-hosted: windows, x64, isshoni-audio and the os input's label; environment audiotest, so it waits for
 #   the owner's approval): no checkout, no secrets, no token (permissions: {}); downloads audiotest-tools and checks
 #   the DLL against native-manifest.json again. Suites release and full: `isshoni-audiotest.exe probe`, then
@@ -94,9 +95,38 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          if ! env_json=$(gh api "repos/$REPO/environments/audiotest" 2>/dev/null); then
-            echo "::error::the environment audiotest does not exist: create it with $OWNER as required reviewer first (deploy/windows/runner/README.md)"
-            exit 1
+          err="$RUNNER_TEMP/environment-err.txt"
+          if ! env_json=$(gh api "repos/$REPO/environments/audiotest" 2>"$err"); then
+            if grep -q 'HTTP 403' "$err"; then
+              # The contents: read default token may lack the permission environments need; the repository is
+              # public, so the same read works without a token (no actions: read here: fetch is the only job with it).
+              # Unauthenticated reads share 60 an hour per IP with every job on that hosted runner's address, so
+              # retry, and name a rate limit apart from other failures.
+              echo "the token can't read environments ($(tr '\n' ' ' <"$err")); reading it without a token"
+              headers="$RUNNER_TEMP/environment-headers.txt"
+              if env_json=$(curl -fsS --retry 4 --retry-delay 15 --retry-all-errors -D "$headers" \
+                -H 'Accept: application/vnd.github+json' \
+                "$GITHUB_API_URL/repos/$REPO/environments/audiotest" 2>"$err"); then
+                : # read; checked below
+              elif grep -q 'error: 404' "$err"; then
+                echo "::error::the environment audiotest does not exist: create it with $OWNER as required reviewer first (deploy/windows/runner/README.md)"
+                exit 1
+              elif [ "$(grep -i '^x-ratelimit-remaining:' "$headers" 2>/dev/null | tail -n 1 | tr -dc '0-9')" = "0" ]; then
+                reset=$(grep -i '^x-ratelimit-reset:' "$headers" | tail -n 1 | tr -dc '0-9' || true)
+                echo "::error::GitHub's unauthenticated rate limit for this runner's address is used up until $(date -u -d "@${reset:-0}" '+%H:%M UTC'): re-run this job after that"
+                exit 1
+              else
+                echo "::error::could not read the environment audiotest, with or without a token: $(tr '\n' ' ' <"$err")"
+                exit 1
+              fi
+            elif grep -q 'HTTP 404' "$err"; then
+              echo "::error::the environment audiotest does not exist: create it with $OWNER as required reviewer first (deploy/windows/runner/README.md)"
+              exit 1
+            else
+              # A 5xx or a rate limit is GitHub's side.
+              echo "::error::could not read the environment audiotest: $(tr '\n' ' ' <"$err")"
+              exit 1
+            fi
           fi
           reviewers=$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | .reviewer.login // empty] | join(" ")' <<<"$env_json")
           case " $reviewers " in
@@ -392,9 +422,13 @@ jobs:
             echo "$file: $got"
           }
           check "$(jq -r '.dll.name' "$manifest")" "$(jq -r '.dll.sha256 // empty' "$manifest")"
+          # Read into a variable first: set -e sees a failing jq there, not inside a process substitution.
+          jq -e '(.ffmpeg.dlls | type) == "object" and (.ffmpeg.dlls | length) == 2' "$manifest" >/dev/null ||
+            { echo "::error::native-manifest.json has no ffmpeg.dlls with two entries (avcodec, avutil; 06 §5.1)"; exit 1; }
+          ffmpeg_dlls=$(jq -r '.ffmpeg.dlls | to_entries[] | "\(.key)\t\(.value)"' "$manifest")
           while IFS=$'\t' read -r name sha; do
             check "$name" "$sha"
-          done < <(jq -r '.ffmpeg.dlls | to_entries[] | "\(.key)\t\(.value)"' "$manifest")
+          done <<<"$ffmpeg_dlls"
           ls -l
 
       - name: Upload audiotest-tools
@@ -538,7 +572,10 @@ jobs:
           $script = Join-Path $hw 'hwcheck.ps1'
           if (-not (Test-Path -LiteralPath $script)) { throw 'the tools have no hwcheck.ps1 (README WA76 adds it to native:dist)' }
 
-          # The result bundle lands in the current folder; hwcheck.ps1 keeps machine names and paths out of it (04 section 14).
+          # The contract with hwcheck.ps1 (04 section 14; WA76 writes the script): no arguments, a result zip in the
+          # current folder, no machine names or paths in it. 04 section 14 names no output argument and WA76 isn't on
+          # this base yet, so the zip next to the script is accepted too. At integration with WA76, pass its
+          # documented output argument here explicitly and drop that fallback.
           Set-Location -LiteralPath $bundle
           $start = Get-Date
           $ErrorActionPreference = 'Continue'
