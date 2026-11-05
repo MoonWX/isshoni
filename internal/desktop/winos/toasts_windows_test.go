@@ -5,6 +5,7 @@ package winos
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -84,12 +85,14 @@ func idsOf(ts []DeliveredToast) []string {
 // TestActionCenterRemovesStaleToasts is 03 §15's removal on Windows (README WA68 R3): three toasts as the shell
 // shows them through Wails (an untagged toast whose launch is Wails' payload) plus a tagged one; removing two by
 // their app.Notification IDs leaves the third in Action Center with its XML, now tagged, and removing that one
-// takes it by its tag. Toasts that are off for this user (a policy, the user's setting) skip it with the reason.
+// takes it by its tag. Toasts that are off for this user (a policy, the user's setting) skip it with the reason. A
+// fresh test AppUserModelID has no NotificationSetting until its first toast (errNoSetting), so the setting is read
+// again after the toasts are shown, before Action Center is checked; it must be readable then.
 func TestActionCenterRemovesStaleToasts(t *testing.T) {
 	appID := testAppID(t)
-	if s, err := notificationSetting(appID); err != nil {
+	if s, err := notificationSetting(appID); err != nil && !errors.Is(err, errNoSetting) {
 		t.Fatal(err)
-	} else if s != 0 {
+	} else if err == nil && s != 0 {
 		t.Skipf("toasts are off for this user or app (NotificationSetting %d)", s)
 	}
 	const nonceA, nonceB, nonceC = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210",
@@ -104,6 +107,11 @@ func TestActionCenterRemovesStaleToasts(t *testing.T) {
 		if err := ShowToast(appID, toast); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if s, err := notificationSetting(appID); err != nil {
+		t.Fatalf("after three toasts: %v", err)
+	} else if s != 0 {
+		t.Skipf("toasts are off for this user or app (NotificationSetting %d)", s)
 	}
 	got := waitDelivered(t, appID, 3)
 	if ids := idsOf(got); !slices.Equal(ids, []string{"lock-paused-1", "lock-paused-2", "stopped-locked-3"}) {

@@ -88,7 +88,7 @@ const (
 	roInitMultithreaded = 1          // RO_INIT_MULTITHREADED
 	sFalse              = 1          // S_FALSE: the thread was initialized already
 	rpcEChangedMode     = 0x80010106 // RPC_E_CHANGED_MODE: an STA thread, where WinRT works too
-	hrNotFound          = 0x80070490 // HRESULT_FROM_WIN32(ERROR_NOT_FOUND): no toasts of that app
+	hrNotFound          = 0x80070490 // HRESULT_FROM_WIN32(ERROR_NOT_FOUND): no toasts, or no settings yet, of that app
 )
 
 func mustGUID(s string) windows.GUID {
@@ -107,6 +107,10 @@ var toastMu sync.Mutex
 
 // errNoWinRT is a Windows without WinRT's combase exports.
 var errNoWinRT = errors.New("winos: WinRT is unavailable")
+
+// errNoSetting is get_Setting's ERROR_NOT_FOUND: Windows keeps an unpackaged AppUserModelID's notification settings
+// from its first toast on, so one that has shown none yet has no NotificationSetting to read.
+var errNoSetting = errors.New("winos: no NotificationSetting for this app yet (it has shown no toast)")
 
 // hrError is a failed WinRT call.
 func hrError(op string, hr uintptr) error {
@@ -415,8 +419,11 @@ func (c *actionCenter) setting() (int32, error) {
 	}
 	defer release(n)
 	var s int32
-	if hr, _, _ := syscall.SyscallN(method(n, slotNotifierGetSetting), uintptr(n),
-		uintptr(unsafe.Pointer(&s))); failed(hr) {
+	hr, _, _ := syscall.SyscallN(method(n, slotNotifierGetSetting), uintptr(n), uintptr(unsafe.Pointer(&s)))
+	if uint32(hr) == hrNotFound { //nolint:gosec // G115: an HRESULT is 32 bits
+		return 0, errNoSetting
+	}
+	if failed(hr) {
 		return 0, hrError("get_Setting", hr)
 	}
 	return s, nil
@@ -519,7 +526,8 @@ func ShowToast(appID string, t Toast) error {
 	return withActionCenter(appID, func(c *actionCenter) error { return c.show(t) })
 }
 
-// notificationSetting is appID's NotificationSetting (0: toasts are enabled).
+// notificationSetting is appID's NotificationSetting (0: toasts are enabled); errNoSetting before appID's first
+// toast.
 func notificationSetting(appID string) (int32, error) {
 	var s int32
 	err := withActionCenter(appID, func(c *actionCenter) error {
