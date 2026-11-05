@@ -709,6 +709,15 @@ controller (`cmd/isshoni-desktop`'s test core) gets a stand-in whose calls that 
 `bridge.Core` gained no method. `Share.Capabilities` already answers from the probe: each usable encoder kind once, in
 04's order (the probe lists a kind once per adapter), with `reason` the media code when `canShare` is false.
 
+As built (WA80 and group 15's integration; README §3 items 95–96): `App.WindowNotice()` and
+`App.WindowNoticeShown(code)` are bound (`bridge.Core` gained both, over `app.App`'s; `app.ErrNoNotice` maps to
+`not_found`), with the `window.notice` event (§6.3); the notice's code is `still-sharing` and its `text` comes from
+the catalog (`desktop.native.toast.stillSharing`). `bridge.ts` types them (`WindowNotice`, `NativeBridge.app`'s
+`windowNotice` and `windowNoticeShown`). `app.App.Hotkeys()` answers 03's `HotkeyStatus` list (while live, what the
+registration found; otherwise `idle` for a combination that parses, `invalid` for one that doesn't), but the bound
+`Settings.Hotkeys` still answers `not_implemented` until WA84 maps it, so the SPA shows `Settings.Get()`'s
+combinations as `idle` meanwhile.
+
 | Service.Method | In → out | Errors | Notes |
 |---|---|---|---|
 | `App.Info()` | → `AppInfo {version, os, osBuild, arch, publisherConnectionId, wizardDone, dev}` | — | `publisherConnectionId` is `core.Status().ConnectionID` of C2, "" while it isn't ready |
@@ -720,6 +729,8 @@ controller (`cmd/isshoni-desktop`'s test core) gets a stand-in whose calls that 
 | `App.OpenLogsFolder()`, `App.OpenNotices()` | → — | `io_error` | Explorer at `%LOCALAPPDATA%\isshoni\logs`; `<exe dir>\licenses\THIRD_PARTY_NOTICES.txt` (06 §2.2) |
 | `App.PendingLink()`, `App.LinkHandled()` | → `PendingLink \| null` (the `deeplink.open` payload) / — | — | the link not yet acted on, e.g. the one that started the app before the SPA ran; `LinkHandled` clears it after the SPA navigated (room) or the add step was answered (Add or Cancel) |
 | `App.OwnConnections(ids)` | `string[]` (≤ 64) → — | `invalid_argument` | the online connection ids of C1's `user.connections`, sent by the SPA on every change; expires `playback.state` senders (§12.2) |
+| `App.WindowNotice()` | → `WindowNotice {code, text}` or `null` | — | the notice due at the top of the window (§11.6): `null` while the window is hidden or none is due; pull for `window.notice` |
+| `App.WindowNoticeShown(code)` | `string` → — | `not_found` (that notice isn't due, or the window isn't showing) | the visible page showed the notice: for `still-sharing`, sets `tips.trayNoticeShown` (§11.6) |
 | `Auth.State()` | → `AuthState` (02 §11.7) | — | the active server's state; pull for `auth.state` |
 | `Auth.Servers()` | → `ServerInfo[]` = 02's `ServerEntry` plus `{id, active, linked}` | — | `id` derived (§8.1); `user` is `api.User {id, username, role}`; `linked = user != null` |
 | `Auth.Probe(address)` | `string` → `ServerProbe {origin, name, version}` | `invalid_address`, `server_unreachable`, `tls_untrusted`, `not_isshoni`, `server_not_set_up`, `incompatible_server` | 03's own (§8.1); never adds the server |
@@ -777,7 +788,9 @@ README §7 Q8), so nothing in the bridge or the SPA can set an audio mode. Sound
 Names carry the prefix `isshoni:` (not shown below) so they never collide with Wails' own. Every stateful event has
 a pull method; the SPA subscribes first and then pulls, so it misses nothing. As built (WA48): the services' events go
 out through the shell's `Emit` (`bridge.Deps.Emit`); none is registered with `application.RegisterEvent`, because
-the pinned Wails drops an event whose data type isn't exactly the registered one.
+the pinned Wails drops an event whose data type isn't exactly the registered one. As built (group 15's integration,
+README §3 item 96): `bridge.Events` lists the 13 events of the table below, `window.notice` (`app.EventWindowNotice`)
+included; `services_test`'s `TestEvents` checks the list and `bridge.ts`'s `BridgeEvents` has the same names.
 
 | Event | Payload | When | Pull |
 |---|---|---|---|
@@ -791,6 +804,7 @@ the pinned Wails drops an event whose data type isn't exactly the registered one
 | `auth.state` | `AuthState` (02 §11.7; its `origin` names the server) | every change of the active server's state; the SPA ignores one whose `origin` isn't its `serverOrigin` (§5.8) | `Auth.State()` |
 | `deeplink.open` | `PendingLink`, exactly one shape: `{roomId}` for the active server (`""` = the SPA's own last room); `{add: {origin, host, hostUnicode, roomId}}` for an unknown server (`host`/`hostUnicode` from `deeplink.Link`); `{switch: {origin, host, hostUnicode, roomId}, live: {roomId}}` for a known server while a share is live (§13.2's question); `{error: "too_many_servers"}` for a 21st server (WA41) | a deep link, `--server` or `PendingServer` (§13.2) | `App.PendingLink()` |
 | `window.state` | `{visible, focused, fullscreen}` | changes | — |
+| `window.notice` | `WindowNotice {code, text}` (`still-sharing`: "isshoni is still sharing. Stop it from the tray icon (^).") | `App.ShowWindow` opens the window with a notice due (§11.6) | `App.WindowNotice()` |
 | `settings.changed` | `SettingsView` | after any change, from any source | `Settings.Get()` |
 | `update.state` | `UpdateStatus` | changes | `Updates.Status()` |
 
@@ -1677,7 +1691,20 @@ while no mounted host shows them (the panel and both sheets register through `us
 never asked twice on screen and never waits unseen while the window is in front with no panel (Settings, another
 page). It is built to be mounted once for the whole desktop app, in its layout; as group 14 merged nothing mounts it
 yet, so until the integrator (or WA80, which owns the window notice beside it) mounts it, a prompt that comes while
-the window is in front and no panel or sheet is open waits unseen, kept out (05's default).
+the window is in front and no panel or sheet is open waits unseen, kept out (05's default). Since group 15's
+integration (README §3 item 96) the app shell mounts it once for every desktop page (§11.6).
+
+As built (WA80; README §3 item 95): the bar has **Pause** next to Stop while live (also while reconnecting or
+unreachable) and **Resume** while paused, both through `Share.SetPaused`, the same path as the hotkey, the tray and
+the pill; the buttons' tooltips name the registered combinations ("Pause (Ctrl+Alt+Shift+F9)", "Stop
+(Ctrl+Alt+Shift+F10)", from `Settings.Hotkeys`, asked again on every change of `share.state`; until WA84 binds it,
+`Settings.Get()`'s combinations, §6.2), and a combination
+another app has adds "Pause hotkey unavailable: another app uses …" (or the Stop hotkey's line) with a link to
+Settings → Sharing. **Pause is disabled only after the server answered
+`feature_disabled`**: the SPA can't see the server's features (C2's `core.Status().Features` stays in Go, and
+`ShareView` doesn't carry them), so the button is enabled until a press answers `feature_disabled`, which disables it
+with the tooltip "Pause needs a newer server" for as long as the panel is mounted (no error toast). The tray and the
+pill, which Go draws, know the features and are disabled from the start (§11.3, §11.4).
 
 On the Mac and in the e2e harness the same `audio.Service` runs on 05's fake engine audio (`ISSHONI_FAKE_AUDIO`
 scenarios, 05 §13.3), so every row rule, prompt and banner above is exercised without Windows.
@@ -1822,6 +1849,9 @@ func Render(s State, t *i18n.Catalog) View
 - A server without `share.pause` in C2's `core.Status().Features`: `Share.SetPaused` answers `feature_disabled`, the
   Pause button, tray item and pill button are disabled with the tooltip "Pause needs a newer server", the Pause hotkey
   is not registered (Stop still is), and a screen lock does not pause (the share goes on, as it would in a browser).
+  As built (WA80): the tray item and the pill button are disabled from the start (Go reads the features); the
+  panel's button only once a press answered `feature_disabled` (§10.3); the pill's disabled button carries the text
+  as its accessible name (§11.4).
 - **Viewer** (`viewer/`, all platforms): a share with status `paused` shows its last frame, dimmed, with "Paused" and
   the sharer's name when the viewer has one, else a Paused placeholder; its audio is silent anyway. M1's freeze and
   "connection unstable" detection is off while the share's status is `paused` (01 §10.3 leaves this to 03). The M1
@@ -1857,6 +1887,32 @@ func Render(s State, t *i18n.Catalog) View
   games use borderless or flip-model windows, where the pill shows.
 - Whether Desktop Duplication on Windows 10 honors `WDA_EXCLUDEFROMCAPTURE` is checked on the owner's PC (M-DESK-8);
   if it doesn't, the pill still shows (it says only "Sharing · N watching") and the result is recorded here.
+- **As built (WA80; README §3 item 95)**: `winos`' pill (`pill_windows.go`, its pure layout in `pill.go`) on the
+  `winos` thread, behind `app.Pill`. `app.PillState` is `{Visible, Mode, Watching, VoiceAppsHeard, Questions, Monitor,
+  Positions, PauseUnavailable, Text}`: the fields after `Monitor` are the app's additions, so the Windows pill needs
+  neither the settings nor the catalog. **`Monitor`** is the shared monitor's device name from the share's source:
+  the controller's `share.View.Monitor` is `media.Source.MonitorID` without its `mon:` prefix for a monitor share
+  (04's `mon:` + the output's `DeviceName`), and `""` for a window share, whose pill goes on the primary monitor; a
+  device name no attached monitor has also gets the primary one. **`Positions`** is `settings.json`'s
+  `pill.positions` (monitor device name → top left corner in physical pixels), clamped to that monitor's work area.
+  **`PauseUnavailable`**: the share's server has no `share.pause`. **`Text`** (`PillText {Line, Pause, Resume, Stop,
+  PauseUnavailable, Questions, Collapsed}`) is the catalog's words: the line (`desktop.native.pill.live`, `.paused`,
+  `.lockPrompt`, `.reconnecting`, and `.liveAlert` "Sharing · {{alert}}" with "Friends hear voice apps" while
+  `VoiceAppsHeard`), the buttons' names, the disabled Pause's name ("Pause needs a newer server",
+  `desktop.native.tray.pauseNeedsNewerServer`), the marker's name ("1 question waiting", empty without a question)
+  and **`Collapsed`**, the collapsed dot's name (`desktop.native.pill.collapsed`, "Sharing"). `Mode` is
+  `lockPrompt` while a lock pause asks (§11.6); with no share, or one that is starting or ending, the state is the
+  zero one (hidden). The pill window's name, which Narrator reads, is the line and the marker's name ("Sharing · 3
+  watching · 1 question waiting"), and while collapsed the dot's name (its buttons are hidden then). **The disabled
+  Pause** has no tooltip control: its window text, which is its accessible name, is "Pause needs a newer server",
+  while it still draws "Pause". Actions: `pause`, `resume`, `stop` (end reason `tray`, §10.1), `collapse`,
+  `expand`, `moved {monitor, x, y}` (saved in `pill.positions`) and **`open`**, a click on the amber marker, which
+  shows the window (`App.ShowWindow`), where the prompt card is (the panel's, or the corner card, §10.3). The pill
+  may also implement the optional **`app.PillShowing`** (`Shown() bool`): `winos`' pill does, and answers false
+  while hidden and when Windows refused it (a failed `CreateWindowExW` or `WDA_EXCLUDEFROMCAPTURE`, after which it
+  is never shown); the app asks it before the pause toast of §15 ("when no pill is shown"), and takes a pill without
+  it to show what it was last given. The colors are a red dot (amber while paused) and the amber marker, or the
+  system colors in high contrast.
 
 ### 11.5 `WDA_EXCLUDEFROMCAPTURE` on every isshoni window
 
@@ -1900,6 +1956,26 @@ long-lock cases need `web/e2e/fixtures.ts`'s `lockResumeMs`/`lockStopMs` (WF13) 
 §20's hidden-page gap), the fixtures (`desktop-system.spec` uses 2 s and 6 s, unlocking after 3 s, and asserts the
 tray unconditionally) and `end-session-confirmed`; of Action Center it built `winos`' removal, which the app starts
 calling with WF14 in group 14 (§15; README §3 item 84).
+
+As built (WA80 and group 15's integration; README §3 items 95–96): **the close-to-tray notice's handshake**. The first
+close while live (and `tips.trayNoticeShown` unset) hides the window, sends the toast (once a run) and marks the notice
+due in memory (`App.sys.noticeDue`). `App.WindowNotice()` answers `{code: "still-sharing", text}` while the notice is
+due, the flag is unset and the window is visible, and `null` otherwise. Go emits `window.notice` from `App.ShowWindow`
+(the tray's Open, a toast's Open, the pill's marker); a window shown another way (a deep link, a second launch, a change
+of the active server, which call the shell directly) emits nothing, so the page also pulls `App.WindowNotice()` at mount
+(after subscribing) and again each time `document.visibilityState` turns `visible`. Once the notice is on screen in a
+visible page, the page calls `App.WindowNoticeShown("still-sharing")`, which sets `tips.trayNoticeShown` and clears the
+due mark; Go answers `not_found` when that notice isn't due or the window isn't showing, so a hidden page never sets the
+flag. The notice is dismissible (it hides until the next code) and is `role="status"`. **Mounting**: the app shell
+(`web/src/app/App.tsx`) mounts `WindowNotice` (under the required-update banner) and `MicPromptCorner` once, for every
+desktop page, lazily through `web/src/desktop/shell.ts`, which re-exports them from `share/native`, so the browser never
+fetches them; the share panel no longer mounts its own notice, and `desktopShell.test.tsx` checks both in the desktop
+(the `windowNoticeShown` report included) and neither in the browser. A run that quits before the window opens again
+loses the due mark, so a later run's first close sends the toast again. The pill shows the lock prompt (`lockPrompt`,
+"Paused · Resume sharing?") and the tray its Paused menu; **the panel's "Sharing is still paused since you locked your
+PC. [Resume sharing] [Stop]" bar is not built**: it needs a `ShareView.lockPrompt` field filled from `App.sys.prompt`,
+which WF17 (group 16) adds with the bar, along with `desktop-share.spec`'s close-to-tray step (an e2ehost hook that
+calls `WindowClosing`).
 
 Quit always stops a share first (`core.Share.Stop`: `share.stop`, engine stop, `room.leave`; then
 `audio.OnShareStopped()`), closes C2 (`core.Client.Close`, 1000) and C1 (1000), calls `audio.Service.Close()`,
@@ -2148,7 +2224,9 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    As built (WA77 and PR #53's CI; README §3 item 91): `winos.RelaunchUnderShell` (`relaunch_windows.go`).
    `STARTUPINFO.lpDesktop` names `winsta0\default`, the shell's desktop: the child takes the shell's token, and with
    `lpDesktop` unset it opened the starting process's window station and desktop, which that token may not use (on
-   the CI runner it died with `STATUS_DLL_INIT_FAILED`, 0xC0000142, before `main`). The watch is
+   the CI runner it died with `STATUS_DLL_INIT_FAILED`, 0xC0000142, before `main`). On GitHub's hosted image the
+   child still dies that way with `winsta0\default`, under an Explorer in the start's own session and of its own user
+   (a shell elsewhere is refused before any relaunch), which is what the watch catches there (§22.2). The watch is
    `relaunchedLives`: `WaitForSingleObject` on the child for `relaunchDeathWindowMs` (1500); a nonzero exit in that
    time is `errRelaunchDied` (with the code) and the start goes on in place, while a child still running, one that
    exited 0, or one that can't be watched counts as started. An elevated start is not refused: it relaunches
@@ -2289,6 +2367,15 @@ temporary profile therefore needs only another data root (and a test credential 
 | Updates `#updates` | Check for updates automatically (on; greyed out with "Turned off by your administrator" when `policyOff`); Get release candidates (beta channel) (off; `updates.channel`); Check now; the status line of §16.2 with **Restart and update** when `ready`; "Updates come only from GitHub Releases" |
 | About `#about` | Version, Windows build, WebView2 version, engine summary (encoders, audio backend); Open logs folder; Copy version info (a text block with app, Windows, WebView2 and engine versions; no paths, no server); Third-party notices (`App.OpenNotices` → `<exe dir>\licenses\THIRD_PARTY_NOTICES.txt`, and the SPA's `/licenses.txt`); links to the project site's `/privacy#desktop` and `/code-signing` |
 
+As built (WA82; README §3 item 97): `web/src/desktop/SettingsPage` renders every section above (Servers through
+`desktop/ServerSwitcher`, Audio from WA77) with a component test per section and per update state. Differences:
+the Sharing section lists the usable encoders, or `ShareCaps.reason` when none works, without §10.5's per-encoder
+notes (`ShareCaps` carries no per-encoder status yet); the SPA's `/licenses.txt` opens in a dialog read from the
+app's own files rather than as a link, since the app never navigates away from its page (§5.5); the OpenH264 opt-in
+(`OpenH264OptIn.tsx`, with the texts of 04 §9.9's reasons) declares the `OpenH264Control` it needs, and
+`openH264Control()` answers `null` until WA84 binds the methods, which hides the opt-in as if 04 didn't offer it.
+Until WA84 binds `Settings.Update`, `TestHotkey` and `Updates.*`, those controls get `not_implemented`.
+
 ---
 
 ## 15. Notifications
@@ -2416,7 +2503,10 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   `serverOrigin + '/download'` (the server's page, which 06 pre-fills with its URL); `error` with `not_installed` (a
   build run from a folder) → open `notesUrl`, `{kind: 'not-installed', notesUrl}`; any other error (and `off` or
   `disabled`) → `{kind: 'error', code}` with its text (`desktop.update.error.<code>`, or a bridge error's code). Nothing
-  in M1 implements `updateApp`.
+  in M1 implements `updateApp`. As built (WA82): the desktop variant of `VersionMismatch` (`desktop/VersionScreen`,
+  loaded through `desktop/shell.ts`) labels the button **Update the app** (the slice's acceptance text, not
+  "Update now"), offers **Open in browser** (the current room) and **Try again** (`Auth.Recheck()`, reloading the
+  page when the server is compatible again); the browser's screen is unchanged.
 - `versionActions().openInBrowser`: `openExternal(serverOrigin + (currentRoomId ? '/r/' + currentRoomId : '/'))`.
 - `staleBuild` is off in the desktop (§7.2).
 - REST: the desktop SPA uses only the room's endpoints (`/info`, `/me`, `/rooms`, `/invites` for the invite dialog,
@@ -2499,7 +2589,13 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   tree has no `codes.gen.ts`; it prints its count on a line of its own before the summary. `codes.node.test.ts` keeps
   checking the same in `test:web`, with the reason texts. When WA82 ends the exemption, rule 6 maps an `update.*` code
   to `desktop.update.error.<code>` instead of dropping the exemption (which would demand `desktop.errors.update.*`
-  keys nobody writes), so WA82 lists `check-i18n.mjs` too.
+  keys nobody writes), so WA82 lists `check-i18n.mjs` too. As built (group 15's integration; README §3 item 96):
+  WA82 wrote every `desktop.update.error.<code>` text, but its run's paths left both files out, so the integration
+  ended the exemption. **Rule 6** now requires `desktop.update.error.<code>` for every `update.<code>` and
+  `desktop.errors.<code>` for every other code (`BRIDGE_ERRORS`' `updatePrefixConstant`, the file's `UpdatePrefix`,
+  and `updatePrefix`, `desktop.update.error`), counts both as used, and prints "N bridge error codes, each with its
+  desktop.errors.<code> text (desktop.update.error.<code> for the update ones)". `codes.node.test.ts` checks the same
+  (each update code has its update screen text), and `check-i18n-codes.node.test.ts` covers the mapping.
 
 ### 18.2 Accessibility
 
@@ -2620,7 +2716,13 @@ there.
 - `winos`: register and unregister a hotkey; a second registration of the same combo → `ErrHotkeyTaken`; `SendInput`
   of the combo delivers `WM_HOTKEY` (interactive session; skipped with a reason when the runner has none).
 - Pill: created, `GetWindowDisplayAffinity` reads `WDA_EXCLUDEFROMCAPTURE`, extended styles include `WS_EX_TOPMOST |
-  WS_EX_NOACTIVATE`, positions clamp to the work area, actions on simulated button clicks.
+  WS_EX_NOACTIVATE`, positions clamp to the work area, actions on simulated button clicks. As built (WA80):
+  `pill_windows_test.go`'s `TestPillWindow` (styles, affinity, `Shown()` true while shown and false once hidden, the
+  window's and the disabled Pause's names), `TestPillButtonClicks` (the clicks, and a double click collapsing to the
+  dot with the buttons hidden and the window named by `Collapsed`), `TestPillPositions` and
+  `TestPillMovedReportsItsMonitor`; a click is the `WM_COMMAND`/`BN_CLICKED` message a button sends its parent, not
+  `BM_CLICK`, which can need the foreground that a CI runner may not give the window. The layout, hit test, button
+  and name rules are portable (`pill_test.go`, every OS).
 - Autostart: set, read, unset under a test value name (`isshoni-test-<random>`), never the real one.
 - DLL search order (§13.4's first action, 04 §13.3 layer 2): a child process runs `main`'s first step with
   `im-marker.dll` (a test DLL whose `DllMain` writes a file named after itself; a name in no system folder) in its
@@ -2635,8 +2737,10 @@ there.
   refuse the relaunch (exit 3, the refusal in its file) and the explorer-parent half is skipped with the reason;
   skipped too when `GetShellWindow` returns 0 (no shell on the runner); the explorer-parent half runs on the owner's
   PC runner. On GitHub's hosted `windows-2025` image (`RUNNER_ENVIRONMENT=github-hosted`: UAC off, one full admin
-  token, an elevated Explorer in the job's session) the relaunched child dies with `STATUS_DLL_INIT_FAILED`
-  (0xC0000142) before `main` whatever the desktop, session or elevation (the diagnostics ruled each out), so there
+  token, an elevated Explorer in the job's session) the shell passes the session and user check, and the relaunched
+  child dies with `STATUS_DLL_INIT_FAILED` (0xC0000142) before `main` even on `winsta0\default`, in the same session
+  as the test and as the same user (`relaunch_windows_test.go` reaches this branch only after `shellIsOurs`
+  accepted the shell; a shell in another session or of another user takes the refusal branch above), so there
   the test checks the guard instead: the helper exits 3 with `errRelaunchDied` in its file (the start saw the death
   and went on in place, never exit 0 with no app), and the explorer-parent half is skipped with the reason. Anywhere
   else a failure fails the test and prints the sessions, the helper processes left, whether the test runs elevated,
@@ -2770,8 +2874,8 @@ uploads it as `e2ehost-linux-amd64`; the `e2e` job downloads it and sets `DESKTO
 | Spec | Asserts |
 |---|---|
 | `desktop-link.spec` | wizard: server address → confirm → device code, QR code and short URL shown → a second browser context signed in on the server approves at `/link` → sound step (05's fake: `captured`) → voice step (`voiceApps` from the scenario) → the room; a denied code shows "declined"; the password path: "Sign in with username and password instead", a wrong password shows the error and clears the field, the right one links; an unknown server delivered as `--server` shows "Add server {host}?" and the harness records no request to it before Add, and after Add (same host) the link step follows with no confirm step. **Second server, no token crosses**: with the page in a room on server A (C1 open) and a second e2e server B from `fixtures.ts` (its own port and data dir), the harness started with `-reload-delay=2s`: add B through `--server`, Add; during the delay the spec creates a room on A (A's `invalidate` makes the page refetch `['rooms']` from A) and closes C1 through Playwright's `page.routeWebSocket` (C1 reconnects and resumes), so the page's refetch and C1's resume hello reach A while B is active; then B's link step renders on B's `bridge.js` and is approved. Asserted: no request to A (`page.on('request')`, the `Authorization` header) and no `hello` to A (`page.on('websocket')`, `framesent`) carries a token whose hash `/__e2e/state` lists for B; the harness lists no token handed out for origin A while B was active; the window reloaded exactly once, at `/desktop/setup?link=1` |
-| `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off. As built (WA65): Share → sheet → fake pick → first-share sheet ("Friends will see: Fake window") → Go live; the log check also covers the `normal` scenario's apps; the viewer, the own tile ("Preview: what friends see") and the panel's Stop; a second share needs no first-share sheet. The tray step is a note until the harness has the tray (WA68; WA80 then asserts "Live, 1 watching", adjusting the expected names if WA68 names them differently); Pause, the late joiner, the hotkeys and the mic prompt step (WA77's card) come with WA80, which extends the spec (README's WA80 row) |
-| `desktop-share.spec` (audio alert case) | with `ISSHONI_FAKE_AUDIO=degrade-live`: Share → live; 5 s later the fake degrades to `endpoint`; the harness's debug endpoint shows `tray.Render` with `tray-warn`, the first menu line "Friends hear voice apps" and, with a scripted prompt, "1 question waiting"; `PillState` with `VoiceAppsHeard` and `Questions` 1; exactly one recorded `desktop.native.toast.voiceAppsHeard` toast; a second degrade within 60 s records none |
+| `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off. As built (WA65): Share → sheet → fake pick → first-share sheet ("Friends will see: Fake window") → Go live; the log check also covers the `normal` scenario's apps; the viewer, the own tile ("Preview: what friends see") and the panel's Stop; a second share needs no first-share sheet. The tray step is a note until the harness has the tray (WA68; WA80 then asserts "Live, 1 watching", adjusting the expected names if WA68 names them differently); Pause, the late joiner, the hotkeys and the mic prompt step (WA77's card) come with WA80, which extends the spec (README's WA80 row). As built (WA80): the tray says "Live, 1 watching"; the hotkeys are registered while live (the harness's state) and named in the panel's tooltips; Pause and Resume from the panel, then Pause by `/__e2e/hotkey?id=pause` (the tray then `tray-paused`), each time with the friend's tile "Paused", no new frames and no audio energy, and a friend who joins while paused decodes no frame; Resume by hotkey brings frames back to both; the Stop hotkey ends the share for both, empties the registered hotkeys and releases keep-awake. The `normal` scenario's mic prompt is checked as its card at the top of the panel; the harness's window never hides, so the toast a hidden window gets is `internal/desktop/app`'s `TestMicPromptToast`. The close-to-tray step (WindowClosing while live, the notice's handshake) is WF17's (§11.6) |
+| `desktop-share.spec` (audio alert case) | with `ISSHONI_FAKE_AUDIO=degrade-live`: Share → live; 5 s later the fake degrades to `endpoint`; the harness's debug endpoint shows `tray.Render` with `tray-warn`, the first menu line "Friends hear voice apps" and, with a scripted prompt, "1 question waiting"; `PillState` with `VoiceAppsHeard` and `Questions` 1; exactly one recorded `desktop.native.toast.voiceAppsHeard` toast; a second degrade within 60 s records none. As built (WA80; README §3 item 95): the two states can't be on screen together in this scenario: the degrade to `endpoint` makes the prompting app (the fake's Chrome) heard, so 05 drops its mic row and prompt (05 §14.6). So the spec makes the prompt pending before the share (a test-held `Audio.Watch(true)` through the harness's bridge call, until `FriendsHear.prompts` has one), checks "1 question waiting" right after the share's line in the tray menu and `PillState` `{Mode: live, Questions: 1, Text.Questions: "1 question waiting"}` while live before the degrade, then, after it, `tray-warn` with the tooltip and first menu line "Friends hear voice apps", `PillState` `{VoiceAppsHeard: true, Text.Line: "Sharing · Friends hear voice apps"}`, exactly one `voice-apps-heard` toast with Open, and still one after 6 s more; the Stop hotkey then hides the pill and sets `tray-idle`. Both states together are `internal/desktop/app`'s `TestAudioAlertOutsideWindow`. "A second degrade within 60 s records none" can't happen in the e2e (the fake degrades once per share, and 05 resets its alert memory per share), so the spec checks no second toast in the same share, and the 60 s rule is 05's own unit test |
 | `desktop-handoff.spec` | a web tab of the same user watches Lounge; the desktop page joins Lounge → the tab shows "Now watching in the isshoni app" and its subscriptions are all off; "Watch here instead" resumes and the tab's `playback.state {playing: true}` reaches the app (`/__e2e/state` shows 05's viewer rule input); closing the tab sets it to `playing: false`; a phone-emulated tab (role `viewer`) keeps playing |
 | `desktop-reload.spec` | reload the desktop page while sharing → the share continues for viewers and the page adopts it (panel back, live). As built (WA65): the adopted panel passes axe in both color schemes, the own tile is local at the low layer again, and its Stop ends the share |
 | `desktop-security.spec` | the HTML response carries the CSP; `/sw.js` 404; an external link click records an `OpenURL` and the page stays; no `isa_` in `localStorage`; `/wails/runtime` with a foreign Origin 403 (assets handler mounted the same way); same-origin runtime requests from the page for `Browser.OpenURL('ms-settings:display')`, `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403 and reach no handler, while a bound-method `Call` reaches the stub; `/link` opens the browser |
