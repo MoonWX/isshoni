@@ -231,14 +231,14 @@ isshoni runs in a container. Check that `compose.yaml` publishes the media ports
 outside, `7882:7882/udp` and `7882:7882/tcp`, and open them in your provider's firewall. Published ports bypass ufw,
 so ufw rules neither help nor block them ([Docker](/install/docker#host)).
 
-<!-- The desktop app links to #desktop-linking from its "Can't reach the server" texts (docs/m2/03-desktop-app.md
-§8.1, §9): never rename or remove that anchor. The section's first paragraph goes once the Windows app is released
-(06 R14, which turns /download into the Windows page). -->
+<!-- The desktop app, its installer, the PowerShell script and the server's Download page link to the
+{#desktop-…} anchors below (docs/m2/03-desktop-app.md §8.1, §9, §23; docs/m2/06-windows-release.md §13, §17), and
+TestDocsAnchors requires each of them: never rename or remove one. -->
 
 ## Linking the app {#desktop-linking}
 
-The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 and links only to a server that
-runs 0.2 or later ([Desktop apps](/download)). This section describes linking as it will work.
+The desktop app (for Windows, from isshoni 0.2) links only to a server that runs 0.2 or later
+([Desktop apps](/download)).
 
 The desktop app signs in to your server once, when you link it: it shows a code and opens your server's page in your
 browser, where you approve it while signed in. "Sign in with username and password instead" in the app links it
@@ -330,6 +330,165 @@ Windows Credentials**, under "Generic Credentials", named `isshoni:v1:` and the 
   you remove it there, or until 90 days pass. **Sign out** in the app does both.
 - Uninstalling isshoni signs it out of every server it can reach, and deletes its entries either way.
 - A new PC, or a Windows profile copied to one, doesn't bring the sign-in along: link the app there again.
+
+## The Windows app {#desktop}
+
+Installing the app, its warnings and its updates are on [Desktop apps](/download#windows). These are the problems
+the app itself points you to.
+
+### Sound: what friends hear {#desktop-sound}
+
+When you share with **Share sound** on, friends hear everything your PC plays **except**:
+
+- **Voice apps**: Discord, TeamSpeak and the other apps on isshoni's built-in list are always kept out, so friends
+  never hear themselves echoed back. The list can't be turned off.
+- **Apps that use your microphone**: when an app uses the microphone, isshoni asks whether to keep it out of your
+  stream, and remembers the answer (Settings → Audio). A voice chat in a browser tab (Discord in the browser) can only
+  be kept out together with the whole browser; the Discord app works better.
+- **isshoni itself**, and the shares you watch in it.
+
+The share sheet's **What friends hear** lists what is kept out right now. Muting your PC or turning its volume down
+doesn't change what friends hear: **Pause** or **Share sound** off does.
+
+**"Voice apps can't be kept out on this PC"**: on Windows 10, and on a Windows 11 PC where the sound check found that
+Windows' per-app capture doesn't work, isshoni captures everything your default speakers or headphones play (Settings
+→ About shows "Everything on this PC"), voice apps included. Then:
+
+- set your voice app's output to another device than Windows' default output (in the voice app's own voice
+  settings), so friends don't hear it; or
+- share without sound; or
+- on Windows 10, update to Windows 11, where voice apps are kept out.
+
+Other sound messages:
+
+- **No speakers or headphones are connected**: Windows has no output device, so there is nothing to capture. Connect
+  one.
+- **Another app is using your speakers on its own (exclusive mode)**: close that app, or turn off "Allow applications
+  to take exclusive control of this device" in the device's Sound properties (Sound settings → the device →
+  Properties → Advanced), then run the sound check again (Settings → Audio).
+- **isshoni is playing in a browser on this PC**: you are also watching your room in a browser on the same PC, whose
+  sound would reach friends; pause it there.
+
+### The update didn't install {#desktop-update-failed}
+
+The app tried to install an update twice, and the version it runs is still the old one, so it stopped trying for that
+version ([how updates work](/download#windows-updates)). Usually something blocked the installer: an antivirus, an
+app-control policy, Smart App Control, or a full disk.
+
+1. Quit isshoni from its tray icon.
+2. Install the new version by hand from your server's Download page, or with its PowerShell command
+   ([Install with PowerShell](/download#windows-powershell)): both update the app in place and keep your settings and
+   sign-ins. The installer's and the script's messages say what went wrong.
+3. If your antivirus quarantined a file of isshoni, restore it and allow it, or ask its vendor: 0.x builds aren't
+   code-signed yet, which some scanners distrust.
+
+Other update messages: **"Update info is out of date"** means that no release came for months, or that your PC's clock
+is wrong: set the clock, and get the new version from your server's Download page. **"isshoni X is available"** with a
+link instead of an update means that this copy runs from another folder than the installed app (a copy that was moved
+or unpacked), which never updates itself: install the app.
+
+### Smart App Control and other app-control policies {#desktop-smart-app-control}
+
+Smart App Control (on some fresh installs of Windows 11) blocks apps and libraries that aren't code-signed, and the
+0.x builds aren't ([Smart App Control](/download#windows-smart-app-control)). Organizations can block them the same
+way (App Control for Business, AppLocker). What you see:
+
+- the installer, or the PowerShell command, doesn't start ("Windows blocked the installer"), or the PowerShell command
+  says "Smart App Control is on" and downloads nothing;
+- in the app, sharing says that Windows blocked part of isshoni's video engine: the video encoder's libraries were
+  blocked. If the app offers **Enable Cisco OpenH264**, that encoder is signed by Cisco and may be allowed.
+
+Check Smart App Control in Windows Security → App & browser control → Smart App Control settings. While it is on,
+share from Chrome or Edge ([Share](/guide/#share)); watching in the browser works too. On a PC your organization
+manages, ask its administrators. The app will be code-signed once the project's application for free code signing is
+approved ([Code signing policy](/code-signing)).
+
+### WebView2 {#desktop-webview2}
+
+isshoni shows its pages in Microsoft Edge WebView2 and needs its runtime, **version 120 or newer**. Windows 10 and 11
+normally have it and keep it current with Edge. When it is missing, the installer installs it (it downloads it from
+Microsoft); when that fails, the installer, the PowerShell command or the app says that WebView2 is needed.
+
+1. Install the runtime from Microsoft's [WebView2 page](https://developer.microsoft.com/microsoft-edge/webview2/)
+   (the Evergreen Bootstrapper).
+2. If it is installed but too old, updates of Edge and WebView2 are probably blocked on this PC (an organization's
+   policy, or a tool that turned updates off): let Microsoft Edge update (Edge → Settings → About Microsoft Edge).
+3. Start isshoni again, or run the installer again.
+
+### The OpenSSH Client, for the PowerShell install {#desktop-openssh}
+
+The PowerShell command checks the signature of the download with `ssh-keygen` from Windows' **OpenSSH Client**
+(OpenSSH 8.1 or newer), and installs nothing without it. Current Windows 10 and 11 have it. To add it:
+
+- Windows 11: Settings → System → Optional features → View features, search "OpenSSH Client", Add.
+- Windows 10: Settings → Apps → Optional features → Add a feature → OpenSSH Client.
+- Or in a PowerShell run as administrator: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`
+
+Then open a new PowerShell window and run the command again. If Git for Windows is installed, its `ssh-keygen` is
+used when Windows' isn't there. "Your ssh-keygen is older than OpenSSH 8.1" means an old copy was found: update
+Windows, or install from your server's Download page instead.
+
+### Windows N and KN editions {#desktop-windows-n}
+
+The N and KN editions of Windows (sold in Europe and Korea) come without Windows' media features. Without them, H.264
+video, which isshoni uses, doesn't play: **watching fails in the app and in Microsoft Edge**, and the app can't use
+Windows' own video encoders for sharing. The app says so when it finds an N edition.
+
+Install the [Media Feature Pack](#desktop-media-feature-pack). Until then, Chrome and Firefox can watch, as they decode
+H.264 themselves.
+
+### Installing the Media Feature Pack {#desktop-media-feature-pack}
+
+- Windows 11: Settings → System → Optional features → View features, search "Media Feature Pack", Add.
+- Windows 10: Settings → Apps → Optional features → Add a feature → Media Feature Pack.
+
+Restart the PC afterwards. It brings back H.264 decoding, for watching in the app and in Edge, and Windows' Media
+Foundation encoders, which isshoni uses for sharing when no GPU encoder works.
+
+### Graphics drivers {#desktop-gpu-driver}
+
+isshoni encodes video on the graphics card (NVIDIA NVENC, Intel Quick Sync, AMD AMF) when it can, and that needs a
+current driver:
+
+- **NVIDIA**: driver **531.61 or newer**. With an older one the app says "Update your graphics driver (NVIDIA 531.61
+  or newer)" and uses another encoder meanwhile.
+- **AMD and Intel**: a current driver from AMD or Intel, or from Windows Update.
+
+Get the driver from your graphics card's maker (NVIDIA, AMD or Intel) or your PC's maker, then restart isshoni.
+Settings → Sharing shows the encoder isshoni found. Without a GPU encoder it uses Windows' own encoder (up to 1080p at
+30 frames per second; not on N editions without the [Media Feature Pack](#desktop-media-feature-pack)), or Cisco's
+OpenH264 when you turn it on there.
+
+### Full-screen games show black {#desktop-fullscreen-games}
+
+A game in **exclusive full-screen** mode can show friends a black picture or your desktop instead of the game, and on
+Windows 10 a share of the whole screen can stop when the game changes the display mode. Set the game to **borderless**
+(also called "windowed full-screen" or "full-screen windowed") in its display settings: it looks the same, and isshoni
+captures it. Most current games use that mode already.
+
+### A yellow border around a shared window {#desktop-windows10-border}
+
+On Windows 10, Windows draws a yellow border around a window while it is being shared. That is Windows showing you
+that the window is captured; it is expected, and friends don't see it. Windows 10 has no way to turn it off. Sharing a
+whole screen shows no border there. On Windows 11 the border is left out when Windows allows it, and isshoni shows its
+own **Sharing** indicator instead.
+
+### When the app crashes {#desktop-crash-dumps}
+
+The app writes its own crash reports to `%LOCALAPPDATA%\isshoni\logs\crash-<time>.txt`, next to its logs. For a crash
+in the video engine, Windows can keep a crash dump: in a Command Prompt run as administrator,
+
+```bat
+reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\isshoni.exe" /v DumpType /t REG_DWORD /d 1 /f
+```
+
+The next crash leaves `isshoni.exe.<number>.dmp` in `%LOCALAPPDATA%\CrashDumps`. Remove the setting afterwards with
+`reg delete "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\isshoni.exe" /f`.
+
+Every release publishes the engine's debug symbols as `isshoni-desktop_<version>_windows_amd64_symbols.zip`, which
+make a dump readable. A dump holds part of the app's memory, which can include server addresses and what was on your
+screen: open an [issue](https://github.com/MoonWX/isshoni/issues) that says you have one, and don't attach the dump
+publicly. A "Copy diagnostics" button comes later ([Copying diagnostics](#copy-diagnostics)).
 
 ## Other problems {#other}
 

@@ -25,7 +25,11 @@ import (
 //   - /troubleshooting#ct-<code> for every code in web/src/conntest/codes.json (the connection test);
 //   - /install/vps#<provider> for every CloudProvider constant of internal/protocol/api, collected with go/parser
 //     (doctor's firewall hint, the wizard's fix text);
-//   - the fixed pages and anchors that the installer, the release notes and the product name.
+//   - the fixed pages and anchors that the installer, the release notes and the product name;
+//   - the Windows app's anchors of docs/m2/06-windows-release.md §17 ("Site anchors"), which the app, its installer,
+//     install-desktop.ps1 and the server's Download page link to (desktopAnchors);
+//   - every link with an anchor into the site that the product's sources carry (cmd/, internal/, web/src/, deploy/,
+//     .goreleaser.yaml), and every link with an anchor between the site's own pages.
 //
 // It lives here because no other slice of its group touches this package, and tools/ is a module that can't import
 // internal/ packages. It runs in CI's test-go job and in the site job, so a docs-only or codes-only change runs it too.
@@ -68,6 +72,7 @@ func TestDocsAnchors(t *testing.T) {
 	t.Run("fixed", func(t *testing.T) {
 		for _, page := range []string{
 			"docs/index.md",
+			"docs/download.md",
 			"docs/install/index.md",
 			"docs/install/docker.md",
 			"docs/install/tls.md",
@@ -89,6 +94,239 @@ func TestDocsAnchors(t *testing.T) {
 		requireAnchor(t, security, "verify", "install.sh and the release notes link to /security#verify")
 		requireAnchor(t, security, "keys", "the release notes link to /security#keys")
 	})
+
+	// The Windows app's anchors (docs/m2/06-windows-release.md §13 and §17's "Site anchors"): the app (03), the
+	// server's Download page, the installer, install-desktop.ps1 and the release notes link to them.
+	t.Run("desktop", func(t *testing.T) {
+		pages := map[string]anchors{}
+		for _, a := range desktopAnchors {
+			page, ok := pages[a.page]
+			if !ok {
+				page = pageAnchors(t, root, a.page)
+				pages[a.page] = page
+			}
+			requireAnchor(t, page, a.anchor, a.why)
+		}
+	})
+
+	// Every link into the site that the product's sources carry, whether or not a list above names it: a new link
+	// to a section that doesn't exist fails here rather than in a friend's browser.
+	t.Run("product links", func(t *testing.T) {
+		links := productSiteLinks(t, root)
+		if len(links) == 0 {
+			t.Fatal("found no link into the project site in the product's sources: productSiteLinks needs updating")
+		}
+		checkLinks(t, root, links, "the product links to it")
+	})
+
+	// The site's own links between its pages, so a page never sends a reader to a section that isn't there.
+	t.Run("site links", func(t *testing.T) {
+		checkLinks(t, root, docsSiteLinks(t, root), "a page of the site links to it")
+	})
+}
+
+// desktopAnchors are the Windows app's fixed sections of the site (docs/m2/06-windows-release.md §17, "Site
+// anchors"), and the ones docs/m2/README.md's WA57 and WA85 rows add: /troubleshooting#desktop-linking (the app's
+// linking texts, 03 §8.1, §9) and #desktop-sound (the sound check's "Learn more", 03 §8.4).
+var desktopAnchors = []struct{ page, anchor, why string }{
+	{"docs/download.md", "windows", "the installer's welcome page and Apps & features' help link open /download#windows"},
+	{"docs/download.md", "windows-powershell", "install-desktop.ps1's header and the Download page link to it"},
+	{"docs/download.md", "windows-smartscreen", "the Download page and the release notes link to it"},
+	{"docs/download.md", "windows-smart-app-control", "the Download page and install-desktop.ps1 link to it"},
+	{"docs/download.md", "windows-verify", "install-desktop.ps1 links to it when it can't check a download"},
+	{"docs/download.md", "windows-updates", "the app's update texts link to it"},
+	{"docs/download.md", "windows-uninstall", "06 §17's site anchors"},
+	{"docs/download.md", "windows-firewall", "06 §17's site anchors"},
+	{"docs/download.md", "windows-webview2", "06 §17's site anchors"},
+	{"docs/download.md", "ffmpeg-source", "the LGPL notice of the app (06 §9.1) points to the FFmpeg source"},
+	{"docs/download.md", "macos", "06 §13: the macOS app is coming"},
+	{"docs/download.md", "linux", "06 §13: the Linux agent is coming"},
+	{"docs/privacy.md", "desktop", "the installer's update option and the app's About link to /privacy#desktop"},
+	{"docs/privacy.md", "linked-apps", "the Devices page links to /privacy#linked-apps"},
+	{"docs/security.md", "verify-desktop", "install-desktop.ps1 links to it after a bad signature"},
+	{"docs/security.md", "linked-apps", "the app's linking texts link to /security#linked-apps"},
+	{"docs/troubleshooting.md", "desktop-update-failed", "06 §17's site anchors"},
+	{"docs/troubleshooting.md", "desktop-smart-app-control", "the app's blocked_by_policy text links to it"},
+	{"docs/troubleshooting.md", "desktop-webview2", "the app's and the installer's WebView2 messages link to it"},
+	{"docs/troubleshooting.md", "desktop-openssh", "06 §17's site anchors"},
+	{"docs/troubleshooting.md", "desktop-windows-n", "the app's codec banner and its N-edition fix link to it"},
+	{"docs/troubleshooting.md", "desktop-media-feature-pack", "the Download page and the app's engine errors link to it"},
+	{"docs/troubleshooting.md", "desktop-gpu-driver", "the Download page and the app's driver_too_old text link to it"},
+	{"docs/troubleshooting.md", "desktop-fullscreen-games", "06 §17's site anchors"},
+	{"docs/troubleshooting.md", "desktop-crash-dumps", "06 §17's site anchors"},
+	{"docs/troubleshooting.md", "desktop-windows10-border", "06 §17's site anchors"},
+	{"docs/troubleshooting.md", "desktop-linking", "the app's \"Can't reach the server\" texts link to it"},
+	{"docs/troubleshooting.md", "desktop-sound", "the app's sound check links to it (\"Learn more\")"},
+}
+
+// siteLink is a link into a page of the project site with an anchor, and where it was found.
+type siteLink struct {
+	page   string // the page's file, such as docs/troubleshooting.md
+	anchor string
+	from   string // file:line
+}
+
+// checkLinks fails t for every link whose anchor its page doesn't have, or whose page doesn't exist.
+func checkLinks(t *testing.T, root string, links []siteLink, why string) {
+	t.Helper()
+	pages := map[string]*anchors{}
+	for _, l := range links {
+		a, ok := pages[l.page]
+		if !ok {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(l.page))); err != nil {
+				t.Errorf("%s links to %s#%s, but there is no %s", l.from, l.page, l.anchor, l.page)
+				pages[l.page] = nil
+				continue
+			}
+			p := pageAnchors(t, root, l.page)
+			a = &p
+			pages[l.page] = a
+		}
+		if a == nil {
+			continue
+		}
+		requireAnchor(t, *a, l.anchor, why+" ("+l.from+")")
+	}
+}
+
+var (
+	// A link into the site in the product's sources: a page path, then #anchor. The page path comes after a slash, a
+	// brace or a quote, as in https://moonwx.github.io/isshoni/troubleshooting#<anchor>, ${DOCS_URL}download#<anchor>,
+	// "$site/download#<anchor>", "${SITE}/privacy#<anchor>" or "troubleshooting#<anchor>". An anchor that ends in - or
+	// _ is the start of one built at run time (#doctor-<id>, #ct-<code>), which the subtests above check.
+	productLinkRE = regexp.MustCompile(`(?:^|[/}"'` + "`" + `])(troubleshooting|download|privacy|security|code-signing|` +
+		`install(?:/[a-z-]+)?|guide|reference/[a-z]+)/?#([a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)(?:[^a-z0-9_$-]|$)`)
+	// The engine errors' troubleshooting sections, given as `anchor: '<id>'` (web/src/share/native/engineErrors.ts).
+	engineAnchorRE = regexp.MustCompile(`\banchor:\s*'([a-z0-9][a-z0-9_-]*)'`)
+	// A markdown link into the site from one of its pages: ](/page#anchor), ](/page/#anchor) or ](#anchor).
+	docsLinkRE = regexp.MustCompile(`\]\((/[a-z0-9/_-]*)?#([a-z0-9][a-z0-9_-]*)\)`)
+)
+
+// productSourceExts are the kinds of files that can carry a link into the site.
+var productSourceExts = map[string]bool{
+	".go": true, ".ts": true, ".tsx": true, ".js": true, ".mjs": true, ".json": true, ".ps1": true, ".nsi": true,
+	".nsh": true, ".sh": true, ".yaml": true, ".yml": true, ".txtar": true, ".txt": true,
+}
+
+// productSiteLinks are the links into the site that the product's sources carry: the server, the web client, the
+// desktop app, the installers and scripts, and the release notes.
+func productSiteLinks(t *testing.T, root string) []siteLink {
+	t.Helper()
+	var links []siteLink
+	scan := func(rel string) {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			from := rel + ":" + strconv.Itoa(i+1)
+			for _, m := range productLinkRE.FindAllStringSubmatch(line, -1) {
+				links = append(links, siteLink{page: sitePage(m[1]), anchor: m[2], from: from})
+			}
+			if strings.HasPrefix(rel, "web/src/") {
+				for _, m := range engineAnchorRE.FindAllStringSubmatch(line, -1) {
+					links = append(links, siteLink{page: "docs/troubleshooting.md", anchor: m[1], from: from})
+				}
+			}
+		}
+	}
+	files := []string{".goreleaser.yaml"} // slash-separated, relative to root
+	for _, dir := range []string{"cmd", "internal", "web/src", "deploy"} {
+		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if name := d.Name(); name == "node_modules" || name == "dist" || strings.HasPrefix(name, ".") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !productSourceExts[filepath.Ext(path)] {
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			files = append(files, filepath.ToSlash(rel))
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, rel := range files {
+		scan(rel)
+	}
+	return links
+}
+
+// docsSiteLinks are the links with an anchor between the site's pages (docs/, without the design documents that
+// the site leaves out: PLAN.md, m1/, m2/).
+func docsSiteLinks(t *testing.T, root string) []siteLink {
+	t.Helper()
+	var (
+		links []siteLink
+		pages []string // slash-separated, relative to root
+	)
+	docs := filepath.Join(root, "docs")
+	err := filepath.WalkDir(docs, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			switch rel {
+			case "docs/m1", "docs/m2", "docs/node_modules", "docs/public", "docs/scripts":
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) == ".md" && rel != "docs/PLAN.md" {
+			pages = append(pages, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range pages {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			for _, m := range docsLinkRE.FindAllStringSubmatch(line, -1) {
+				page := rel
+				if m[1] != "" {
+					page = sitePage(strings.TrimPrefix(m[1], "/"))
+				}
+				links = append(links, siteLink{page: page, anchor: m[2], from: rel + ":" + strconv.Itoa(i+1)})
+			}
+		}
+	}
+	return links
+}
+
+// sitePage is the markdown file of a page of the site, from its path without the base: "troubleshooting" →
+// docs/troubleshooting.md, "install/" and "install" → docs/install/index.md, "guide/" → docs/guide/index.md.
+func sitePage(path string) string {
+	path = strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/")
+	switch path {
+	case "", "index":
+		return "docs/index.md"
+	case "install", "guide":
+		return "docs/" + path + "/index.md"
+	}
+	return "docs/" + path + ".md"
 }
 
 // anchors are a page's explicit heading anchors, with the line of each.
