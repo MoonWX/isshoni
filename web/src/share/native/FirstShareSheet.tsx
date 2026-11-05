@@ -5,7 +5,10 @@
 // and the volume note, for a pick with sound (README WA77) · the "Optimize for" picker · Go live · Cancel. The label
 // is the Windows picker's name of the source; it stays on this PC.
 //
-// A later slice adds the line with the Pause and Stop hotkeys (WA80).
+// Under the picker, the line "Pause: Ctrl+Alt+Shift+F9 · Stop: Ctrl+Alt+Shift+F10, also from the tray icon" with the
+// combinations Go registers when the share goes live; a hotkey that won't work (another app has it, or settings.json
+// holds one that doesn't parse) is left out (README WA80).
+import type { TFunction } from 'i18next';
 import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -18,6 +21,7 @@ import { AppGroups, AudioBanners, MicPromptCards, VoiceAppsLine, VolumeNote } fr
 import styles from './native.module.css';
 import { useMicPromptHost } from './MicPromptCorner';
 import { useAudioBridge, useFriendsHear } from './useAudio';
+import { usable, useHotkeys, type ShareHotkeys } from './useHotkeys';
 
 export interface FirstShareSheetProps {
   open: boolean;
@@ -47,6 +51,8 @@ export function FirstShareSheet({
   const bridge = useAudioBridge();
   const fh = useFriendsHear(open ? bridge : null, { watch: true });
   useMicPromptHost(open && bridge !== null);
+  const hotkeys = useHotkeys(open ? bridge : null);
+  const hotkeyLine = hotkeysText(hotkeys, t);
   return (
     <Dialog
       open={open}
@@ -91,7 +97,22 @@ export function FirstShareSheet({
             );
           })}
         </fieldset>
+        {hotkeyLine !== null && (
+          <p className={styles.note} data-hotkeys="">
+            {hotkeyLine}
+          </p>
+        )}
       </div>
     </Dialog>
   );
+}
+
+/** The sheet's hotkey line (desktop.share.first.hotkeys*); null when neither hotkey works. */
+export function hotkeysText(h: ShareHotkeys, t: TFunction): string | null {
+  const pause = usable(h.pause) ? h.pause.combo : null;
+  const stop = usable(h.stop) ? h.stop.combo : null;
+  if (pause !== null && stop !== null) return t('desktop.share.first.hotkeys', { pause, stop });
+  if (pause !== null) return t('desktop.share.first.hotkeysPause', { pause });
+  if (stop !== null) return t('desktop.share.first.hotkeysStop', { stop });
+  return null;
 }

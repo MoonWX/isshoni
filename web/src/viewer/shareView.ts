@@ -5,6 +5,7 @@ import type { TFunction } from 'i18next';
 import {
   ShareKindTab,
   ShareKindWindow,
+  ShareStatusPaused,
   ShareStatusStalled,
   StatusReasonBandwidth,
   StatusReasonCodec,
@@ -77,9 +78,10 @@ export function watchingText(t: TFunction, share: ViewerShare): string {
 
 /**
  * What covers the video: a spinner while connecting, a notice while the sharer's connection is down, the codec
- * wait, and "Waiting for video…" over a picture that stopped moving.
+ * wait, "Waiting for video…" over a picture that stopped moving, and "Paused" while the sharer paused (docs/m2/03
+ * §11.3).
  */
-export type ShareOverlay = 'connecting' | 'stalled' | 'codec' | 'frozen';
+export type ShareOverlay = 'connecting' | 'stalled' | 'codec' | 'frozen' | 'paused';
 /** A small label on a playing video: why it isn't the quality that was asked for. */
 export type ShareBadge = 'bandwidth' | 'unavailable' | 'reduced';
 
@@ -98,6 +100,9 @@ export interface ShareView {
  *   last frame stays under "Waiting for video…";
  * - the `bandwidth` or `unavailable` reason: a badge; a reason this build doesn't know: a badge without a specific
  *   reason (01 §8.13).
+ * - the share is `paused` (docs/m2/03 §11.3, M2 01 §10.3: feature share.pause): nothing new leaves the sharer's PC, so
+ *   the last frame stays, dimmed, under "Paused", and a viewer who joined while paused sees "Paused" with no frame
+ *   (never "Connecting…", "Waiting for video…" or the codec wait, and no quality badge);
  * A share this page publishes shows its preview; only `stalled` applies to it. A local share of another local
  * connection (the desktop app's own share, docs/m2/03 §10.4) shows its subscribed layer, with every state above.
  */
@@ -109,6 +114,7 @@ export function shareView(
 ): ShareView {
   const stalled = share.info.status === ShareStatusStalled;
   if (share.localPreview) return { overlay: stalled ? 'stalled' : null, badge: null };
+  if ((share.info.status as string) === ShareStatusPaused) return { overlay: 'paused', badge: null };
   const reason: string | undefined = status?.reason;
   if (reason === StatusReasonCodec) return { overlay: 'codec', badge: null };
   let badge: ShareBadge | null = null;
@@ -140,6 +146,8 @@ export function overlayText(t: TFunction, overlay: ShareOverlay, codec: CodecNot
       return t('viewer.state.codec');
     case 'frozen':
       return t('viewer.state.frozen');
+    case 'paused':
+      return t('viewer.state.paused');
   }
 }
 

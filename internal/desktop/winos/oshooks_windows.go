@@ -17,11 +17,12 @@ import (
 var errNotImplemented = errors.New("winos: not implemented yet")
 
 // Hooks is app.OSHooks on Windows. The winos thread (thread_windows.go) carries the hotkeys, the session and power
-// events and keep-awake; WDA is SetWindowDisplayAffinity; the settings pages and OpenPath are ShellExecuteW. The pill
-// (README WA80) is a no-op and autostart (WA84) answers errNotImplemented until their slices.
+// events, keep-awake and the Sharing pill (pill_windows.go, README WA80); WDA is SetWindowDisplayAffinity; the
+// settings pages and OpenPath are ShellExecuteW. Autostart (WA84) answers errNotImplemented until its slice.
 type Hooks struct {
 	log   *slog.Logger
 	t     *thread // nil when the thread didn't start: the methods that need it degrade
+	pill  *pill   // on the thread; nil without it
 	build int
 }
 
@@ -40,6 +41,7 @@ func New() *Hooks {
 		h.log.Warn("winos: the winos thread didn't start", "err", err)
 	} else {
 		h.t = t
+		h.pill = newPill(t, h.log)
 	}
 	return h
 }
@@ -47,6 +49,9 @@ func New() *Hooks {
 // Close ends the winos thread (tests; the app's thread ends with the process).
 func (h *Hooks) Close() error {
 	if h.t != nil {
+		if h.pill != nil {
+			_ = h.t.call(h.pill.destroy)
+		}
 		h.t.close()
 	}
 	return nil
@@ -82,8 +87,13 @@ func (h *Hooks) Hotkeys() <-chan app.HotkeyID {
 	return h.t.keys
 }
 
-// Pill is the Sharing pill (README WA80); a no-op until then.
-func (*Hooks) Pill() app.Pill { return nopPill{} }
+// Pill is the Sharing pill (03 §11.4): a window of the winos thread; a no-op when the thread didn't start.
+func (h *Hooks) Pill() app.Pill {
+	if h.pill == nil {
+		return nopPill{}
+	}
+	return h.pill
+}
 
 // ExcludeFromCapture sets WDA_EXCLUDEFROMCAPTURE on a window of this process (03 §11.5).
 func (*Hooks) ExcludeFromCapture(hwnd uintptr) error {

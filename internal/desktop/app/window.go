@@ -37,7 +37,8 @@ type visibility interface {
 // WindowClosing is the shell's close hook (W7): the user closed the window (X, Alt+F4). The shell has cancelled the
 // close; the app hides the window or quits by ClosePolicy. The first close while live shows the toast "isshoni is
 // still sharing. Stop it from the tray icon (^)." while the window notice of the same line hasn't been shown
-// (tips.trayNoticeShown, which README WA80's notice sets), at most once a run. The shell calls it off its UI
+// (tips.trayNoticeShown, which the window notice sets once the SPA showed it: safety.go's WindowNoticeShown), at
+// most once a run; the window shows the same line as a notice the next time it opens. The shell calls it off its UI
 // thread: a quit waits for the share's stop.
 func (a *App) WindowClosing() {
 	_, live := a.Live()
@@ -53,6 +54,9 @@ func (a *App) WindowClosing() {
 	a.mu.Lock()
 	first := !a.sys.closeToastSent
 	a.sys.closeToastSent = true
+	if first {
+		a.sys.noticeDue = true // the same line in the window the next time it opens (safety.go)
+	}
 	a.mu.Unlock()
 	if first {
 		a.notify(ToastStillSharing, a.d.I18n.T("desktop.native.toast.stillSharing"))
@@ -63,6 +67,7 @@ func (a *App) WindowClosing() {
 func (a *App) ShowWindow() {
 	a.d.Shell.ShowWindow(true)
 	a.windowVisible(true)
+	a.emitWindowNotice()
 }
 
 // HideWindow hides the main window; the page keeps running (03 §4.4).

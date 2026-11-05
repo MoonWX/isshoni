@@ -505,7 +505,7 @@ func TestHooks(t *testing.T) {
 	if err := SetAppUserModelID("io.isshoni.test"); err != nil {
 		t.Error(err)
 	}
-	// Not there yet (README WA80, WA84): a clear error, never a silent success.
+	// Not there yet (README WA84): a clear error, never a silent success.
 	if err := h.SetAutostart(true, `C:\x.exe`); !errors.Is(err, errNotImplemented) {
 		t.Errorf("SetAutostart: %v", err)
 	}

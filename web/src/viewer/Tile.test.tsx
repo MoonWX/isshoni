@@ -223,6 +223,27 @@ describe('Tile', () => {
     expect(video().srcObject).not.toBeNull();
   });
 
+  it('M2: says "Paused" over the last frame of a paused share, and over no frame for a late joiner (03 §11.3)', () => {
+    const share = synced('s_a', shareInfo('s_a', 'u_bea', 1, { status: 'paused' }));
+    const { unmount } = renderTile(<Tile share={share} onPick={vi.fn()} />);
+    // Joined while paused: no track, no frame, and "Paused" rather than "Connecting…".
+    expect(screen.getByText('Paused')).toBeInTheDocument();
+    expect(screen.queryByText('Connecting…')).not.toBeInTheDocument();
+    expect(mainButton()).toHaveAccessibleDescription('Paused');
+    unmount();
+
+    viewer.registry.set('s_a', 'video', track('video'));
+    renderTile(<Tile share={share} onPick={vi.fn()} />);
+    act(() => {
+      viewer.store.getState().setFrozen(['s_a']);
+    });
+    expect(screen.getByText('Paused')).toBeInTheDocument();
+    expect(screen.queryByText('Waiting for video…')).not.toBeInTheDocument();
+    expect(screen.queryByText('Connection unstable')).not.toBeInTheDocument();
+    // The last frame stays, under the notice.
+    expect(video().srcObject).not.toBeNull();
+  });
+
   it('shows the local preview for a share this page publishes', () => {
     const share = synced(
       's_mine',

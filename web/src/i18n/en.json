@@ -120,7 +120,8 @@
       "bandwidth": "Lower quality (your connection)",
       "unavailable": "The sharer isn't sending this quality right now",
       "reduced": "Lower quality",
-      "frozen": "Waiting for video…"
+      "frozen": "Waiting for video…",
+      "paused": "Paused"
     },
     "media": {
       "unreachable": "Can't reach the server's media port. isshoni keeps trying.",
