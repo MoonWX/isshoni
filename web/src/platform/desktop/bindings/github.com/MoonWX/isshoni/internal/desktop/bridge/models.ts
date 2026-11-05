@@ -1070,9 +1070,11 @@ export class ShareStatsSample {
 /**
  * ShareView is the native share as the SPA sees it (03 §6.3): Share.Current() and the share.state event. state is
  * picking, starting, live, paused, reconnecting, unreachable, stopping, ended or failed; endReason user, hotkey,
- * tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; liveSince is RFC 3339. server
- * is {layers: protocol.ServerLayerStats[]} while WatchServerStats is on, else null: 03 §6.3's ShareSnapshot.Server
- * (01's server view of this connection's layers), wrapped in an object by WA48's DTO type.
+ * tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; lockPrompt is true while a
+ * share a screen lock paused waits for "Resume sharing?" (an unlock after 03 §11.6's 5 min: the panel's bar, filled
+ * from the app's lock pause); liveSince is RFC 3339. server is {layers: protocol.ServerLayerStats[]} while
+ * WatchServerStats is on, else null: 03 §6.3's ShareSnapshot.Server (01's server view of this connection's layers),
+ * wrapped in an object by WA48's DTO type.
  */
 export class ShareView {
     "state": string;
@@ -1087,6 +1089,11 @@ export class ShareView {
     "border": boolean;
     "pill": boolean;
     "minimized": boolean;
+
+    /**
+     * paused by a lock: "Resume sharing?" waits (03 §11.6)
+     */
+    "lockPrompt": boolean;
     "watching": number;
     "liveSince": string | null;
     "hint": ShareHint | null;
@@ -1139,6 +1146,9 @@ export class ShareView {
         if (!("minimized" in $$source)) {
             this["minimized"] = false;
         }
+        if (!("lockPrompt" in $$source)) {
+            this["lockPrompt"] = false;
+        }
         if (!("watching" in $$source)) {
             this["watching"] = 0;
         }
@@ -1174,22 +1184,22 @@ export class ShareView {
      * Creates a new ShareView instance from a string or object.
      */
     static createFrom($$source: any = {}): ShareView {
-        const $$createField14_0 = $$createType35;
-        const $$createField17_0 = $$createType37;
-        const $$createField18_0 = $$createType7;
-        const $$createField20_0 = $$createType39;
+        const $$createField15_0 = $$createType35;
+        const $$createField18_0 = $$createType37;
+        const $$createField19_0 = $$createType7;
+        const $$createField21_0 = $$createType39;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("hint" in $$parsedSource) {
-            $$parsedSource["hint"] = $$createField14_0($$parsedSource["hint"]);
+            $$parsedSource["hint"] = $$createField15_0($$parsedSource["hint"]);
         }
         if ("layers" in $$parsedSource) {
-            $$parsedSource["layers"] = $$createField17_0($$parsedSource["layers"]);
+            $$parsedSource["layers"] = $$createField18_0($$parsedSource["layers"]);
         }
         if ("server" in $$parsedSource) {
-            $$parsedSource["server"] = $$createField18_0($$parsedSource["server"]);
+            $$parsedSource["server"] = $$createField19_0($$parsedSource["server"]);
         }
         if ("error" in $$parsedSource) {
-            $$parsedSource["error"] = $$createField20_0($$parsedSource["error"]);
+            $$parsedSource["error"] = $$createField21_0($$parsedSource["error"]);
         }
         return new ShareView($$parsedSource as Partial<ShareView>);
     }

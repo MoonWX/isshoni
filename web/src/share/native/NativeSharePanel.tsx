@@ -26,6 +26,11 @@
 // "Pause hotkey unavailable: another app uses …" with a link to Settings → Sharing for a combination another app
 // has, and Pause disabled with "Pause needs a newer server" once the server answered feature_disabled. The close-to-
 // tray notice (WindowNotice) is the desktop shell's, above every page (app/App.tsx, desktop/shell.ts).
+//
+// The lock prompt (03 §11.6, README WF17): a share a screen lock paused, unlocked after the first bound (5 min), stays
+// paused and the bar asks "Sharing is still paused since you locked your PC. [Resume sharing] [Stop]" while
+// ShareView.lockPrompt is set (Go fills it from the app's lock pause; the tray, the pill and a toast ask too). Resume
+// sharing is the panel's Resume (Share.SetPaused(false)), which ends the lock pause in Go; Stop is the panel's Stop.
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -218,6 +223,8 @@ export function NativeSharePanel({
 
   const viewState = view?.state;
   const paused = viewState === 'paused';
+  // A lock pause that waits for "Resume sharing?" (03 §11.6): only ever set while paused.
+  const lockPrompt = paused && view?.lockPrompt === true;
   const unreachable = viewState === 'unreachable';
   const count = watchers.length;
   let status: string;
@@ -225,6 +232,7 @@ export function NativeSharePanel({
   else if (phase === 'stopping') status = t('share.panel.stopping');
   else if (unreachable) status = t('desktop.share.panel.unreachable');
   else if (phase === 'reconnecting' || viewState === 'reconnecting') status = t('desktop.share.panel.reconnecting');
+  else if (lockPrompt) status = t('desktop.share.panel.lockPrompt');
   else if (paused) status = t('desktop.share.panel.paused');
   else {
     status = t('desktop.share.panel.live', {
@@ -271,7 +279,12 @@ export function NativeSharePanel({
           className={cx(styles.dot, phase === 'live' && !paused && styles.dotLive, paused && styles.dotPaused)}
           aria-hidden="true"
         />
-        <p className={styles.status} data-share-status={viewState ?? phase}>
+        <p
+          className={styles.status}
+          data-share-status={viewState ?? phase}
+          data-lock-prompt={lockPrompt ? '' : undefined}
+          role={lockPrompt ? 'status' : undefined}
+        >
           {status}
         </p>
         <div className={styles.actions}>
@@ -289,14 +302,14 @@ export function NativeSharePanel({
             <Button
               size="sm"
               variant="primary"
-              title={pauseTitle(t('desktop.share.panel.resume'))}
+              title={pauseTitle(t(lockPrompt ? 'desktop.share.panel.resumeSharing' : 'desktop.share.panel.resume'))}
               onClick={() => {
                 active.setPaused(false).catch((err: unknown) => {
                   ui.getState().toast({ kind: 'error', message: errorMessage(err, t) });
                 });
               }}
             >
-              {t('desktop.share.panel.resume')}
+              {t(lockPrompt ? 'desktop.share.panel.resumeSharing' : 'desktop.share.panel.resume')}
             </Button>
           )}
           {canPause && active !== null && (

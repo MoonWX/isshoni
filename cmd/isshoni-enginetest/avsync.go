@@ -80,7 +80,40 @@ const (
 
 // With -source mon:<id> the picture is the whole monitor, of which the 1280×720 flash window covers 44 % at 1080p;
 // the tap's region, the centered 256-pixel box (04 §5.8), lies inside the window, which the flash role centers on the
-// captured monitor (-monitor), so the mean is the window's alone (WF16 resolved WA76's open point this way).
+// captured monitor (-monitor), so the mean is the window's alone (WF16 resolved WA76's open point this way;
+// flashWindowPos is the placement, which avsync_test.go checks on synthetic monitor rects).
+
+// The flash window's size in physical pixels (the flash role is per-monitor DPI aware).
+const (
+	avsyncFlashW = 1280
+	avsyncFlashH = 720
+)
+
+// winRect is a Win32 RECT: a monitor's desktop rect in physical pixels (x and y negative left of or above the primary
+// monitor), Right and Bottom exclusive.
+type winRect struct{ Left, Top, Right, Bottom int32 }
+
+// contains reports whether r lies inside o.
+func (o winRect) contains(r winRect) bool {
+	return r.Left >= o.Left && r.Top >= o.Top && r.Right <= o.Right && r.Bottom <= o.Bottom
+}
+
+// flashWindowPos is the flash window's top-left corner on the monitor whose desktop rect is mon (the captured monitor
+// of -source mon:<id>, else the primary): centered on it, but never left of or above the monitor's own corner when the
+// monitor is narrower or shorter than the window (the window then spans that side of it). Either way the window holds
+// the monitor's centered box of up to 256 pixels a side, the luma tap's region of a monitor capture (lumaBox, 04
+// §5.8), so the tap reads the flash on whichever monitor is captured.
+func flashWindowPos(mon winRect) (x, y int32) {
+	return mon.Left + max(0, (mon.Right-mon.Left-avsyncFlashW)/2), mon.Top + max(0, (mon.Bottom-mon.Top-avsyncFlashH)/2)
+}
+
+// lumaBox is the luma tap's region of a w×h frame (04 §5.8): the centered box of min(256, side) pixels on each side,
+// in the frame's coordinates.
+func lumaBox(w, h int32) winRect {
+	bw, bh := min(256, w), min(256, h)
+	x, y := (w-bw)/2, (h-bh)/2
+	return winRect{Left: x, Top: y, Right: x + bw, Bottom: y + bh}
+}
 
 // lumaSample is one encoded picture as the luma tap shows it: its capture time (session clock) and its mean luma,
 // 0 (black) to 1 (white). Missed and Discontinuity are native.LumaSample's: frames before it that have no reading,
@@ -363,6 +396,8 @@ type avsyncReport struct {
 	Frames       int        `json:"frames"`         // pictures the luma tap saw
 	Edges        int        `json:"lumaEdges"`      // rising edges through 50 %
 	EdgesDropped int        `json:"edgesDiscarded"` // rising edges after a lost reading (possibly late): not paired
+	LumaMissed   int        `json:"lumaMissed"`     // captured frames without a reading (lumaLosses)
+	LumaRings    int        `json:"lumaRingDrops"`  // readings after a drop of the debug ring (lumaLosses)
 	Onsets       int        `json:"pcmOnsets"`      // click onsets found in the PCM tap
 	PCMChunks    int        `json:"pcmChunks"`      // PCM-tap chunks read
 	Pairs        []avPair   `json:"pairs"`          // every pair
@@ -490,6 +525,7 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 	rep.RefreshMS = float64(fr.RefreshNS) / 1e6
 	rep.Clicks, rep.Frames, rep.Edges, rep.Onsets = len(cr.OnsetsNS), len(frames), len(edges), len(det.onsets)
 	rep.EdgesDropped = discarded
+	rep.LumaMissed, rep.LumaRings = lumaLosses(frames)
 
 	v := shift(edges, epoch)
 	u := shift(det.onsets, epoch)
@@ -690,6 +726,21 @@ func lumaEdges(frames []lumaSample, level float64) (edges []int64, discarded int
 	return edges, discarded
 }
 
+// lumaLosses sums what the luma tap lost (04 §5.8), for avsync.json's lumaMissed and lumaRingDrops: the captured
+// frames without a reading (the readings' Missed: all 8 staging copies were busy, or the frame was replaced in the
+// frame slots first) and the readings with DISCONTINUITY (each follows one or more readings the debug ring dropped,
+// which no counter of the engine reports, not even RING_OVERFLOW). They are the tap's health: a loss right at a
+// flash's rising edge discards that edge (lumaEdges, edgesDiscarded), and many make unpaired flashes likely.
+func lumaLosses(frames []lumaSample) (missed, ringDrops int) {
+	for _, f := range frames {
+		missed += max(f.Missed, 0)
+		if f.Discontinuity {
+			ringDrops++
+		}
+	}
+	return missed, ringDrops
+}
+
 // nearest is the index of the value of ts nearest to t within ±window that used doesn't mark, or -1.
 func nearest(ts []int64, t, window int64, used map[int]bool) int {
 	best, bestD := -1, window+1
@@ -821,8 +872,9 @@ func flashTimes(firstWhite []uint32, stats []frameStat, freq int64) flashResult 
 func printAVSync(w io.Writer, r avsyncReport) {
 	fmt.Fprintf(w, "avsync: %s, %.0f s; %d flashes (%d extrapolated, %d unresolved, refresh %.2f ms), %d clicks\n",
 		r.Source, r.Seconds, r.Flashes, r.FlashEst, r.FlashMissing, r.RefreshMS, r.Clicks)
-	fmt.Fprintf(w, "luma tap: %d pictures, %d flashes seen (%d discarded after a lost reading); PCM tap: %d chunks, "+
-		"%d clicks heard\n", r.Frames, r.Edges, r.EdgesDropped, r.PCMChunks, r.Onsets)
+	fmt.Fprintf(w, "luma tap: %d pictures, %d frames without a reading, %d ring drops; %d flashes seen (%d discarded "+
+		"after a lost reading); PCM tap: %d chunks, %d clicks heard\n", r.Frames, r.LumaMissed, r.LumaRings, r.Edges,
+		r.EdgesDropped, r.PCMChunks, r.Onsets)
 	for _, p := range r.ClickPairs {
 		fmt.Fprintf(w, "click %2d: audio (U − A) %+7.1f ms\n", p.Click, p.AudioMS)
 	}

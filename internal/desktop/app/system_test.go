@@ -1066,6 +1066,81 @@ func TestOutsideResumeEndsLockPause(t *testing.T) {
 	}
 }
 
+// TestLockPromptInShareView (03 §11.6, README WF17): the late unlock's "Resume sharing?" reaches the share's view
+// (ShareView.lockPrompt, the panel's bar) with a share.state event of its own, while the share stays paused; a resume
+// from anywhere (here the panel's, through the controller) ends it, and the view says live without it. A lock that
+// the unlock resumes in time never shows it, nor does a pause the user chose.
+func TestLockPromptInShareView(t *testing.T) {
+	s := newSysEnv(t)
+	var mu sync.Mutex
+	var prompts []bool // the state events' LockPrompt, while paused
+	unsubscribe := s.app.shares.Subscribe(func(ev share.Event) {
+		if ev.Kind == share.EventState && ev.View != nil && ev.View.State == share.StatePaused {
+			mu.Lock()
+			prompts = append(prompts, ev.View.LockPrompt)
+			mu.Unlock()
+		}
+	})
+	t.Cleanup(unsubscribe)
+	sawPrompt := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Contains(prompts, true)
+	}
+	waitView := func(ok func(*share.View) bool, what string) {
+		t.Helper()
+		for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			if v := s.app.shares.Current(); v != nil && ok(v) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("view %+v: %s", s.app.shares.Current(), what)
+			}
+		}
+	}
+
+	// A short lock: paused without the prompt, then live again.
+	s.goLive(t)
+	s.app.handleSystemEvent(EventLock)
+	s.waitState(t, share.StatePaused)
+	s.app.handleSystemEvent(EventUnlock)
+	s.waitState(t, share.StateLive)
+	if sawPrompt() || s.app.shares.Current().LockPrompt {
+		t.Fatal("a short lock showed the lock prompt")
+	}
+
+	// A late unlock: the prompt is in the view and in an event of its own, the share still paused.
+	time.Sleep(3 * share.StateEvery)
+	s.app.handleSystemEvent(EventLock)
+	s.waitState(t, share.StatePaused)
+	s.clock.Advance(6 * time.Minute)
+	s.app.handleSystemEvent(EventUnlock)
+	waitView(func(v *share.View) bool { return v.State == share.StatePaused && v.LockPrompt }, "the lock prompt")
+	for deadline := time.Now().Add(3 * time.Second); !sawPrompt(); time.Sleep(2 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no share.state event with the lock prompt")
+		}
+	}
+
+	// The panel's Resume: live, no prompt, the lock pause over.
+	if err := s.app.shares.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StateLive)
+	s.waitLockCleared(t)
+	waitView(func(v *share.View) bool { return v.State == share.StateLive && !v.LockPrompt }, "live without it")
+
+	// Paused again by the user: no prompt (the question was answered, and this pause isn't the lock's).
+	if err := s.app.shares.SetPaused(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StatePaused)
+	time.Sleep(20 * time.Millisecond) // the tray's debounce, which syncs the prompt, is 1 ms here
+	if s.app.shares.Current().LockPrompt {
+		t.Fatal("a pause the user chose shows the lock prompt")
+	}
+}
+
 // TestLockStopFindsLiveShare: a 30 min timer that comes due for a share that is live again, before the app has its
 // live event, only forgets the lock pause.
 func TestLockStopFindsLiveShare(t *testing.T) {

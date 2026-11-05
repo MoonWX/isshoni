@@ -404,6 +404,40 @@ func TestHostEndSession(t *testing.T) {
 	}
 }
 
+// TestHostWindow: /__e2e/window's open is the tray's Open (App.ShowWindow) and close the shell's close hook
+// (App.WindowClosing): without a share and with closeToTray off (the default), closing quits (03 §11.6's close
+// policy). desktop-share.spec covers the close while live, which hides the window to the tray.
+func TestHostWindow(t *testing.T) {
+	h := newTestHost(t)
+	if w := do(t, h, http.MethodPost, "/__e2e/window?action=open", "", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("open: %d %s", w.Code, w.Body)
+	}
+	if s := state(t, h); !s.WindowVisible || s.ShowWindowCalls != 1 || s.Quit {
+		t.Fatalf("after open: visible %v, %d ShowWindow calls, quit %v", s.WindowVisible, s.ShowWindowCalls, s.Quit)
+	}
+	for _, path := range []string{"/__e2e/window?action=minimize", "/__e2e/window"} {
+		if w := do(t, h, http.MethodPost, path, "", ""); w.Code != http.StatusBadRequest {
+			t.Errorf("POST %s: %d", path, w.Code)
+		}
+	}
+	if w := do(t, h, http.MethodGet, "/__e2e/window?action=close", "", ""); w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: %d", w.Code)
+	}
+	if w := do(t, h, http.MethodPost, "/__e2e/window?action=close", "http://evil.example", ""); w.Code !=
+		http.StatusForbidden {
+		t.Errorf("another origin: %d", w.Code)
+	}
+	if s := state(t, h); s.Quit {
+		t.Fatal("a refused close quit the app")
+	}
+	if w := do(t, h, http.MethodPost, "/__e2e/window?action=close", "", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("close: %d %s", w.Code, w.Body)
+	}
+	if s := waitState(t, h, 10*time.Second, "the quit", func(s hostState) bool { return s.Quit }); len(s.Toasts) != 0 {
+		t.Fatalf("toasts at a quit without a share: %v", s.Toasts)
+	}
+}
+
 // TestRecorderRemoveToasts: the recording winos removal records the IDs of toasts it saw, once each.
 func TestRecorderRemoveToasts(t *testing.T) {
 	r := newRecorder(testOrigin, 0)
