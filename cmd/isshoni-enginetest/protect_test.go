@@ -75,7 +75,9 @@ type fakeProtectEngine struct {
 	picks      int
 	released   []string
 	configs    []media.Config
-	sessionErr error // the session ends with it after its first packets
+	sessionErr error  // the session ends with it after its first packets
+	running    string // the path a pick's session runs on (native.CapturePath); "" is the pick's Capture
+	onStart    func() // called by Start
 }
 
 const noisyBytes = 20000 // × 200 frames/s × 8 = 32 Mbit/s
@@ -112,10 +114,20 @@ func (e *fakeProtectEngine) Start(_ context.Context, cfg media.Config) (media.Se
 	e.mu.Lock()
 	e.configs = append(e.configs, cfg)
 	e.mu.Unlock()
+	if e.onStart != nil {
+		e.onStart()
+	}
 	if e.startErr != nil {
 		return nil, e.startErr
 	}
-	return &fakeProtectSession{e: e, t0: time.Now(), stopped: make(chan struct{})}, nil
+	running := "dd"
+	if !cfg.Listed {
+		running = e.pick.Capture
+		if e.running != "" {
+			running = e.running
+		}
+	}
+	return &fakeProtectSession{e: e, t0: time.Now(), stopped: make(chan struct{}), running: running}, nil
 }
 
 type fakeProtectSession struct {
@@ -123,16 +135,23 @@ type fakeProtectSession struct {
 	e       *fakeProtectEngine
 	t0      time.Time
 	n       int
+	running string // its native.CapturePath
 	stopped chan struct{}
 	once    sync.Once
 }
 
-// annexB is an access unit of the given NAL units, each a type and a payload size.
-func annexB(units ...[2]int) []byte {
+// nal is a NAL unit of annexB: its header byte and its payload size.
+type nal struct {
+	typ  byte
+	size int
+}
+
+// annexB is an access unit of the given NAL units.
+func annexB(units ...nal) []byte {
 	var b []byte
 	for _, u := range units {
-		b = append(b, 0, 0, 0, 1, byte(u[0]))
-		b = append(b, bytes.Repeat([]byte{0xAB}, u[1])...)
+		b = append(b, 0, 0, 0, 1, u.typ)
+		b = append(b, bytes.Repeat([]byte{0xAB}, u.size)...)
 	}
 	return b
 }
@@ -160,12 +179,12 @@ func (s *fakeProtectSession) Next(ctx context.Context) (media.Packet, error) {
 	switch {
 	case s.n%20 == 0: // a periodic IDR: big, and never counted
 		p.Keyframe = true
-		p.Data = annexB([2]int{0x67, 10}, [2]int{0x68, 4}, [2]int{0x65, 200000})
+		p.Data = annexB(nal{0x67, 10}, nal{0x68, 4}, nal{0x65, 200000})
 	case s.e.covered || (s.e.w.protected() && !s.e.leaky):
 		// a still desktop: a tiny slice, plus filler and SEI that don't count
-		p.Data = annexB([2]int{0x06, 50000}, [2]int{0x41, 40}, [2]int{0x0C, 50000})
+		p.Data = annexB(nal{0x06, 50000}, nal{0x41, 40}, nal{0x0C, 50000})
 	default:
-		p.Data = annexB([2]int{0x41, noisyBytes})
+		p.Data = annexB(nal{0x41, noisyBytes})
 	}
 	return p, nil
 }
@@ -183,8 +202,17 @@ func fastProtectOptions(wgc string) protectOptions {
 
 func runFakeProtect(t *testing.T, e *fakeProtectEngine, o protectOptions) (int, protectReport, string) {
 	t.Helper()
+	return runFakeProtectCtx(t, context.Background(), e, o)
+}
+
+func runFakeProtectCtx(t *testing.T, ctx context.Context, e *fakeProtectEngine, o protectOptions) (int,
+	protectReport, string) {
+	t.Helper()
+	saved := sessionCapturePath
+	sessionCapturePath = func(s media.Session) string { return s.(*fakeProtectSession).running }
+	t.Cleanup(func() { sessionCapturePath = saved })
 	var out, errb bytes.Buffer
-	code := runProtectCheck(context.Background(), e, e.w, o, true, &out, &errb)
+	code := runProtectCheck(ctx, e, e.w, o, true, &out, &errb)
 	var rep protectReport
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
 		t.Fatalf("the JSON report: %v\n%s\nstderr: %s", err, out.String(), errb.String())
@@ -195,7 +223,7 @@ func runFakeProtect(t *testing.T, e *fakeProtectEngine, o protectOptions) (int, 
 func newFakeProtect() *fakeProtectEngine {
 	w := &fakePatternWindow{visible: true}
 	return &fakeProtectEngine{w: w, pick: media.Source{ID: "pick:3", Kind: media.SourceScreen, Capture: "wgc",
-		Name: "SECRET MONITOR NAME"}}
+		Name: "SECRET MONITOR NAME", MonitorID: `mon:\\.\DISPLAY1`}}
 }
 
 func TestProtectCheckPasses(t *testing.T) {
@@ -298,6 +326,24 @@ func TestProtectCheckWGC(t *testing.T) {
 		t.Errorf("start failure: code %d, released %v, report %s", code, e.released, out)
 	}
 
+	// Windows 11: a WGC start that fell back to DD is no WGC run: not reachable, exit 0.
+	e = newFakeProtect()
+	e.running = "dd"
+	if code, rep, out = runFakeProtect(t, e, fastProtectOptions("pick")); code != exitPass ||
+		rep.Paths[1].Outcome != "not_reachable" || rep.Paths[1].Capture != "dd" ||
+		!strings.Contains(rep.Paths[1].Reason, "fell back to DD") || len(e.configs) != 2 || e.w.protected() {
+		t.Errorf("fallback: code %d, report %s", code, out)
+	}
+
+	// A pick of another monitor than the noise window's: an operator error, released, exit 2.
+	e = newFakeProtect()
+	e.pick.MonitorID = `mon:\\.\DISPLAY2`
+	if code, rep, out = runFakeProtect(t, e, fastProtectOptions("pick")); code != exitEnv ||
+		rep.Paths[1].Outcome != "error" || !strings.Contains(rep.Paths[1].Reason, "not the one the noise window") ||
+		len(e.released) != 1 || len(e.configs) != 1 {
+		t.Errorf("other monitor: code %d, released %v, report %s", code, e.released, out)
+	}
+
 	// -wgc off: no pick.
 	e = newFakeProtect()
 	if code, rep, out = runFakeProtect(t, e, fastProtectOptions("off")); code != exitPass || e.picks != 0 ||
@@ -314,12 +360,28 @@ func TestProtectCheckWGC(t *testing.T) {
 	}
 }
 
+// An interrupted run (Ctrl-C) is the environment, exit 2, not a failed assertion.
+func TestProtectCheckInterrupted(t *testing.T) {
+	e := newFakeProtect()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.onStart = func() { time.AfterFunc(100*time.Millisecond, cancel) }
+	code, rep, out := runFakeProtectCtx(t, ctx, e, fastProtectOptions("pick"))
+	if code != exitEnv || rep.Pass || len(rep.Paths) != 1 || rep.Paths[0].Outcome != "error" ||
+		rep.Paths[0].Reason != "interrupted" || e.picks != 0 {
+		t.Errorf("code %d, %d picks, report %s", code, e.picks, out)
+	}
+	if e.w.protected() {
+		t.Error("the window is still protected after the run")
+	}
+}
+
 func TestProtectMeasures(t *testing.T) {
-	au := annexB([2]int{0x09, 1}, [2]int{0x06, 30}, [2]int{0x41, 100}, [2]int{0x41, 50}, [2]int{0x0C, 999})
+	au := annexB(nal{0x09, 1}, nal{0x06, 30}, nal{0x41, 100}, nal{0x41, 50}, nal{0x0C, 999})
 	if got := sliceBytes(au); got != 152 { // two slices, each with its header byte
 		t.Errorf("sliceBytes = %d", got)
 	}
-	if got := sliceBytes(annexB([2]int{0x65, 10})); got != 11 {
+	if got := sliceBytes(annexB(nal{0x65, 10})); got != 11 {
 		t.Errorf("an IDR slice: %d", got)
 	}
 	samples := []protectSample{{0, 1000}, {int64(time.Second / 2), 1000}, {int64(time.Second), 5000}}

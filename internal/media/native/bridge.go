@@ -1443,7 +1443,8 @@ type session struct {
 	c       caller
 	log     *slog.Logger
 	h       uint64
-	epochNS int64 // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+	epochNS int64  // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+	capture string // im_session_info.capture_path at start: the path that runs ("wgc", "dd", "test"; CapturePath)
 
 	rids          []string // layer index → rid
 	hasAudio      bool
@@ -1464,6 +1465,17 @@ type session struct {
 
 	smu   sync.Mutex
 	freed bool // im_stop ran: the handle never reaches the DLL again
+}
+
+// CapturePath is the capture path a session of this package started on, from im_session_info.capture_path: "wgc",
+// "dd" or "test". It can differ from the source's planned media.Source.Capture: on Windows 11 a WGC start that fails
+// falls back to Desktop Duplication on the same output (04 §7.1, §7.5). It is "" for any other media.Session. Only
+// isshoni-enginetest's protect-check uses it.
+func CapturePath(s media.Session) string {
+	if ns, ok := s.(*session); ok {
+		return ns.capture
+	}
+	return ""
 }
 
 // The session's limits (04 §12.3): the pull timeout, and each packet kind's largest size (the f arena; one Opus
@@ -1502,6 +1514,7 @@ func newSession(e *Engine, h uint64, info *imSessionInfo, cfg media.Config, sc *
 		log:           e.log,
 		h:             h,
 		epochNS:       info.epochNS,
+		capture:       captureToken(info.capturePath),
 		rids:          make([]string, n),
 		hasAudio:      cfg.Audio != nil,
 		noOSIndicator: info.flags&imSessNoOSIndicator != 0,

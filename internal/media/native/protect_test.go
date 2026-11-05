@@ -55,3 +55,22 @@ func TestProtectWindow(t *testing.T) {
 		t.Error("a call after Close reached the DLL")
 	}
 }
+
+// TestCapturePath (README WA70): a session's running capture path is im_session_info.capture_path at start, which may
+// differ from the source's planned one; any other media.Session has none.
+func TestCapturePath(t *testing.T) {
+	for _, tc := range []struct {
+		path uint32
+		want string
+	}{{imCaptureWGC, "wgc"}, {imCaptureDD, "dd"}, {imCaptureTest, "test"}, {99, ""}} {
+		sf := newSessionFake(t)
+		sf.info.capturePath = tc.path
+		_, s := startFake(t, sf, baseConfig())
+		if got := CapturePath(s); got != tc.want {
+			t.Errorf("capture_path %d: CapturePath = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+	if got := CapturePath(nil); got != "" {
+		t.Errorf("CapturePath(nil) = %q", got)
+	}
+}

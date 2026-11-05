@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -173,10 +174,12 @@ func (w *noiseWindow) run(ready chan<- error) {
 	}
 	mw, mh := mi.Monitor.Right-mi.Monitor.Left, mi.Monitor.Bottom-mi.Monitor.Top
 	x, y := mi.Monitor.Left+mw/4, mi.Monitor.Top+mh/4
+	// Win32 int arguments, non-negative here: the primary monitor's origin is (0, 0).
+	ux, uy, uw, uh := uintptr(x), uintptr(y), uintptr(mw/2), uintptr(mh/2) //nolint:gosec // G115: see above
 	instance, _, _ := procPWGetModuleHandleW.Call(0)
 	hwnd, _, err := procPWCreateWindowExW.Call(pwWSExTopmost|pwWSExToolWindow|pwWSExNoActivate,
 		uintptr(unsafe.Pointer(patternClassName)), uintptr(unsafe.Pointer(patternTitle)), pwWSPopup,
-		uintptr(x), uintptr(y), uintptr(mw/2), uintptr(mh/2), 0, 0, instance, 0)
+		ux, uy, uw, uh, 0, 0, instance, 0)
 	if hwnd == 0 {
 		ready <- fmt.Errorf("%w: %w", errPatternWindowNotCreated, err)
 		return
@@ -240,10 +243,7 @@ func patternWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 // blocks keep hard edges, which no encoder predicts from the last frame).
 func paintNoise(hwnd uintptr) {
 	for i := 0; i+8 <= len(patternBits); i += 8 {
-		v := rand.Uint64() //nolint:gosec // G404: a test pattern, not a secret
-		for j := range 8 {
-			patternBits[i+j] = byte(v >> (8 * j))
-		}
+		binary.LittleEndian.PutUint64(patternBits[i:], rand.Uint64()) //nolint:gosec // G404: a test pattern
 	}
 	var ps pwPaintStruct
 	hdc, _, _ := procPWBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
@@ -252,7 +252,8 @@ func paintNoise(hwnd uintptr) {
 	}
 	var rc pwRect
 	_, _, _ = procPWGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
-	_, _, _ = procPWStretchDIBits.Call(hdc, 0, 0, uintptr(rc.Right), uintptr(rc.Bottom), 0, 0, patternW, patternH,
+	cw, ch := uintptr(rc.Right), uintptr(rc.Bottom) //nolint:gosec // G115: Win32 int arguments, a client rect's size
+	_, _, _ = procPWStretchDIBits.Call(hdc, 0, 0, cw, ch, 0, 0, patternW, patternH,
 		uintptr(unsafe.Pointer(&patternBits[0])), uintptr(unsafe.Pointer(&patternBitmapInfo)), pwDIBRGBColors,
 		pwSrcCopy)
 	_, _, _ = procPWEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/media"
+	"github.com/MoonWX/isshoni/internal/media/native"
 )
 
 func init() {
@@ -41,9 +42,14 @@ func init() {
 // (the DD path covers the monitor). -wgc off skips the pick (unattended runs). The pattern window is hidden while
 // the picker is open, so it never covers the picker.
 //
+// WGC is also "not_reachable" when a WGC start fell back to Desktop Duplication (04 §7.1, §7.5): the verdict follows
+// the path the session runs on (im_session_info.capture_path), not the pick's planned one. A picked monitor other than
+// the noise window's is an operator error (exit 2), not a failure of the engine.
+//
 // Exit codes: 0 when DD passed and WGC passed, was not reachable or was off; 1 when a path failed (the pattern showed
 // while protected, did not show after, or the affinity did not read back); 2 for the environment (the engine, the
-// window, an OS below build 19041, a source that can't start, a cancelled pick).
+// window, an OS below build 19041, a source that can't start, a cancelled pick, the wrong monitor picked, an
+// interrupted run).
 
 // The thresholds of a path's verdict.
 const (
@@ -80,6 +86,9 @@ type patternWindow interface {
 	SetVisible(visible bool)
 	Close()
 }
+
+// sessionCapturePath is the capture path a started session runs on (native.CapturePath; tests fake it).
+var sessionCapturePath = native.CapturePath
 
 // newPatternWindow creates the shown noise window on the primary monitor (protect_windows.go); off Windows it fails.
 var newPatternWindow = createPatternWindow
@@ -158,7 +167,7 @@ func runProtectCheck(ctx context.Context, e protectEngine, w patternWindow, o pr
 		rep.Paths = append(rep.Paths, protectRun(ctx, e, w, "dd", "dd", mon, true, o))
 	}
 	if ctx.Err() == nil {
-		rep.Paths = append(rep.Paths, protectWGC(ctx, e, w, o, stdout, asJSON))
+		rep.Paths = append(rep.Paths, protectWGC(ctx, e, w, mon, o, stdout, asJSON))
 	}
 
 	code := exitPass
@@ -169,7 +178,8 @@ func runProtectCheck(ctx context.Context, e protectEngine, w patternWindow, o pr
 		case "error":
 			if code == exitPass {
 				code = envCode(p.err)
-				if p.err == nil {
+				// An interrupt (Ctrl-C) is no failed assertion: 1 is only for those (04 §14).
+				if p.err == nil || errors.Is(p.err, context.Canceled) || ctx.Err() != nil {
 					code = exitEnv
 				}
 			}
@@ -204,9 +214,10 @@ func runProtectCheck(ctx context.Context, e protectEngine, w patternWindow, o pr
 }
 
 // protectWGC is the WGC path: the user picks the pattern's monitor with the window hidden; a pick the engine captures
-// with Desktop Duplication (Windows 10's mapping) makes WGC not reachable.
-func protectWGC(ctx context.Context, e protectEngine, w patternWindow, o protectOptions, stdout io.Writer,
-	asJSON bool) protectPath {
+// with Desktop Duplication (Windows 10's mapping) makes WGC not reachable. mon is the noise window's monitor id ("" if
+// unknown): a pick of another monitor (media.Source.MonitorID, filled for a mapped monitor pick) is an operator error.
+func protectWGC(ctx context.Context, e protectEngine, w patternWindow, mon string, o protectOptions,
+	stdout io.Writer, asJSON bool) protectPath {
 	if o.wgc == "off" {
 		return protectPath{Path: "wgc", Outcome: "off"}
 	}
@@ -225,6 +236,10 @@ func protectWGC(ctx context.Context, e protectEngine, w patternWindow, o protect
 		e.Release(src.ID)
 		return protectPath{Path: "wgc", Capture: src.Capture, Outcome: "error",
 			Reason: "the pick is a window, not a monitor: pick the monitor the noise window is on"}
+	case mon != "" && src.MonitorID != "" && src.MonitorID != mon:
+		e.Release(src.ID)
+		return protectPath{Path: "wgc", Capture: src.Capture, Outcome: "error",
+			Reason: "the picked monitor is not the one the noise window is on"}
 	case src.Capture != "wgc":
 		e.Release(src.ID)
 		return protectPath{Path: "wgc", Capture: src.Capture, Outcome: "not_reachable",
@@ -268,6 +283,15 @@ func protectRun(ctx context.Context, e protectEngine, w patternWindow, path, cap
 		}
 		_ = w.Unprotect()
 		return fail("error", "start: "+err.Error(), err)
+	}
+	if path == "wgc" {
+		if running := sessionCapturePath(s); running != "wgc" {
+			// A WGC start that fails falls back to DD on the same output (04 §7.1, §7.5): that is no WGC run.
+			_ = s.Stop()
+			_ = w.Unprotect()
+			r.Capture = running
+			return fail("not_reachable", "WGC fell back to DD at start", nil)
+		}
 	}
 
 	half := time.Duration(o.seconds * float64(time.Second))
