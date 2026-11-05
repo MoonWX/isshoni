@@ -441,6 +441,8 @@ function Get-ProtocolStart {
     return [pscustomobject]@{ Path = $m.Groups[1].Value; Arguments = $m.Groups[2].Value.Replace('%1', $Link) }
 }
 
+# Get-AppProcess: the isshoni.exe processes started from InstallDir. A function's output unrolls (none comes back as
+# $null, one as that object), so callers wrap the call in @() before .Count.
 function Get-AppProcess {
     param([string]$InstallDir)
     $exe = Join-Path -Path $InstallDir -ChildPath 'isshoni.exe'
@@ -570,7 +572,7 @@ function Invoke-CiMode {
     Confirm-That ($app.ExitCode -eq 0) "a link start during an install exited $($app.ExitCode), not 0"
     Confirm-That (-not $sawRunning) 'a link start during an install created the running mutex'
     Confirm-That (-not (Test-Mutex $script:RunningMutex)) 'the running mutex exists after the link start'
-    Confirm-That ((Get-AppProcess -InstallDir $dir).Count -eq 0) 'an isshoni.exe is left running'
+    Confirm-That (@(Get-AppProcess -InstallDir $dir).Count -eq 0) 'an isshoni.exe is left running'
     Confirm-That ((Get-RegValue $script:AppKey 'PendingServer') -ceq 'https://smoke.invalid') "PendingServer is '$(Get-RegValue $script:AppKey 'PendingServer')'"
     Confirm-That ((Get-RegValue $script:AppKey 'PendingRoom') -ceq 'abc') "PendingRoom is '$(Get-RegValue $script:AppKey 'PendingRoom')'"
     Clear-RegValue $script:AppKey 'PendingServer'
