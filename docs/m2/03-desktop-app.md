@@ -105,9 +105,9 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W2 | `window.isSecureContext` is true there | CDP e2e | None needed: `DesktopPlatform` skips the NeedsHttps check (§7.2) and WebRTC works in any context |
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
-| W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and the native `window.open(…)` (from a fresh frame) leave the page on the asset origin, the open returns `null` and no page appears; a browser-started navigation (CDP `Page.navigate`) to a foreign URL comes back to the asset origin by itself; `chrome.webview.postMessage` is still there under the CSP sandbox | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, the start page again. **Fails at beta.34, fallback taken**: Wails registers no `NewWindowRequested` handler (the COM types exist in `internal/webview2/pkg/webview2`, nothing subscribes), and its `NavigationStarting` callback drops the event's arguments (`edge/chromium.go`, `application/webview_window_windows.go`'s `navigationStarting`), so Go can cancel neither, and no Wails option or reachable WebView2 setting blocks them. The fallback, §5.5 layer 2: (1) `bridge.js`'s Navigation API `navigate` listener cancels a script's foreign navigation (§5.2); (2) the HTML response's header CSP ends with `sandbox allow-scripts allow-same-origin allow-forms`, no `allow-popups`, so Blink refuses every new window before WebView2 sees one (§5.3); (3) after each `WebViewNavigationCompleted`, Go asks the page where it is and loads the start page (`SetURL("/")`) when the browser-reported top-level source (`OriginInfo.TopOrigin`) is not the asset origin or no answer comes (`navguard.go`). `Shell.Reload()` can't be the fallback: at beta.34 it is `location.reload()` of whatever page is showing, so the shell loads the start page instead when the window was last seen elsewhere, and W17's watchdog loads it after a reload that brought no beat back. The CDP check is written against the fallback; `desktop-security.spec` checks (1) and (2) in Chrome too. Not covered: a new window the browser starts itself (the default context menu's "Open link in new window", on only in dev and e2e builds, §5.4), and a foreign page that loads runs until Go sends it back (layer 3 keeps it off `/wails/*`). Re-check at every bump; drop (3) and the sandbox once Wails can cancel |
+| W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and the native `window.open(…)` (from a fresh frame) leave the page on the asset origin, the open returns `null` and no page appears; a browser-started navigation (CDP `Page.navigate`) to a foreign URL comes back to the asset origin by itself; `chrome.webview.postMessage` is still there under the CSP sandbox | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, the start page again. **Fails at beta.34, fallback taken**: Wails registers no `NewWindowRequested` handler (the COM types exist in `internal/webview2/pkg/webview2`, nothing subscribes), and its `NavigationStarting` callback drops the event's arguments (`edge/chromium.go`, `application/webview_window_windows.go`'s `navigationStarting`), so Go can cancel neither, and no Wails option or reachable WebView2 setting blocks them. The fallback, §5.5 layer 2: (1) `bridge.js`'s Navigation API `navigate` listener cancels a script's foreign navigation (§5.2); (2) the HTML response's header CSP ends with `sandbox allow-scripts allow-same-origin allow-forms`, no `allow-popups`, so Blink refuses every new window before WebView2 sees one (§5.3); (3) after each `WebViewNavigationCompleted`, Go asks the page where it is and loads the start page (`SetURL("/")`) when the browser-reported top-level source (`OriginInfo.TopOrigin`) is not the asset origin or no answer comes within 5 s once the runtime is up (`navguard.go`; a window that keeps leaving is sent back at most 3 times a minute). `Shell.Reload()` can't be the fallback: at beta.34 it is `location.reload()` of whatever page is showing, so the shell loads the start page instead when the window was last seen elsewhere, and W17's watchdog loads it after a reload that brought no beat back. The CDP check is written against the fallback, and PR #53's `windows-desktop` run passed it (README §3 item 92): it reaches the native `window.open` through a fresh `src`-less iframe's window (`DesktopPlatform` replaced `window.open` itself), asserts that it returns `null` with no new page, and asserts that a browser-started navigation really reached the foreign origin before it came back; `desktop-security.spec` checks (1) and (2) in Chrome too. Not covered: a new window the browser starts itself (the default context menu's "Open link in new window", on only in dev and e2e builds, §5.4), and a foreign page that loads runs until Go sends it back (layer 3 keeps it off `/wails/*`). Re-check at every bump; drop (3) and the sandbox once Wails can cancel |
 | W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Local\io.isshoni.desktop.v1` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>` in `winos` (distinct from the running mutex of §13.4). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
-| W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test | Window option to hide on close, plus our own quit path from the tray |
+| W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test. **Holds at beta.34** (PR #53's `windows-desktop` run; README §3 item 92): after `WM_CLOSE` (`CloseMainWindow()` on the app's process) the main HWND still exists (`IsWindow`) and is hidden (`IsWindowVisible` false), the page reports `document.visibilityState` `hidden`, and the process lives. The spec attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation keeps `visibilityState` `visible` whatever the window does, so without it the row could never see the hide. The two state polls are soft, so the row records the window's and the webview's state apart | Window option to hide on close, plus our own quit path from the tray |
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
 | W9 | WebView2 settings: DevTools off in production builds, default context menu off, zoom control off, browser accelerator keys off, general autofill and password save off, status bar off, swipe navigation off, external drop off | CDP e2e per setting where observable; else manual | The SPA-level mitigations of §5.4 |
 | W10 | The main window's native handle (HWND) is available to Go | Go test on Windows | `FindWindowExW` by the window class Wails registers, on the UI thread |
@@ -693,7 +693,15 @@ its arguments against the generated signatures and casts results to `bridge.ts`'
 `update.PolicyDisabled` as `Deps.PolicyOff` (§14.2's `updates.policyOff`). Methods whose slice hasn't landed answer
 `not_implemented` (README §4): `Auth.Unlink`, `AddServer`, `SwitchServer` and `RemoveServer` until WA71 (they need the
 app's reload and share stop), `Settings.Update`, `Hotkeys`, `TestHotkey` and `Updates.*` until WA84; `Audio.*` work
-over 05's service once `main.go` passes it as `Deps.Audio` (WA77). As built (WA58): every `Share` method works through
+over 05's service once `main.go` passes it as `Deps.Audio` (WA77). As built (WA77): `main.go` passes 05's
+`audio.Service` (over the engine's `media.AudioController`, with `settings.NewAudioStore` and 05's
+`audio.DefaultSettings` when `settings.json` has no `audio` section) as both `app.Deps.Audio` and `bridge.Deps.Audio`,
+so `Audio.*` work; without an engine there is no service and `Audio.*` still answer `not_implemented`.
+`Settings.Update` already applies one patch: `{wizardDone: true}` alone, which the wizard's voice step sends at Done
+(§8.2); `wizardDone: false` is `invalid_argument` (the steps can't be unseen), and a patch with any other field is
+still `not_implemented` until WA84. Go's `bridge.SettingsPatch` and `bridge.ts`'s `SettingsPatch` carry
+`wizardDone` (`*bool` / `wizardDone?: true`). A test checks that `Audio` binds `DismissPrompt` and no sound-mode
+method. As built (WA58): every `Share` method works through
 the app's share controller (§10.1), which `bridge.New` finds on `Deps.App` (`*app.App`'s `Shares`; `bridge.Deps.Shares`
 overrides it) and whose events it forwards as `share.state`, `share.stats` and `share.notice`; a `Core` without a
 controller (`cmd/isshoni-desktop`'s test core) gets a stand-in whose calls that would make or change a share answer
@@ -1144,9 +1152,23 @@ New routes in `app/router.tsx` (the page-folder contract of 05 §5; folder `desk
   would throw with no `serverOrigin`).
 - The account menu in the desktop: "Settings" (`/desktop/settings`), "Switch server" (when more than one), "Account ↗"
   and, for admins, "Admin ↗" (both open the browser), and "Sign out of <server>" (§8.3) through `Auth.Unlink()`,
-  never `POST /auth/logout` (02 §11.8). "Invite friends" stays (its dialog is a REST call). Not built yet: the menu is
-  `web/src/rooms/AccountMenu.tsx`, which WA42's paths didn't include; WA71 builds it (README WA71's row), and until
-  then the desktop still shows M1's menu with its Sign out and Notifications.
+  never `POST /auth/logout` (02 §11.8). "Invite friends" stays (its dialog is a REST call). **Built by WF14** (group
+  14; README §3 items 80, 86) in `web/src/rooms/AccountMenu.tsx`, whose browser menu is unchanged. The desktop menu,
+  in order: "Settings"; "Switch server", only when `Auth.Servers()` (read again each time the menu opens) lists more
+  than one server, which goes to Settings → Servers (`DesktopPaths.servers`, `/desktop/settings#servers`, the same
+  target as the Offline screen's Switch server, §8.3), not to an embedded `ServerSwitcher`, which would pull the
+  `desktop` chunk and its lazy namespace into the main bundle; "Account ↗"; "Invite friends" (M1's rule, as in
+  the browser); "My invites ↗" for members with `createInvites` (not admins, who reach it through Admin), opened in
+  the system browser like Account and Admin, because `/admin/invites` is behind `RequireBrowser`; "Admin ↗" for
+  admins; "Test my connection" when the room offers it; "About isshoni"; and "Sign out of <server>" (the active
+  server's name, else its host), which asks first ("Sign out of <server>?") and then calls `Auth.Unlink()`. There is
+  no Notifications entry (web push is the browser's). After the unlink `['me']` is forgotten and `RequireAuth`'s
+  desktop branch follows `Auth.State()` to the link step; an unconfirmed unlink (`{confirmed: false}`) leaves a toast
+  that stays until dismissed ("Remove <device> on your Devices page to finish"), and a refused one is an error toast
+  with the user still signed in. The texts are `room.menu.*` keys in `en.json` (the menu is in the main bundle, where
+  `check:i18n` forbids `desktop.*` keys). As group 14 merged, `SettingsPage` has only WA77's Audio section, so
+  `#servers` lands on a page without servers; WA82's `#servers` section renders `desktop/ServerSwitcher` (Switch,
+  Sign out, Remove, Add), which both links rely on.
 - `/about` works in both.
 
 ### 7.6 What the browser keeps unchanged
@@ -1318,7 +1340,12 @@ in settings (per install) records that the sound and voice steps were seen once.
   voice apps from `FriendsHear.voiceApps` (Discord, TeamSpeak, Mumble, …; "running" from its `running` flag),
   "apps that use your microphone (you'll be asked)" with the toggle **Keep out apps that use my microphone** (on;
   `Audio.SetKeepOutMicUsers`), and "isshoni itself". The note "Change this anytime in Settings → Audio". **Done** sets
-  `wizardDone`.
+  `wizardDone`. As built (WA77; README §3 item 87): Done calls `Settings.Update({wizardDone: true})`, the one patch
+  `Settings.Update` applies before WA84 (§6.2), and goes to the room whether or not the call succeeded. The sound and
+  voice steps (`DesktopFeatures.wizardSteps()`) follow the link step only when it came from `Auth.AddServer`'s reload
+  (`?link=1`) and `App.Info().wizardDone` is `false`; no answer from `App.Info` ends the wizard. Linking the same
+  server again (the relink page's Link again, the password form there) ends at "Linked" and goes to the room, so
+  `desktop-relink.spec` is unchanged; in `desktop-link.spec` the real sound and voice steps run on the fake.
 - The wizard has no "Skip" for linking (nothing works unlinked); Cancel on the first server quits to an empty
   "Link isshoni to your server" page with [Start].
 
@@ -1640,6 +1667,18 @@ Resume, reconnecting, unreachable with [Test connection], the minimized line, th
 expander's Optimize for, Share sound, watchers and Details, and a failed share's text and action. What friends hear,
 the banners and the mic prompt card come with WA77, Pause and the hotkeys' tooltips with WA80.
 
+As built (WA77; README §3 item 87): What friends hear (`FriendsHear.tsx`: the groups, levels, toggles, banners, the
+ducking tip, the volume note and "Nothing is playing right now") is in the panel, the share sheet and the first-share
+sheet, which call `Audio.Watch(true)` while open (WA65's hand-over, §10.2); a snapshot test renders the share sheet
+under every `ISSHONI_FAKE_AUDIO` scenario. The mic prompt card (`MicPromptCards`) shows at the top of the panel, in
+the share sheet and in the first-share sheet (a modal sheet makes the rest of the window inert, so it shows the cards
+itself). The corner card is `MicPromptCorner` (`web/src/share/native/`): the same cards in a corner of the window
+while no mounted host shows them (the panel and both sheets register through `useMicPromptHost`), so a prompt is
+never asked twice on screen and never waits unseen while the window is in front with no panel (Settings, another
+page). It is built to be mounted once for the whole desktop app, in its layout; as group 14 merged nothing mounts it
+yet, so until the integrator (or WA80, which owns the window notice beside it) mounts it, a prompt that comes while
+the window is in front and no panel or sheet is open waits unseen, kept out (05's default).
+
 On the Mac and in the e2e harness the same `audio.Service` runs on 05's fake engine audio (`ISSHONI_FAKE_AUDIO`
 scenarios, 05 §13.3), so every row rule, prompt and banner above is exercised without Windows.
 
@@ -1888,7 +1927,12 @@ disturb), on Windows 10 `ms-settings:quiethours` (Focus assist). isshoni doesn't
 - **Endpoint mute** (05 §11.2, §15): endpoint loopback re-captures isshoni's own playback, so while a share is live
   and `FriendsHear.engine === 'endpoint'`, `viewerStore.audioMutedForShare` forces `audio: off` on every subscription
   (`layerPolicy`). It reverts when the engine leaves `endpoint` or the share ends; 05's `viewer-muted` banner explains
-  it.
+  it. As built (WA77; README §3 item 87): `viewer/endpointMute.ts`'s `attachEndpointMute(store, bridge)` follows
+  `audio.report` (then a pull of `Audio.FriendsHear`, newer `seq` only) into `setAudioMutedForShare(live && engine ===
+  'endpoint')`, and `layerPolicy`'s rule 8 turns every subscription's audio off. It is attached from `ViewerLayout`
+  (`useEndpointMute`), because `rooms/runtime.ts` was outside WA77's paths, so the mute holds only while the room
+  page's viewer is mounted; it belongs in `rooms/runtime.ts` with the room's viewer store (a later slice that owns
+  that file moves it; `attachEndpointMute` is exported for that).
 
 ### 12.2 Handoff: `playback.stop` and `playback.state`
 
@@ -2101,6 +2145,15 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    `AllowSetForegroundWindow(childPid)`, watch the child for 1.5 s, and exit 0. On any failure (no shell window, a
    shell in another session or of another user, access denied, a child that exits within the 1.5 s with a nonzero
    code; exit 0 is a normal end, e.g. a forward), log WARN and continue in place.
+   As built (WA77 and PR #53's CI; README §3 item 91): `winos.RelaunchUnderShell` (`relaunch_windows.go`).
+   `STARTUPINFO.lpDesktop` names `winsta0\default`, the shell's desktop: the child takes the shell's token, and with
+   `lpDesktop` unset it opened the starting process's window station and desktop, which that token may not use (on
+   the CI runner it died with `STATUS_DLL_INIT_FAILED`, 0xC0000142, before `main`). The watch is
+   `relaunchedLives`: `WaitForSingleObject` on the child for `relaunchDeathWindowMs` (1500); a nonzero exit in that
+   time is `errRelaunchDied` (with the code) and the start goes on in place, while a child still running, one that
+   exited 0, or one that can't be watched counts as started. An elevated start is not refused: it relaunches
+   de-elevated under the shell's token (a refusal tried during PR #53 rested on a wrong reading of the runner, whose
+   Explorer is elevated too, and was taken out). No error or log names an exe.
 2a. **Installer running** (06 §2.4, §8.7): `OpenMutexW(SYNCHRONIZE, FALSE, "Local\\io.isshoni.desktop.installing")`.
    When it succeeds (an installer runs right now: interactive, `/S`, or a start-time update), a start from
    `--open-url` writes the link's origin to `PendingServer` and its room id to `PendingRoom` (overwriting older
@@ -2262,6 +2315,16 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 
 - A mic-prompt toast action calls `audio.Service.Decide(prompt.id, 'keep-out' | 'include')`; a dismissed toast calls
   `audio.Service.DismissPrompt(prompt.id)` (kept out, not asked again this run, nothing saved; 05 §14.6).
+- **As built (WA77; README §3 item 87)**: the app subscribes to 05's events (`App.onAudioEvent`). A new prompt becomes
+  a toast (`notifyRef` with the prompt's id as its ref) only while the window isn't in front: `windowInFront` asks
+  the shell's optional `WindowFocused()` (the Wails shell: `IsVisible() && !IsMinimised() && IsFocused()`), so a
+  window that is minimized or behind a full-screen game gets the toast although Windows counts it as visible; a shell
+  without that method counts a visible window as in front. Each `audio.report` settles the toasts of prompts it no
+  longer lists (`toastBook.dropRefsExcept`: answered in the window, dismissed or gone), and those toasts leave Action
+  Center at the next `removeStaleToasts` or `notify`. `App.ToastDismissed(nonce)` (a dismissed mic-prompt toast →
+  `DismissPrompt`) is built and tested but has no caller: the pinned Wails notifications service reports no
+  dismissal, so a swiped-away toast leaves the prompt pending (still kept out, the in-window card still up) until it
+  is answered in the window. The slice that moves the Wails pin wires it once the service reports a dismissal.
 - **Action safety**: every toast with buttons carries a random 128-bit nonce; the app accepts an action only for a
   nonce of a toast it sent in this run and hasn't settled. Should actions arrive through protocol activation
   (`isshoni://…`) rather than COM activation, a web page can't forge them without the nonce.
@@ -2276,10 +2339,23 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   shows during it would be lost, so **callers must serialize `RemoveToasts` with `Shell.Notify`** (one ordered toast
   path) **and never call it with `App.mu` held** (several WinRT round trips). The Windows test (`windows-go`) runs
   under a random AppUserModelID registered in HKCU and deleted afterwards, never `io.isshoni.desktop`. As WF13 merged
-  the app doesn't call it yet: WF14 (group 14) wires it where a toast's question is answered another way
+  the app didn't call it yet: WF14 (group 14) wires it where a toast's question is answered another way
   (`toastBook.dropKind`, the lock pause's `clearLockLocked`, the pending toast keeping its notification id, through an
   optional remover interface the tests fake), and `desktop-system.spec`'s note-only branch then expects the removed
   toast's id. Until then the toast book's settled nonce makes a stale toast's button a no-op.
+  **As built (WF14 and PR #53; README §3 items 86, 90)**: `toastBook.dropKind` and `dropRefsExcept` keep the dropped
+  toasts' notification ids as stale (they only touch the book, so callers may hold `App.mu`), and `removeStaleToasts`,
+  called once `App.mu` is released, removes them through `toastRemover` (`winos.Hooks.RemoveToasts`, found on
+  `Deps.OS` by type assertion; compile-time checks in `winos` and in the app's tests keep `winos.Hooks` satisfying it).
+  `toastBook.out` serializes `Shell.Notify` and the removal, and `notify` removes the stale toasts before it shows a
+  new one, so "Sharing stopped while your PC was locked" never races the removal of "Resume sharing?". A failed
+  removal is logged, not retried. Two Windows facts from PR #53's CI: `ToastNotificationHistory.Remove` removes only
+  the calling app's toasts, and an unpackaged process is the app its process AppUserModelID names, so the app sets it
+  first thing (`SetAppUserModelID`) and the Windows test makes its random test id the process's
+  (`E_INVALIDARG` from `RemoveGroupedTagWithId` otherwise); and an unpackaged app can't remove a tagged toast without
+  a group, so a toast delivered again keeps its group or gets `keepGroup` (`isshoni`; Wails' toasts have none). A
+  fresh AppUserModelID's `NotificationSetting` reads `ERROR_NOT_FOUND` until its first toast, which the test
+  tolerates only before it has shown one.
 - *Later (M5)*: "Alex started sharing in Lounge" toasts in the desktop app.
 
 ---
@@ -2558,7 +2634,14 @@ there.
   another session or of another user than the test (a CI runner's job outside Explorer's session), the helper must
   refuse the relaunch (exit 3, the refusal in its file) and the explorer-parent half is skipped with the reason;
   skipped too when `GetShellWindow` returns 0 (no shell on the runner); the explorer-parent half runs on the owner's
-  PC runner.
+  PC runner. On GitHub's hosted `windows-2025` image (`RUNNER_ENVIRONMENT=github-hosted`: UAC off, one full admin
+  token, an elevated Explorer in the job's session) the relaunched child dies with `STATUS_DLL_INIT_FAILED`
+  (0xC0000142) before `main` whatever the desktop, session or elevation (the diagnostics ruled each out), so there
+  the test checks the guard instead: the helper exits 3 with `errRelaunchDied` in its file (the start saw the death
+  and went on in place, never exit 0 with no app), and the explorer-parent half is skipped with the reason. Anywhere
+  else a failure fails the test and prints the sessions, the helper processes left, whether the test runs elevated,
+  the helper's own report in the temp root and the relaunched process's PID and exit code (the test-only hook
+  `AfterRelaunchForTest`).
 - `--version` prints one JSON line with the fields of §13.4 when stdout is redirected; `--self-check=<path>` on a
   GPU-less runner, against `windows-native`'s `release\` DLL and FFmpeg DLLs, writes `ok: true` with `engine.loaded`,
   `ffmpegLoaded`, `testHooks: false` and `spa.ok` (06's smoke runs the same against the install).
