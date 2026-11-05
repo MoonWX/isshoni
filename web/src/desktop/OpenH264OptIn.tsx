@@ -3,31 +3,26 @@
 // size and SHA-256 (native.InstallOpenH264; 04 owns the download and the checksum), and turning it off deletes the
 // file. While it is installed, About shows Cisco's attribution "OpenH264 Video Codec provided by Cisco Systems, Inc."
 //
-// The bridge has no OpenH264 methods yet: the Go side (the install and remove through WA51's helpers) is README
-// WA84's. This file declares what the page needs from it (OpenH264Control) and openH264Control() answers null until
-// those methods exist, which hides the opt-in exactly as "04 doesn't offer it" does. The failures of 04 §9.9 have their
-// texts here: dependency with reason download (the network: trying again may help), corrupt (Cisco's file didn't
-// match the pinned size or hash), missing, version or blocked_by_policy; cancelled and timeout.
+// The control is the bound Settings.OpenH264, EnableOpenH264 and DisableOpenH264 (README WA84: Go installs and removes
+// through WA51's helpers); Go answers state unavailable where 04 doesn't offer it, which hides the opt-in. The failures
+// of 04 §9.9 have their texts here: dependency with reason download (the network: trying again may help), corrupt
+// (Cisco's file didn't match the pinned size or hash), missing, version or blocked_by_policy; cancelled and timeout.
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import type { NativeBridge, OpenH264Status } from '../platform/desktop/bridge';
 import { Button } from '../ui/Button';
 import { failureOf } from './authText';
-import { bridgeText } from './settingsState';
+import { bridgeText, isObject } from './settingsState';
 import { OutLink } from './UpdateParts';
 import styles from './settings.module.css';
 
 /** Cisco's binary license, which applies to the downloaded DLL (04 §17). */
 export const OPENH264_LICENSE_URL = 'https://www.openh264.org/BINARY_LICENSE.txt';
 
-export interface OpenH264Status {
-  /** unavailable: 04 doesn't offer it here (not Windows, a build without the engine); on: installed and verified. */
-  state: 'unavailable' | 'off' | 'on';
-  /** The pinned release (native.OpenH264.Version), e.g. "2.7.0". */
-  version: string;
-}
+export type { OpenH264Status };
 
-/** What the opt-in needs from Go (README WA84 binds it). */
+/** What the opt-in needs from Go: the bound Settings methods (openH264Control), or a test's fake. */
 export interface OpenH264Control {
   status(): Promise<OpenH264Status>;
   /** Downloads Cisco's binary, verifies it and turns it on; rejects with the bridge error of 04 §9.9. */
@@ -36,12 +31,13 @@ export interface OpenH264Control {
   disable(): Promise<OpenH264Status>;
 }
 
-/**
- * The opt-in's control from Go, or null while the bridge has none: README WA84 adds the bound methods and builds the
- * control over them here; until then the page shows no opt-in, as when 04 doesn't offer it.
- */
-export function openH264Control(): OpenH264Control | null {
-  return null;
+/** The opt-in's control over the bound Settings methods (docs/m2/03 §14.4). */
+export function openH264Control(bridge: NativeBridge): OpenH264Control {
+  return {
+    status: () => bridge.settings.openH264(),
+    enable: () => bridge.settings.enableOpenH264(),
+    disable: () => bridge.settings.disableOpenH264(),
+  };
 }
 
 /** The reasons of 04 §9.9 that have a text of their own. */
@@ -77,7 +73,7 @@ export function useOpenH264(control: OpenH264Control | null): OpenH264State {
     let live = true;
     control.status().then(
       (s) => {
-        if (live) setStatus(s);
+        if (live && isObject(s)) setStatus(s);
       },
       () => undefined,
     );

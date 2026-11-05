@@ -66,9 +66,10 @@ var boundMethods = map[string]map[string]bool{
 	"Audio": {"FriendsHear": false, "Watch": false, "WatchLevels": false, "SetAppDecision": false,
 		"SetKeepOutMicUsers": false, "Decide": false, "DismissPrompt": false, "DismissTip": false, "AppRules": false,
 		"SoundCheck": true},
-	"Settings": {"Get": false, "Update": false, "Hotkeys": false, "TestHotkey": false},
-	"Window":   {"SetFullscreen": false},
-	"Updates":  {"Status": false, "Check": true, "Install": true},
+	"Settings": {"Get": false, "Update": false, "Hotkeys": false, "TestHotkey": false, "OpenH264": false,
+		"EnableOpenH264": true, "DisableOpenH264": false},
+	"Window":  {"SetFullscreen": false},
+	"Updates": {"Status": false, "Check": true, "Install": true},
 }
 
 var ctxType = reflect.TypeFor[context.Context]()
@@ -195,6 +196,11 @@ func TestNotImplemented(t *testing.T) {
 		"Updates.Status":          func() error { _, err := s.Updates.Status(); return err },
 		"Updates.Check":           func() error { _, err := s.Updates.Check(ctx); return err },
 		"Updates.Install":         func() error { return s.Updates.Install(ctx) },
+		"Settings.EnableOpenH264": func() error { _, err := s.Settings.EnableOpenH264(ctx); return err },
+		"Settings.DisableOpenH264": func() error {
+			_, err := s.Settings.DisableOpenH264()
+			return err
+		},
 		"Window.SetFullscreen(∅)": func() error { return (&Window{}).SetFullscreen(true) },
 	}
 	// A Core without a share controller (not *app.App): no share can exist.
@@ -540,17 +546,13 @@ func TestSettingsAndWindow(t *testing.T) {
 		!v.Updates.PolicyOff || v.Log.Level != "info" || v.ServerPrefs == nil || v.Pill.Positions == nil {
 		t.Fatalf("settings view %+v", v)
 	}
-	// Update takes wizardDone alone (the wizard's Done, README WA77); the rest of it is WA84's.
+	// The wizard's Done (README WA77); every other field is settings_test.go's.
 	done, no := true, false
 	if v, err := s.Settings.Update(SettingsPatch{WizardDone: &done}); err != nil || !v.WizardDone || !st.WizardDone() {
 		t.Fatalf("Update wizardDone: %+v %v", v, err)
 	}
 	if _, err := s.Settings.Update(SettingsPatch{WizardDone: &no}); codeOf(t, err) != codes.CodeInvalidArgument {
 		t.Fatalf("Update wizardDone false: %v", err)
-	}
-	if _, err := s.Settings.Update(SettingsPatch{WizardDone: &done, CloseToTray: &done}); codeOf(t,
-		err) != codes.CodeNotImplemented {
-		t.Fatalf("Update with another field: %v", err)
 	}
 	if err := s.Window.SetFullscreen(true); err != nil || !slices.Equal(shell.fullscreen, []bool{true}) {
 		t.Fatalf("SetFullscreen: %v %v", err, shell.fullscreen)

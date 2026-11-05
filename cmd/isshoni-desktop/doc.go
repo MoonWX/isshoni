@@ -12,9 +12,11 @@
 // starts the app afresh in a new process only when it is the toast's Open), step 2 (the shell relaunch, D16: a start
 // whose parent isn't Explorer or a launcher starts again under the user's shell, with --relaunched first, and exits;
 // skipped with --relaunched and while the running mutex exists), step 2a (an installer running: a link start leaves
-// its link in PendingServer/PendingRoom and every start exits), single instance, the running mutex, the Pending
-// values and the app, with 05's audio service over the engine. Step 5 and --update-now are marked in start.go where
-// their slice puts them.
+// its link in PendingServer/PendingRoom and every start exits), single instance, the running mutex, step 5 (the
+// first instance builds 06's updater over settings.json and applies a pending update before any window opens, the
+// link of this start written to PendingServer/PendingRoom first; never at an --autostart start), the Pending values
+// and the app, with 05's audio service over the engine and 06's updater. An --autostart start creates no window until
+// the user opens one (03 §16.1). --update-now is a one-shot mode of builds with the updatetest tag (06 §8.11).
 //
 // Files:
 //
@@ -29,11 +31,17 @@
 //	                     and step 2a's link-to-Pending rule (no build constraint: tested on every OS, ubuntu too)
 //	oneshot_os.go        their real parts: native.Open from the exe's folder, the asset handler over web.Dist(),
 //	                     the credential store and 02's servers in the data root
+//	update.go            step 5 (the start-time update with the Pending values), --update-now's logic, the
+//	                     updater over settings.json (opened at step 5, kept for step 7) and the late logger they keep
+//	updatenow_*.go       --update-now with the updatetest tag (06 §8.11), and nil (exit 2) without it
+//	openh264.go          the Cisco OpenH264 opt-in over WA51's helpers and the engine's SetOpenH264Path (04 §9.9),
+//	                     in the data root's codecs folder; a file installed earlier goes to the engine at every start
 //	firstaction_*.go     main's first action (SetDefaultDllDirectories, SetDllDirectory) and --version's stdout
 //	engine_release.go    the engine of every release: native.Open (01 §7.1), and this exe as the sound check's helper
 //	engine_fake.go       the engine of dev and e2e builds: 01's fake with 05's audio scenarios (03 §4.5, §22.4),
 //	                     which plays the sound check's chime itself (no helper)
-//	shell.go             internal/desktop/app's Shell over Wails (03 §6.1): the main window with its close hook (W7)
+//	shell.go             internal/desktop/app's Shell over Wails (03 §6.1): the main window (created at the first
+//	                     ShowWindow after an --autostart start, newDeferredShell) with its close hook (W7)
 //	                     and WDA report (W10), the tray drawn from internal/desktop/tray's View with the embedded
 //	                     build/tray icons (W18), Wails' shutdown into App.Shutdown (W14), its validated OpenURL
 //	                     (03 §5.5), and registerServices: the bound services of internal/desktop/bridge (03 §6.2)
@@ -61,10 +69,11 @@
 //	oneshot_windows_test.go --forget-credentials and --purge-data against Credential Manager under a test prefix,
 //	                     and step 2a with a real mutex and registry key (test names)
 //	bindings_test.go     the services as the pinned Wails binds them: W11, W12 and the committed bindings' method ids
+//	autostart_windows_test.go the real e2e exe started with --autostart shows no window until a second launch (it
+//	                     needs the built SPA, so it skips where web/dist holds only .gitkeep)
 //
 // Build tags: production (every release, and Wails' own release mode: no DevTools), dev (`task desktop:dev`: Vite's
 // dev server, http loopback servers, the fake engine) and e2e (the CDP build: http loopback servers, the WEBVIEW2_*
-// variables kept, the fake engine). A release has exactly production (06 §5.2).
-//
-// Still to come, by README slice: the hotkeys and the pill (WA80), the start-time update and --update-now (WA84).
+// variables kept, the fake engine), and updatetest beside them in the updater e2e's CI builds (--update-now and 06's
+// test hooks, 06 §8.11). A release has exactly production (06 §5.2).
 package main

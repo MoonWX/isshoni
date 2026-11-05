@@ -453,6 +453,35 @@ export class LogView {
 }
 
 /**
+ * OpenH264Status is the opt-in's state (Settings.OpenH264()): state unavailable, off or on; version the pinned
+ * release ("" when unavailable).
+ */
+export class OpenH264Status {
+    "state": string;
+    "version": string;
+
+    /** Creates a new OpenH264Status instance. */
+    constructor($$source: Partial<OpenH264Status> = {}) {
+        if (!("state" in $$source)) {
+            this["state"] = "";
+        }
+        if (!("version" in $$source)) {
+            this["version"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new OpenH264Status instance from a string or object.
+     */
+    static createFrom($$source: any = {}): OpenH264Status {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new OpenH264Status($$parsedSource as Partial<OpenH264Status>);
+    }
+}
+
+/**
  * PendingLink is the deeplink.open payload and App.PendingLink()'s answer (03 §6.3, §13.2).
  */
 export type PendingLink = app$0.PendingLink;

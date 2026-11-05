@@ -3,7 +3,6 @@
 package winos
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -13,12 +12,9 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/hotkey"
 )
 
-// errNotImplemented is returned by the OSHooks methods whose slices haven't landed yet.
-var errNotImplemented = errors.New("winos: not implemented yet")
-
 // Hooks is app.OSHooks on Windows. The winos thread (thread_windows.go) carries the hotkeys, the session and power
 // events, keep-awake and the Sharing pill (pill_windows.go, README WA80); WDA is SetWindowDisplayAffinity; the
-// settings pages and OpenPath are ShellExecuteW. Autostart (WA84) answers errNotImplemented until its slice.
+// settings pages and OpenPath are ShellExecuteW; autostart is the Run value (autostart_windows.go, README WA84).
 type Hooks struct {
 	log   *slog.Logger
 	t     *thread // nil when the thread didn't start: the methods that need it degrade
@@ -103,9 +99,6 @@ func (*Hooks) ExcludeFromCapture(hwnd uintptr) error {
 // IncludeInCapture resets a window's affinity to WDA_NONE (Settings → App → "Hide isshoni windows from screen
 // capture" off; the main window only).
 func (*Hooks) IncludeInCapture(hwnd uintptr) error { return setDisplayAffinity(hwnd, wdaNone) }
-
-func (*Hooks) SetAutostart(bool, string) error { return errNotImplemented }
-func (*Hooks) Autostart() (bool, error)        { return false, errNotImplemented }
 
 // OpenSettingsPage opens a Windows settings page by the OS build's URI (settingsTarget).
 func (h *Hooks) OpenSettingsPage(p app.OSPage) error {

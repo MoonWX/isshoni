@@ -44,7 +44,7 @@ const SECTION_KEYS: Readonly<Record<(typeof SETTINGS_SECTIONS)[number], string>>
 };
 
 export interface SettingsPageProps {
-  /** The OpenH264 opt-in's control; default: Go's (openH264Control()), null while the bridge has none. */
+  /** The OpenH264 opt-in's control; default: Go's (openH264Control over the bridge); null hides the opt-in. */
   openH264?: OpenH264Control | null;
 }
 
@@ -69,7 +69,7 @@ function Settings({
   const { bridge } = desktop;
   const settings = useSettings(bridge);
   const [status, setStatus] = useUpdateStatus(bridge);
-  const control = useMemo(() => (openH264 === undefined ? openH264Control() : openH264), [openH264]);
+  const control = useMemo(() => (openH264 === undefined ? openH264Control(bridge) : openH264), [openH264, bridge]);
   const h264 = useOpenH264(control);
 
   // An anchor in the address (#servers from the account menu or the Offline screen): show that section.

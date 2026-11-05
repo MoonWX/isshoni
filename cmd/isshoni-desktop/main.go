@@ -78,6 +78,7 @@ func run(args []string) int {
 	if firstActionErr != nil {
 		log.Warn("desktop: "+firstActionError(firstActionErr).Error(), "err", firstActionErr)
 	}
+	early := &earlyParts{}
 	s := &starter{
 		log:              log,
 		stdout:           versionOutput,
@@ -100,19 +101,23 @@ func run(args []string) int {
 			return si, nil
 		},
 		holdRunning: func() error { return winos.HoldRunningMutex(winos.RunningMutex) },
+		openUpdater: early.open,
 		takePending: func() (app.Pending, error) { return app.TakePending(winos.NewRegistry(winos.RegistryKey)) },
+		updateNow:   updateNowMode(log),
 		embedding:   func() bool { return awaitToastActivation(slog.Default(), embeddingWait) },
 		relaunch:    startFresh,
-		runApp:      runApp,
+		runApp: func(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst instance) int {
+			return runApp(p, args, pending, fwd, inst, early)
+		},
 	}
 	return s.start(args)
 }
 
 // runApp is 03 §13.4 step 7 in the first instance: the env scrub, the AppUserModelID, the WebView2 runtime check,
-// logs, servers, settings, the engine, the asset handler, Wails and the app; then, once Wails runs, the app's Run,
-// HandleArgs with the Pending values (App.Boot) and the command lines second instances forwarded (fwd, served since
-// step 3).
-func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst instance) int {
+// logs, servers, settings (step 5's, when it opened them), the engine, the asset handler, Wails and the app with 06's
+// updater; then, once Wails runs, the app's Run, HandleArgs with the Pending values (App.Boot) and the command lines
+// second instances forwarded (fwd, served since step 3). An --autostart start creates no window (03 §16.1).
+func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst instance, early *earlyParts) int {
 	log := slog.Default().With("component", "app")
 
 	// Before application.New: Wails reads its updater-helper variables there, and WebView2 reads WEBVIEW2_* when
@@ -212,15 +217,28 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		return exitFailed
 	}
 	defer func() { _ = srv.Close() }()
-	st, err := settings.Open(settings.Options{Dir: root, UpdateChecks: winos.NewRegistry(winos.RegistryKey).UpdateChecks,
-		KnownServer: srv.Has, Logger: slog.Default()})
+	st, err := openSettings(root, early, srv.Has)
 	if err != nil {
 		log.Error("desktop: settings.json is unusable", "err", err)
 		return exitFailed
 	}
 	defer func() { _ = st.Close() }()
-	if st.DebugLogging() {
-		level.Set(slog.LevelDebug)
+	setLogDebug := func(debug bool) {
+		if debug || p.Debug {
+			level.Set(slog.LevelDebug)
+		} else {
+			level.Set(slog.LevelInfo)
+		}
+	}
+	setLogDebug(st.DebugLogging())
+	// 06's updater (built at step 5 in the first instance, or here when step 5 couldn't): its schedule runs with the
+	// app, and Settings → Updates, the tray and the toast reach it through the app.
+	upd := early.updater
+	if upd == nil {
+		if upd, err = newUpdater(root, st); err != nil {
+			log.Warn("desktop: no updater", "err", err)
+			upd = nil
+		}
 	}
 
 	var engine media.Engine
@@ -230,6 +248,9 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		engine = e
 		defer func() { _ = e.Close() }()
 	}
+	// The Cisco OpenH264 opt-in (04 §9.9): a file installed earlier goes to the engine again.
+	h264 := newOpenH264(engine, root, slog.Default())
+	h264.applyAtStart()
 
 	webviewData, err := webviewDataDir()
 	if err != nil {
@@ -257,7 +278,12 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 	opts := appOptions(handler, assetGuard(), webviewData, wailsLog)
 	opts.RawMessageHandler = navMessages(nav)
 	wailsApp := application.New(opts)
-	shell := newShell(wailsApp, mainWindowOptions(), slog.Default())
+	var shell *wailsShell
+	if p.Autostart {
+		shell = newDeferredShell(wailsApp, mainWindowOptions(), slog.Default())
+	} else {
+		shell = newShell(wailsApp, mainWindowOptions(), slog.Default())
+	}
 	shell.guardNavigation(nav)
 	deps := app.Deps{
 		Settings:         st,
@@ -270,10 +296,17 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		InsecureLoopback: insecureLoopback(),
 		LogsDir:          filepath.Join(root, "logs"),
 		NoticesFile:      noticesFile(),
+		SetLogDebug:      setLogDebug,
 	}
 	bdeps := bridge.Deps{Servers: bridge.ServersOf(srv), ProbeApp: appInfo(),
 		AllowInsecureLoopback: insecureLoopback(), Settings: st, PolicyOff: update.PolicyDisabled,
 		Log: slog.Default()}
+	if upd != nil { // never a typed nil inside the interfaces
+		deps.Updater = upd
+	}
+	if h264 != nil {
+		bdeps.OpenH264 = h264
+	}
 	if audioSvc != nil { // never a typed nil inside the interfaces
 		deps.Audio, bdeps.Audio = audioSvc, audioSvc
 	}
@@ -359,6 +392,27 @@ func noticesFile() string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(exe), "licenses", "THIRD_PARTY_NOTICES.txt")
+}
+
+// openSettings is settings.json for step 7: step 5's store when it opened one (without servers.json, which wasn't
+// open yet: the preferences of servers that aren't listed are dropped now, as Open's KnownServer does), else a store
+// opened here.
+func openSettings(root string, early *earlyParts, known func(origin string) bool) (*settings.Store, error) {
+	if early == nil || early.settings == nil {
+		return settings.Open(settings.Options{Dir: root, UpdateChecks: winos.NewRegistry(winos.RegistryKey).UpdateChecks,
+			KnownServer: known, Logger: slog.Default()})
+	}
+	st := early.settings
+	if err := st.Update(func(s *settings.Settings) {
+		for origin := range s.ServerPrefs {
+			if !known(origin) {
+				delete(s.ServerPrefs, origin)
+			}
+		}
+	}); err != nil {
+		slog.Default().Warn("desktop: the preferences of removed servers weren't dropped", "err", err)
+	}
+	return st, nil
 }
 
 // setupLogging makes the process's default logger and returns the app's own, which adds component=app. The default

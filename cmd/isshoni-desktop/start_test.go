@@ -327,7 +327,7 @@ func checkNoStartStep(t *testing.T, what string, rec []string) {
 }
 
 // TestOneShotModesSkipTheStart (03 §13.4 step 1): every one-shot mode runs before anything else, without a window,
-// single instance or mutex, and the first mode on the command line wins; --update-now isn't in this build yet;
+// single instance or mutex, and the first mode on the command line wins; --update-now needs the updatetest tag;
 // -Embedding exits 0 (its actions belong to a run that is gone); --sound-check-helper is step 0, before anything.
 func TestOneShotModesSkipTheStart(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "self-check.json")
