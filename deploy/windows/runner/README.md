@@ -129,6 +129,8 @@ session with its label.
 | Symptom | Cause |
 |---|---|
 | The `environment` job fails | The environment `audiotest` is missing or has no required reviewer: set it up as above |
+| The `environment` log says "the token can't read environments" | The `contents: read` default token may not read environments; the job then reads the public repository's environment without a token, which is fine |
+| The `environment` job fails "could not read the environment audiotest" | Neither read worked: an HTTP 5xx or a rate limit is GitHub's side (re-run the job); anything else, look at the message before trusting `run` to wait for approval |
 | `build` fails with "suite release runs the isshoni-exit-tools of a release.yml run" | Suite `release` needs `release_run_id`; use `full` for a diagnostic rebuild |
 | `fetch` fails "is … not .github/workflows/release.yml" | `release_run_id` names a run of another workflow |
 | `fetch` fails on a SHA-256 | The artifact's DLLs differ from its `native-manifest.json`: don't run it; look at the release run |
