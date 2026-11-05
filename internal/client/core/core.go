@@ -29,7 +29,7 @@ type Options struct {
 	// ServerURL is the linked server's origin: "https://watch.example.com" (02). http only for 02's loopback dev
 	// origins (localhost, 127.0.0.1, ::1).
 	ServerURL string
-	// Auth is 02's *deviceauth.Manager; nil only with Header.
+	// Auth is 02's *deviceauth.Manager, through 03's session adapter (see Auth); nil only with Header.
 	Auth Auth
 	// Header is for tests and tools only: a Cookie instead of a bearer token. It goes with every upgrade request.
 	Header http.Header
@@ -57,7 +57,9 @@ type Options struct {
 	timing *timing
 }
 
-// Auth is exactly what 02's *deviceauth.Manager provides.
+// Auth is what 02's *deviceauth.Manager provides, through 03's session adapter (03 §9, README WA58): the Manager has
+// AccessToken as declared here, but its SessionEnded returns the resulting State (02 §11.3), so the Manager itself
+// doesn't satisfy Auth and the adapter wraps it (as package itest's appAuth does, README WA73).
 type Auth interface {
 	// AccessToken returns an access token, normally with at least 120 s left (02 §11.4); while a refresh is being
 	// retried, possibly as little as 10 s, which is enough for one hello, since the token is checked once (M1 01
