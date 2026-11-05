@@ -153,11 +153,18 @@ func startUnderShell(args []string) error {
 		return fmt.Errorf("winos: CreateProcessW: %w", err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
-	_ = windows.CloseHandle(pi.Process)
 	// The new process shows the window; this one, which the user started, may hand it the foreground.
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(pi.ProcessId))
+	if f := AfterRelaunchForTest; f != nil {
+		f(pi.ProcessId, pi.Process)
+	}
+	_ = windows.CloseHandle(pi.Process)
 	return nil
 }
+
+// AfterRelaunchForTest, when set (the relaunch test's helper only), gets the relaunched process's PID and handle
+// before the handle is closed, so the test can report how that process ended.
+var AfterRelaunchForTest func(pid uint32, process windows.Handle)
 
 // errShellElsewhere: the shell window's process is in another session or runs as another user, or this process is
 // elevated and the shell is not. The child would inherit its token (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the

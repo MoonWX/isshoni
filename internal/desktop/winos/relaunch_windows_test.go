@@ -143,8 +143,12 @@ func TestRelaunchUnderShell(t *testing.T) {
 		if err != nil {
 			b = []byte("no report in the temp root: " + err.Error())
 		}
-		return fmt.Sprintf("%s; %s; elevated %v; the helper's report: %q", where, processesNamed(filepath.Base(exe)),
-			windows.GetCurrentProcessToken().IsElevated(), b)
+		child, err := os.ReadFile(out + ".child") //nolint:gosec // G304: the helper's report on its relaunched process
+		if err != nil {
+			child = []byte("none: " + err.Error())
+		}
+		return fmt.Sprintf("%s; %s; elevated %v; the helper's report: %q; the relaunched process: %s", where,
+			processesNamed(filepath.Base(exe)), windows.GetCurrentProcessToken().IsElevated(), b, child)
 	})
 	if got = strings.ToLower(got); got != "explorer.exe" {
 		t.Fatalf("the relaunched helper's parent is %q, want explorer.exe", got)

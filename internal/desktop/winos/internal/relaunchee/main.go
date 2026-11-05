@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/MoonWX/isshoni/internal/desktop/winos"
 )
@@ -22,6 +23,7 @@ func run(args []string) int {
 		return 2
 	}
 	out := args[len(args)-1]
+	watchChild(out)
 	relaunched, err := winos.RelaunchUnderShell(args)
 	switch {
 	case relaunched:
@@ -57,4 +59,22 @@ func write(path, text string) bool {
 // FallbackPath is where write reports a failed write of out: in the temp root, named after out's folder.
 func FallbackPath(out string) string {
 	return filepath.Join(os.TempDir(), "relaunchee-"+filepath.Base(filepath.Dir(out))+".txt")
+}
+
+// childReport is where the helper records how the process it relaunched ended (its PID and exit code), for the
+// test's failure message.
+func childReport(out string) string { return out + ".child" }
+
+// watchChild makes RelaunchUnderShell's relaunched process report itself: its PID, then, if it ends within 10 s, its
+// exit code (0xC0000142 would mean it could not start on the desktop).
+func watchChild(out string) {
+	setAfterRelaunch(func(pid uint32, wait func(time.Duration) (uint32, bool)) {
+		text := fmt.Sprintf("pid %d", pid)
+		if code, ended := wait(10 * time.Second); ended {
+			text += fmt.Sprintf(", exited 0x%08X", code)
+		} else {
+			text += ", still running after 10 s"
+		}
+		_ = os.WriteFile(childReport(out), []byte(text), 0o600) //nolint:gosec // G703: next to the test's file
+	})
 }
