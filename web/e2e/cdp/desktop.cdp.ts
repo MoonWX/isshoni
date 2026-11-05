@@ -1098,9 +1098,9 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
   // from the control's browser block although isshoni.exe's had it. A child made by CreateProcess inherits its
   // parent's environment unless the caller passes a block of its own, and neither Wails nor the WebView2 loader's
   // public API documents one (the runtime that starts msedgewebview2.exe is closed source), so the control's browser
-  // process must hold MARKER: one that doesn't means the read isn't of an inherited block, and the test fails saying
-  // so rather than reading anything into the production build's. Where MARKER is there but WEBVIEW2_X is not, the
-  // runtime drops WEBVIEW2_* from its browser process, and "no WEBVIEW2_X in the production build's browser process"
+  // process was expected to hold MARKER; the second run showed that it doesn't (the runtime gives it an environment of
+  // its own), which is recorded rather than read into. Where MARKER is there but WEBVIEW2_X is not, the runtime
+  // drops WEBVIEW2_* from its browser process. In both cases "no WEBVIEW2_X in the production build's browser process"
   // proves nothing about the scrub: that half is the owner's (03 W19's manual column, §22.5 M-DESK-13).
   const browserOf = (tree: readonly ChildProcessInfo[]): ChildProcessInfo[] =>
     webviewProcesses(tree).filter((p) => !p.commandLine.includes('--type='));
@@ -1123,17 +1123,18 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
   const controlBrowserX = controlBrowserRead.some((e) => has(e, 'WEBVIEW2_X'));
   const controlBrowserMarker = controlBrowserRead.some((e) => has(e, MARKER));
   const controlBrowserPort = controlBrowserRead.some((e) => has(e, PORT_ENV));
-  expect(
-    controlBrowserMarker,
-    `the e2e build's WebView2 browser process has ${MARKER}: its block was read (it holds SYSTEMROOT or PATH) and ` +
-      `isshoni.exe's has ${MARKER}, so a block without it contradicts CreateProcess's inheritance: either the ` +
-      'WebView2 runtime starts its browser process with an environment block of its own, or the reader read ' +
-      "something other than that process's current block; either way the browser side shows nothing here",
-  ).toBe(true);
-  const inheritance = controlBrowserX
-    ? "the e2e build's WebView2 browser process kept WEBVIEW2_X"
-    : `the WebView2 runtime drops WEBVIEW2_* from its browser process (the e2e build's has ${MARKER} but not ` +
-      "WEBVIEW2_X), so the production browser process shows nothing about the scrub (the owner's M-DESK-13)";
+  // The second windows-desktop run (PR #56) found a readable block without MARKER: the WebView2 runtime starts its
+  // browser process with an environment of its own, so nothing of isshoni.exe's block, scrubbed or not, reaches it.
+  // Either outcome is recorded; the production build's browser process must show the same inheritance as the
+  // control's (the read is of the same kind of process), and never WEBVIEW2_X. The scrub that matters is asserted on
+  // isshoni.exe's own block below, where the WebView2 loader reads WEBVIEW2_*.
+  const inheritance = !controlBrowserMarker
+    ? `the WebView2 runtime starts its browser process with its own environment (the e2e build's has no ${MARKER}), ` +
+      "so the browser side shows nothing about the scrub (the owner's M-DESK-13)"
+    : controlBrowserX
+      ? "the e2e build's WebView2 browser process inherited the app's environment and kept WEBVIEW2_X"
+      : `the WebView2 runtime drops WEBVIEW2_* from its browser process (the e2e build's has ${MARKER} but not ` +
+        "WEBVIEW2_X), so the production browser process shows nothing about the scrub (the owner's M-DESK-13)";
 
   // The production build. It has no e2e data folder: remember whether %LOCALAPPDATA%\isshoni was there before.
   const localAppData = process.env['LOCALAPPDATA'] ?? '';
@@ -1201,12 +1202,13 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
       browserRead.length,
       "a WebView2 browser process's environment can be read (a block with SYSTEMROOT or PATH)",
     ).toBeGreaterThan(0);
-    // The browser side proves the scrub only as far as the control showed that it can (see above): the control's
-    // browser process inherited the app's environment (asserted above), so the production build's must have too (the
-    // read is of the right process); where the control's also kept WEBVIEW2_X, the production build's must not have
-    // it. Where the control's dropped it, that half is unobservable here and is M-DESK-13's.
-    expect(browserMarker, `the production build's WebView2 browser process has ${MARKER}, as the control's`).toBe(true);
-    if (controlBrowserX) expect(browserX, "the production build's WebView2 browser process has WEBVIEW2_X").toBe(0);
+    // The browser side shows the scrub only where the control showed inheritance with WEBVIEW2_X kept; otherwise
+    // that half is M-DESK-13's. Either way the production browser process inherits exactly as the control's did.
+    expect(
+      browserMarker,
+      `the production build's WebView2 browser process has ${MARKER} exactly when the control's has (${String(controlBrowserMarker)})`,
+    ).toBe(controlBrowserMarker);
+    expect(browserX, "the production build's WebView2 browser process has WEBVIEW2_X").toBe(0);
   } finally {
     await kill(child, exited);
     if (!hadData) await fsp.rm(dataRoot, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);

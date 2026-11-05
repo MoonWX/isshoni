@@ -232,7 +232,9 @@ func pipeExists(t *testing.T, name string) bool {
 	}
 	var fd windows.Win32finddata
 	h, err := windows.FindFirstFile(pattern, &fd)
-	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+	// The pipe file system answers a name it doesn't hold with ERROR_NO_MORE_FILES (the windows-2025 runner, PR #56),
+	// not ERROR_FILE_NOT_FOUND; both mean no such pipe.
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_NO_MORE_FILES) {
 		return false
 	}
 	if err != nil {
