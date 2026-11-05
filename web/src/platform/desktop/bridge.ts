@@ -182,6 +182,11 @@ export interface ShareView {
   border: boolean;
   pill: boolean;
   minimized: boolean;
+  /**
+   * A share a screen lock paused waits for "Resume sharing?" (an unlock after docs/m2/03 §11.6's 5 min): the panel's
+   * lock-prompt bar. Only ever true while state is paused.
+   */
+  lockPrompt: boolean;
   watching: number;
   /** RFC 3339, null until live. */
   liveSince: string | null;

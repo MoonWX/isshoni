@@ -777,6 +777,53 @@ func TestPauseOrder(t *testing.T) {
 	})
 }
 
+// TestSetLockPrompt (03 §11.6, README WF17): the app's "Resume sharing?" shows in the view only while the share is
+// paused; a change sends a share.state, the same value again sends none, and without a share nothing is sent.
+func TestSetLockPrompt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		e.ctl.SetLockPrompt(true) // no share: nothing to send
+		synctest.Wait()
+		if n := len(e.rec.kind(EventState)); n != 0 {
+			t.Fatalf("%d state events without a share", n)
+		}
+		e.ctl.SetLockPrompt(false)
+		s := e.start(t, "lounge", false)
+		goLive(s)
+		synctest.Wait()
+		e.ctl.SetLockPrompt(true) // live: the view doesn't show it
+		synctest.Wait()
+		if v := e.ctl.Current(); v.State != StateLive || v.LockPrompt {
+			t.Fatalf("live view %+v", v)
+		}
+		if err := e.ctl.SetPaused(context.Background(), true); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(StateEvery)
+		synctest.Wait()
+		if v := e.ctl.Current(); v.State != StatePaused || !v.LockPrompt {
+			t.Fatalf("paused view %+v", v)
+		}
+		if v := e.rec.lastView(); v == nil || v.State != StatePaused || !v.LockPrompt {
+			t.Fatalf("last event %+v", v)
+		}
+		time.Sleep(StateEvery)
+		e.rec.reset()
+		e.ctl.SetLockPrompt(true) // the same value: no event
+		time.Sleep(StateEvery)
+		synctest.Wait()
+		if n := len(e.rec.kind(EventState)); n != 0 {
+			t.Fatalf("%d state events for an unchanged lock prompt", n)
+		}
+		e.ctl.SetLockPrompt(false)
+		time.Sleep(StateEvery)
+		synctest.Wait()
+		if v := e.rec.lastView(); v == nil || v.State != StatePaused || v.LockPrompt {
+			t.Fatalf("event after the answer %+v", v)
+		}
+	})
+}
+
 // TestSetAudioEnabled calls only 05's SetShareSound, and is a no-op for a share started without sound.
 func TestSetAudioEnabled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

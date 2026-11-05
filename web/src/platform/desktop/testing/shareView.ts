@@ -16,6 +16,7 @@ export function shareView(over: Partial<ShareView> = {}): ShareView {
     border: false,
     pill: true,
     minimized: false,
+    lockPrompt: false,
     watching: 3,
     liveSince: '2026-10-21T12:00:00.000Z',
     hint: null,

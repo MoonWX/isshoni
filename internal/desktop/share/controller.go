@@ -45,6 +45,8 @@ type Controller struct {
 	watchStats bool
 	stateTimer *time.Timer // a coalesced share.state that is due
 	lastState  time.Time   // when the last share.state went out
+	// lockPrompt is the app's "Resume sharing?" after a late unlock (SetLockPrompt); views show it while paused.
+	lockPrompt bool
 }
 
 // held is the pick the controller holds (03 §10.1): one at a time, PickHold from the pick.
@@ -289,6 +291,7 @@ func (c *Controller) Start(ctx context.Context, r StartRequest) (View, error) {
 		done: make(chan struct{})}
 	a.view = c.viewLocked(a, nil, "")
 	c.cur, c.last = a, nil
+	c.lockPrompt = false // a new share: the app's lock pause, and its question, belong to the one before
 	c.mu.Unlock()
 	c.stateChanged()
 
@@ -505,8 +508,19 @@ func (c *Controller) refresh(a *active) {
 		return
 	}
 	a.view = c.viewLocked(a, &snap, conn)
+	c.dropLockPromptLocked(a.view.State)
 	c.mu.Unlock()
 	c.stateChanged()
+}
+
+// dropLockPromptLocked forgets the lock prompt when the share's view is live, ended or failed: the app's lock pause
+// ends on those same states (its question is answered or moot; internal/desktop/app's onShareEvent), and the next
+// tray flush that would tell the controller so may come TrayDebounce later, so a pause in between would show a stale
+// bar. c.mu is held.
+func (c *Controller) dropLockPromptLocked(now State) {
+	if now == StateLive || now.final() {
+		c.lockPrompt = false
+	}
 }
 
 // ended runs the local steps of every share end once (03 §10.1), also of one the server or the core made: 05's
@@ -521,6 +535,7 @@ func (c *Controller) ended(a *active) {
 	}
 	c.mu.Lock()
 	a.view = c.viewLocked(a, &snap, conn) // ended: also stops a reconnecting timer
+	c.dropLockPromptLocked(a.view.State)
 	if c.cur == a {
 		c.cur = nil
 	}
@@ -663,11 +678,32 @@ func (c *Controller) Current() *View {
 func (c *Controller) currentLocked() *View {
 	switch {
 	case c.cur != nil:
-		return cloneView(c.cur.view)
+		v := cloneView(c.cur.view)
+		v.LockPrompt = c.lockPrompt && v.State == StatePaused
+		return v
 	case c.last != nil:
 		return cloneView(*c.last)
 	}
 	return nil
+}
+
+// SetLockPrompt records whether the app's lock pause waits for its "Resume sharing?" answer (03 §11.6: an unlock
+// later than LockResume after the lock that paused the share). The controller knows nothing of locks: the app
+// (internal/desktop/app, from its lock-pause state) tells it, and the view's LockPrompt shows it while the share is
+// paused, so the panel can show its bar. A change sends the view again as an EventState; the same value again sends
+// nothing. It must not be called from a subscriber (it may deliver an event itself).
+func (c *Controller) SetLockPrompt(on bool) {
+	c.mu.Lock()
+	if c.lockPrompt == on {
+		c.mu.Unlock()
+		return
+	}
+	c.lockPrompt = on
+	running := c.cur != nil
+	c.mu.Unlock()
+	if running {
+		c.stateChanged()
+	}
 }
 
 // Live reports a share being started or running, and its room (03 §13.2's live share, §11.6's "while live"): the

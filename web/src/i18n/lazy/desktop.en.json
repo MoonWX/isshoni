@@ -159,8 +159,10 @@
       "panel": {
         "live": "You're live · {{label}} · {{preset}} · {{watching}}",
         "paused": "Paused · nothing new leaves your PC; friends see \"Paused\" and hear nothing",
+        "lockPrompt": "Sharing is still paused since you locked your PC.",
         "pause": "Pause",
         "resume": "Resume",
+        "resumeSharing": "Resume sharing",
         "stop": "Stop",
         "withHotkey": "{{action}} ({{hotkey}})",
         "pauseNeedsNewerServer": "Pause needs a newer server",

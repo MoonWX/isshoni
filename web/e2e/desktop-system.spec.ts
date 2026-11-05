@@ -6,16 +6,16 @@
 // - a suspend stops the share with the end reason system and releases keep-awake; the resume shows the toast
 //   "Sharing stopped because your PC went to sleep";
 // - an unlock after the first bound (lockResumeMs) leaves the share paused and asks "Resume sharing?" with the tray's
-//   Paused menu and a toast with Resume and Stop; a resume through the controller (the panel's) ends the lock pause,
-//   so keep-awake is back, the answered toast leaves Action Center (03 §15) and the second bound no longer stops the
-//   share;
+//   Paused menu, the pill, a toast with Resume and Stop, and the panel's bar "Sharing is still paused since you locked
+//   your PC. [Resume sharing] [Stop]" (ShareView.lockPrompt, README WF17); the bar's Resume sharing ends the lock
+//   pause, so keep-awake is back, the answered toast leaves Action Center (03 §15) and the second bound no longer
+//   stops the share; the bar's Stop ends the share instead;
 // - a lock pause that reaches the second bound (lockStopMs) stops the share with the end reason system and the toast
 //   "Sharing stopped while your PC was locked";
 // - the end of the session: WM_QUERYENDSESSION stops the share and is acknowledged while the app keeps running (the
 //   end may be cancelled); WM_ENDSESSION (end-session-confirmed) quits the app, acknowledged once it has.
 //
-// The pill's "Paused · Resume sharing?" is in the long-lock case (README WA80). The panel's "Resume sharing?" bar needs
-// a ShareView field of the bridge's (internal/desktop/bridge), which WA80's paths don't include: a later slice adds it.
+// The pill's "Paused · Resume sharing?" (README WA80) and the panel's bar (README WF17) are in the long-lock cases.
 import {
   expect,
   test,
@@ -41,7 +41,11 @@ test.describe.configure({ timeout: 120_000 });
 interface ShareView {
   state: string;
   endReason: string | null;
+  lockPrompt: boolean;
 }
+
+/** The panel's lock-prompt bar (03 §11.6). */
+const LOCK_PROMPT = 'Sharing is still paused since you locked your PC.';
 
 /** A recorded toast (app.Notification as the harness's JSON has it). */
 interface Toast {
@@ -211,9 +215,17 @@ test('an unlock after the first bound asks "Resume sharing?"; a resume ends the 
     .poll(async () => (await desktop.state()).pill, { timeout: STATE_TIMEOUT_MS })
     .toMatchObject({ Mode: 'lockPrompt', Text: { Line: 'Paused · Resume sharing?', Resume: 'Resume' } });
 
-  // Resume from outside the app's own prompt (the panel calls the controller): the lock pause ends.
-  await desktop.call('Share', 'SetPaused', false);
+  // The panel asks too (ShareView.lockPrompt): the bar's line, Resume sharing and Stop.
+  expect((await desktop.call<ShareView | null>('Share', 'Current'))?.lockPrompt).toBe(true);
+  const panel = desktop.page.getByRole('region', { name: 'Your share' });
+  await expect(panel.locator('[data-lock-prompt]')).toHaveText(LOCK_PROMPT, { timeout: STATE_TIMEOUT_MS });
+  await expect(panel.getByRole('button', { name: 'Stop sharing' })).toBeVisible();
+
+  // Resume from outside the app's own prompt, with the panel's Resume sharing (Share.SetPaused): the lock pause ends.
+  await panel.getByRole('button', { name: 'Resume sharing' }).click();
   await expectShare(desktop, 'live');
+  await expect(panel.getByText(LOCK_PROMPT)).toHaveCount(0);
+  expect((await desktop.call<ShareView | null>('Share', 'Current'))?.lockPrompt).toBe(false);
   await expectKeepAwake(desktop, true);
   // The question was answered, so its toast leaves Action Center (03 §15): the app calls the OS hooks' removal
   // (winos.Hooks.RemoveToasts, which the harness records) with the toast's Notification ID.
@@ -231,6 +243,35 @@ test('an unlock after the first bound asks "Resume sharing?"; a resume ends the 
   expect((await desktop.state()).keepAwake).toBe(true);
   // Nothing else left Action Center meanwhile.
   expect((await desktop.state()).removedToasts).toEqual([toast.ID]);
+});
+
+test("the lock-prompt bar's Stop ends a share the lock paused", async ({ startDesktop, server }) => {
+  const room = 'lounge';
+  // The second bound out of the way: the bar's Stop, not the 30 min stop, ends this share.
+  const desktop = await linkedDesktop(startDesktop, server, room, {
+    lockResumeMs: LOCK_RESUME_MS,
+    lockStopMs: 120_000,
+  });
+  await shareLive(desktop, room);
+  await desktop.system('lock');
+  await expectShare(desktop, 'paused');
+  // The app counts from when the lock's pause succeeded, which is before the paused state is seen here: the unlock
+  // comes well after the first bound even on a loaded machine.
+  await desktop.page.waitForTimeout(LOCK_RESUME_MS + 1_500);
+  await desktop.system('unlock');
+  const toast = await expectToast(desktop, 'lock-paused');
+  const panel = desktop.page.getByRole('region', { name: 'Your share' });
+  await expect(panel.locator('[data-lock-prompt]')).toHaveText(LOCK_PROMPT, { timeout: STATE_TIMEOUT_MS });
+
+  await panel.getByRole('button', { name: 'Stop sharing' }).click();
+  const ended = await expectShare(desktop, 'ended');
+  expect(ended.endReason).toBe('user');
+  await expect(panel).toBeHidden({ timeout: STATE_TIMEOUT_MS });
+  // The question is answered: its toast leaves Action Center, and keep-awake stays off.
+  await expect
+    .poll(async () => (await desktop.state()).removedToasts, { timeout: STATE_TIMEOUT_MS })
+    .toEqual([toast.ID]);
+  await expectKeepAwake(desktop, false);
 });
 
 test('a lock pause that reaches the second bound stops the share with a toast', async ({ startDesktop, server }) => {

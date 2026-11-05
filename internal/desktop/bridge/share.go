@@ -62,9 +62,11 @@ type StartRequest struct {
 
 // ShareView is the native share as the SPA sees it (03 §6.3): Share.Current() and the share.state event. state is
 // picking, starting, live, paused, reconnecting, unreachable, stopping, ended or failed; endReason user, hotkey,
-// tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; liveSince is RFC 3339. server
-// is {layers: protocol.ServerLayerStats[]} while WatchServerStats is on, else null: 03 §6.3's ShareSnapshot.Server
-// (01's server view of this connection's layers), wrapped in an object by WA48's DTO type.
+// tray, source-gone, elsewhere, server, server-unreachable, unlinked, system or error; lockPrompt is true while a
+// share a screen lock paused waits for "Resume sharing?" (an unlock after 03 §11.6's 5 min: the panel's bar, filled
+// from the app's lock pause); liveSince is RFC 3339. server is {layers: protocol.ServerLayerStats[]} while
+// WatchServerStats is on, else null: 03 §6.3's ShareSnapshot.Server (01's server view of this connection's layers),
+// wrapped in an object by WA48's DTO type.
 type ShareView struct {
 	State        string          `json:"state"`
 	ShareID      string          `json:"shareId"`
@@ -78,6 +80,7 @@ type ShareView struct {
 	Border       bool            `json:"border"`
 	Pill         bool            `json:"pill"`
 	Minimized    bool            `json:"minimized"`
+	LockPrompt   bool            `json:"lockPrompt"` // paused by a lock: "Resume sharing?" waits (03 §11.6)
 	Watching     int             `json:"watching"`
 	LiveSince    *string         `json:"liveSince"`
 	Hint         *ShareHint      `json:"hint"`
@@ -385,7 +388,8 @@ func (s *Share) view(v share.View) ShareView {
 	out := ShareView{
 		State: string(v.State), ShareID: v.ShareID, ConnectionID: v.ConnectionID, RoomID: v.RoomID,
 		Kind: string(v.Kind), Label: v.Label, Preset: string(v.Preset), WithAudio: v.WithAudio, AudioOn: v.AudioOn,
-		Border: v.Border, Pill: v.Pill, Minimized: v.Minimized, Watching: v.Watching, Encoder: v.Encoder, HW: v.HW,
+		Border: v.Border, Pill: v.Pill, Minimized: v.Minimized, LockPrompt: v.LockPrompt, Watching: v.Watching,
+		Encoder: v.Encoder, HW: v.HW,
 		Layers: make([]ShareLayer, 0, len(v.Layers)),
 	}
 	if !v.LiveSince.IsZero() {

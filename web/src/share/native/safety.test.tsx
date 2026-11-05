@@ -1,7 +1,8 @@
 // Share safety in the desktop's share UI (docs/m2/03 §10.2, §10.3, §11.2, §11.3, §11.6, §22.3; README WA80): Pause in
 // the panel's bar with the hotkeys in the buttons' tooltips, "Pause hotkey unavailable: another app uses …" with the
 // way to Settings, Pause disabled once the server answered feature_disabled, the first-share sheet's hotkey line, and
-// the close-to-tray notice at the top of the window, reported shown only while the page is visible.
+// the close-to-tray notice at the top of the window, reported shown only while the page is visible, and the
+// lock-prompt bar of a late unlock (ShareView.lockPrompt, README WF17).
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -28,6 +29,7 @@ afterEach(() => {
 async function renderPanel(
   current: ShareView,
   hotkeys: HotkeyStatus[] | 'not_implemented' = REGISTERED,
+  onStop: () => unknown = vi.fn(),
 ): Promise<NativeSetup> {
   const setup = await nativeSetup({ current });
   setup.fake.answers['settings.hotkeys'] =
@@ -39,9 +41,7 @@ async function renderPanel(
     routes: [
       {
         path: '/',
-        element: (
-          <NativeSharePanel share={setup.sharing.current()} onStop={vi.fn()} watchers={[]} store={setup.store} />
-        ),
+        element: <NativeSharePanel share={setup.sharing.current()} onStop={onStop} watchers={[]} store={setup.store} />,
       },
       { path: '/desktop/settings', element: <h1>Settings</h1> },
     ],
@@ -115,6 +115,65 @@ describe('Pause in the panel (docs/m2/03 §10.3, §11.3)', () => {
         'Pause (Ctrl+Alt+Shift+F9)',
       );
     });
+  });
+});
+
+describe('the lock-prompt bar (docs/m2/03 §11.6; README WF17)', () => {
+  const PROMPT = 'Sharing is still paused since you locked your PC.';
+
+  it('asks while ShareView.lockPrompt is set: Resume sharing resumes through Share.SetPaused', async () => {
+    const user = userEvent.setup();
+    const setup = await renderPanel(shareView({ state: 'paused', lockPrompt: true }));
+    // The panel's status line, a live region whatever it says, so the prompt's text is announced when it comes.
+    const status = within(region()).getByText(PROMPT);
+    expect(status).toHaveAttribute('data-lock-prompt');
+    expect(status).toHaveAttribute('role', 'status');
+    const resume = within(region()).getByRole('button', { name: 'Resume sharing' });
+    await waitFor(() => {
+      expect(resume).toHaveAttribute('title', 'Resume sharing (Ctrl+Alt+Shift+F9)');
+    });
+    expect(within(region()).getByRole('button', { name: 'Stop sharing' })).toHaveTextContent('Stop');
+    expect(within(region()).queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    await user.click(resume);
+    expect(setup.fake.callsOf('share.setPaused')).toEqual([[false]]);
+    // Go ends the lock pause and the share goes live: the bar asks no more.
+    act(() => {
+      setup.fake.emit('share.state', shareView({ state: 'live', lockPrompt: false }));
+    });
+    await waitFor(() => {
+      expect(within(region()).queryByText(PROMPT)).not.toBeInTheDocument();
+    });
+    expect(within(region()).getByRole('button', { name: 'Pause' })).toBeInTheDocument();
+  });
+
+  it('its Stop is the panel’s Stop (the room session’s stopShare)', async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn();
+    await renderPanel(shareView({ state: 'paused', lockPrompt: true }), REGISTERED, onStop);
+    expect(within(region()).getByText(PROMPT)).toBeInTheDocument();
+    await user.click(within(region()).getByRole('button', { name: 'Stop sharing' }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('comes with the share.state that sets it, and a pause without it is the plain paused bar', async () => {
+    const setup = await renderPanel(shareView({ state: 'paused' }));
+    expect(within(region()).queryByText(PROMPT)).not.toBeInTheDocument();
+    // The live region is there before the prompt: only its text changes.
+    const status = within(region()).getByRole('status');
+    expect(status).not.toHaveAttribute('data-lock-prompt');
+    expect(within(region()).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+    act(() => {
+      setup.fake.emit('share.state', shareView({ state: 'paused', lockPrompt: true }));
+    });
+    expect(await within(region()).findByText(PROMPT)).toBe(status);
+    expect(status).toHaveAttribute('data-lock-prompt');
+    expect(within(region()).getByRole('button', { name: 'Resume sharing' })).toBeInTheDocument();
+  });
+
+  it('never shows for a share that isn’t paused', async () => {
+    await renderPanel(shareView({ state: 'live', lockPrompt: true }));
+    expect(within(region()).queryByText(PROMPT)).not.toBeInTheDocument();
+    expect(within(region()).queryByRole('button', { name: 'Resume sharing' })).not.toBeInTheDocument();
   });
 });
 

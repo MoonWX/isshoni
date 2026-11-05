@@ -15,6 +15,12 @@
 //   scenario's apps (03 §17, §22.4);
 // - a second share needs no first-share sheet (tips.firstShareShown), and the panel's Stop ends it.
 //
+// Closing the window while live (03 §11.6, README WF17; the harness's POST /__e2e/window calls App.WindowClosing and
+// the tray's Open): the window hides to the tray and the share goes on; the first close shows the toast "isshoni is
+// still sharing…", a hidden window shows no notice and tips.trayNoticeShown stays unset; the tray's Open shows the
+// same line as a notice at the top of the window, the page reports it shown and only then is the flag set; after
+// that neither the toast nor the notice comes again.
+//
 // The audio alert case (05 §14.7 "Outside the window", README WA80): with ISSHONI_FAKE_AUDIO=degrade-live, a mic
 // prompt is pending when the share goes live (the tray's "1 question waiting", the pill's marker), and 5 s into the
 // share the fake loses process loopback: the tray warns with "Friends hear voice apps" first, the pill's state says
@@ -275,6 +281,98 @@ test('a fake pick goes live through the first-share sheet; a browser watches; th
   expect(log).not.toContain(FAKE_LABEL);
   expect(log).not.toMatch(/\.exe\b/i);
   for (const name of NORMAL_SCENARIO_APPS) expect(log, name).not.toContain(name);
+});
+
+/** The window's X (the shell's close hook, App.WindowClosing) or the tray's Open (App.ShowWindow). */
+async function windowAction(desktop: DesktopApp, action: 'close' | 'open'): Promise<void> {
+  const res = await fetch(`${desktop.hostUrl}/__e2e/window?action=${action}`, { method: 'POST' });
+  expect(res.status, `POST /__e2e/window?action=${action}`).toBe(204);
+}
+
+/** settings.json's tips.trayNoticeShown, through Settings.Get. */
+async function trayNoticeShown(desktop: DesktopApp): Promise<boolean> {
+  return (await desktop.call<{ tips: { trayNoticeShown: boolean } }>('Settings', 'Get')).tips.trayNoticeShown;
+}
+
+/** The close-to-tray line, as the toast and the window notice say it (03 §11.6). */
+const STILL_SHARING = 'isshoni is still sharing. Stop it from the tray icon (^).';
+
+test('closing the window while live hides it to the tray; the notice follows the toast once (03 §11.6)', async ({
+  startDesktop,
+  server,
+}) => {
+  const room = 'lounge';
+  const desktop = await linkedDesktop(startDesktop, server, room);
+  const { page } = desktop;
+  await page.getByRole('banner').getByRole('button', { name: 'Share', exact: true }).click();
+  await page
+    .getByRole('dialog', { name: 'Share your screen' })
+    .getByRole('button', { name: 'Share', exact: true })
+    .click();
+  await page.getByRole('dialog', { name: 'Ready to go live?' }).getByRole('button', { name: 'Go live' }).click();
+  const panel = page.getByRole('region', { name: 'Your share' });
+  await expect(panel.getByText(`You're live · ${FAKE_LABEL}`)).toBeVisible({ timeout: LIVE_TIMEOUT_MS });
+  await expect.poll(async () => (await desktop.state()).hotkeys).toEqual(HOTKEYS);
+  const notice = page.locator('[data-window-notice="still-sharing"]');
+  const stillSharing = async (): Promise<Toast[]> =>
+    ((await desktop.state()).toasts as Toast[]).filter((t) => t.Kind === 'still-sharing');
+  expect(await trayNoticeShown(desktop)).toBe(false);
+
+  // X while live: the window hides to the tray and the app goes on sharing (the hotkeys stay, the tray says Live);
+  // the first time, the toast "isshoni is still sharing…".
+  await windowAction(desktop, 'close');
+  let st = await desktop.state();
+  expect(st.windowVisible, 'the window is hidden').toBe(false);
+  expect(st.quit, 'the app quit').toBe(false);
+  expect((await desktop.call<{ state: string } | null>('Share', 'Current'))?.state).toBe('live');
+  expect(st.hotkeys).toEqual(HOTKEYS);
+  await expect
+    .poll(async () => trayOf(await desktop.state()))
+    .toMatchObject({ icon: 'tray-live', tooltip: `Sharing ${FAKE_LABEL} · 0 watching` });
+  await expect.poll(async () => (await stillSharing()).length).toBe(1);
+  const [toast] = await stillSharing();
+  expect(toast?.Body).toBe(STILL_SHARING);
+
+  // While the window is hidden, nothing is shown in it and the flag stays unset (03 §11.6: set only once the window
+  // notice was shown); App.WindowNotice answers null for a hidden window.
+  expect(await desktop.call('App', 'WindowNotice')).toBeNull();
+  await page.waitForTimeout(500);
+  await expect(notice).toHaveCount(0);
+  expect(await trayNoticeShown(desktop)).toBe(false);
+  // A second close in the same run shows no second toast.
+  await windowAction(desktop, 'close');
+  await page.waitForTimeout(500);
+  expect(await stillSharing()).toHaveLength(1);
+
+  // The tray's Open: the window shows the same line as a dismissible notice (window.notice), the page reports it
+  // shown, and only then is tips.trayNoticeShown set.
+  await windowAction(desktop, 'open');
+  expect((await desktop.state()).windowVisible).toBe(true);
+  await expect(notice).toBeVisible({ timeout: MEDIA_TIMEOUT_MS });
+  await expect(notice).toContainText(STILL_SHARING);
+  await expect.poll(() => trayNoticeShown(desktop), { message: 'tips.trayNoticeShown after the notice' }).toBe(true);
+  await expectAccessible(page, 'the close-to-tray notice', '[data-window-notice]');
+  await notice.getByRole('button', { name: 'Dismiss' }).click();
+  await expect(notice).toHaveCount(0);
+
+  // Once shown, never again: another close hides the window without a toast, and opening it shows no notice.
+  await windowAction(desktop, 'close');
+  st = await desktop.state();
+  expect(st.windowVisible).toBe(false);
+  expect(st.quit).toBe(false);
+  await windowAction(desktop, 'open');
+  expect(await desktop.call('App', 'WindowNotice')).toBeNull();
+  await page.reload();
+  await waitForRoom(page, room);
+  await expect(panel.getByText(`You're live · ${FAKE_LABEL}`)).toBeVisible({ timeout: LIVE_TIMEOUT_MS });
+  await page.waitForTimeout(500);
+  await expect(notice).toHaveCount(0);
+  expect(await stillSharing()).toHaveLength(1);
+
+  // The share ran throughout; Stop ends it.
+  expect((await desktop.call<{ state: string } | null>('Share', 'Current'))?.state).toBe('live');
+  await desktop.hotkey('stop');
+  await expect(panel).toBeHidden({ timeout: MEDIA_TIMEOUT_MS });
 });
 
 /** A recorded toast (app.Notification as the harness's JSON has it). */

@@ -2,9 +2,10 @@
 // finds no serious or critical violation, in the light and the dark colour scheme (05 §16.6: AA in both): the login,
 // invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), the admin's user
 // list, and every state of the device-link page (M2 02 §10.1: enter, invalid, confirm on the same, a different and an
-// unknown network, linked, denied, rate_limited, error). In the room the tile list is reachable with the keyboard and
-// F switches the stage's fullscreen, and the overlay shows the friend's tile as the page receives it and as the
-// server forwards it, with no IP address.
+// unknown network, linked, denied, rate_limited, error), and the desktop app's settings page (M2 03 §14.4, in the
+// e2e harness's desktop app) as it opens, with the hotkey recorder open and with the licenses dialog open. In the room
+// the tile list is reachable with the keyboard and F switches the stage's fullscreen, and the overlay shows the
+// friend's tile as the page receives it and as the server forwards it, with no IP address.
 //
 // What axe can't judge (a screen reader's reading order, the live regions' timing) is the manual matrix's and the
 // component tests' (05 §19.2, §19.4).
@@ -285,6 +286,40 @@ test('the room with a share: axe, the tile list by keyboard, F for fullscreen, t
   await expectAccessible(page, 'the debug overlay', '[data-debug-overlay]');
   await overlay.getByRole('button', { name: 'Close the stats' }).click();
   await expect(overlay).toHaveCount(0);
+});
+
+test('the desktop settings page (M2 03 §14.4), with the hotkey recorder and the licenses dialog open', async ({
+  startDesktop,
+  server,
+}) => {
+  // The desktop app's real Go parts (internal/desktop/e2ehost) and its SPA at http://wails.localhost, linked to the
+  // worker's server as a new member.
+  const account = await server.createUser();
+  const desktop = await startDesktop({ server: server.url });
+  const linked = await desktop.call<{ status: string }>('Auth', 'LinkWithPassword', account.username, account.password);
+  expect(linked.status).toBe('linked');
+  const { page } = desktop;
+  await page.goto(`${desktop.origin}/desktop/settings`);
+  await pageReady(page, 'Settings');
+  await expect(page.getByTestId('hotkey-pause')).toHaveText('Ctrl+Alt+Shift+F9');
+  await expectAccessible(page, 'the desktop settings page');
+
+  // The hotkey recorder (HotkeyField, 03 §11.2): Change opens it with the focus in it; it stays open while axe runs.
+  await page.getByRole('button', { name: 'Change the hotkey: Pause and resume sharing' }).click();
+  const recorder = page.getByRole('textbox', { name: /^New combination for Pause and resume sharing/ });
+  await expect(recorder).toBeFocused();
+  await expectAccessible(page, 'the desktop settings page with the hotkey recorder open');
+  await expect(recorder, 'the recorder stayed open through both colour schemes').toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(recorder).toHaveCount(0);
+  await expect(page.getByTestId('hotkey-pause')).toHaveText('Ctrl+Alt+Shift+F9');
+
+  // The bundled web app's licenses in a dialog (About, 03 §14.4: the desktop never navigates away).
+  await page.getByRole('button', { name: 'Web app licenses', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Web app licenses' });
+  await expect(dialog.getByRole('textbox', { name: 'Web app licenses' })).toBeVisible({ timeout: MEDIA_TIMEOUT_MS });
+  await expectAccessible(page, 'the desktop settings page with the licenses dialog open');
+  await expectAccessible(page, 'the licenses dialog', 'dialog[open]');
 });
 
 /** Clicks Share in the header and Share in the sheet, with the page in front (05 §19.3); returns once it is live. */
