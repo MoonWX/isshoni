@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"github.com/MoonWX/isshoni/internal/client/credstore"
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
+	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/protocol/api"
 )
 
 // withPub gives the app a recording C2 hook (Refresh after every change of the active server, 03 §9).
@@ -29,12 +33,24 @@ func (p *fakePub) refreshCount() int {
 	return p.refreshes
 }
 
+// loopbackOnly reaches the tests' httptest servers and fails every other request, so no test depends on the network.
+type loopbackOnly struct{}
+
+var loopbackTransport = &http.Transport{DisableKeepAlives: true}
+
+func (loopbackOnly) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Hostname() != "127.0.0.1" {
+		return nil, fmt.Errorf("test: no network request to %s", r.URL.Host)
+	}
+	return loopbackTransport.RoundTrip(r)
+}
+
 // TestAddServer: Add makes the probed server active through 02's Servers.Add (its own public origin), reloads the
 // window once, starts its manager and has C2 look again; the add question's room waits in PendingLink.
 func TestAddServer(t *testing.T) {
 	ts := newLinkServer(t)
 	e := newEnvWith(t, []string{"https://a.example.com"}, map[string]bool{"https://a.example.com": true},
-		&http.Client{Transport: &http.Transport{DisableKeepAlives: true}}, true)
+		&http.Client{Transport: loopbackOnly{}}, true)
 	pub := withPub(e)
 	e.app.offer(&PendingLink{Add: &LinkAdd{Origin: ts.URL, Host: ts.URL[len("http://"):], RoomID: "lounge"}})
 	e.shell.reset()
@@ -70,6 +86,45 @@ func TestAddServer(t *testing.T) {
 	}
 	if n := e.shell.count("reload"); n != 3 || len(e.srv.List()) != 2 {
 		t.Errorf("%d reloads, %d servers", n, len(e.srv.List()))
+	}
+}
+
+// TestAddServerOtherHost: the add question's server calls itself another host (03 §8.2's confirm step). The page
+// confirms under the question's origin, Servers.Add adopts the other host, and the question is answered all the
+// same: its room waits in PendingLink, and the next link isn't ignored.
+func TestAddServerOtherHost(t *testing.T) {
+	b := newLinkServer(t)
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/info" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.Info{
+			Server:   api.InfoServer{Name: "S", Version: "0.2.0", PublicURL: b.URL},
+			Protocol: api.InfoProtocol{Current: protocol.Version, Min: protocol.MinVersion},
+			Features: []string{api.InfoFeatureDeviceFlow},
+		})
+	}))
+	t.Cleanup(a.Close)
+	e := newEnvWith(t, nil, nil, &http.Client{Transport: loopbackOnly{}}, true)
+	e.app.offer(&PendingLink{Add: &LinkAdd{Origin: a.URL, Host: a.URL[len("http://"):], RoomID: "lounge"}})
+
+	if err := e.app.AddServer(context.Background(), a.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.srv.Active().State().Origin; got != b.URL {
+		t.Errorf("active %s, want the server's own origin %s", got, b.URL)
+	}
+	if p := e.app.PendingLink(); p == nil || p.RoomID != "lounge" || p.Add != nil {
+		t.Fatalf("PendingLink = %+v, want the add question's room", p)
+	}
+	e.app.LinkHandled()
+	e.clock.Advance(5 * time.Second)
+	e.shell.reset()
+	e.app.HandleLink(link(t, "isshoni://other.example.com/"))
+	if got := lastEvent(t, e.shell); got.Add == nil || got.Add.Origin != "https://other.example.com" {
+		t.Errorf("the next link after the answer: %+v", got)
 	}
 }
 

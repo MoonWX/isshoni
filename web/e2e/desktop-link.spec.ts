@@ -224,6 +224,8 @@ test('an unknown server shows "Add server {host}?" with no request before Add; t
     await password.fill(account.password);
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expectLinked(desktop, server.url);
+    // The add question was answered although the server stored is another host: the app takes the next link.
+    expect(await desktop.call('App', 'PendingLink')).toBeNull();
   } finally {
     proxy.close();
   }

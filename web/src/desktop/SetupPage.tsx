@@ -280,7 +280,9 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
             <Button
               variant="primary"
               onClick={() => {
-                activate(step.probe.origin, step);
+                // An add question is confirmed under its own origin, so Go answers it even when the server calls
+                // itself another host (Servers.Add adopts that host's publicUrl all the same).
+                activate(step.add?.origin ?? step.probe.origin, step);
               }}
             >
               {t('desktop.setup.confirm.link')}

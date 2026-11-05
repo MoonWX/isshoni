@@ -202,8 +202,9 @@ describe('add step', () => {
     expect(await screen.findByText('This server calls itself other.example.net.')).toBeInTheDocument();
     expect(d.fake.callsOf('auth.addServer')).toEqual([]);
     await user.click(screen.getByRole('button', { name: 'Link' }));
+    // Confirmed under the add question's origin, so Go answers the question (Servers.Add adopts the other host).
     await waitFor(() => {
-      expect(d.fake.callsOf('auth.addServer')).toEqual([['https://other.example.net']]);
+      expect(d.fake.callsOf('auth.addServer')).toEqual([[NEW]]);
     });
   });
 
@@ -338,9 +339,11 @@ describe('link step', () => {
   it.each([
     ['server_unreachable', {}, "isshoni can't reach this server. Check the address and your connection."],
     ['rate_limited', {}, 'Too many tries. Wait a moment and try again.'],
-    ['internal', {}, 'Something went wrong in isshoni. Try again.'],
-    // 02's ErrBadResponse (a verification URI that failed the check) maps to a code the step has no text for.
-    ['bad_response', {}, "Couldn't start linking with this server"],
+    // 02's ErrBadResponse (a verification URI that failed the check) is internal {reason: bad_response}: the
+    // generic link error, as is any other code the step has no text for.
+    ['internal', { reason: 'bad_response' }, "Couldn't start linking with this server"],
+    ['internal', {}, "Couldn't start linking with this server"],
+    ['something_new', {}, "Couldn't start linking with this server"],
   ])('a Link() error (%s): its text with Try again', async (code, params, text) => {
     const user = userEvent.setup();
     const d = createDesktopTestPlatform();

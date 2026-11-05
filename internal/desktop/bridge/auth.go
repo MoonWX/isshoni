@@ -247,7 +247,10 @@ func (s *Auth) RemoveServer(ctx context.Context, origin string) error {
 }
 
 // Link starts a device-flow link on the active server (02 §11.3): it returns once the code is shown, and progress
-// arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server.
+// arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server. 02's
+// ErrBadResponse here is a server answer that failed §11.2's check (a verification URI on another origin): not the
+// network's fault, so it is internal {reason: bad_response}, which the link step shows as its generic "Couldn't
+// start linking with this server" (03 §8.2), not as server_unreachable (mapError's rule for every other call).
 func (s *Auth) Link(ctx context.Context) error {
 	m := s.servers.Active()
 	if m == nil {
@@ -255,7 +258,12 @@ func (s *Auth) Link(ctx context.Context) error {
 	}
 	ctx, cancel := withTimeout(ctx, linkTimeout)
 	defer cancel()
-	return s.authError(m.Link(ctx), m)
+	err := m.Link(ctx)
+	if errors.Is(err, deviceauth.ErrBadResponse) {
+		s.log.Warn("bridge: Auth.Link: the server's answer failed the check", "err", err)
+		return newError(codes.CodeInternal, map[string]any{"reason": "bad_response"})
+	}
+	return s.authError(err, m)
 }
 
 // CancelLink ends a running device-flow link on the active server; without one it does nothing.

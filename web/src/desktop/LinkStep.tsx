@@ -25,6 +25,9 @@ import { PasswordForm } from './PasswordForm';
 import { useAuthState } from './useAuthState';
 import styles from './wizard.module.css';
 
+/** The Link() errors with a text of their own (03 §8.2); every other one is the generic link error. */
+const LINK_ERROR_CODES: ReadonlySet<string> = new Set(['server_unreachable', 'rate_limited', 'incompatible_server']);
+
 export interface LinkStepProps {
   bridge: NativeBridge;
   /** This page's server (bridge.js), the active one. */
@@ -212,7 +215,9 @@ export function LinkStep({
   let message: string | null = null;
   let action = t('desktop.setup.link.start');
   if (error !== null) {
-    message = failureText(t, error, appVersion);
+    // A Link() error has its own text only for these codes; any other (02's ErrBadResponse is internal
+    // {reason: bad_response}) is the generic "Couldn't start linking with this server" (03 §8.2).
+    message = LINK_ERROR_CODES.has(error.code) ? failureText(t, error, appVersion) : t('desktop.setup.link.failed');
     action = t('desktop.setup.tryAgain');
   } else if (state.notice === 'denied') {
     message = t('desktop.setup.link.denied');

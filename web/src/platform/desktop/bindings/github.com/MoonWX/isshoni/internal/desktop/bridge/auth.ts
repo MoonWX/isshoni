@@ -70,7 +70,10 @@ export function HelloRefused(origin: string, refusal: $models.HelloRefusal): $Ca
 
 /**
  * Link starts a device-flow link on the active server (02 §11.3): it returns once the code is shown, and progress
- * arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server.
+ * arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server. 02's
+ * ErrBadResponse here is a server answer that failed §11.2's check (a verification URI on another origin): not the
+ * network's fault, so it is internal {reason: bad_response}, which the link step shows as its generic "Couldn't
+ * start linking with this server" (03 §8.2), not as server_unreachable (mapError's rule for every other call).
  */
 export function Link(): $CancellablePromise<void> {
     return $Call.ByID(3295379497);
