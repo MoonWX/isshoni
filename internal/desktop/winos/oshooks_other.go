@@ -21,7 +21,7 @@ func (*Hooks) Hotkeys() <-chan app.HotkeyID                    { return nil }
 func (*Hooks) Pill() app.Pill                                  { return nopPill{} }
 func (*Hooks) ExcludeFromCapture(uintptr) error                { return nil }
 func (*Hooks) SetAutostart(bool, string) error                 { return app.ErrNotSupported }
-func (*Hooks) Autostart() (bool, error)                        { return false, nil }
+func (*Hooks) Autostart() (bool, error)                        { return false, app.ErrNotSupported }
 func (*Hooks) OpenSettingsPage(app.OSPage) error               { return app.ErrNotSupported }
 func (*Hooks) KeepAwake(bool)                                  {}
 func (*Hooks) Events() <-chan app.SystemEvent                  { return nil }

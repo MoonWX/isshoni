@@ -37,6 +37,10 @@
 //   server's view; only inside the app, whose preferences say whether it is on. `?debug=1` shows it on this page
 //   only and leaves the preference alone; Shift+D switches what is on screen, and hiding it ends the URL's part too;
 // - "Now listening to bo" for screen readers when the sound moves to a share that was already there (05 §16.6).
+//
+// A tab handed off to the user's desktop app (viewerStore.handedOff, docs/m2/03 §12.2) shows no share: the stage says
+// "Now watching in the isshoni app" with Watch here instead, and the tiles are gone until then, but for the page's
+// own share's (its preview, which subscribes nothing).
 import { Layers } from 'lucide-react';
 import {
   useCallback,
@@ -61,7 +65,6 @@ import { Sheet } from '../ui/Sheet';
 import { CodecBanner } from './CodecBanner';
 import { ViewerContext } from './context';
 import { DebugOverlay, debugInUrl } from './DebugOverlay';
-import { useEndpointMute } from './endpointMute';
 import { FocusFromUrl } from './FocusFromUrl';
 import { IosHint } from './IosHint';
 import { attachShortcuts, moveTileFocus, TILE_LIST, TILE_MAIN, type ShortcutAction } from './keyboard';
@@ -183,6 +186,7 @@ export function ViewerLayout({
   const focusedId = useStore(viewer.store, (s) => s.focusedShareId);
   const isFullscreen = useStore(viewer.store, (s) => s.fullscreen);
   const media = useStore(viewer.store, (s) => s.media);
+  const handedOff = useStore(viewer.store, (s) => s.handedOff);
   const phoneLandscape = useMediaQuery(PHONE_LANDSCAPE_QUERY);
   // The layout's element, in state: the controllers below are made for it.
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
@@ -199,12 +203,12 @@ export function ViewerLayout({
   }, [fullscreen]);
   const pip = usePip(viewer, root, caps?.pip === true);
   useWakeLock(viewer, platform, caps?.wakeLock === true);
-  // The desktop app's endpoint share mutes every share here (docs/m2/03 §12.1).
-  useEndpointMute(viewer.store, platform);
   useMediaSession(viewer, roomName);
 
-  const focused = shares.find((s) => s.id === focusedId) ?? null;
-  const others = shares.filter((s) => s !== focused);
+  // Handed off to the desktop app: no share on the stage and no tiles (nothing is subscribed, layerPolicy rule 9).
+  const focused = handedOff ? null : (shares.find((s) => s.id === focusedId) ?? null);
+  // Handed off, the page's own share keeps its tile and preview (03 §12.2: it is untouched); nothing else shows.
+  const others = handedOff ? shares.filter((s) => s.localPreview) : shares.filter((s) => s.id !== focusedId);
   const showOthers = !isFullscreen && others.length > 0;
   const inSheet = showOthers && phoneLandscape;
   // One tab stop for the list: the tile that had the focus, else the first.
@@ -360,7 +364,17 @@ export function ViewerLayout({
             className={styles.stage}
             share={focused}
             preview={focused?.local ? localPreviews?.[focused.id] : undefined}
-            empty={<EmptyStage shares={shares} empty={empty} />}
+            empty={
+              handedOff ? (
+                <HandedOff
+                  onWatchHere={() => {
+                    viewer.store.getState().setHandedOff(false);
+                  }}
+                />
+              ) : (
+                <EmptyStage shares={shares} empty={empty} />
+              )
+            }
             controls={
               focused && (
                 <>
@@ -425,6 +439,24 @@ export function ViewerLayout({
         )}
       </div>
     </ViewerContext.Provider>
+  );
+}
+
+/**
+ * The stage of a tab handed off to the user's desktop app (docs/m2/03 §12.2): "Now watching in the isshoni app" and
+ * Watch here instead, which subscribes again as before. A status, so a screen reader hears it when it appears.
+ */
+function HandedOff({ onWatchHere }: { onWatchHere: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div className={styles.handedOff}>
+      <p className={styles.handedOffText} role="status">
+        {t('viewer.handoff.watching')}
+      </p>
+      <Button variant="primary" onClick={onWatchHere}>
+        {t('viewer.handoff.watchHere')}
+      </Button>
+    </div>
   );
 }
 

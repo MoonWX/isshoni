@@ -34,6 +34,7 @@ export {
     LinkCode,
     LogPatch,
     LogView,
+    OpenH264Status,
     Picked,
     PillPatch,
     PillView,

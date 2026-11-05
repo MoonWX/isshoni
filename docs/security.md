@@ -1,3 +1,26 @@
+<script setup lang="ts">
+// The fingerprints of the desktop app's update keys (docs/m2/06-windows-release.md §11.5, §13), from the facts that
+// .github/workflows/site.yml wrote into .vitepress/release.json: `updateKeyFingerprints`, the keys of main's
+// deploy/keys/update_signers, which the site serves as /keys/update_signers. Without the file (every local build, and
+// the site before the first release) the glob below finds nothing; a malformed list fails the build.
+const releases = import.meta.glob('./.vitepress/release.json', { eager: true, import: 'default' });
+
+function updateKeyFingerprints(): string[] {
+  const raw = Object.values(releases)[0] as Record<string, unknown> | undefined;
+  if (raw === undefined) return [];
+  const fps = raw.updateKeyFingerprints;
+  if (!Array.isArray(fps) || !fps.every((f) => typeof f === 'string' && /^SHA256:[A-Za-z0-9+/]{43}$/.test(f))) {
+    throw new Error(
+      '.vitepress/release.json: updateKeyFingerprints is not a list of SHA256:… fingerprints ' +
+        '(written by .github/workflows/site.yml, docs/m2/06-windows-release.md §13)',
+    );
+  }
+  return fps as string[];
+}
+
+const updateFingerprints = updateKeyFingerprints();
+</script>
+
 # Security
 
 ## Reporting a vulnerability {#report}
@@ -32,8 +55,30 @@ Their fingerprints, which the "Release signing keys" section of the repository's
 The public keys are in `deploy/keys/allowed_signers` in the repository
 ([deploy/keys](https://github.com/MoonWX/isshoni/tree/main/deploy/keys)), and this site serves the same file as
 `https://moonwx.github.io/isshoni/keys/allowed_signers` once there is a release. If a key is ever replaced, the new
-one is added to that file, the old one is marked as valid only before a date (or removed, if it leaked), and a new
-release follows at once; a leak also gets a security advisory.
+one is added to that file and the old one is removed from it (at once if it leaked), and a new release follows at once;
+a leak also gets a security advisory.
+
+**The Windows app's update keys** (from isshoni 0.2) are keys of their own. The app carries their public halves and
+installs an update only when the release's update info, `isshoni-desktop-update.json`, carries a valid signature by
+one of them ([Updates](/download#windows-updates)):
+
+| Key | Use |
+|---|---|
+| `isshoni-update-1` | signs the update info of every release |
+| `isshoni-update-backup-1` | kept offline; signs only the release that replaces a leaked update key |
+
+Their fingerprints, which the README lists too:
+
+<ul v-if="updateFingerprints.length > 0">
+  <li v-for="fp in updateFingerprints" :key="fp"><code>{{ fp }}</code></li>
+</ul>
+<p v-else>
+  None here yet: they appear with the first release that has them. Until then the
+  <a href="https://github.com/MoonWX/isshoni#release-signing-keys">README.md</a> has them as soon as the keys exist.
+</p>
+
+The public keys are in `deploy/keys/update_signers` in the repository, and this site serves the same file as
+`https://moonwx.github.io/isshoni/keys/update_signers`.
 
 ## How to verify a download {#verify}
 
@@ -100,15 +145,58 @@ gh attestation verify isshoni_${V}_linux_amd64.tar.gz --repo MoonWX/isshoni
 Each archive also comes with an SPDX SBOM (`*.sbom.json`) that lists what it contains, and each archive, package and
 image carries `THIRD_PARTY_NOTICES` with the licenses of everything isshoni bundles.
 
-See also the [code signing policy](/code-signing).
+### The Windows app {#verify-desktop}
 
-<!-- The section's first paragraph goes once the Windows app is released (06 R14, which turns /download into the
-Windows page). -->
+The Windows installer is in the release's `checksums.txt`, so it is verified like every other file: the signature of
+`checksums.txt` with the release keys, then the installer's SHA-256. The PowerShell install command does both by itself
+([Install with PowerShell](/download#windows-powershell)). By hand, in Windows PowerShell with Windows' OpenSSH Client
+(here for 0.2.0):
+
+```powershell
+$V = '0.2.0'; $B = "https://github.com/MoonWX/isshoni/releases/download/v$V"; $F = "isshoni-desktop_${V}_windows_amd64_setup.exe"
+foreach ($n in $F, 'checksums.txt', 'checksums.txt.sig') { Invoke-WebRequest -UseBasicParsing "$B/$n" -OutFile $n }
+Invoke-WebRequest -UseBasicParsing https://moonwx.github.io/isshoni/keys/allowed_signers -OutFile allowed_signers
+cmd /c "ssh-keygen -Y verify -f allowed_signers -I isshoni-release -n isshoni-checksums -s checksums.txt.sig < checksums.txt"
+(Get-FileHash $F -Algorithm SHA256).Hash.ToLower(); Select-String -Path checksums.txt -SimpleMatch -Pattern $F
+```
+
+1. `ssh-keygen` must say `Good "isshoni-release" signature` with one of the [release keys' fingerprints](#keys).
+   (`cmd /c` because PowerShell has no `<` redirection, and a pipe would change the file's bytes.)
+2. The hash it prints next must be the one in the line of `checksums.txt` that `Select-String` shows.
+
+On Linux or a Mac, the commands of [the install script's check](#verify-checksums) work for the installer too: add
+`-O $B/isshoni-desktop_${V}_windows_amd64_setup.exe` to the `curl` line, and skip `sh install.sh`. The installer also
+has a build provenance attestation (`gh attestation verify isshoni-desktop_${V}_windows_amd64_setup.exe --repo
+MoonWX/isshoni`).
+
+**The update info**, which the app checks before every update, can be checked the same way with the
+[update keys](#keys):
+
+```sh
+V=0.2.0; B=https://github.com/MoonWX/isshoni/releases/download/v$V
+curl -fsSLO $B/isshoni-desktop-update.json -O $B/isshoni-desktop-update.json.sig
+curl -fsSL https://moonwx.github.io/isshoni/keys/update_signers -o update_signers   # compare fingerprints with README
+ssh-keygen -Y verify -f update_signers -I isshoni-update -n isshoni-update \
+  -s isshoni-desktop-update.json.sig < isshoni-desktop-update.json
+```
+
+It names the installer's URL, size and SHA-256, which the app checks the download against twice: after the download
+and right before it runs it.
+
+**The limit of key revocation.** If the active update key ever leaks, the project publishes, at once and with a
+security advisory, a release whose update info is signed with the offline backup key and tells the app to stop
+trusting the leaked key. An app that checks for updates learns that at its next check and never trusts the leaked
+key again; an attacker holding the leaked key can't stop it, because only the backup key can revoke a key. But an app
+that doesn't check again (updates turned off, or a PC that stays offline) can't be told: if you turned updates off,
+follow the [security advisories](https://github.com/MoonWX/isshoni/security/advisories), and install new versions
+from your server's Download page.
+
+See also the [code signing policy](/code-signing).
 
 ## Linked apps {#linked-apps}
 
-The desktop apps aren't released yet: the first, for Windows, comes with isshoni 0.2 ([Desktop apps](/download)).
-This section describes how they will sign in.
+The desktop apps (the first, for Windows, comes with isshoni 0.2: [Desktop apps](/download)) sign in as described
+here. What the app keeps on your PC: [Privacy](/privacy#desktop).
 
 The desktop apps never keep your password or a browser cookie. You link an app to your server once, and the server gives
 that app a sign-in of its own. This is that sign-in's threat model: what it is, where it is kept, what someone who

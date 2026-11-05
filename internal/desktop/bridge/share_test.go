@@ -51,7 +51,7 @@ func TestShareViewJSON(t *testing.T) {
 	}
 	want := `{"state":"live","shareId":"s_q7m2k9x4w3bd8c1a","connectionId":"c_k3v9q2m7xw4pa8d1","roomId":"lounge",` +
 		`"kind":"window","label":"Minecraft","preset":"game","withAudio":true,"audioOn":true,"border":false,` +
-		`"pill":true,"minimized":false,"watching":3,"liveSince":"2026-10-21T12:00:00.000Z","hint":null,` +
+		`"pill":true,"minimized":false,"lockPrompt":false,"watching":3,"liveSince":"2026-10-21T12:00:00.000Z","hint":null,` +
 		`"encoder":"nvenc","hw":true,"layers":[{"rid":"f","width":1920,"height":1080,"fps":60,"targetKbps":8000,` +
 		`"sentKbps":7712,"captureToSendMs":{"p50":14,"p95":22}},{"rid":"q","width":640,"height":360,"fps":15,` +
 		`"targetKbps":300,"sentKbps":296,"captureToSendMs":{"p50":12,"p95":19}}],"server":null,"endReason":null,` +
@@ -90,6 +90,17 @@ func TestShareViewJSON(t *testing.T) {
 	if got := s.Share.Current(); got.Error.Code != string(codes.CodeEngineEncoderLost) ||
 		got.Error.Params["reason"] != "device_removed" {
 		t.Errorf("engine end with a reason %+v", got.Error)
+	}
+	// A lock pause that asks "Resume sharing?" (03 §11.6): lockPrompt, for the panel's bar.
+	v = liveView()
+	v.State, v.LockPrompt = share.StatePaused, true
+	core.shares.set(func(f *fakeShares) { f.current = &v })
+	if got := s.Share.Current(); got.State != "paused" || !got.LockPrompt {
+		t.Errorf("lock prompt %+v", got)
+	}
+	b, _ = json.Marshal(s.Share.Current())
+	if !bytes.Contains(b, []byte(`"lockPrompt":true`)) {
+		t.Errorf("lock prompt JSON %s", b)
 	}
 	core.shares.set(func(f *fakeShares) { f.current = nil })
 	if s.Share.Current() != nil {

@@ -13,7 +13,8 @@
 // auth.state, the link page in the browser and server switching from the SPA (WA71: servers.go, which calls the
 // session's Refresh after 02's Add, SetActive and Remove), 05's audio service (WA77: audio.go), the tray, the window's close policy, toasts,
 // system events, keep-awake, WDA on the main window and the watchdog (WA68: tray.go, window.go, toasts.go,
-// system.go), hotkeys and the pill (WA80), the updater (WA84).
+// system.go), hotkeys and the pill (WA80), the updater, autostart and the settings' side effects (WA84: updates.go,
+// prefs.go).
 package app
 
 import (
@@ -30,6 +31,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
 	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/media"
+	"github.com/MoonWX/isshoni/internal/update"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -40,7 +42,7 @@ type Deps struct {
 	Session  Session             // C2 (03 §9); nil: New builds internal/desktop/session for Engine (share.go)
 	Engine   media.Engine        // native.Open on Windows; fake.NewEngine in dev and e2e builds; nil when none opened
 	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio); nil: no audio policy
-	Updater  Updater             // 06's *update.Updater, built in the first instance only (wired by WA84)
+	Updater  Updater             // 06's *update.Updater, built in the first instance only (step 5); nil: none
 	Shell    Shell               // cmd/isshoni-desktop over Wails; e2ehost: a recording fake
 	OS       OSHooks             // winos on Windows; stubs elsewhere
 	I18n     *i18n.Catalog
@@ -57,6 +59,12 @@ type Deps struct {
 	// installed THIRD_PARTY_NOTICES.txt App.OpenNotices opens (06 §2.2). "" means the method isn't available
 	// (ErrNotImplemented), as in the e2e harness.
 	LogsDir, NoticesFile string
+	// Exe is the path the autostart Run value starts (03 §16.1); "" means os.Executable().
+	Exe string
+	// SetLogDebug follows a change of settings.json's log.level (Settings → About's debug logging, 03 §17): main
+	// raises or lowers the file log's level (never below a --log-level debug of the command line). nil: the level
+	// changes at the next start.
+	SetLogDebug func(debug bool)
 }
 
 // Session is what the app runs of internal/desktop/session (03 §9): C2 for the active linked server. The share
@@ -72,9 +80,16 @@ type AudioService interface {
 	Close() error
 }
 
-// Updater is what the app runs of 06's update.Updater (06 §8.4).
+// Updater is what the app runs of 06's update.Updater (06 §8.9): the schedule, the status the tray, the toast and the
+// bound Updates service follow, "Check now", and "Restart and update" (updates.go).
 type Updater interface {
 	Run(ctx context.Context) error // the schedule; returns when ctx ends
+	Status() update.Status
+	// Subscribe is a latest-value channel of the status (the current one at once); cancel closes it.
+	Subscribe() (<-chan update.Status, func())
+	CheckNow(ctx context.Context) (update.Status, error)
+	Ready() *update.Pending // the verified installer that waits; nil unless ready
+	Apply(ctx context.Context, p *update.Pending, relaunch bool) error
 }
 
 // QuitTimeout bounds Quit's wait for the server's replies (03 §11.6, §20).
@@ -100,12 +115,14 @@ type App struct {
 	after func(d time.Duration, f func()) stopper
 	// trayEvery is the tray's debounce (03 §11.1: 250 ms), guarded by tray.mu.
 	trayEvery time.Duration
-	tray      trayModel   // tray.go
-	toasts    toastBook   // toasts.go
-	sys       systemState // system.go, guarded by mu
-	beat      watchdog    // system.go, guarded by mu
-	awakeMu   sync.Mutex  // orders KeepAwake calls; guards awake
-	awake     bool
+	tray      trayModel // tray.go
+	// lockSync serializes syncLockPrompt's read of sys.prompt and its SetLockPrompt (tray.go).
+	lockSync sync.Mutex
+	toasts   toastBook   // toasts.go
+	sys      systemState // system.go, guarded by mu
+	beat     watchdog    // system.go, guarded by mu
+	awakeMu  sync.Mutex  // orders KeepAwake calls; guards awake
+	awake    bool
 
 	probeDone chan struct{}
 	probe     media.Probe
@@ -124,6 +141,7 @@ type App struct {
 	pill Pill   // OSHooks.Pill(); nil when the OS hooks have none
 
 	authSubs authSubscribers // SubscribeAuth: the auth.state event's source (servers.go)
+	upd      updateFollow    // updates.go: SubscribeUpdates, the ready toast
 	opened   openedCodes     // the link codes whose approval page was opened (servers.go)
 
 	mu       sync.Mutex
@@ -208,8 +226,10 @@ func (a *App) Run(ctx context.Context) error {
 	defer stop()
 	defer a.cancel()
 
+	a.syncAutostart()
 	a.startActive()
 	a.startAudio()
+	a.startUpdates()
 	unsubscribe := a.shares.Subscribe(a.onShareEvent)
 	a.startSafety()
 	a.flushTray()

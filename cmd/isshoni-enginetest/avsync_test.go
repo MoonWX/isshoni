@@ -255,6 +255,75 @@ func TestLumaEdges(t *testing.T) {
 	}
 }
 
+// TestLumaLosses: the report's lumaMissed sums the readings' Missed and lumaRingDrops counts the readings with
+// DISCONTINUITY, wherever they are (README WF17, WF16-R2), and the text report says both.
+func TestLumaLosses(t *testing.T) {
+	frames := []lumaSample{
+		{CaptureNS: 0, Mean: 0.1},
+		{CaptureNS: 16, Mean: 0.1, Missed: 3},
+		{CaptureNS: 33, Mean: 0.9, Missed: 1, Discontinuity: true},
+		{CaptureNS: 50, Mean: 0.9, Discontinuity: true},
+		{CaptureNS: 66, Mean: 0.1, Missed: 2},
+	}
+	if missed, drops := lumaLosses(frames); missed != 6 || drops != 2 {
+		t.Errorf("lumaLosses = %d, %d; want 6, 2", missed, drops)
+	}
+	if missed, drops := lumaLosses(nil); missed != 0 || drops != 0 {
+		t.Errorf("no readings: %d, %d", missed, drops)
+	}
+	var b bytes.Buffer
+	printAVSync(&b, avsyncReport{Source: "mon", Frames: 1500, LumaMissed: 6, LumaRings: 2, Edges: 20, EdgesDropped: 1})
+	want := "luma tap: 1500 pictures, 6 frames without a reading, 2 ring drops; 20 flashes seen (1 discarded"
+	if !strings.Contains(b.String(), want) {
+		t.Errorf("text report %q, want %q", b.String(), want)
+	}
+}
+
+// TestFlashWindowPos: on synthetic monitor rects (the primary, monitors right of, left of and above it with negative
+// desktop coordinates, 4K, portrait, and monitors smaller than the window), the flash window's rect holds the luma
+// tap's region of that monitor's capture (04 §5.8's centered box of up to 256 pixels a side), so avsync -source
+// mon:<id> sees the flashes on whichever monitor it captures (README WF17, WF16-R1).
+func TestFlashWindowPos(t *testing.T) {
+	cases := []struct {
+		name string
+		mon  winRect
+		x, y int32 // the window's top-left corner
+	}{
+		{"primary 1080p", winRect{0, 0, 1920, 1080}, 320, 180},
+		{"right of the primary", winRect{1920, 0, 4480, 1440}, 1920 + 640, 360},
+		{"left of the primary", winRect{-1920, 0, 0, 1080}, -1920 + 320, 180},
+		{"above the primary, offset", winRect{-500, -1440, 2060, 0}, -500 + 640, -1440 + 360},
+		{"4K", winRect{0, 0, 3840, 2160}, 1280, 720},
+		{"portrait", winRect{1920, -420, 3000, 1500}, 1920, -420 + 600},
+		{"smaller than the window", winRect{0, 0, 1024, 600}, 0, 0},
+		{"the window's size", winRect{3840, 0, 5120, 720}, 3840, 0},
+		{"tiny", winRect{-200, -100, 0, 0}, -200, -100},
+	}
+	for _, c := range cases {
+		x, y := flashWindowPos(c.mon)
+		if x != c.x || y != c.y {
+			t.Errorf("%s: the window at %d,%d, want %d,%d", c.name, x, y, c.x, c.y)
+		}
+		win := winRect{Left: x, Top: y, Right: x + avsyncFlashW, Bottom: y + avsyncFlashH}
+		box := lumaBox(c.mon.Right-c.mon.Left, c.mon.Bottom-c.mon.Top)
+		box = winRect{Left: c.mon.Left + box.Left, Top: c.mon.Top + box.Top, Right: c.mon.Left + box.Right,
+			Bottom: c.mon.Top + box.Bottom}
+		if !win.contains(box) {
+			t.Errorf("%s: the window %+v doesn't hold the tap's box %+v", c.name, win, box)
+		}
+		if win.Left < c.mon.Left || win.Top < c.mon.Top {
+			t.Errorf("%s: the window %+v starts outside the monitor %+v", c.name, win, c.mon)
+		}
+	}
+	// The box itself: 256 a side, centered; a smaller frame's whole side.
+	if b := lumaBox(1920, 1080); b != (winRect{832, 412, 1088, 668}) {
+		t.Errorf("lumaBox(1920, 1080) = %+v", b)
+	}
+	if b := lumaBox(200, 100); b != (winRect{0, 0, 200, 100}) {
+		t.Errorf("lumaBox(200, 100) = %+v", b)
+	}
+}
+
 func TestFlashTimes(t *testing.T) {
 	const freq = 10_000_000 // 10 MHz, as Windows' QPC usually runs
 	period := float64(freq) / 60
@@ -502,7 +571,8 @@ func TestRunAVSyncWithFakes(t *testing.T) {
 		// 30 ms − 12 ms; the PCM tap's 1 ms blocks round the onset down by less than a block.
 		t.Errorf("%d pairs, median %.3f ms: want 18 and 18 ms", len(rep.Pairs), rep.MedianMS)
 	}
-	if rep.Edges != 18 || rep.Onsets != 18 || rep.Clicks != 18 || rep.Flashes != 18 {
+	if rep.Edges != 18 || rep.Onsets != 18 || rep.Clicks != 18 || rep.Flashes != 18 || rep.LumaMissed != 0 ||
+		rep.LumaRings != 0 {
 		t.Errorf("counts: %+v", rep)
 	}
 	if !run.picked || !run.stopped || !run.flashOK || run.monitor != "" {
@@ -585,6 +655,14 @@ func TestRunAVSyncWithTheNativeTap(t *testing.T) {
 		math.Abs(rep.MedianMS-18) > 0.05 {
 		t.Errorf("two lost readings: exit %d, %d edges, %d discarded, %d pairs, unpaired %q, median %.3f ms", code,
 			rep.Edges, rep.EdgesDropped, len(rep.Pairs), rep.Unpaired, rep.MedianMS)
+	}
+	// The report counts what the tap lost (README WF17, WF16-R2): one frame without a reading, one ring drop.
+	if rep.LumaMissed != 1 || rep.LumaRings != 1 {
+		t.Errorf("lumaMissed %d, lumaRingDrops %d: want 1 and 1", rep.LumaMissed, rep.LumaRings)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte(`"lumaMissed": 1`)) ||
+		!bytes.Contains(stdout.Bytes(), []byte(`"lumaRingDrops": 1`)) {
+		t.Errorf("avsync.json without the tap's losses:\n%s", stdout.Bytes())
 	}
 	for _, p := range rep.Pairs {
 		if p.Flash == 3 || p.Flash == 9 {

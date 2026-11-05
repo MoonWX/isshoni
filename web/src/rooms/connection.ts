@@ -29,6 +29,7 @@ import {
   BackoffResetMs,
   isStaleBuild,
   SignalClient,
+  WebHelloFeatures,
   type SignalState,
   type SignalStateInfo,
 } from '../protocol/signal-client';
@@ -307,7 +308,8 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     client: platform.client, // 01 ClientInfo {kind: 'web', version, os, browser}
     role: platform.role, // 'full' if the platform can share, else 'viewer' (01 §6.3)
     caps: () => platform.capsNow(), // 01 detectCaps(), re-read on every (re)connect
-    features: [], // later: 'share.pause' (M2), 'layer.mid' (M5)
+    // agent.relay and user.connections (docs/m2/03 §7.6, §12.2): the handoff (handoff.ts). Later: 'layer.mid' (M5).
+    features: [...WebHelloFeatures],
     onResync: (w) => {
       stores.connection.getState().welcomed(w);
       // The stale-build reload comes before the room. A page that joined first would join, leave (the reload's

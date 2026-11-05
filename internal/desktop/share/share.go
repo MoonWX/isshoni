@@ -148,6 +148,7 @@ type View struct {
 	Border       bool // Windows draws its capture border: Source.OSBorder, then !NoOSIndicator once live
 	Pill         bool // the Sharing pill is due: an active share without the OS border
 	Minimized    bool // the shared window is minimized (04's SOURCE_MINIMIZED)
+	LockPrompt   bool // paused by a lock, the app asks "Resume sharing?" (03 §11.6; SetLockPrompt); only while paused
 	Watching     int  // len(ShareSnapshot.Watchers)
 	LiveSince    time.Time
 	Hint         Hint

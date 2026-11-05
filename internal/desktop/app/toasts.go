@@ -18,8 +18,8 @@ import (
 // -Embedding; a protocol activation a web page made up) does nothing. Opening the window, the toast's body and its
 // Open button, needs no nonce.
 
-// The toasts' kinds (Notification.Kind): WA68's here and the mic prompt's in audio.go (ToastMicPrompt); README WA80
-// and WA84 add the audio alert, pause, stopped and update toasts.
+// The toasts' kinds (Notification.Kind): WA68's here, the mic prompt's in audio.go (ToastMicPrompt), WA80's audio
+// alert and pause in safety.go, and the update's in updates.go (ToastUpdateReady, README WA84).
 const (
 	ToastStillSharing = "still-sharing"  // the first close to the tray while live
 	ToastLockPaused   = "lock-paused"    // an unlock later than LockResume after the lock: Resume · Stop
@@ -265,8 +265,12 @@ func (a *App) ToastAction(nonce, action string) bool {
 			d = audio.DecisionInclude
 		}
 		return a.answerPrompt(p.ref, d)
+	case ToastRestart:
+		if p.kind != ToastUpdateReady {
+			return false
+		}
+		a.restartForUpdate("toast")
 	default:
-		// restart (WA84) has no toast in this build yet.
 		a.log.Info("app: a toast action this build doesn't handle", "kind", p.kind, "action", action)
 		return false
 	}

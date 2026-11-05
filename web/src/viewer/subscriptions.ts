@@ -15,6 +15,8 @@
 //   and the page has no preview of, is subscribed at the low layer at most and never with audio (docs/m2/03 §10.4).
 // - While the desktop app shares with 05's `endpoint` engine, nothing is heard (viewerStore.audioMutedForShare,
 //   docs/m2/03 §12.1).
+// - A tab handed off to the user's desktop app subscribes to nothing until "Watch here instead"
+//   (viewerStore.handedOff, docs/m2/03 §12.2).
 import type { SubscriptionWant } from '../protocol/types.gen';
 import { desiredSubscriptions, PAGE_HIDDEN_OFF_MS, type LayerInputs } from './layerPolicy';
 import type { ViewerServices } from './services';
@@ -41,6 +43,7 @@ export function layerInputs(s: ViewerData, now: number): LayerInputs {
     fullscreen: s.fullscreen,
     pip: s.pipShareId,
     audioMuted: s.audioMutedForShare,
+    handedOff: s.handedOff,
   };
 }
 
@@ -83,7 +86,8 @@ export function attachSubscriptions(
       s.pageHiddenSince !== prev.pageHiddenSince ||
       s.fullscreen !== prev.fullscreen ||
       s.pipShareId !== prev.pipShareId ||
-      s.audioMutedForShare !== prev.audioMutedForShare
+      s.audioMutedForShare !== prev.audioMutedForShare ||
+      s.handedOff !== prev.handedOff
     ) {
       apply();
     }

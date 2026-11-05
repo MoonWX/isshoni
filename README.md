@@ -77,6 +77,14 @@ docker compose exec isshoni isshoni setup-url
 isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement:
 <https://letsencrypt.org/repository/>
 
+**The Windows app** (from v0.2.0; Windows 10 22H2 or later, 64-bit) installs from your server's Download page,
+`https://<your server>/download`, which gives the installer of the server's version and a PowerShell one-liner that
+checks the download's signature before it installs (`irm https://<your server>/install-desktop.ps1 | iex`). The app
+updates itself from this repository's GitHub Releases, after checking the update's signature with the update keys
+[below](#release-signing-keys). 0.x builds aren't code-signed yet, so Windows may warn before the first start, and
+they can't run where Smart App Control is on: see the site's [Desktop apps](https://moonwx.github.io/isshoni/download)
+page.
+
 ## Release signing keys
 
 Every release's `checksums.txt` is signed with `ssh-keygen -Y sign`. `install.sh` checks that signature against the
@@ -87,6 +95,11 @@ public keys built into it before it installs anything, and stops if the check fa
 |---|---|---|
 | `isshoni-release-1` | signs every release | not created yet |
 | `isshoni-release-backup-1` | kept offline; signs nothing until a key is replaced | not created yet |
+| `isshoni-update-1` | signs the Windows app's update info (`isshoni-desktop-update.json`), from v0.2.0 | not created yet |
+| `isshoni-update-backup-1` | kept offline; signs only the release that replaces a leaked update key | not created yet |
+
+The update keys are keys of their own, in [`deploy/keys/update_signers`](deploy/keys/README.md): the Windows app
+carries them and installs an update only when its update info carries a valid signature by one of them.
 
 The script can't vouch for itself, so to be sure of what you run, verify a download by hand (here 0.1.0):
 
@@ -98,10 +111,12 @@ ssh-keygen -Y verify -f allowed_signers -I isshoni-release -n isshoni-checksums 
 sha256sum --ignore-missing -c checksums.txt
 ```
 
-`ssh-keygen` prints the fingerprint of the key that made the signature: it must be one of the fingerprints above.
-Then `sudo sh install.sh` installs exactly that version. Each release also has a Sigstore bundle
-(`checksums.txt.sigstore.json`, for `cosign verify-blob`) and GitHub build provenance (`gh attestation verify`), and
-the image `ghcr.io/moonwx/isshoni` is signed with cosign.
+`ssh-keygen` prints the fingerprint of the key that made the signature: it must be one of the release keys'
+fingerprints above. Then `sudo sh install.sh` installs exactly that version. The Windows installer,
+`isshoni-desktop_${V}_windows_amd64_setup.exe`, is in the same signed `checksums.txt`; the site's
+[Verifying the Windows app](https://moonwx.github.io/isshoni/security#verify-desktop) has the PowerShell commands.
+Each release also has a Sigstore bundle (`checksums.txt.sigstore.json`, for `cosign verify-blob`) and GitHub build
+provenance (`gh attestation verify`), and the image `ghcr.io/moonwx/isshoni` is signed with cosign.
 
 ## Privacy
 

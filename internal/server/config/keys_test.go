@@ -342,6 +342,7 @@ var devEnvNames = []struct{ name, readBy string }{
 	{"ISSHONI_APPLOG_CRASH_CHILD", "internal/desktop/applog/applog_test.go"},
 	{"ISSHONI_MEDIATEST_MUTANT", "internal/media/mediatest/mutant_test.go"},
 	{"ISSHONI_ENGINETEST_TEST_CHILD", "cmd/isshoni-enginetest/main_windows_test.go"},
+	{"ISSHONI_REQUIRE_AUTOSTART_E2E", "cmd/isshoni-desktop/autostart_windows_test.go, set by ci.yml windows-desktop"},
 	{"ISSHONI_TEST_FFMPEG_DIR", "native/windows/tests/ffmpeg_load_test.cpp, mf_sw_test.cpp, set by ci.yml windows-native"},
 }
 

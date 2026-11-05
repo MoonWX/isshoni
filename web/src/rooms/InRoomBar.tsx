@@ -6,6 +6,11 @@
 // room that refused the user (they are in none, whatever the session still wants), and in an app that never opened
 // a room: it reads the runtime only if one exists and never makes one, so no page starts a signaling connection by
 // showing this bar. The app's layout mounts it once, above the routes' pages; it must be inside the router.
+//
+// In the desktop app it also mounts DesktopLinks (docs/m2/03 §13.2: what the page does with the app's deep links),
+// for the same reason: it is the one part of rooms/ that every page has. It is a chunk of its own, never loaded in
+// the browser.
+import { lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useLocation } from 'react-router';
 import { useStore } from 'zustand';
@@ -18,13 +23,25 @@ import styles from './InRoomBar.module.css';
 import { roomOf, useRooms } from './roomsQuery';
 import { peekRoomRuntime, type RoomRuntime } from './runtime';
 
+const DesktopLinks = lazy(() => import('./DesktopLinks').then((m) => ({ default: m.DesktopLinks })));
+
 export function InRoomBar() {
   const app = useApp();
   // Read on every navigation: the first room page makes the runtime, and leaving that page is a navigation.
   const { pathname } = useLocation();
   const runtime = peekRoomRuntime(app);
-  if (runtime === undefined || isRoomPath(pathname)) return null;
-  return <Bar runtime={runtime} />;
+  const links = app.platform.desktop != null && (
+    <Suspense fallback={null}>
+      <DesktopLinks />
+    </Suspense>
+  );
+  if (runtime === undefined || isRoomPath(pathname)) return links || null;
+  return (
+    <>
+      {links}
+      <Bar runtime={runtime} />
+    </>
+  );
 }
 
 function Bar({ runtime }: { runtime: RoomRuntime }) {

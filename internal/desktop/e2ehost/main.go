@@ -19,6 +19,9 @@
 //	                                        (WM_QUERYENDSESSION), end-session-confirmed (WM_ENDSESSION with TRUE: the
 //	                                        app quits) or display-change
 //	POST /__e2e/args                        {"args": [...]}: a command line as a second instance would forward it
+//	POST /__e2e/window?action=close|open    the window's X (the shell's close hook, App.WindowClosing: hide to the
+//	                                        tray while live, else quit by 03 §11.6's close policy) or the tray's
+//	                                        Open (App.ShowWindow); the page in Chrome stays where it is
 //
 // Flags (e2e only; no other build has them): -listen (default 127.0.0.1:0), -data (default: a new temporary folder,
 // removed at exit), -server <origin> (added and made active at start, which the add step would do in the app),
@@ -372,6 +375,20 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 			return
 		}
 		a.HandleArgs(body.Args)
+		w.WriteHeader(http.StatusNoContent)
+	})))
+	mux.HandleFunc("/__e2e/window", sameOrigin(o.origin, post(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("action") {
+		case "close":
+			// As the Wails shell calls it: off the UI thread, after it cancelled the close. A quit waits for the
+			// share's stop, so the answer comes once the app has decided.
+			a.WindowClosing()
+		case "open":
+			a.ShowWindow()
+		default:
+			http.Error(w, "action must be close or open", http.StatusBadRequest)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})))
 	mux.HandleFunc("/wails/runtime", rec.stubRuntime)

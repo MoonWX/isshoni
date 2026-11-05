@@ -138,6 +138,9 @@ export function createWailsBridge(opts: WailsBridgeOptions = {}): NativeBridge {
       update: (p) => call(Settings.Update(p)),
       hotkeys: () => call(Settings.Hotkeys()),
       testHotkey: (combo) => call(Settings.TestHotkey(combo)),
+      openH264: () => call(Settings.OpenH264()),
+      enableOpenH264: () => call(Settings.EnableOpenH264()),
+      disableOpenH264: () => call(Settings.DisableOpenH264()),
     },
     window: { setFullscreen: (on) => call(Window.SetFullscreen(on)) },
     updates: {

@@ -16,13 +16,16 @@
 //   - No method returns a refresh token or a credential (02 §11.7): the only secret that crosses is the access
 //     token of Auth.AccessToken, for the active server's own origin only (03 §5.8).
 //
-// Methods whose slices haven't landed return not_implemented (README §4 "Interfaces first"): Settings' writes and
-// hotkeys and Updates (WA84). Auth's server changes and Unlink call the app (Auth's ServerControl, WA71). Audio
-// works over 05's service, which main and the e2e harness pass as Deps.Audio (without one it is not_implemented too).
-// Share calls the app's share controller (internal/desktop/share).
+// A service whose part is missing answers not_implemented (README §4 "Interfaces first"). Auth's server changes and
+// Unlink call the app (Auth's ServerControl, WA71). Audio works over 05's service, which main and the e2e harness
+// pass as Deps.Audio (without one it is not_implemented too). Share calls the app's share controller
+// (internal/desktop/share). Settings writes settings.json and has the app apply what changed, and Updates calls the
+// app's updater (README WA84; without an updater, as in a second instance or the e2e harness, not_implemented); the
+// OpenH264 opt-in of Settings works over Deps.OpenH264 (unavailable without one).
 //
 // Events (Go → SPA, 03 §6.3) go out through Deps.Emit with the "isshoni:" prefix (events.go): 05's audio events,
-// the share controller's share.state, share.stats and share.notice, and the active server's auth.state.
+// the share controller's share.state, share.stats and share.notice, the active server's auth.state, the updater's
+// update.state, and settings.changed after Settings.Update.
 package bridge
 
 import (
@@ -40,6 +43,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/update"
 )
 
 // The methods' own bounds (03 §6.2, W11's fallback).
@@ -173,6 +177,12 @@ type Deps struct {
 	Shell    WindowShell    // Window.SetFullscreen
 	// PolicyOff reports 06's update policy (update.PolicyDisabled) for SettingsView.updates.policyOff; nil: false.
 	PolicyOff func() bool
+	// Updates is what Updates calls of the app's updater; nil means App's own (*app.App's UpdateStatus,
+	// CheckUpdate, InstallUpdate and SubscribeUpdates). Without one, Updates answers not_implemented.
+	Updates UpdateControl
+	// OpenH264 is the Cisco OpenH264 opt-in (Settings.OpenH264, 04 §9.9): main's, over the engine and the codecs
+	// folder; nil: the opt-in is unavailable (no engine that takes it: not Windows, dev and e2e builds).
+	OpenH264 OpenH264Codec
 	// Emit sends an event to the page (03 §6.3): the shell's Emit. nil drops events.
 	Emit func(name string, data any)
 	Log  *slog.Logger // nil means slog.Default(); the services add component=bridge
@@ -204,6 +214,10 @@ func New(d Deps) (*Services, error) {
 	if src, ok := d.App.(shareSource); ok && shares == nil {
 		shares = src.Shares()
 	}
+	updates := d.Updates
+	if u, ok := d.App.(UpdateControl); ok && updates == nil {
+		updates = u
+	}
 	if shares == nil {
 		shares = noShares{}
 	}
@@ -223,13 +237,14 @@ func New(d Deps) (*Services, error) {
 		}
 	}
 	s := &Services{
-		App:      &App{core: d.App, log: log},
-		Auth:     &Auth{core: d.App, servers: d.Servers, probe: probe, log: log},
-		Share:    &Share{core: d.App, ctl: shares, log: log},
-		Audio:    &Audio{core: d.App, policy: d.Audio, log: log},
-		Settings: &Settings{store: d.Settings, policyOff: d.PolicyOff, log: log},
-		Window:   &Window{shell: d.Shell},
-		Updates:  &Updates{},
+		App:   &App{core: d.App, log: log},
+		Auth:  &Auth{core: d.App, servers: d.Servers, probe: probe, log: log},
+		Share: &Share{core: d.App, ctl: shares, log: log},
+		Audio: &Audio{core: d.App, policy: d.Audio, log: log},
+		Settings: &Settings{store: d.Settings, policyOff: d.PolicyOff, core: d.App, servers: d.Servers,
+			h264: d.OpenH264, emit: emit, log: log},
+		Window:  &Window{shell: d.Shell},
+		Updates: &Updates{ctl: updates, log: log},
 	}
 	if d.Audio != nil {
 		s.closers = append(s.closers, d.Audio.Subscribe(func(ev audio.Event) {
@@ -238,6 +253,11 @@ func New(d Deps) (*Services, error) {
 	}
 	s.closers = append(s.closers, s.Share.ctl.Subscribe(func(ev share.Event) { s.Share.forward(ev, emit) }))
 	s.closers = append(s.closers, s.Auth.forward(emit))
+	if updates != nil {
+		s.closers = append(s.closers, updates.SubscribeUpdates(func(st update.Status) {
+			emit(EventUpdateState, statusView(st))
+		}))
+	}
 	return s, nil
 }
 

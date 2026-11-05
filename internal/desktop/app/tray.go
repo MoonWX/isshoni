@@ -34,7 +34,7 @@ type trayModel struct {
 }
 
 // SetUpdateReady shows "Restart and update to <version>" in the Idle menu; "" takes it away (06's update.state
-// ready; README WA84 calls it).
+// ready: updates.go follows the updater and calls it).
 func (a *App) SetUpdateReady(version string) {
 	a.tray.mu.Lock()
 	a.tray.updateReady = version
@@ -121,8 +121,9 @@ func (a *App) scheduleTray() {
 }
 
 // flushTray renders the tray and gives the view to the shell when it changed; the pill gets its state with it
-// (safety.go).
+// (safety.go), and the share's view its lock prompt (syncLockPrompt).
 func (a *App) flushTray() {
+	a.syncLockPrompt()
 	a.flushPill()
 	ts, ok := a.d.Shell.(TrayShell)
 	if !ok {
@@ -144,7 +145,7 @@ func (a *App) TrayClicked() { a.ShowWindow() }
 
 // TrayAction carries out a tray menu item (03 §11.1, §11.6). Pause and Resume go through the share controller as
 // every control does (03 §11.3); Stop ends the share with the end reason tray; "Stop sharing and quit" and Quit quit
-// with the share stopped first. "Restart and update" opens the window until README WA84 wires Updates.Install, and
+// with the share stopped first. "Restart and update" is InstallUpdate (updates.go; the window when it can't), and
 // "N questions waiting" opens it on the mic prompt card. An unknown action does nothing.
 func (a *App) TrayAction(act tray.Action) {
 	switch act {
@@ -165,9 +166,24 @@ func (a *App) TrayAction(act tray.Action) {
 	case tray.ActionStopAndQuit, tray.ActionQuit:
 		a.quit(true, share.CauseTray, true)
 	case tray.ActionRestart:
-		a.log.Info("app: Restart and update isn't wired yet; opening the window")
-		a.ShowWindow()
+		a.restartForUpdate("tray")
 	default:
 		a.log.Debug("app: unknown tray action", "action", string(act))
 	}
+}
+
+// syncLockPrompt gives the share controller the lock pause's "Resume sharing?" (03 §11.6), so the share's view
+// (ShareView.lockPrompt) shows the panel's bar "Sharing is still paused since you locked your PC. [Resume sharing]
+// [Stop]" while the tray and the pill ask too. Every change of the prompt schedules the tray, so it runs from
+// flushTray, never under a.mu or from the controller's subscriber; the controller sends a share.state only when the
+// value changed. Flushes may overlap (the debounce timer's and Run's), so lockSync makes each read-and-set one step:
+// an older read can't overwrite a newer one. The controller also drops the flag itself once the share is live,
+// ended or failed, the same states that end the lock pause here.
+func (a *App) syncLockPrompt() {
+	a.lockSync.Lock()
+	defer a.lockSync.Unlock()
+	a.mu.Lock()
+	prompt := a.sys.prompt
+	a.mu.Unlock()
+	a.shares.SetLockPrompt(prompt)
 }

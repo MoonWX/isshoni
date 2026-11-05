@@ -182,6 +182,11 @@ export interface ShareView {
   border: boolean;
   pill: boolean;
   minimized: boolean;
+  /**
+   * A share a screen lock paused waits for "Resume sharing?" (an unlock after docs/m2/03 §11.6's 5 min): the panel's
+   * lock-prompt bar. Only ever true while state is paused.
+   */
+  lockPrompt: boolean;
   watching: number;
   /** RFC 3339, null until live. */
   liveSince: string | null;
@@ -352,6 +357,14 @@ export interface HotkeyStatus {
   typesChar?: boolean;
 }
 
+/** The Cisco OpenH264 opt-in (docs/m2/03 §14.4, 04 §9.9): Settings.OpenH264() and what Enable/Disable answer. */
+export interface OpenH264Status {
+  /** unavailable: 04 doesn't offer it here (not Windows, a build without the engine); on: installed and verified. */
+  state: 'unavailable' | 'off' | 'on';
+  /** The pinned release (native.OpenH264.Version), e.g. "2.7.0"; "" when unavailable. */
+  version: string;
+}
+
 // ---- Updates (06 §8.9) ----
 
 export type UpdateState = 'disabled' | 'off' | 'idle' | 'checking' | 'up_to_date' | 'downloading' | 'ready' | 'error';
@@ -476,6 +489,12 @@ export interface NativeBridge {
     update(p: SettingsPatch): Promise<SettingsView>;
     hotkeys(): Promise<HotkeyStatus[]>;
     testHotkey(combo: string): Promise<HotkeyStatus>;
+    /** The OpenH264 opt-in's state. */
+    openH264(): Promise<OpenH264Status>;
+    /** Downloads Cisco's binary, verifies it and turns it on; rejects with 04 §9.9's bridge error. */
+    enableOpenH264(): Promise<OpenH264Status>;
+    /** Turns it off and deletes the file; busy while a share is live. */
+    disableOpenH264(): Promise<OpenH264Status>;
   };
   window: { setFullscreen(on: boolean): Promise<void> };
   updates: { status(): Promise<UpdateStatus>; check(): Promise<UpdateStatus>; install(): Promise<void> };

@@ -26,8 +26,6 @@ import (
 // flip-model swap chain driven through D3D11 and DXGI's COM vtables; no cgo).
 
 const (
-	avsyncFlashW      = 1280
-	avsyncFlashH      = 720
 	avsyncFlashLen    = 100 * time.Millisecond
 	avsyncHelperReady = 20 * time.Second
 	avsyncHelperStop  = 5 * time.Second
@@ -421,9 +419,6 @@ func (w *flashWindow) close() {
 	}
 }
 
-// winRect is RECT.
-type winRect struct{ Left, Top, Right, Bottom int32 }
-
 // monitorInfoEx is MONITORINFOEXW.
 type monitorInfoEx struct {
 	Size    uint32
@@ -487,8 +482,7 @@ func openFlashWindow(device string) (*flashWindow, error) {
 		return nil, fmt.Errorf("RegisterClassExW: %w", e)
 	}
 	w.class = class
-	x := mon.Left + max(0, (mon.Right-mon.Left-avsyncFlashW)/2)
-	y := mon.Top + max(0, (mon.Bottom-mon.Top-avsyncFlashH)/2)
+	x, y := flashWindowPos(mon)
 	// x and y are negative on a monitor left of or above the primary: sign-extended, the int arguments read them back.
 	hwnd, _, e := procCreateWindowExW.Call(wsExTopmost, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)),
 		wsPopup|wsVisible, uintptr(x), uintptr(y), //nolint:gosec // G115: an int argument, sign-extended on purpose

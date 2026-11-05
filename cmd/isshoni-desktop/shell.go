@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -50,13 +51,17 @@ type shellApp interface {
 	Shutdown()
 }
 
-// wailsShell is internal/desktop/app's Shell over Wails (03 §4.4, §11.1, §15): one application with its main
+// wailsShell is internal/desktop/app's Shell over Wails (03 §4.4, §11.1, §15, §16.1): one application with its main
 // window, the tray icon for the app's whole life, the close hook (W7) and toasts (W8). The app it reports to is
 // bound once it exists (bind); until then a close closes and the tray does nothing.
 type wailsShell struct {
-	app  *application.App
-	main *application.WebviewWindow
-	tray *application.SystemTray
+	app      *application.App
+	mainOpts application.WebviewWindowOptions
+	// main is the main window, nil until it exists: newShell creates it at once, newDeferredShell (an --autostart
+	// start, 03 §16.1) at the first ShowWindow. mainMu orders its creation.
+	main   atomic.Pointer[application.WebviewWindow]
+	mainMu sync.Mutex
+	tray   *application.SystemTray
 	// openURL opens a URL that passed validation in the system browser; nil means Wails' Browser.OpenURL.
 	openURL func(string) error
 	notes   notifier
@@ -68,24 +73,18 @@ type wailsShell struct {
 
 // newShell creates the main window, the tray icon and the toasts on app; Wails shows them when Run starts.
 func newShell(a *application.App, main application.WebviewWindowOptions, log *slog.Logger) *wailsShell {
-	s := &wailsShell{app: a, main: a.Window.NewWithOptions(main), tray: a.SystemTray.New(), notes: newNotifier(log)}
-	// W7: closing the window is the app's choice (hide to the tray or quit, 03 §11.6), off the UI thread.
-	s.main.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
-		t := s.app0()
-		if t == nil || s.quitting.Load() {
-			return
-		}
-		e.Cancel()
-		go t.WindowClosing()
-	})
-	// W10: the native handle exists; WDA_EXCLUDEFROMCAPTURE goes on it (03 §11.5). Both are idempotent.
-	for _, ev := range []events.WindowEventType{events.Common.WindowRuntimeReady, events.Common.WindowShow} {
-		s.main.OnWindowEvent(ev, func(*application.WindowEvent) {
-			if t := s.app0(); t != nil {
-				go t.WindowCreated()
-			}
-		})
-	}
+	s := newDeferredShell(a, main, log)
+	w := a.Window.NewWithOptions(main) // Wails runs it with the application
+	s.hookMain(w)
+	s.main.Store(w)
+	return s
+}
+
+// newDeferredShell is newShell without the main window: an --autostart start opens none until the user asks for it
+// (03 §16.1: the tray, a deep link, a toast's Open or a second launch), so no SPA runs and the user is never shown in
+// a room because the PC started. ShowWindow creates it.
+func newDeferredShell(a *application.App, main application.WebviewWindowOptions, log *slog.Logger) *wailsShell {
+	s := &wailsShell{app: a, mainOpts: main, tray: a.SystemTray.New(), notes: newNotifier(log)}
 	// W18: the tray. A left click opens the window; a right click opens the menu the app keeps up to date.
 	s.tray.SetIcon(trayIcon(tray.IconIdle))
 	s.tray.SetTooltip("isshoni")
@@ -105,6 +104,53 @@ func newShell(a *application.App, main application.WebviewWindowOptions, log *sl
 		s.notes.stop()
 	})
 	return s
+}
+
+// hookMain registers the main window's hooks: W7's close (hide to the tray or quit is the app's choice, 03 §11.6,
+// off the UI thread), W10's native handle (WDA_EXCLUDEFROMCAPTURE goes on it, 03 §11.5; both events, idempotent) and
+// W5's navigation guard once guardNavigation gave one.
+func (s *wailsShell) hookMain(w *application.WebviewWindow) {
+	w.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		t := s.app0()
+		if t == nil || s.quitting.Load() {
+			return
+		}
+		e.Cancel()
+		go t.WindowClosing()
+	})
+	for _, ev := range []events.WindowEventType{events.Common.WindowRuntimeReady, events.Common.WindowShow} {
+		w.OnWindowEvent(ev, func(*application.WindowEvent) {
+			if t := s.app0(); t != nil {
+				go t.WindowCreated()
+			}
+		})
+	}
+	if nav := s.nav; nav != nil {
+		w.OnWindowEvent(events.Windows.WebViewNavigationCompleted, func(*application.WindowEvent) { nav.navigated() })
+		w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { nav.runtimeReady() })
+	}
+}
+
+// window is the main window, nil before it exists.
+func (s *wailsShell) window() *application.WebviewWindow { return s.main.Load() }
+
+// ensureWindow returns the main window, creating it first when the start deferred it (--autostart): the window's
+// hooks go on before Wails runs it, so none of its first events is missed.
+func (s *wailsShell) ensureWindow() *application.WebviewWindow {
+	if w := s.window(); w != nil {
+		return w
+	}
+	s.mainMu.Lock()
+	defer s.mainMu.Unlock()
+	if w := s.window(); w != nil {
+		return w
+	}
+	w := application.NewWindow(s.mainOpts)
+	s.hookMain(w)
+	s.main.Store(w)
+	s.app.Window.Add(w)
+	w.Run()
+	return w
 }
 
 // bind gives the shell the app it reports to, and the toasts' actions their way back.
@@ -128,42 +174,59 @@ func (s *wailsShell) started() error { return s.notes.start() }
 // Run runs Wails until the app quits.
 func (s *wailsShell) Run() error { return s.app.Run() }
 
+// ShowWindow shows the main window, creating it first after an --autostart start.
 func (s *wailsShell) ShowWindow(focus bool) {
-	s.main.Show()
+	w := s.ensureWindow()
+	w.Show()
 	if focus {
-		s.main.Focus()
+		w.Focus()
 	}
 }
 
-func (s *wailsShell) HideWindow() { s.main.Hide() }
+func (s *wailsShell) HideWindow() {
+	if w := s.window(); w != nil {
+		w.Hide()
+	}
+}
 
-func (s *wailsShell) WindowVisible() bool { return s.main.IsVisible() }
+func (s *wailsShell) WindowVisible() bool {
+	w := s.window()
+	return w != nil && w.IsVisible()
+}
 
 // WindowFocused reports the main window in the foreground: shown, not minimised and focused. A minimised window, or
 // one behind a full-screen game, is visible to Windows but not in front, so a mic prompt then becomes a toast (03 §15).
 func (s *wailsShell) WindowFocused() bool {
-	return s.main.IsVisible() && !s.main.IsMinimised() && s.main.IsFocused()
+	w := s.window()
+	return w != nil && w.IsVisible() && !w.IsMinimised() && w.IsFocused()
 }
 
 // The app asks the shell whether its window is in front (app's focusReporter).
 var _ interface{ WindowFocused() bool } = (*wailsShell)(nil)
 
 func (s *wailsShell) SetFullscreen(on bool) {
-	if on {
-		s.main.Fullscreen()
-	} else {
-		s.main.UnFullscreen()
+	w := s.window()
+	switch {
+	case w == nil:
+	case on:
+		w.Fullscreen()
+	default:
+		w.UnFullscreen()
 	}
 }
 
 // Reload reloads the SPA at its current address. When the window was last seen off the asset origin (navguard.go),
-// it loads the start page instead: Wails' Reload is location.reload() of whatever page is showing (beta.34).
+// it loads the start page instead: Wails' Reload is location.reload() of whatever page is showing (beta.34). Without
+// a window (an --autostart start) there is no page to reload: the window loads the start page when it opens.
 func (s *wailsShell) Reload() {
-	if s.nav != nil && !s.nav.atHome() {
+	w := s.window()
+	switch {
+	case w == nil:
+	case s.nav != nil && !s.nav.atHome():
 		s.ReturnHome()
-		return
+	default:
+		w.Reload()
 	}
-	s.main.Reload()
 }
 
 // The app's watchdog loads the start page through the shell (app's homeShell).
@@ -171,17 +234,29 @@ var _ interface{ ReturnHome() } = (*wailsShell)(nil)
 
 // ReturnHome loads the start page: a navigation the browser starts, which works from any page, a foreign or hung one
 // included (W5's and W17's fallbacks, 03 §3.2).
-func (s *wailsShell) ReturnHome() { s.main.SetURL("/") }
+func (s *wailsShell) ReturnHome() {
+	if w := s.window(); w != nil {
+		w.SetURL("/")
+	}
+}
 
 // guardNavigation lets nav watch the main window (W5's fallback, 03 §3.2, §5.5): it asks the page where it is after
 // every completed navigation (WebView2 only; WKWebView has no such event in Wails, and the macOS build is a dev
 // build) and sends the window home from anywhere but the asset origin. Call it before Run, with nav's answers wired
 // through navMessages.
 func (s *wailsShell) guardNavigation(nav *navGuard) {
+	s.mainMu.Lock()
+	defer s.mainMu.Unlock()
 	s.nav = nav
-	nav.attach(s.main.ExecJS, func() { go s.ReturnHome() })
-	s.main.OnWindowEvent(events.Windows.WebViewNavigationCompleted, func(*application.WindowEvent) { nav.navigated() })
-	s.main.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { nav.runtimeReady() })
+	nav.attach(func(js string) {
+		if w := s.window(); w != nil {
+			w.ExecJS(js)
+		}
+	}, func() { go s.ReturnHome() })
+	if w := s.window(); w != nil {
+		w.OnWindowEvent(events.Windows.WebViewNavigationCompleted, func(*application.WindowEvent) { nav.navigated() })
+		w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { nav.runtimeReady() })
+	}
 }
 
 // navMessages is Options.RawMessageHandler: the main window's answers to the guard's question, with the browser's
@@ -204,7 +279,13 @@ func navMessages(nav *navGuard) func(application.Window, string, *application.Or
 }
 
 // MainWindowHandle is the main window's HWND on Windows (NSWindow* on macOS), 0 before it exists (W10).
-func (s *wailsShell) MainWindowHandle() uintptr { return uintptr(s.main.NativeWindow()) }
+func (s *wailsShell) MainWindowHandle() uintptr {
+	w := s.window()
+	if w == nil {
+		return 0
+	}
+	return uintptr(w.NativeWindow())
+}
 
 func (s *wailsShell) Emit(name string, data any) { s.app.Event.Emit(name, data) }
 

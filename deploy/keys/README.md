@@ -7,7 +7,7 @@ it installs anything (06 §4.3).
 | File | What it is |
 |---|---|
 | `allowed_signers` | one line per key, in `ssh-keygen`'s allowed-signers format (below). It does not exist until the owner adds the keys: until then `task lint:keys` skips, and release.yml refuses to build a release |
-| `update_signers` | the desktop app's update keys (`docs/m2/06-windows-release.md` §8.3), in the same format with the principal and namespace `isshoni-update`: one `isshoni-update-<n>` line or more and exactly one `isshoni-update-backup-<n>`. `task release:update-keys` writes it into `internal/update/signers.go`, and `task lint:keys` fails when the two differ. It does not exist until the owner creates the update keys (`docs/m2/README.md` §8) |
+| `update_signers` | the desktop app's update keys (`docs/m2/06-windows-release.md` §8.3), in the same format with the principal and namespace `isshoni-update`: one `isshoni-update-<n>` line or more and exactly one `isshoni-update-backup-<n>`. `task release:update-keys` writes it into `internal/update/signers.go`, and `task lint:keys` fails when the two differ. It does not exist until the owner creates the update keys ([below](#the-desktop-apps-update-keys-owner-before-the-release-dry-run-with-the-app)). The project site serves it as `/keys/update_signers` |
 | `update_revoked` | update key fingerprints that the next desktop release revokes, empty normally (`docs/m2/06-windows-release.md` §8.1, §8.12) |
 | `README.md` | this page |
 
@@ -92,7 +92,62 @@ release.yml (its dry run too) refuse to build without it.
    repository (06 §8.6 step 8). Then try `install.sh` from that release on a VPS:
    `curl -fsSL https://github.com/MoonWX/isshoni/releases/download/v0.1.0-rc.1/install.sh | sh`.
 
-## Rotation, or a leaked key (06 §9.4)
+## The desktop app's update keys (owner, before the release dry run with the app)
+
+The Windows app installs an update only when the release's `isshoni-desktop-update.json` carries a valid signature by
+one of the keys it embeds (`docs/m2/06-windows-release.md` §8.1, §8.3, §11.5, "M2 06" below). They are keys of their
+own: never one of `allowed_signers`' keys (`task lint:keys` refuses that). Done once, like the release keys:
+
+1. **Generate the two keys** on the Mac, outside the repository:
+   ```sh
+   ssh-keygen -t ed25519 -N '' -C isshoni-update-1 -f isshoni-update-1
+   ssh-keygen -t ed25519 -C isshoni-update-backup-1 -f isshoni-update-backup-1   # asks for a passphrase
+   ```
+   `isshoni-update-1` signs every release's manifest and has no passphrase (the `sign` job uses it).
+   `isshoni-update-backup-1` signs only the release that replaces a leaked update key (below); it has a passphrase
+   and lives offline only, in the password manager plus a printed copy.
+2. **Add the public halves by pull request**:
+   ```sh
+   for k in isshoni-update-1 isshoni-update-backup-1; do
+     printf 'isshoni-update namespaces="isshoni-update" %s\n' "$(cat "/path/to/$k.pub")"
+   done > deploy/keys/update_signers
+   task release:update-keys   # writes internal/update/signers.go, prints the fingerprints, runs lint:keys
+   # replace the two update keys' "not created yet" cells of README.md's "Release signing keys" table with the
+   # printed fingerprints, then check again
+   task lint:keys
+   git add deploy/keys/update_signers internal/update/signers.go README.md
+   git commit -m "Update signing keys"
+   ```
+   As with the release keys, the first `task release:update-keys` ends with lint:keys' error that README.md does not
+   list them yet. Once merged and released, the project site serves the same file as `/keys/update_signers` and shows
+   the fingerprints on `/security#keys` (site.yml writes them into `release.json`).
+3. **Put the private key into the environment `release`**: environment secret `RELEASE_UPDATE_SIGNING_KEY`, the whole
+   content of the **private** file `isshoni-update-1`. Then delete the local private files, after putting
+   `isshoni-update-backup-1` into the password manager and printing it.
+
+`update_revoked` stays empty except for the release after a leak of the active update key (below).
+
+**Rotation** (M2 06 §8.12): generate `isshoni-update-2`, add its line to `update_signers` (keep `-1`), run
+`task release:update-keys`, add its fingerprint to README.md and release. After one release cycle, replace
+`RELEASE_UPDATE_SIGNING_KEY` with `-2` and drop `-1`'s line (and its README row) in the next release. A rotation never
+uses `update_revoked`.
+
+**A leaked active update key** (M2 06 §8.12):
+1. For one release, sign with the backup key: make a passphrase-free copy (`ssh-keygen -p` on a temporary copy of
+   `isshoni-update-backup-1`), put it into `RELEASE_UPDATE_SIGNING_KEY` in place of the leaked key, and delete the
+   copy.
+2. In the same release, list the leaked key's fingerprint in `update_revoked`, remove its line from `update_signers`
+   and add a new active key's (`task release:update-keys`, README.md's rows). The `sign` job refuses a non-empty
+   `update_revoked` with any key but the backup, and `check-draft.sh` checks the same before `publish`.
+3. Publish the release with a security advisory, then put the new active key into `RELEASE_UPDATE_SIGNING_KEY`, empty
+   `update_revoked` again, and in the following release replace the backup (`isshoni-update-backup-2`), since the old
+   one has been in CI.
+
+Apps that check for updates stop trusting the leaked key for good; an app that never checks again can't be told
+(`/security#verify-desktop` says so). **A leaked or lost backup key** can't be revoked by a manifest: a normal release
+embeds a new backup line instead of the old one, and apps that update stop trusting the old backup.
+
+## Rotation of the release keys, or a leaked one (06 §9.4)
 
 1. Add the new key's line to `allowed_signers`, and delete the old key's line: at once after a leak, otherwise in a
    later change. Do not mark it `valid-before=` instead: Windows 10's OpenSSH 8.1 can't parse that option, so
