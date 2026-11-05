@@ -6,7 +6,8 @@
 //   B8G8R8A8UIntNormalized, 2, item.Size()) → pool.CreateCaptureSession(item), then on the session, each where
 //   ApiInformation says the property exists:
 //   - IsCursorCaptureEnabled(!hide_cursor) (§7.8: the pointer is drawn unless IM_START_HIDE_CURSOR);
-//   - IsBorderRequired(false) when BorderlessAllowed() and not keep_border (IM_START_KEEP_BORDER), read back:
+//   - IsBorderRequired(false) when BorderlessAllowed(0) (the answer the pick kept; none keeps the border) and not
+//     keep_border (IM_START_KEEP_BORDER), read back:
 //     borderless() is true only when the session then reports IsBorderRequired() == false (§7.1), and the session
 //     sets IM_SESS_NO_OS_INDICATOR for it;
 //   - MinUpdateInterval(10'000'000 / (2 × fps) × 100 ns), half layer 0's frame interval (24H2+, §7.3), re-set by

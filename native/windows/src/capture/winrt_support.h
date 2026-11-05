@@ -80,7 +80,7 @@ private:
   std::shared_ptr<winrt::handle> event_;
 };
 
-inline constexpr uint32_t kBorderlessWaitMs = 2000; // the picker and WGC's start (im_start ≤ 3 s)
+inline constexpr uint32_t kBorderlessWaitMs = 2000; // the picker (WGC's start uses 0: the kept answer only)
 
 // Whether borderless capture is allowed (04 §7.1): GraphicsCaptureSession has IsBorderRequired and
 // GraphicsCaptureAccess::RequestAccessAsync(Borderless) returns Allowed. Asked once per process (an Allowed or a final

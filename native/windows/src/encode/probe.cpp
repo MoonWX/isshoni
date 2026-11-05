@@ -52,7 +52,7 @@ constexpr uint32_t kMinSupportedBuild = 19045; // Windows 10 22H2
 constexpr uint32_t kBuild2004 = 19041;         // WDA_EXCLUDEFROMCAPTURE
 // A full probe's wait for GraphicsCaptureAccess's borderless answer (capture::OsFlags): it comes at once for a desktop
 // app, and the encoders' budget runs from the probe's start, so a slow answer takes at most this much of it. A probe
-// that gets none reports IM_OS_WGC_BORDERLESS clear; the pick and WGC's start ask again (2 s) and keep the answer for
+// that gets none reports IM_OS_WGC_BORDERLESS clear; the pick asks again (2 s) and keeps the answer for WGC's start and
 // later probes.
 constexpr uint32_t kProbeBorderlessWaitMs = 250;
 

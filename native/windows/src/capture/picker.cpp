@@ -319,6 +319,12 @@ im_status Picker::Pick(HWND parent, uint32_t timeout_ms, PickResult *out) {
       std::future<std::string> answer = ready.get_future();
       fresh->th = std::thread([fresh, r = std::move(ready)]() mutable { fresh->Run(std::move(r)); });
       if (answer.wait_for(std::chrono::milliseconds(kThreadReadyMs)) != std::future_status::ready) {
+        // A late start must not stay in its loop for ever (nothing else reaches it): quit is seen at its first wait.
+        {
+          std::lock_guard<std::mutex> tlock(fresh->mu);
+          fresh->quit = true;
+        }
+        ::SetEvent(fresh->wake.get());
         fresh->th.detach(); // it holds its own reference
         return abi::Fail(IM_ERR_INTERNAL, {}, "im_pick_source: the picker thread did not start");
       }

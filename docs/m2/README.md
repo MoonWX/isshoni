@@ -647,7 +647,7 @@ the named sections)
     `StartSourceCapture`, `SetCaptureFactoryForTest`; `CaptureSink` and `CaptureOptions` moved there);
     `BorderlessAllowed(wait_ms)` and `OsFlags(borderless_wait_ms)` take a wait, 250 ms in a full probe (the encoders'
     1500 ms budget counts from the probe's start and a quick probe must stay fast), 0 in a quick probe after a stored
-    one, 2 s in the picker and at WGC's start; `VideoFrames::PublishTime` for a capture without slots; the supervisor
+    one, 2 s in the picker, 0 at WGC's start (the pick's kept answer); `VideoFrames::PublishTime` for a capture without slots; the supervisor
     stops the capture as soon as the session ends, and draws no test pattern while a capture runs (04 §7.3, §9.10;
     the WF12 row).
 68. **MF software on the CI runner gives its first AU only on drain, so the probe refuses it there** (PR #52's CI
