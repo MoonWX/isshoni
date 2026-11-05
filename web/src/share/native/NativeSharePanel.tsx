@@ -279,11 +279,13 @@ export function NativeSharePanel({
           className={cx(styles.dot, phase === 'live' && !paused && styles.dotLive, paused && styles.dotPaused)}
           aria-hidden="true"
         />
+        {/* Always a live region, so a change of its line (the lock prompt's too) is announced: one that appears
+            with its text often isn't (NVDA and JAWS on WebView2). */}
         <p
           className={styles.status}
           data-share-status={viewState ?? phase}
           data-lock-prompt={lockPrompt ? '' : undefined}
-          role={lockPrompt ? 'status' : undefined}
+          role="status"
         >
           {status}
         </p>

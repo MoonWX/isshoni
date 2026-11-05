@@ -124,9 +124,10 @@ describe('the lock-prompt bar (docs/m2/03 §11.6; README WF17)', () => {
   it('asks while ShareView.lockPrompt is set: Resume sharing resumes through Share.SetPaused', async () => {
     const user = userEvent.setup();
     const setup = await renderPanel(shareView({ state: 'paused', lockPrompt: true }));
-    const status = within(region()).getByRole('status');
-    expect(status).toHaveTextContent(PROMPT);
+    // The panel's status line, a live region whatever it says, so the prompt's text is announced when it comes.
+    const status = within(region()).getByText(PROMPT);
     expect(status).toHaveAttribute('data-lock-prompt');
+    expect(status).toHaveAttribute('role', 'status');
     const resume = within(region()).getByRole('button', { name: 'Resume sharing' });
     await waitFor(() => {
       expect(resume).toHaveAttribute('title', 'Resume sharing (Ctrl+Alt+Shift+F9)');
@@ -157,11 +158,15 @@ describe('the lock-prompt bar (docs/m2/03 §11.6; README WF17)', () => {
   it('comes with the share.state that sets it, and a pause without it is the plain paused bar', async () => {
     const setup = await renderPanel(shareView({ state: 'paused' }));
     expect(within(region()).queryByText(PROMPT)).not.toBeInTheDocument();
+    // The live region is there before the prompt: only its text changes.
+    const status = within(region()).getByRole('status');
+    expect(status).not.toHaveAttribute('data-lock-prompt');
     expect(within(region()).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
     act(() => {
       setup.fake.emit('share.state', shareView({ state: 'paused', lockPrompt: true }));
     });
-    expect(await within(region()).findByText(PROMPT)).toBeInTheDocument();
+    expect(await within(region()).findByText(PROMPT)).toBe(status);
+    expect(status).toHaveAttribute('data-lock-prompt');
     expect(within(region()).getByRole('button', { name: 'Resume sharing' })).toBeInTheDocument();
   });
 

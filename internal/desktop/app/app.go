@@ -100,12 +100,14 @@ type App struct {
 	after func(d time.Duration, f func()) stopper
 	// trayEvery is the tray's debounce (03 §11.1: 250 ms), guarded by tray.mu.
 	trayEvery time.Duration
-	tray      trayModel   // tray.go
-	toasts    toastBook   // toasts.go
-	sys       systemState // system.go, guarded by mu
-	beat      watchdog    // system.go, guarded by mu
-	awakeMu   sync.Mutex  // orders KeepAwake calls; guards awake
-	awake     bool
+	tray      trayModel // tray.go
+	// lockSync serializes syncLockPrompt's read of sys.prompt and its SetLockPrompt (tray.go).
+	lockSync sync.Mutex
+	toasts   toastBook   // toasts.go
+	sys      systemState // system.go, guarded by mu
+	beat     watchdog    // system.go, guarded by mu
+	awakeMu  sync.Mutex  // orders KeepAwake calls; guards awake
+	awake    bool
 
 	probeDone chan struct{}
 	probe     media.Probe

@@ -1139,6 +1139,35 @@ func TestLockPromptInShareView(t *testing.T) {
 	if s.app.shares.Current().LockPrompt {
 		t.Fatal("a pause the user chose shows the lock prompt")
 	}
+
+	// Within the tray's debounce (README WF17-R1): resumed from the prompt and paused again before any tray flush
+	// syncs the prompt; the controller dropped it with the live view, so the user's pause shows no bar.
+	if err := s.app.shares.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StateLive)
+	time.Sleep(20 * time.Millisecond) // the last 1 ms debounce has flushed
+	s.app.tray.mu.Lock()
+	s.app.trayEvery = time.Hour
+	s.app.tray.mu.Unlock()
+	time.Sleep(3 * share.StateEvery)
+	s.app.handleSystemEvent(EventLock)
+	s.waitState(t, share.StatePaused)
+	s.clock.Advance(6 * time.Minute)
+	s.app.handleSystemEvent(EventUnlock)
+	s.app.syncLockPrompt() // the prompt is in the view (no tray flush in this window)
+	waitView(func(v *share.View) bool { return v.State == share.StatePaused && v.LockPrompt }, "the lock prompt again")
+	if err := s.app.shares.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StateLive)
+	if err := s.app.shares.SetPaused(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	s.waitState(t, share.StatePaused)
+	if s.app.shares.Current().LockPrompt {
+		t.Fatal("a pause right after the prompt's resume, before the tray flush, shows the lock prompt")
+	}
 }
 
 // TestLockStopFindsLiveShare: a 30 min timer that comes due for a share that is live again, before the app has its

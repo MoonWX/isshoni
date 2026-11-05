@@ -177,8 +177,12 @@ func (a *App) TrayAction(act tray.Action) {
 // (ShareView.lockPrompt) shows the panel's bar "Sharing is still paused since you locked your PC. [Resume sharing]
 // [Stop]" while the tray and the pill ask too. Every change of the prompt schedules the tray, so it runs from
 // flushTray, never under a.mu or from the controller's subscriber; the controller sends a share.state only when the
-// value changed.
+// value changed. Flushes may overlap (the debounce timer's and Run's), so lockSync makes each read-and-set one step:
+// an older read can't overwrite a newer one. The controller also drops the flag itself once the share is live,
+// ended or failed, the same states that end the lock pause here.
 func (a *App) syncLockPrompt() {
+	a.lockSync.Lock()
+	defer a.lockSync.Unlock()
 	a.mu.Lock()
 	prompt := a.sys.prompt
 	a.mu.Unlock()

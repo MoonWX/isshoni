@@ -291,6 +291,7 @@ func (c *Controller) Start(ctx context.Context, r StartRequest) (View, error) {
 		done: make(chan struct{})}
 	a.view = c.viewLocked(a, nil, "")
 	c.cur, c.last = a, nil
+	c.lockPrompt = false // a new share: the app's lock pause, and its question, belong to the one before
 	c.mu.Unlock()
 	c.stateChanged()
 
@@ -507,8 +508,19 @@ func (c *Controller) refresh(a *active) {
 		return
 	}
 	a.view = c.viewLocked(a, &snap, conn)
+	c.dropLockPromptLocked(a.view.State)
 	c.mu.Unlock()
 	c.stateChanged()
+}
+
+// dropLockPromptLocked forgets the lock prompt when the share's view is live, ended or failed: the app's lock pause
+// ends on those same states (its question is answered or moot; internal/desktop/app's onShareEvent), and the next
+// tray flush that would tell the controller so may come TrayDebounce later, so a pause in between would show a stale
+// bar. c.mu is held.
+func (c *Controller) dropLockPromptLocked(now State) {
+	if now == StateLive || now.final() {
+		c.lockPrompt = false
+	}
 }
 
 // ended runs the local steps of every share end once (03 §10.1), also of one the server or the core made: 05's
@@ -523,6 +535,7 @@ func (c *Controller) ended(a *active) {
 	}
 	c.mu.Lock()
 	a.view = c.viewLocked(a, &snap, conn) // ended: also stops a reconnecting timer
+	c.dropLockPromptLocked(a.view.State)
 	if c.cur == a {
 		c.cur = nil
 	}
