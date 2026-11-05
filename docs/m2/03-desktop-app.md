@@ -815,7 +815,9 @@ As built (WA48, `bridge/errors.go`): every service maps its Go errors through on
 `internal {reason: timeout}`, because a method's own bound (`Audio.SoundCheck`'s 10 s, a local file) is no server's
 fault; only `Auth`, whose deadlines bound calls to a server, makes it `server_unreachable`. A call the page cancelled
 (W11) is `internal {reason: cancelled}`, which nobody reads. 02's `ErrOffline`, `ErrNetwork` and `ErrBadResponse`
-are `server_unreachable`; an error no rule knows is `internal`, logged once at WARN with its cause (the packages below
+are `server_unreachable`, except that `Auth.Link`'s `ErrBadResponse` (a verification URI that failed 02 §11.2's check:
+the server answered, wrongly) is `internal {reason: bad_response}`, which the link step shows as its generic error
+(§8.2; WA71, README §3 item 80); an error no rule knows is `internal`, logged once at WARN with its cause (the packages below
 never put a token, password, name or path into an error's text). Params hold codes and numbers only, never English.
 The update codes' texts are `desktop.update.error.<code>` (README §3 item 42), written with the update screens (WA82).
 As built (WA58): the share controller's errors are checked first, since they may wrap a wire or media error:
@@ -1250,14 +1252,23 @@ in settings (per install) records that the sound and voice steps were seen once.
     forbids `desktop/` importing from `setup/`; the short URL `link.verificationUri` with the code ("or open {url}
     and enter {code}"); the countdown to `link.expiresAt`. Go opens `verificationUriComplete` in the default browser
     once per new code (the click on Link is the user gesture, 02 §11.3); [Open browser again] repeats it;
-    [Copy link] copies `verificationUriComplete`.
+    [Copy link] copies `verificationUriComplete`. **The app opens it, not 02's `Manager`** (as built, WA71; README §3
+    item 80): `App.OnAuthState` (`internal/desktop/app`, 02's `ServersOptions.OnState`) calls `openLinkPage` for a
+    state of the active server, which opens `link.verificationUriComplete` through `App.OpenExternal` on its own
+    goroutine (`OnAuthState` never blocks) when the status is `linking` with a user code other than the last one it
+    opened for that origin (`openedCodes` keeps one code per origin). The same code again in a row, another server's
+    code and a state without a code open nothing (`TestLinkPageOpened`); [Open browser again] goes through the page's
+    `platform.openExternal`.
   - `status: 'linked'` → "Linked as {user.username}", then the next step.
   - `notice: 'denied'` → "Linking was declined in the browser. [Try again]" (`Auth.Link()`).
   - `notice: 'code_expired'` (600 s, 03 §7.12) → "The code expired. [Get a new code]" (`Auth.Link()`).
   - `status: 'incompatible'` → the version texts of 02 §13.3 with [Try again] (`Auth.Recheck()`).
   - a `Link()` error (`server_unreachable`, `rate_limited`) → its text with [Try again]; 02's `ErrBadResponse` (a
     verification URI that failed 02 §11.2's check) → the generic link error "Couldn't start linking with this server"
-    with [Try again].
+    with [Try again]. As built (WA71's review, README §3 item 80): `Auth.Link` maps that `ErrBadResponse` to `internal`
+    with `params.reason` `bad_response` (§6.4), not `server_unreachable`, since the server answered; the link step
+    shows its own text only for `server_unreachable`, `rate_limited` and `incompatible_server`, and
+    `desktop.setup.link.failed` ("Couldn't start linking with this server") for every other `Link()` error.
   - **"Sign in with username and password instead"** (02 §14: the plan's in-app fallback; the device flow stays the
     default): a link below the code opens a form with username and password fields and [Sign in] [Back]. [Sign in]
     calls `Auth.LinkWithPassword(username, password)` (§6.2), which cancels a running device-flow link first;
@@ -1813,7 +1824,10 @@ Wails application per process, and the real id would point the installed app's `
 harness's default bounds; group 12's integration passes `-lock-resume`/`-lock-stop` into `app.Deps`, and the
 long-lock cases need `web/e2e/fixtures.ts`'s `lockResumeMs`/`lockStopMs` (WF13) and WA80's bar. Left to WF13 (group
 13): the SPA's `App.Heartbeat` (W17's watchdog never arms without it), those fixtures, e2ehost's
-`end-session-confirmed` event and removing toasts that no longer apply from Action Center (§15).
+`end-session-confirmed` event and removing toasts that no longer apply from Action Center (§15). WF13 built the heartbeat (with
+§20's hidden-page gap), the fixtures (`desktop-system.spec` uses 2 s and 6 s, unlocking after 3 s, and asserts the
+tray unconditionally) and `end-session-confirmed`; of Action Center it built `winos`' removal, which the app starts
+calling with WF14 in group 14 (§15; README §3 item 84).
 
 Quit always stops a share first (`core.Share.Stop`: `share.stop`, engine stop, `room.leave`; then
 `audio.OnShareStopped()`), closes C2 (`core.Client.Close`, 1000) and C1 (1000), calls `audio.Service.Close()`,
@@ -2216,6 +2230,19 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   (`isshoni://…`) rather than COM activation, a web page can't forge them without the nonce.
 - Without buttons (W8's fallback) a click opens the window on the mic prompt card or the panel.
 - Toast texts come from the catalog (§18.1).
+- **Removing a toast that no longer applies** (as built, WF13; README §3 item 84): `winos.Hooks.RemoveToasts(ids...)`
+  (`internal/desktop/winos/toasts.go`; a no-op off Windows) removes the app's delivered toasts whose notification id is
+  listed and reports how many went; a toast that isn't there is no error. Windows removes a single toast only by its
+  tag, and Wails beta.34 shows toasts without one, so for an untagged match it lists Action Center again just before
+  it clears, clears all of the app's toasts and delivers the others again (silently, each with its own tag), counting
+  the untagged ones only after the clear succeeded. That is a workaround, not a per-toast removal: a toast that Wails
+  shows during it would be lost, so **callers must serialize `RemoveToasts` with `Shell.Notify`** (one ordered toast
+  path) **and never call it with `App.mu` held** (several WinRT round trips). The Windows test (`windows-go`) runs
+  under a random AppUserModelID registered in HKCU and deleted afterwards, never `io.isshoni.desktop`. As WF13 merged
+  the app doesn't call it yet: WF14 (group 14) wires it where a toast's question is answered another way
+  (`toastBook.dropKind`, the lock pause's `clearLockLocked`, the pending toast keeping its notification id, through an
+  optional remover interface the tests fake), and `desktop-system.spec`'s note-only branch then expects the removed
+  toast's id. Until then the toast book's settled nonce makes a stale toast's button a no-op.
 - *Later (M5)*: "Alex started sharing in Lounge" toasts in the desktop app.
 
 ---
@@ -2418,7 +2445,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | `--self-check` probe | 20 s |
 | Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s |
 | End of session | share stopped within 2 s |
-| WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni" |
+| WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni". As built (WF13, `app.HeartbeatEvery`/`HeartbeatTimeout`; README §3 item 84): the page beats at once at boot, every 5 s, and again at once when it becomes visible; Go's watchdog arms with the first beat, checks every 5 s, watches only a visible window (one just shown gets a fresh 15 s) and waits another 15 s after a reload. The cap of 3 reloads per 5 min and the error page are not built yet. **Known gap while hidden**: Go asks `Shell.WindowVisible()` (Wails' `IsVisible`, which reads the window's `WS_VISIBLE` style bit (beta.34's `webview_window_windows.go`)), which stays true for a minimized window and one fully covered by a full-screen game, the main case while sharing, while WebView2 marks such a page hidden and, after 5 min hidden, Chromium's intensive throttling runs chained timers about once a minute. The page then beats less often than every 15 s, and the watchdog may reload it every 15–60 s while the user plays (WF13's review, R2; not reproduced on a Mac). A dedicated Worker's timer isn't throttled that way, but §5.3's CSP has `worker-src 'none'`. The fix belongs to the app or the shell, in a later slice: watch only a page that isn't minimized or occluded (`IsIconic`, or the page's own `visibilitychange` sent with the beat), or start WebView2 with `--disable-background-timer-throttling`; M-DESK-11's variant checks it (§22.5) |
 | Settings write debounce | 500 ms |
 | `settings.json` objects | ≤ 1024 keys each (§14.2) |
 | Logs | 5 MiB × 5 files |
@@ -2673,7 +2700,7 @@ webview processes' environment and command lines, and the unit test of `scrubEnv
 | M-DESK-8 | Win10 22H2: share a monitor (Desktop Duplication) and a window (WGC) | Monitor: no border, pill shown and checked against the stream (records whether DD honors the affinity); window: yellow border, no pill by default |
 | M-DESK-9 | Open `isshoni://<another host>/` from a web page | "Add server" confirmation with the host, before any request (no hit in that server's log); nothing starts; Cancel leaves no trace |
 | M-DESK-10 | High contrast on; text size 150 %; 200 % display scaling | Pill, tray menu and SPA readable and usable |
-| M-DESK-11 | Kill a `msedgewebview2.exe` renderer while live (W17) | The page comes back; the share never stopped |
+| M-DESK-11 | Kill a `msedgewebview2.exe` renderer while live (W17); then, while live, minimize the window for 10 minutes, and cover it with a full-screen game for 10 minutes | The page comes back; the share never stopped. Minimized or covered, the page is not reloaded (the app's log has no "the page sent no heartbeat; reloading it"): until the hidden-page gap of §20 is fixed this part is expected to fail, and its result is recorded |
 | M-DESK-12 | Measure startup and memory (§20) with Task Manager after 30 minutes of sharing 1080p60 while watching | Within §20's budgets; numbers recorded |
 
 Discord exclusion is 05's audiotest. Glass-to-glass is 01 §12.2's run: a Chrome viewer on the same PC and monitor,

@@ -2504,6 +2504,21 @@ Native tests use GoogleTest through 04's vcpkg `tests` feature and run with `tas
   slashes, and the `--user-data-dir=<dir>\EBWebView` form WebView2 really uses); watcher start/stop with no endpoint
   (state `no-device`, no crash, no leak: handle count back to baseline after 100 start/stop cycles); `IM_INIT_NO_AUDIO`
   returns of §4.3; `selfcheck`.
+- **`audio_live_test`** (04's `native/windows/tests/`, WA45's real `AudioEngine` on whatever audio the machine has;
+  as changed by PR #53's CI fixes, README §3 item 77): a share's mixer runs on the 10 ms grid, its report says live
+  with mode, engine, mute and pause, `im_audio_set_mode` and `im_audio_set_muted` work while live, and Stop ends the
+  chunks. **The engine it expects follows from the rules and the probe, not from the machine**: the test reads the
+  settled report (the startup probe has left `pending`, within 3 s, §11.2) and expects the engine that §6.1's gate
+  implies. A `failed` or `unsupported` probe (Windows 10's build gate reports `unsupported`) plans `endpoint`; anything
+  else, the probe `ok` or `skipped` because there is no render endpoint (CI's hosted runners, state `no-device`), plans
+  process loopback, which captures nothing until a device comes. `AMixerFeedsTheGridReportsLiveAndStops` turns the
+  fast path off (rules without `IM_EXCLF_FAST_PATH`) and expects `include-set` (or `endpoint` after such a probe),
+  again after sound off and on. `TheFastPathRunsFromTheFirstPlan` keeps the share sheet's flags (the fast path on, as
+  the release default ships it) and expects `exclude-self` from the first plan (§6.4 "At engine start", event
+  `fastpath_enter`) and again after sound off and on (§6.5), with or without a device; it skips, printing the reason
+  and the report, where process loopback is unavailable or a kept-out app other than isshoni's own tree runs (a voice
+  app or a mic user takes the fast path's condition away). Before PR #53 the test expected `include-set` with the
+  fast path allowed, which WA53's fast path from the first plan made wrong on every machine.
 - **Go, any OS**: `internal/desktop/audio` against the fake through a full share lifecycle with goleak: watch → pick
   (`SetSharedPID`) → start (`OnShareStarted`) → prompt → decide → sound off → pause → resume (stays silent) → sound on
   → stop (`OnShareStopped`). Asserts the fake's call log (`audio_mode off` at sound off, no audio call at pause or

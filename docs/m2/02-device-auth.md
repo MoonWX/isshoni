@@ -2158,7 +2158,8 @@ tokens, in `TestDeviceManagerLink` (cases 1–4 and 7) and `TestDeviceManagerPas
 raw-HTTP `TestDeviceLink` and `TestDeviceClientOutdated`, which keep the step-by-step checks (case 3's 4401 close and
 its 100 ms bound stay there). `device_helpers_test.go` gains `newManager` (a caller's store) and `linkManager`, which
 `linkedManager` is built on with the one-value signature above; `linkedManager` itself has no caller until WA73 (a
-`nolint:unused` directive until then), because these cases read the app's store. Where the cases depart from the text:
+`nolint:unused` directive until then), because these cases read the app's store. WA73 (group 13) gave it its callers:
+01 §14's desktop itests link through it (`linkApp`), and the directive is gone. Where the cases depart from the text:
 - Case 1: the Manager's poll waits use real timers (`ManagerOptions.Clock` only reads the time), so the server's
   clock hook can't shorten them: each Manager link takes one real 5 s interval, and "within one poll interval" is
   checked in case 1 only, as linked less than two intervals after `Link` (the first poll got the pair). `linkManager`
