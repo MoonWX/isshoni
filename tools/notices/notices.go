@@ -18,6 +18,8 @@ type config struct {
 	npmPath        string   // web/dist/licenses.txt
 	extraPath      string   // deploy/notices/extra.txt
 	exceptionsPath string   // deploy/notices/exceptions.md
+	nativePath     string   // deploy/notices/native-windows.json; "" for the server's file (no native section)
+	nativeRoot     string   // the windows-native artifact's release folder, whose licenses/ the entries name
 	version        string   // shown in the header
 	goCmd          goCmdFunc
 }
@@ -28,6 +30,7 @@ type result struct {
 	modules      int      // Go modules listed, without the runtime
 	goVersion    string   // the Go runtime's version, go1.x.y
 	extraEntries int      // "License:" entries of extra.txt
+	native       int      // entries of the native section, 0 without -native
 	warnings     []string // stale exceptions
 }
 
@@ -101,7 +104,7 @@ func generate(ctx context.Context, cfg config) (result, error) {
 		c := component{title: moduleTitle(m), files: files}
 		c.ids, failed = licensesOf(files, func(id string) bool {
 			for _, e := range exceptions {
-				if e.module == m.path && e.license == id {
+				if !e.native && e.module == m.path && e.license == id {
 					e.used = true
 					return true
 				}
@@ -114,6 +117,17 @@ func generate(ctx context.Context, cfg config) (result, error) {
 		comps = append(comps, c)
 	}
 
+	var natives []nativeComponent
+	if cfg.nativePath != "" {
+		var nativeProblems []string
+		natives, nativeProblems, err = loadNative(cfg, exceptions)
+		if err != nil {
+			return res, err
+		}
+		res.native = len(natives)
+		problems = append(problems, nativeProblems...)
+	}
+
 	n, extraProblems := checkExtra(extraText)
 	res.extraEntries = n
 	for _, p := range extraProblems {
@@ -121,9 +135,14 @@ func generate(ctx context.Context, cfg config) (result, error) {
 	}
 
 	for _, e := range exceptions {
-		if !e.used {
-			res.warnings = append(res.warnings, fmt.Sprintf("%s line %d: the exception for %s (%s) matches no linked module; remove it",
-				cfg.exceptionsPath, e.line, e.module, e.license))
+		// The native rows are the desktop file's: the server's run (no -native) doesn't judge them.
+		if !e.used && (!e.native || cfg.nativePath != "") {
+			what := "linked module"
+			if e.native {
+				what = "entry of " + filepath.Base(cfg.nativePath)
+			}
+			res.warnings = append(res.warnings, fmt.Sprintf("%s line %d: the exception for %s (%s) matches no %s; remove it",
+				cfg.exceptionsPath, e.line, e.module, e.license, what))
 		}
 	}
 	if len(problems) != 0 {
@@ -131,7 +150,7 @@ func generate(ctx context.Context, cfg config) (result, error) {
 		return res, &gateError{problems: problems}
 	}
 
-	res.text = render(cfg.version, rt, comps, npmText, extraText)
+	res.text = render(cfg.version, rt, comps, npmText, natives, extraText, cfg.nativePath != "")
 	return res, nil
 }
 
@@ -178,16 +197,31 @@ func moduleTitle(m linkedModule) string {
 	return strings.TrimSpace(title)
 }
 
+// nativeSectionTitle heads the desktop file's native section; desktoppkg stage looks for it.
+const nativeSectionTitle = "3. Native components"
+
 const (
 	sectionRule = "================================================================================"
 	entryRule   = "--------------------------------------------------------------------------------"
 )
 
-// render writes THIRD_PARTY_NOTICES.
-func render(version string, rt component, mods []component, npmText, extraText string) []byte {
+// render writes THIRD_PARTY_NOTICES: the server's file, or with desktop the desktop app's, which has the native
+// section (docs/m2/06-windows-release.md §9.2) before the adapted code.
+func render(version string, rt component, mods []component, npmText string, natives []nativeComponent, extraText string, desktop bool) []byte {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "THIRD_PARTY_NOTICES for isshoni %s\n\n", version)
-	b.WriteString(`isshoni is licensed under the Apache License, Version 2.0 (see LICENSE and NOTICE). The isshoni server
+	if desktop {
+		b.WriteString(`isshoni is licensed under the Apache License, Version 2.0 (see LICENSE and NOTICE). The isshoni desktop
+app also contains the third-party software listed below. Each entry names the component, its version and license,
+and reproduces the license and notice files that come with it.
+
+  1. Go modules and the Go runtime
+  2. Web client (bundled JavaScript)
+  3. Native components
+  4. Adapted source code and data
+`)
+	} else {
+		b.WriteString(`isshoni is licensed under the Apache License, Version 2.0 (see LICENSE and NOTICE). The isshoni server
 binary also contains the third-party software listed below. Each entry names the component, its version and
 license, and reproduces the license and notice files that come with it.
 
@@ -195,6 +229,7 @@ license, and reproduces the license and notice files that come with it.
   2. Web client (bundled JavaScript)
   3. Adapted source code and data
 `)
+	}
 
 	section(&b, fmt.Sprintf("1. Go modules and the Go runtime (%d modules)", len(mods)))
 	entry(&b, rt)
@@ -206,7 +241,15 @@ license, and reproduces the license and notice files that come with it.
 	b.WriteString("\n")
 	b.WriteString(npmText)
 
-	section(&b, "3. Adapted source code and data")
+	adapted := "3. Adapted source code and data"
+	if desktop {
+		section(&b, nativeSectionTitle)
+		for _, c := range natives {
+			nativeEntryText(&b, c)
+		}
+		adapted = "4. Adapted source code and data"
+	}
+	section(&b, adapted)
 	b.WriteString("\n")
 	b.WriteString(extraText)
 	return b.Bytes()
