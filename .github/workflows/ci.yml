@@ -210,11 +210,22 @@ jobs:
               - 'internal/media/testdata/audio/**'
               - '.github/workflows/ci.yml'
               - 'Taskfile.yml'
-            # The updater end to end (windows-desktop, from README WA88).
+            # The updater end to end (windows-desktop's updater e2e step, README WA88): M2 06 §10.1's three paths, and
+            # what else the e2e runs: the app's start-time apply and --update-now (step 2a, step 5; main.go's
+            # installerRunning, writePending, takePending and early open), the installing mutex and WritePending
+            # (internal/desktop/winos), the smoke script, relserve and this workflow. The plan below starts
+            # windows-native and windows-desktop on it too, so a change to any of these runs the e2e.
             update:
               - 'internal/update/**'
               - 'deploy/windows/nsis/**'
               - 'tools/desktoppkg/**'
+              - 'cmd/isshoni-desktop/update*.go'
+              - 'cmd/isshoni-desktop/start.go'
+              - 'cmd/isshoni-desktop/main.go'
+              - 'internal/desktop/winos/**'
+              - 'deploy/test/windows/smoke.ps1'
+              - 'tools/relserve/**'
+              - '.github/workflows/ci.yml'
             # The PowerShell scripts (lint:ps and test:ps in lint-deploy, from README WA49).
             ps:
               - 'deploy/install-desktop.ps1'
@@ -412,8 +423,9 @@ jobs:
           # is one of its inputs too (the native filter adds only Taskfile.yml to desktop's paths).
           # The ps filter too: windows-desktop, which needs this job's artifact, runs the Pester tests and the
           # grammar check under Windows PowerShell 5.1 (README WA72).
+          # And on the update filter, as windows-desktop (its updater e2e needs this job's DLLs; README WA88).
           windows_native_when=$desktop
-          if [ "$native" = true ] || [ "$ps" = true ]; then windows_native_when=true; fi
+          if [ "$native" = true ] || [ "$ps" = true ] || [ "$update" = true ]; then windows_native_when=true; fi
           decide windows-native "$windows_native_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
             deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions
@@ -423,8 +435,10 @@ jobs:
           # deploy/test/windows/*.ps1) the desktop filter doesn't all list. And on the native filter, as windows-native:
           # that filter adds Taskfile.yml, whose test:ps, desktop:exe:windows, desktop:package:windows and native:dist
           # bodies this job runs, and the DLL-dependent Go tests moved here from windows-native.
+          # And on the update filter (README WA88): the updater e2e's inputs (tools/relserve, internal/desktop/winos)
+          # start the job that runs it.
           windows_desktop_when=$desktop
-          if [ "$native" = true ] || [ "$ps" = true ]; then windows_desktop_when=true; fi
+          if [ "$native" = true ] || [ "$ps" = true ] || [ "$update" = true ]; then windows_desktop_when=true; fi
           decide windows-desktop "$windows_desktop_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
             deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions \
@@ -2215,11 +2229,13 @@ jobs:
     # the desktop notices and the native license gate (06 §9.2-§9.3: tools/notices -native, before packaging) and
     # the check that the stage, so the installed tree, has them and 06 §9.1's LGPL files; R13 (WA81) adds the
     # server-rendered ps1 test; WA84 the autostart round trip (TestAutostartRoundTrip, after the -tags e2e tests);
-    # WA88 the updater e2e.
+    # WA88 the updater e2e (06 §16, R9: two updatetest builds 0.0.1-ci.1 and ci.2 served by relserve, --update-now,
+    # smoke.ps1 -Mode update) after the WebView2 runtime, only on the update filter's changes; it adds about 10
+    # minutes, so the job has 65 (06 §10.1's 50 before it).
     needs: [changes, web, windows-native]
     if: needs.changes.outputs.run-windows-desktop == 'true'
     runs-on: windows-2025
-    timeout-minutes: 50
+    timeout-minutes: 65
     permissions:
       contents: read
     defaults:
@@ -2992,6 +3008,158 @@ jobs:
           $v = Get-WebView2Version
           if (-not $v) { throw "the WebView2 bootstrapper exited $($p.ExitCode) and no runtime 120.0 or newer is registered" }
           "WebView2 runtime $v (installed)"
+
+      - name: The updater e2e (two updatetest builds, relserve, smoke.ps1 -Mode update)
+        # M2 06 §8.11, §16, R9 (README WA88). Two updatetest builds of isshoni.exe (TAGS=production,updatetest, 06
+        # §5.2; only that tag makes a ci.N version eligible, §8.11), 0.0.1-ci.1 and 0.0.1-ci.2, each packed into an
+        # installer from a copy of the stage with that exe in place of the release one. An ed25519 update key made
+        # for this run only (never a release key) signs three manifests that tools/desktoppkg manifest -releases
+        # writes, and tools/relserve serves them over HTTPS on loopback (its test CA in the machine's root store, which
+        # Go's verifier on Windows reads, and out again below), with latest = ci.2: the release root (ci.2's
+        # manifest), badsha/ (the same manifest with ci.1's installer's SHA-256, correctly signed) and ci0/ (a
+        # manifest for 0.0.1-ci.0 as the latest, older than the installed ci.1). smoke.ps1 -Mode update then runs
+        # §16's cases with ISSHONI_UPDATE_TEST_BASE and ISSHONI_UPDATE_TEST_SIGNERS, de-elevated (the job is elevated,
+        # and an elevated installer would start the app through explorer.exe without --updated-from, §6.4).
+        # Whatever fails, the step leaves no install behind for the steps after it. It runs on the update filter's
+        # changes (and on every push to main); nightly.yml's windows-full runs it every night.
+        id: update-e2e
+        if: ${{ !cancelled() && needs.changes.outputs.update == 'true' && steps.package.outcome == 'success' && steps.nsis.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        timeout-minutes: 25
+        env:
+          MAKENSIS: ${{ steps.nsis.outputs.makensis }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'update-e2e'
+          $rel = Join-Path $work 'releases'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $old = '0.0.1-ci.1'
+          $new = '0.0.1-ci.2'
+          $ci0 = '0.0.1-ci.0'
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\isshoni'
+          $utf8 = New-Object Text.UTF8Encoding($false)
+          if (Test-Path -LiteralPath $installDir) { throw "$installDir exists before the test (left by an earlier step?)" }
+
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
+          $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/.build/uninst/uninstall.exe'
+          $webview2 = Join-Path $env:NATIVE 'MicrosoftEdgeWebview2Setup.exe'
+          $setups = @{}
+          foreach ($v in $old, $new) {
+            task desktop:exe:windows 'TAGS=production,updatetest' "VERSION=$v"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $st = Join-Path $work "stage-$v"
+            Copy-Item -LiteralPath $stage -Destination $st -Recurse
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/windows_amd64-test/isshoni.exe') `
+              -Destination (Join-Path $st 'isshoni.exe') -Force
+            $setups[$v] = Join-Path $work "isshoni-desktop_$($v)_windows_amd64_setup.exe"
+            go -C tools run ./desktoppkg nsis -version $v -stage $st -out $setups[$v] -webview2 $webview2 `
+              -prebuilt-uninstaller $uninstaller -makensis $env:MAKENSIS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          # The update key and its allowed-signers line (ISSHONI_UPDATE_TEST_SIGNERS, 06 §8.3's format).
+          $sk = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe'
+          if (-not (Test-Path -LiteralPath $sk -PathType Leaf)) { throw "this runner has no inbox $sk" }
+          $key = Join-Path $work 'update-key'
+          & $sk -q -t ed25519 -N '' -C 'isshoni-update-ci' -f $key
+          if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen could not make the update key' }
+          icacls $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict $key" }
+          $signers = Join-Path $work 'update_signers'
+          $pub = (Get-Content -Raw -LiteralPath "$key.pub").Trim()
+          [IO.File]::WriteAllText($signers, "isshoni-update namespaces=`"isshoni-update`" $pub`n", $utf8)
+
+          # relserve first, on a port the system picks (no probe that another process could take in between): it
+          # opens the files under -dir on each request, so the manifests, whose URLs are all under the base (06 §8.2,
+          # §8.11), are written once its address is known.
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          $relserve = Join-Path $work 'relserve.exe'
+          go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') build -o $relserve ./relserve
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ca = Join-Path $work 'ca.pem'
+          $ready = Join-Path $work 'addr'
+          $rs = Start-Process -FilePath $relserve -PassThru -NoNewWindow `
+            -ArgumentList @('-dir', "`"$rel`"", '-latest', $new, '-addr', '127.0.0.1:0', '-ca-out', "`"$ca`"",
+              '-ready-file', "`"$ready`"") `
+            -RedirectStandardOutput (Join-Path $work 'relserve.out') -RedirectStandardError (Join-Path $work 'relserve.err')
+          $store = $null
+          $cert = $null
+          try {
+            $deadline = (Get-Date).AddSeconds(30)
+            while (-not (Test-Path -LiteralPath $ready)) {
+              if ($rs.HasExited) { throw "relserve exited ($($rs.ExitCode)): $(Get-Content -Raw (Join-Path $work 'relserve.err'))" }
+              if ((Get-Date) -gt $deadline) { throw 'relserve did not start within 30 s' }
+              Start-Sleep -Milliseconds 200
+            }
+            $addr = (Get-Content -Raw -LiteralPath $ready).Trim()
+            if ($addr -notmatch '^127\.0\.0\.1:\d+$') { throw "relserve's ready file holds '$addr', not 127.0.0.1:port" }
+            $base = "https://$addr"
+            $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+            function New-SignedManifest {
+              param([string]$Version, [string]$Installer, [string]$Releases, [string]$Dir, [string]$BadSha = '')
+              New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+              $m = Join-Path $Dir 'isshoni-desktop-update.json'
+              go -C tools run ./desktoppkg manifest -version $Version -installer $Installer -date $date -releases $Releases -out $m
+              if ($LASTEXITCODE -ne 0) { throw "desktoppkg manifest exited $LASTEXITCODE for $Version" }
+              if ($BadSha) {
+                $good = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+                $text = [IO.File]::ReadAllText($m)
+                if (-not $text.Contains("`"sha256`": `"$good`"")) { throw "$m has no sha256 $good" }
+                [IO.File]::WriteAllText($m, $text.Replace("`"sha256`": `"$good`"", "`"sha256`": `"$BadSha`""), $utf8)
+              }
+              & $sk -Y sign -f $key -n isshoni-update $m 2>&1 | Out-Null
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$m.sig")) { throw "ssh-keygen -Y sign failed for $m" }
+            }
+            $name = "isshoni-desktop_$($new)_windows_amd64_setup.exe"
+            foreach ($root in '', 'badsha') {
+              $d = [IO.Path]::Combine($rel, $root, 'download', "v$new")
+              New-Item -ItemType Directory -Force -Path $d | Out-Null
+              Copy-Item -LiteralPath $setups[$new] -Destination (Join-Path $d $name)
+              $bad = ''
+              if ($root) { $bad = (Get-FileHash -Algorithm SHA256 -LiteralPath $setups[$old]).Hash.ToLowerInvariant() }
+              $releases = $base
+              if ($root) { $releases = "$base/$root" }
+              New-SignedManifest -Version $new -Installer (Join-Path $d $name) -Releases $releases -Dir $d -BadSha $bad
+            }
+            # ci0/: relserve's latest URL (ci.2's folder) answers with a manifest for ci.0, built over a copy of ci.1's
+            # installer under ci.0's name (the app never downloads it).
+            $ci0Dir = Join-Path $work 'ci0-installer'
+            New-Item -ItemType Directory -Force -Path $ci0Dir | Out-Null
+            $ci0Setup = Join-Path $ci0Dir "isshoni-desktop_$($ci0)_windows_amd64_setup.exe"
+            Copy-Item -LiteralPath $setups[$old] -Destination $ci0Setup
+            New-SignedManifest -Version $ci0 -Installer $ci0Setup -Releases "$base/ci0" `
+              -Dir ([IO.Path]::Combine($rel, 'ci0', 'download', "v$new"))
+
+            $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ca)
+            $store = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+            $store.Open('ReadWrite')
+            $store.Add($cert)
+
+            ./deploy/test/windows/smoke.ps1 -Mode update -Setup $setups[$old] -Version $old -NewerSetup $setups[$new] `
+              -NewerVersion $new -UpdateBase $base -Signers $signers
+          } finally {
+            if ($null -ne $store) {
+              if ($null -ne $cert) { $store.Remove($cert) }
+              $store.Close()
+            }
+            if (-not $rs.HasExited) { Stop-Process -Id $rs.Id -Force }
+            "---- relserve's requests"
+            Get-Content -LiteralPath (Join-Path $work 'relserve.err') -ErrorAction SilentlyContinue
+            # A failed case may leave the app running or installed: the later steps (the autostart round trip) need
+            # neither.
+            $exe = Join-Path $installDir 'isshoni.exe'
+            Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'" |
+              Where-Object { $_.ExecutablePath -eq $exe } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            $u = Join-Path $installDir 'uninstall.exe'
+            if (Test-Path -LiteralPath $u) {
+              '::warning::the updater e2e left an install behind; uninstalling it'
+              Start-Sleep -Seconds 2
+              $p = Start-Process -FilePath $u -ArgumentList '/S', '/PURGE' -PassThru
+              $null = $p.Handle
+              $p.WaitForExit()
+              $deadline = (Get-Date).AddSeconds(180)
+              while ((Test-Path -LiteralPath $u) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+            }
+          }
 
       - name: The e2e isshoni.exe and the server (task desktop:exe:windows TAGS=e2e, go build ./cmd/isshoni)
         id: e2e-exe
