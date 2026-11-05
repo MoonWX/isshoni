@@ -58,7 +58,7 @@ The engine needs only the main window's `HWND`, which 03 passes in as the picker
 | Struct evolution | Every top-level struct starts with `struct_size`; a minor ABI bump only appends fields or functions. Structs embedded by value or used as array elements have no `struct_size` and are frozen in v1 | Old Go with new DLL and the reverse both keep working within major 1; a nested struct that grew would shift every later offset |
 | Detail tokens | Every failure that a UI state depends on carries a fixed token (§5.7): at the start of `im_last_error`'s text, in `im_encoder_info.reason` and in the `ENDED` JSON | The UI maps codes plus tokens, never free text |
 | Go loading | `x/sys/windows` `LoadLibraryEx` + `SyscallN`, no cgo, no purego | S1's loader ran on Win11 25H2 and Server 2025; `x/sys` is already a dependency |
-| COM apartments | No API call does COM, WinRT or DXGI work on the caller's thread: one engine worker thread (MTA) runs it; the picker has its own STA thread | Goroutines hop OS threads, and the Wails UI thread is an STA |
+| COM apartments | No API call does COM, WinRT or DXGI work on the caller's thread: one engine worker thread (MTA) runs it; the picker has its own STA thread; the engine holds the MTA for the life of the process, so C++/WinRT's cached factories stay valid across `im_init` cycles (§6.1) | Goroutines hop OS threads, and the Wails UI thread is an STA |
 | Capture paths | Win11: WGC for windows and monitors, borderless when the OS allows it. Win10 22H2: WGC for windows (yellow border), DXGI Desktop Duplication (DD) for monitors | Plan "Engines per OS" |
 | Win10 monitor pick | The OS picker, then the picked item is mapped to a DXGI output (size, then name) and captured with DD; WGC with the border when that leaves several. A frame match is added only if E11 finds that names don't tell identical monitors apart (§7.5) | Keeps "OS pickers only" and avoids the yellow border without building a matcher that may never be reached |
 | GPU path | One D3D11 device per session on the encoder's adapter; captured BGRA → our texture slot → cursor → VideoProcessor to NV12 per layer (BT.709 limited range); a pixel-shader converter as fallback and CI reference | Zero copy into hardware encoders; deterministic reference on WARP |
@@ -961,8 +961,8 @@ on 01's sentinels and reads `Reason`.
 | **Engine worker** | 1 per process | `im_init` | normal, COM MTA | every API call that touches COM, WinRT, DXGI or D3D creation (probe, sources, start and stop steps); the API call posts a job and waits. **No WASAPI work**: the probe's audio flags (`AudioEngine::ProbeFlags`) and the audio app list (`ListAppsJson`) are posted to 05's watcher | media work |
 | **Picker** | 1, on demand | `im_pick_source` | normal, **STA** with a message loop and a hidden owner window | `GraphicsCapturePicker` (§7.2) | anything else |
 | **WGC callback** | the system's pool | WGC `FrameArrived` | system | `TryGetNextFrame`, one `CopySubresourceRegion` into a free slot, publish, signal (≤ 1 ms) | wait, allocate, encode |
-| **DD capture** | 1 per DD session | `im_start` | MMCSS "Capture" | `AcquireNextFrame`, copy to a slot, pointer shape, release | encode |
-| **Video** | 1 per session | `im_start` | MMCSS "Capture", `THREAD_PRIORITY_ABOVE_NORMAL` | pacer, cursor blend, VideoProcessor, every layer's encoder, the AU normalizer, writes to the rings | wait on the consumer |
+| **DD capture** | 1 per DD session | `im_start` | MMCSS "Capture" | `AcquireNextFrame`, copy to a slot, pointer shape and (as built, WA60) its blend into the slot, release | encode |
+| **Video** | 1 per session | `im_start` | MMCSS "Capture", `THREAD_PRIORITY_ABOVE_NORMAL` | pacer, cursor blend (planned; as built the DD thread blends, §7.8), VideoProcessor, every layer's encoder, the AU normalizer, writes to the rings | wait on the consumer |
 | **Supervisor** | 1 per session | `im_start` | normal | turns real-time flags into events, `IsIconic` polling (500 ms), resize debounce, staleness, ending the session on device loss (§9.8), test-pattern timer | real-time work |
 | **Audio watcher** (05) | 1 per process | `im_init` (`AudioEngine::Init`) | normal, COM MTA | all WASAPI enumeration, session and device notifications, the process table, the report, `im_list_audio_apps`, `im_audio_watch`, `im_set_exclusions`, the sound check's requests (05 §7) | real-time work |
 | **Audio activators** (05) | 2 per process | 05's watcher | normal, COM MTA | process-loopback activation (`ActivateAudioInterfaceAsync`), 3 s limit (05 §8.1) | real-time work |
@@ -981,6 +981,20 @@ logged at warn and `im_init` still returns `IM_OK` with no `im_last_error` detai
 which copes with a failed `Init`. Only an `Init` that outlives its bound fails `im_init` (`IM_ERR_TIMEOUT`, and the
 worker is stopped again); when that late `Init` then succeeds, the worker calls `Shutdown` on it itself, so a later
 `im_init` never finds 05's watcher running.
+
+**COM stays up for the life of the process** (PR #53's CI fixes, README §3 item 75): the worker enters the MTA with
+`CoInitializeEx(COINIT_MULTITHREADED)` and, the first time any worker starts, also takes one process-wide MTA usage
+with `CoIncrementMTAUsage`, whose cookie is never released (`os::EnterWorkerThread`, `src/engine/os_windows.cpp`). The
+reason is C++/WinRT's factory cache: the activation factories it got for the probe's OS flags
+(`GraphicsCaptureSession`, `ApiInformation`, `GraphicsCaptureAccess`, `capture::OsFlags`, §9.10) stay cached as long as
+the engine's DLL is loaded. Without the extra usage, the worker's `CoUninitialize` at `im_shutdown` ended the process's
+last apartment, COM unloaded the DLLs those factories live in, and the next `im_init`'s probe called through a dangling
+cache entry (an access violation on the worker; every Windows test binary that called `im_probe` after a re-init
+crashed). So `im_init` may follow `im_shutdown` any number of times and each probe works like the first
+(`exports_test`'s `EveryInitCycleProbesLikeTheFirst`, three rounds, §18.2). A failure of either call fails the
+worker's start, and `im_init` answers `IM_ERR_INTERNAL` ("engine worker: COM setup (CoInitializeEx MTA /
+CoIncrementMTAUsage) failed"). Any later engine thread that uses C++/WinRT relies on the same rule: never end COM in
+the process while the DLL is loaded.
 
 Rules for every real-time thread (WGC callback, DD capture, video, audio capture and mixer, test tone): no
 allocation after warm-up (pools are sized at start), no lock that another thread holds across blocking work, no
@@ -1285,6 +1299,35 @@ test pattern, also for a test-source capture (the fake). DD sources (WA60) plug 
   path. If the output is gone from `EnumOutputs` for 5 s: `SOURCE_GONE`.
 - `DXGI_ERROR_WAIT_TIMEOUT` is normal (static screen).
 
+**As built (WA60, group 13; README §3 item 78)** (`src/capture/dd_capture.{h,cpp}`, `dd_policy.h`):
+- `DdCapture::Start` runs on the engine worker, on the session's own device, on a per-monitor-v2 thread. It looks the
+  output up by its `DeviceName` among the outputs of the device's adapter and calls `DuplicateOutput1` (the older
+  `IDXGIOutput1::DuplicateOutput` where `IDXGIOutput5` is missing). A process that isn't per-monitor DPI aware fails
+  with `IM_ERR_INTERNAL` `dpi_unaware`, an output that is no longer attached with `IM_ERR_SOURCE_GONE`,
+  `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` (too many duplications) with `IM_ERR_LIMIT`, and a removed device with
+  `IM_ERR_ENCODER_LOST` `device_removed`. An output on another adapter, or a duplication DXGI refuses as unsupported,
+  lets the caller capture a picked monitor with WGC (with the border) instead; a listed `mon:` id has no WGC item to
+  fall back to, so it fails. A secure desktop or a mode change at that moment starts the capture interrupted.
+- The DD thread ("isshoni dd", MMCSS "Capture") waits at most `kDdMaxWaitMs` = 100 ms in `AcquireNextFrame`.
+  `DXGI_ERROR_ACCESS_LOST`, `E_ACCESSDENIED` and `DXGI_ERROR_SESSION_DISCONNECTED` interrupt the capture:
+  `CaptureSink::OnInterrupted` with the cause (`secure_desktop` when the input desktop isn't the user's, `mode_change`
+  when the output's size or rotation changed, else `access_lost`), once per interruption. The duplication is re-created
+  every `kDdRetryNs` = 250 ms; on success `OnResumed`, then `OnResized` when the upright size changed. The session turns
+  these into `CAPTURE_INTERRUPTED` / `CAPTURE_RESUMED` with `{"cause":…}` (group 13's integration, §7.5).
+- **Only lasting interruptions are retried** (WA60's review, its R3): a re-creation that fails with one of the three
+  interrupting errors or `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` is tried again while the output is listed; any other
+  failure (`DXGI_ERROR_UNSUPPORTED`, `E_INVALIDARG`, …) won't heal by waiting, so the capture fails
+  (`CaptureSink::OnFailed`, `IM_ERR_INTERNAL`) instead of repeating the last frame for ever. An output missing from the
+  adapter's `EnumOutputs` for `kDdGoneNs` = 5 s is `OnClosed` (`SOURCE_GONE`). A removed device is `OnFailed` with
+  `IM_ERR_ENCODER_LOST` `device_removed`. No frame follows a failure.
+- `DdCapture::Stop` (any thread but the DD thread) ends the thread within 100 ms and joins it; after it returns no sink
+  call is made. DD never shows a border, so the session sets `IM_SESS_NO_OS_INDICATOR`, and `im_session_info` and the
+  stats report the running capture's path (`CaptureSource::capture_path()`), also when a pick fell back from one path
+  to the other (WA60-R2, fixed in group 13's integration).
+- The process check of the second bullet is in place on both ends: `DdCapture::Start` refuses with `dpi_unaware`, and
+  `im_probe` clears `IM_OS_DESKTOP_DUPLICATION` with a `dpi_unaware` warning when `capture::ProcessPerMonitorAware()` is
+  false (group 13's integration; no test asserts that flag yet).
+
 ### 7.5 Windows 10: mapping a picked monitor to a DXGI output
 
 The picker returns a `GraphicsCaptureItem` with no `HMONITOR`. To capture it with DD:
@@ -1328,8 +1371,12 @@ through to step 5.
   adapter (§7.4) falls back to WGC with the border.
 - The DD thread blends the pointer into the slot copy itself, before the slot is published (`gpu::CursorOverlay`), and
   publishes the frame with the pointer marked drawn; a pointer that moves over a static desktop is drawn into a copy of
-  the last desktop image, at most once per half frame interval. Rotation goes to the converter through
-  `FrameMeta::rotation`; slots hold the panel's orientation.
+  the last desktop image, at most once per half frame interval. This is a deviation from §7.8, which names the video
+  thread, and it is accepted (README §3 item 78): §7.8's rule that matters, into the copy and never into the desktop
+  texture, holds (§7.8's "As built"). Rotation goes to the converter through `FrameMeta::rotation`; slots hold the
+  panel's orientation. A 90° or 270° monitor's first frame builds a VideoProcessor of the swapped size on the video
+  thread, because `VideoFrames` is configured with the upright source size before DD reports the rotation; that costs
+  one extra VideoProcessor, nothing else (a performance detail, recorded in `session/frames.cpp`).
 - **The session's half (group 13's integration)**: `SourceRegistry::Resolve` answers `mon:` ids with
   `capture::ResolveMonitor`; a DD source's session device is created on `capture::OutputAdapterLuid(source)`'s adapter,
   which is also the capture adapter of §9.1's order (`encode::AdapterIndexOfLuid`); the session's sink turns
@@ -1347,6 +1394,13 @@ and `pick -name -count 2`, picking each monitor; M-DD, §18.4):
 
 **Verdict**: pending the owner's Win10 run. Names unique → step 4 stays M5 (§16); names ambiguous for identical
 monitors → recorded here and the integrator adds a `WF` slice for step 4 (README §5).
+
+The table and the verdict stay "pending (owner's PC)" as WA60 merged (README §3 item 78): the values can only be
+measured on the owner's Windows 10 22H2 install, and M-DD (§18.4), which records them, can run since group 13's
+integration made `mon:` ids startable. The owner's run fills the table; the write-back slice after it copies the
+values here from the PR body's "Results for the spec" (README §5, shared files), and the integrator opens the step 4
+`WF` slice if the names are ambiguous. Also open: WGC's source monitor is not reported as the capture adapter
+(§9.1's "As built (WA61)").
 
 ### 7.6 Window identity, minimized windows, isshoni's own windows
 
@@ -1393,6 +1447,14 @@ Unidentified windows simply lack these extras; capture is unaffected.
   blending, precompiled shaders) before the VideoProcessor, at the pointer's position adjusted for rotation. With
   `IM_START_HIDE_CURSOR` the DD thread skips the blend.
 - The cursor is drawn into the copy, never into the desktop texture.
+- **As built (WA60, group 13; README §3 item 78)**: the DD thread blends the pointer, not the video thread. It converts
+  a new shape (`gpu/cursor_shape.h`) into a `gpu::CursorOverlay` and blends it into the slot it just copied the desktop
+  into, before `FrameSlots::Publish`, so the published `FrameMeta::cursor` is marked invisible (already drawn) and the
+  video thread draws nothing. A pointer that moves over an unchanged desktop is drawn into a fresh copy of the last
+  desktop image (kept by the DD thread) and published at most every half frame interval of layer 0, with
+  `LastMouseUpdateTime` as its capture time. The session's video thread doesn't call `CursorOverlay::Blend`, so this
+  needed no change in `session/`; the blend still goes into a copy, never into the desktop texture. `gpu_warp_test`'s
+  cursor goldens check the blend itself (§18.2); M-DD checks the shapes on the owner's PC (§18.4).
 
 ### 7.9 HDR, odd sizes, rotation, DPI, multiple monitors
 
@@ -1635,6 +1697,18 @@ real entry has `IM_ERR_DEPENDENCY` and takes no part. A session whose first cand
 (§6.1). `mf_sw_test` uses the session's own catalog. `probeFallback` is gone, and `TestDLLConformance` uses the
 session engine directly: the `win-x64-ci` probe lists the test hooks' `IM_ENC_FAKE` as tested with both profiles
 (`encode/probe.cpp`'s `PlanEncoders`), which is what Conformance's check 1 finds (01 §6.4).
+
+**As built (WA61, group 13; README §3 item 79):** steps 1, 2, 4 and 5 are built; **step 3 is not**. A session has one
+D3D device, on its first pixel candidate's adapter (§8.1), and the copy across adapters is not built, so a hardware
+encoder on another adapter fails to open in it (`open_failed`, logged as `encoder skipped` with `why`
+`other_adapter`) and the next candidate is tried; a software encoder reads back from any device.
+`Candidate::cross_adapter_copy` is set for DD candidates on other adapters but nothing reads it yet. The capture
+adapter of step 1 is `CaptureAdapterIndex` (`session/session_object.cpp`): for a DD source the output's adapter
+(`capture::OutputAdapterLuid`, mapped to the probe's adapter index by `encode::AdapterIndexOfLuid`, group 13's
+integration), else the primary monitor's adapter (`encode::PrimaryAdapterIndex`: the probe's first adapter when it
+has outputs, else none), because WGC doesn't report the monitor that holds most of the source yet. On a single-GPU PC
+this is the full order. Step 3 and WGC's source monitor stay open for a later `WF` slice (they need a GPU → CPU → GPU
+copy and a hybrid-GPU PC to test on).
 
 ### 9.2 libavcodec integration
 
@@ -2715,6 +2789,8 @@ for tests and tools, and NULL means the engine DLL's own directory.
   Access violations are **not** caught (the state would be corrupt); they crash the process with Go's report.
 - Crash minidumps and "Copy diagnostics" are later (M5/M6). Until then the troubleshooting page (06) explains Windows
   Error Reporting's `LocalDumps`, and the published PDBs make a user's dump readable.
+- The Windows **test** executables print their own crash report (PR #53, `tests/support/crash_report.cpp`, §18.2); the
+  shipped DLL installs no exception filter (it would replace the host's).
 
 ### 13.5 Licenses and notices
 
@@ -2881,9 +2957,21 @@ target in the slice that adds it and in the nightly; seeds in `native/common/tes
 The test executables link the engine's objects (`im_engine`), not the DLL, so `exports_test` can stall the worker
 and `dll_search_test` runs with the engine's delay-load hook; the DLL's real export table is `dll-check`'s (§13.1).
 
+**A crash report in every test executable** (PR #53's CI fixes, README §3 item 75): gtest guards only the test bodies
+on the main thread, so a crash on the engine worker or any other thread ended a test binary with nothing but ctest's
+"Exception: SegFault". `tests/support/crash_report.cpp`, built as the OBJECT library `im_test_crash_report` (so its
+static initializer is always linked) and linked into every `tests/*_test.cpp` executable, installs a last-chance
+exception filter at start. It prints to stderr the exception code, the faulting address as module+offset ("no loaded
+module" when the code was in a DLL that has since been unloaded, as in the MTA crash of §6.1), an access violation's
+target address and a symbolized stack (DbgHelp, with the PDBs of `/DEBUG:FULL`), then hands the exception to the filter
+installed before it (the CRT's), so the crash proceeds as before: the test still fails and ctest still reports the
+exception. It also makes stdout unbuffered, so a test's own `printf` reaches ctest's log before a crash. Under
+`win-x64-asan` the file is empty, since ASan's handler reports crashes there. It is test support, never shipped
+(`tests/support/` holds it beside `dll_search_test`'s marker and probe DLLs).
+
 | Test | Asserts |
 |---|---|
-| `exports_test` | every export with null and invalid arguments returns its documented code, and `im_last_error` starts with the §5.7 token where one applies; `struct_size` below v1.0 → `IM_ERR_ABI`, above → accepted; JSON functions follow snprintf; `im_clock` is monotonic and within 50 ms of the system time; `im_abi_layout` equals the golden file; `isshoni-media.def` lists exactly the header's `IM_API` functions (both parsed); a hook that stalls the worker makes a posted call return `IM_ERR_TIMEOUT` (`engine_timeout`) after its bound + 1 s |
+| `exports_test` | every export with null and invalid arguments returns its documented code, and `im_last_error` starts with the §5.7 token where one applies; `struct_size` below v1.0 → `IM_ERR_ABI`, above → accepted; JSON functions follow snprintf; `im_clock` is monotonic and within 50 ms of the system time; `im_abi_layout` equals the golden file; `isshoni-media.def` lists exactly the header's `IM_API` functions (both parsed); a hook that stalls the worker makes a posted call return `IM_ERR_TIMEOUT` (`engine_timeout`) after its bound + 1 s; a full probe works in every `im_init`/`im_shutdown` cycle of a process, not just the first (`EveryInitCycleProbesLikeTheFirst`: three rounds, each `im_probe(IM_PROBE_FULL)` `IM_OK`, the OS flags other than `IM_OS_WGC_BORDERLESS` equal to the first round's; PR #53, §6.1) |
 | `session_fake_test` | `test:pattern` + `IM_ENC_FAKE` + test tone (no D3D device: `IM_ENC_FAKE` sessions stay off WARP, §6.1, so the timing bounds hold; "a new device" below is the session's device id): first packet per layer `KEYFRAME\|REINIT` within 500 ms after `im_start` returns, also with a static pattern; `IM_ENC_FAKE` output as §18.2's note (real SPS/PPS for the profile and size, CB byte `e0`, AU sizes, Marker `CaptureNS` = `capture_ts_ns − epoch_ns`); every `capture_ts_ns ≥ epoch_ns` for every kind; `f` ≈ 60 fps, `q` 15 fps; keyframe within one interval; `im_set_layer_active` stops and restarts `f` with an IDR; pause yields only `REFRESH`/IDR and audio keeps 50 silent packets/s, while the stats' `fpsIn` stays above 40 (§5.6, WF2); `im_set_profile` → `REINIT\|KEYFRAME` with the new `profile`; `im_set_content_hint` → `REINIT\|KEYFRAME` on every layer, coalesced with an `im_update_layer` in the same second; injected encoder error → `ENCODER_CHANGED`, delivered by `im_next_packet` before the new encoder's first `REINIT\|KEYFRAME` packet; injected device removal → `ENDED{IM_ERR_ENCODER_LOST}` with detail token `device_removed` within 1 s (no `DEVICE_RESET`, no RECOVERING), and a following `im_start` on a new listed source runs on a new device; exhausted candidates → `ENDED{IM_ERR_ENCODER_LOST}`; a consumer that stops for 2 s gets `RING_OVERFLOW`, stale drops and an IDR when it resumes; `im_stop` with a blocked consumer returns in ≤ 2 s and the consumer gets `IM_ENDED` in ≤ 50 ms; the fifth session → `IM_ERR_LIMIT`; pick tokens through the test hooks' fake picker: a failed `im_start` keeps the token, consumed, expired (clock hook at 5 min after the pick) and evicted (fifth pick) tokens → `IM_ERR_SOURCE_GONE` `pick_expired`. WF10 (group 11) added: the catalog lists the probe's encoders after the fakes and a fake session still gets no device; an encoder one frame behind gives each AU its own frame's capture time and the first IDR the first frame's; `im_layer_config.gop_ms` per layer reaches the layer |
 | `session_gpu_test` (WF2) | a session's GPU path through the C ABI on WARP, with the test hooks: the test lists an encoder of its own first in the catalog (`session::SetCatalogPrefixForTest`; `testhooks::Reset` doesn't clear it, the test does), one that takes pixels on a WARP device, reads every converted picture back and leaves the access unit to `IM_ENC_FAKE`. Such a session runs the GPU path (`session::GpuPathOf`; an `IM_ENC_FAKE` one doesn't); each layer's first packet `KEYFRAME\|REINIT` within 500 ms; every picture of a new frame shows that frame's counter and flash box (the frame whose grid instant is its `capture_ts_ns`) on `f` (1:1) and `q` (2:1); on a static screen refreshes and keyframes show the one frame again; with no frame at all the first keyframe is black (Y 16, Cb/Cr 128); while paused every picture shows one frame captured before the pause, and resuming shows new frames; device loss that first shows as an ordinary error (a conversion's target, a recovery's re-opens, a re-init's open; `session::SetDeviceRemovedForTest` stands in, since WARP can't be removed) ends the session `ENDED{IM_ERR_ENCODER_LOST}` `device_removed` with the probe's cache stale, while the same failure on a sound device is an encode error the session recovers from. The two 500 ms first-keyframe bounds on WARP may be tight in the nightly `win-x64-asan` run |
 | `session_frames_test` (WF2) | the session's two portable frame pieces, without a GPU or the test hooks (every test build): `PatternGrid` (frame times exact at whole seconds and WA23's arithmetic for 1 to 240 Hz, late frames below half an interval with every third on time, `NewestDue` the newest due frame and never one before `next`) and `FrameTimes` (fresh, skipped and the newest time; across two threads every published frame is taken or skipped and the times taken only grow, bounded by a 10 s deadline). Being portable it also builds on the Mac against the host preset's GoogleTest (group 5's integration ran it plain, under TSan and under ASan+UBSan), though no host target lists it |
@@ -2892,7 +2980,7 @@ and `dll_search_test` runs with the engine's delay-load hook; the DLL's real exp
 | `gpu_warp_test` | on WARP: the shader converter against a CPU BT.709 limited-range reference (≤ 1 code value on flat areas, ≤ 2 on edges); the VideoProcessor against the shader output (≤ 2) when WARP offers one, else skipped with the reason; letterbox geometry; rotation 90/180/270; cursor blending of color, masked and monochrome shapes against golden images, and no blend with `IM_START_HIDE_CURSOR`; the GPU test pattern renders (pixel for pixel against `pattern_layout.h`'s model, and through slots and converters on two threads, the frame counter decoded from the NV12); slot growth steps, one VideoProcessor per slot size, the planar readback and its refused sources, the context lock free while the readback waits (test hook). The goldens are text pictures in `tests/testdata/gpu/`, and the portable `tests/gpu_warp_support.h` checks them on any OS; both belong to this test (§4). With `IM_GPU_TEST_HARDWARE=1`, `GpuHardware.*` compares the VideoProcessor with the shader on every hardware adapter (the owner's-PC check) |
 | `ffmpeg_load_test` | with the pinned artifact: loads, versions check, encoders listed (none available without a GPU, MF software if the runner has Media Foundation); `ffmpeg_dir` pointed at an empty folder → `IM_ERR_DEPENDENCY` (`missing`) and an audio-only test-tone session still works; a stub DLL with another major → `IM_ERR_DEPENDENCY` (`version`). As built (WA44): the other major is the real avutil DLL offered under another major's name, and a minor below the build's is `version` too; it also checks §9.10 step 4 (`audio_flags` from `ProbeFlags()`, a fake `AudioEngine`) and, in a child process, `dll_search_test`'s vendor-runtime and libvpl part (markers `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll`, `libmfxhw64.dll` in the current directory and on `PATH`, `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` at them; the two libvpl names also next to the child's executable; after a full probe the child also opens `h264_nvenc`, `h264_qsv` and `h264_amf` on a default device, since a GPU-less runner's probe plans none of them, and on a device without video support (Basic Render: no `ID3D11VideoDevice`, so FFmpeg's D3D11VA device init fails before `avcodec_open2`) opens them without a device, where FFmpeg loads the same runtimes; each open must reach its runtime or libvpl's dispatcher in FFmpeg's log; no marker loads). The FFmpeg folder is `ISSHONI_TEST_FFMPEG_DIR` (the locked zip's `bin`); without it the cases skip, except in CI, where they fail |
 | `dll_search_test` (§13.3) | Run as a child process whose current directory and one `PATH` entry each hold marker DLLs (a tiny test DLL whose `DllMain` writes a file named after itself; built by the tests, never shipped). **Delay-load hook** (E2): the `win-x64-ci` build's test binary links the engine code with an extra `/DELAYLOAD:im-test-missing.dll` (a name that is in no system folder; the windows-2025 image has `mfplat.dll` in System32, which is searched before the current directory, so a planted `mfplat.dll` could never show the bug); with `im-test-missing.dll` planted in both places, `__HrLoadAllImportsForDll("im-test-missing.dll")` fails, no marker file appears and `GetModuleHandleW(L"im-test-missing.dll")` is NULL; the same check with `mfplat.dll` passes and loads it from System32 (`GetModuleFileNameW`), asked as `mfplat.dll` while `mfplat.lib` stores `MFPlat.DLL` (§13.1). **The `/DEPENDENTLOADFLAG` verdict** (06 §5.1): two probe DLLs (`tests/support/dlprobe.cpp`) delay-load the marker with the default helper and no hook, one linked plain and one with `/DEPENDENTLOADFLAG:0x800`; whether the flagged one still loads the planted marker goes to the test log and to `<build>/windows/dependentloadflag-verdict.txt`, which `windows-native` writes into its summary. **Vendor runtimes and libvpl** (E7, in `ffmpeg_load_test`'s harness with the pinned FFmpeg): markers named `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll` and `libmfxhw64.dll` (none exist on the GPU-less runner) planted in both places, the two libvpl names also next to the child's executable (a copy of the test binary in a temporary folder; FFmpeg's `win32_dlopen` takes the other three from the application folder by design, layer 4), `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` set to the marker folders, and **no** process default set (the host-independent case); after `im_init`, a full `im_probe` and a forced open of each vendor encoder, no marker file exists and `EnumProcessModules` lists none of them. A failure of the libvpl names is §17's libvpl risk, not a flake: FFmpeg r1 failed it from `PATH`, and r2's libvpl patch is what makes it pass |
-| `openh264_test` | CI downloads Cisco's DLL and checks the pinned hash (a mismatch fails the job); `test:pattern` 1280×720@30 for 3 s through the full session (WARP, readback, OpenH264) and back through OpenH264's decoder: PSNR ≥ 35 dB on the pattern's static regions; profile key `42e0`; SPS and PPS before every IDR; a live bitrate step lands within ±25 % |
+| `openh264_test` | CI downloads Cisco's DLL and checks the pinned hash (a mismatch fails the job); `test:pattern` 1280×720@30 for 3 s through the full session (WARP, readback, OpenH264) and back through OpenH264's decoder: PSNR ≥ 35 dB on the pattern's static regions; profile key `42e0`; SPS and PPS before every IDR; a live bitrate step (1 Mbit/s → 500 kbit/s at 1.5 s) brings no `REINIT` or `KEYFRAME` packet in the 2 s after it, and those 2 s stay under 125 % of the new target. As changed by PR #53's CI fixes (README §3 item 76): the lower bound, 75 % of the new target, is checked only where the content can fill it, i.e. when the second before the step already ran at 75 % of the new target or more; otherwise the test prints that the lower bound was not checked, with the rate it measured. The pattern is mostly static (about 55 kbit/s at 720p30; CI measured 53.5 kbit/s after the step to 500 kbit/s), OpenH264's rate control caps rather than pads, and layer 0's 100 kbit/s floor keeps every legal target above that, so on `test:pattern` the lower bound is never reached; M-OPENH264 checks it with real moving content (§18.4) |
 | `mf_sw_test` | the same through MF software when `MFStartup` works on the runner, through the session's own catalog (WF10), with capture times increasing per layer; otherwise skipped and logged. On Windows Server, where Microsoft's H.264 encoder MFT is not supported, a failed probe is skipped when FFmpeg's log shows the MFT refused (the skip prints its HRESULT) or when the first AU came only on drain with complete drained AUs (SPS, PPS, IDR; §9.10's runner finding, the skip prints the record); any other failure fails, and a client Windows must pass in full |
 
 **`IM_ENC_FAKE`** (`IM_TEST_HOOKS` builds; for a `test:` source `IM_ENC_AUTO` selects it first, so CI is deterministic
@@ -2987,7 +3075,7 @@ separately. Each slice that needs it attaches the bundle to its PR.
 | M-WDA (E12; again with the pill in README WA80) | both | in the desktop app, share the full screen with the isshoni window on top and a share-sheet dropdown open; watch from a phone | the isshoni window (its WebView2 content included) and the pill never appear. This checks the affinity 03's `winos` sets (§11), on WGC (Win11) and DD (Win10) |
 | M-GAME | both | share a GPU-bound game in borderless mode at 1080p60 | `fpsOut` ≥ 50, or `LIMIT_CHANGED gpu` recorded with the game's GPU load |
 | M-AVSYNC (E15) | both | `isshoni-enginetest avsync -dll ci` (05 §19.3's steps): Win11 with `-source pick` (the flash window, WGC), Win10 22H2 with `-source mon:<id>` (DD) | \|median A/V offset\| ≤ 20 ms over ≥ 15 pairs; `avsync.json` attached to the exit record (05 §18.10 item 3) |
-| M-OPENH264 | both | turn OpenH264 on in the app, force it (`encoder` override), share, watch in Chrome | download, verification, attribution; Chrome decodes |
+| M-OPENH264 | both | turn OpenH264 on in the app, force it (`encoder` override), share, watch in Chrome; then share a monitor that shows real moving content (a video playing full screen) with OpenH264 forced for 60 s, and read the share's stats (Details: `f`'s target and its bitrate) | download, verification, attribution; Chrome decodes; with the moving content `f`'s bitrate reaches at least 75 % of its target (and stays under 125 %) after every rate change: the lower bound that `openh264_test` checks only where the content can fill the target, which `test:pattern` never does (§18.2, README §3 item 76) |
 | M-LATENCY | both | 01 §12.2's run book (`tools/g2g`, a monitor share, one monitor, RTT ≤ 50 ms) | p95 < 200 ms over 60 s at 1080p60; the share's `latencyMs` and a `bench` run (§15) recorded next to it |
 
 ### 18.5 Exit criterion

@@ -2285,7 +2285,9 @@ Before the first rc with the app:
    the owner).
 4. **Actions setting**: "Require approval for all external contributors".
 5. **Self-hosted runner** on the Win11 and the Win10 22H2 install (§10.5, ephemeral), and the environment `audiotest`
-   with the owner as required reviewer, created before the first dispatch (§10.4).
+   with the owner as required reviewer, created before the first dispatch (§10.4). As built (WA75; README §3 item
+   83, §8): the environment is needed for any dispatch, runner or not, with "Prevent self-review" off, since the owner
+   both dispatches and approves; the workflow's `environment` job fails the run until it exists with that reviewer.
 6. Consider GitHub's immutable releases (M1's suggestion); with them the deps releases can't change either.
 
 During the release: the checklist items marked (owner) in §11.8.
