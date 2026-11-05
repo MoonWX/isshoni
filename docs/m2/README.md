@@ -1226,8 +1226,9 @@ the named sections)
      single-instance pipe it left behind (03 §16.1; 06 §10.1, §16).
 115. **PR #56's green `windows-desktop` run (42102224032) fills 03 §3.2's CI half** (WA87-R1; WB16): W1/W2, W3, W5, W7,
      W9, W13, W16, W21, the end-to-end case and W19 passed, `TestAutostartRoundTrip` passed twice and the updater e2e
-     passed (it had passed in the first run too); W8's registry half is PR #53's green `windows-go` run
-     (`TestToastRegistryKeys` passed). The run printed none of the spec's annotations (the `list` reporter doesn't, and
+     passed (it had passed in the first run too); the same run's `protocol` job passed W15's ubuntu half (PR #56 changed
+     `cmd/isshoni-desktop/**`, and `ci-ok` needs `protocol`), so W15 holds; W8's registry half and W6's
+     `TestSingleInstanceAndRunningMutex` are PR #53's green `windows-go` run (`TestToastRegistryKeys` passed). The run printed none of the spec's annotations (the `list` reporter doesn't, and
      its results upload only on failure), so the CI budgets of 03 §20 and the rows' recorded details stay "to be read
      from the next run's summary (WF19)". WA87's `socketExists` (the folder listing it uses because `existsSync` was
      taken to be false for an AF_UNIX socket on Windows) works there: the spec's servers became ready on the runner
