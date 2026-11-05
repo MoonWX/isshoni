@@ -30,6 +30,10 @@ const (
 	maxArgBytes     = 8 << 10
 )
 
+// forwardArrivedMsg is serveLoop's log line for each second launch's command line it delivers (the count only);
+// cmd/isshoni-desktop's TestAutostartRoundTrip looks for it.
+const forwardArrivedMsg = "winos: a second launch's command line arrived"
+
 // ErrNotFirst is Serve's error in a process that isn't the first instance.
 var ErrNotFirst = errors.New("winos: not the first instance")
 
@@ -92,6 +96,9 @@ func serveLoop(p pipeServer, onArgs func(args []string), log *slog.Logger) {
 		if err != nil {
 			log.Info("winos: a second launch's message was dropped", "err", err)
 		} else {
+			// Its count only: what arrives may hold a link. The first instance's own record that a forward came, so a
+			// second launch whose window never showed reads apart from one whose forward never arrived.
+			log.Info(forwardArrivedMsg, "args", len(args))
 			onArgs(args)
 		}
 		if nextErr != nil {

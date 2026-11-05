@@ -26,6 +26,9 @@ type Settings struct {
 	h264      OpenH264Codec  // nil: the opt-in is unavailable
 	emit      func(name string, data any)
 	log       *slog.Logger
+	// watched is true when the store reports its own changes (settingsSubscriber): settings.changed then goes out
+	// from New's subscription for every change, whatever made it, and Update doesn't send it a second time.
+	watched bool
 
 	mu sync.Mutex // one Update at a time: each reads the settings it changes
 }
@@ -174,6 +177,15 @@ type settingsWriter interface {
 
 var _ settingsWriter = (*settings.Store)(nil)
 
+// settingsSubscriber is the store's change feed (*settings.Store's Subscribe), found on Deps.Settings: New sends
+// settings.changed from it, so a change made outside Update (the app's tips, the pill's position, the audio section)
+// reaches the page too (03 §6.3).
+type settingsSubscriber interface {
+	Subscribe(fn func(prev, next settings.Settings)) (cancel func())
+}
+
+var _ settingsSubscriber = (*settings.Store)(nil)
+
 // What Settings calls of the app (*app.App), each found on Deps.App by a type assertion: the autostart Run value,
 // the side effects of a saved change, and the hotkeys' state and test.
 type (
@@ -198,7 +210,8 @@ var (
 	_ hotkeyTester    = (*app.App)(nil)
 )
 
-// Update applies a patch and returns the new settings (03 §14.2); settings.changed carries them to the page too.
+// Update applies a patch and returns the new settings (03 §14.2); settings.changed carries them to the page too
+// (from the store's subscription when it has one, else from here).
 // invalid_argument with params.field for a value that isn't valid, and then nothing is saved. wizardDone can only be
 // set (false is invalid: the wizard's steps can't be unseen); serverPrefs only for a listed server; Pause and Stop
 // must differ. Autostart is written to Windows first (the Run value, 03 §16.1), so a value Windows refused (io_error)
@@ -243,7 +256,7 @@ func (s *Settings) Update(patch SettingsPatch) (SettingsView, error) {
 	if err != nil {
 		return SettingsView{}, err
 	}
-	if s.emit != nil {
+	if s.emit != nil && !s.watched {
 		s.emit(EventSettingsChanged, v)
 	}
 	return v, nil

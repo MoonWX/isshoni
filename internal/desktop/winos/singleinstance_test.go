@@ -295,6 +295,13 @@ func TestServeLoop(t *testing.T) {
 	if n := calls.Load(); n != 4 {
 		t.Errorf("onArgs was called %d times, want 4", n)
 	}
+	// Each delivered command line is logged by its count, never its arguments.
+	if n := strings.Count(log.String(), forwardArrivedMsg); n != 4 {
+		t.Errorf("%d command lines logged as arrived, want 4; log:\n%s", n, log)
+	}
+	if strings.Contains(log.String(), "lounge") {
+		t.Errorf("a forwarded argument was logged; log:\n%s", log)
+	}
 }
 
 // TestServeLoopCloseWhileHandling: Close while onArgs runs ends the loop once onArgs returns: a launch that connected

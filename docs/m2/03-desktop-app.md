@@ -123,6 +123,36 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W20 | License gate (`go-licenses`, GOOS=windows) and `govulncheck` pass for `./cmd/isshoni-desktop` | CI | Replace or drop the offending module before DK1 merges |
 | W21 | The Wails runtime's own objects. At beta.34 the same `/wails/runtime` endpoint serves, besides bound-method `Call`/`CancelCall`: `Clipboard` (`SetText`, `Text`), `Application` (`Quit`, `Hide`, `Show`), `Window` (52 methods, e.g. `Hide`, `SetAlwaysOnTop`, `Reload`, `OpenDevTools`, `Print`), `Dialog`, `ContextMenu`, `Screens`, `System`, `Events.Emit` and `Browser.OpenURL` (whose check refuses only `javascript:`, `data:`, `file:`, `ftp:`, empty schemes, shell metacharacters and backslashes, so `ms-settings:`, `search-ms:` and any registered protocol pass). `Events.On`/`Off` are JS-local. The postMessage IPC (`System.invoke`: `wails:runtime:ready`, drag and resize) is a separate path. The row records, at every pin: each object and method with its wire id, both request forms (the object in the JSON body or in the `?object=` query), the transport's chunking (its header or field names), what the runtime itself calls at load, and the postMessage messages | Go test of `assets.Guard` against requests built as the pinned runtime builds them; CDP e2e (§22.4 B): from the page, `Browser.OpenURL('ms-settings:display')`, `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403 and have no effect (no settings page or search opens, the window stays visible), and a bound method still answers | If the Guard can't see the object (W4 fails, or the body can't be read and restored without breaking the runtime): record it, prefer a pin where it can, and rely on the navigation lock, CSP and no raw HTML (§5.5, §5.8) until then |
 
+**Results at beta.34** (README WA87, group 17; the record the PRs' "Wails checklist" sections and the runs below
+give). A row is complete when each of its checks has a recorded result; "pending" names the run that records it. The
+CDP spec (`web/e2e/cdp/desktop.cdp.ts`) writes one annotation per row ("Wails checklist") in `windows-desktop`'s
+CDP step; the owner's `TestWailsChecklist` (`go test -tags isshoni_hw -run TestWailsChecklist ./cmd/isshoni-desktop`,
+and once more with `-tags "isshoni_hw production"` for W19) prints its rows the same way.
+
+| # | Result | Recorded by | Still to record |
+|---|---|---|---|
+| W1 | **Holds**: `location.origin` is `http://wails.localhost`; `TestDesktopOrigins` passes (Mac, group 17) | CDP spec since WA48's skeleton (PR #53's `windows-desktop` CDP step, which ran it with W5 and W7) | WA87's end-to-end half: the link case reaches the server's REST API from that origin (02's CORS), on its first `windows-desktop` run; `TestWailsChecklist` |
+| W2 | **Holds**: `isSecureContext` true | CDP spec (as W1) | `TestWailsChecklist` |
+| W3 | **Holds**: an injected inline script doesn't run and reports a `script-src` violation of the header policy | CDP spec (as W1); `desktop-security.spec` in Chrome | `TestWailsChecklist`'s header-only page (`testdata/checklist/w3.html`) |
+| W4 | **Go half holds**: the Guard's tests (`internal/desktop/assets`, `TestGuard*`: foreign and missing `Origin`, the runtime's objects, chunked and oversized bodies, both request forms) pass (Mac, group 17); `desktop-security.spec` gets 403 for a foreign `Origin` through the real Guard in Chrome | Go tests; e2e | The real webview's half (the middleware sees the runtime's requests): `TestWailsChecklist`. The CDP spec can't send a foreign `Origin` to `wails.localhost`: nothing outside the webview reaches that host, and the page's CSP (`frame-src 'none'`) admits no other origin's frame |
+| W5 | **Fails; fallback taken and holds** (above; PR #53, README §3 item 92) | CDP spec | Re-check at every bump |
+| W6 | **Fallback taken (WA41)** (above): `winos`' mutex and pipe; `TestSingleInstanceAndRunningMutex` on `windows-go` | Windows Go test | — |
+| W7 | **Holds** (PR #53): hidden, not destroyed, `visibilityState` `hidden`, process alive; `TestWindowClosing` passes (Mac, group 17) | CDP spec; Go hook test | — |
+| W8 | Registry half: `TestToastRegistryKeys` runs on `windows-go` (made to run there by PR #53's lesson (c): the test process carries its random AppUserModelID, README §3 item 90); its result is pending: the integrator copies `windows-go`'s result from PR #53's run ("Holds (windows-go, PR #53)" if it was green) | Windows Go test | The registry half's result (above); the buttons: M-DESK-5 on the owner's PC |
+| W9 | Zoom control (Ctrl + wheel, Ctrl+=, Ctrl+numpad +) and the browser accelerator keys (F5, Ctrl+R, Ctrl+P, Ctrl+F, Ctrl+U, Ctrl+Shift+I, F12): CDP-observable checks written (WA87): no zoom change, no reload, no `beforeprint`, no new DevTools or view-source target | CDP spec (WA87), pending its first `windows-desktop` run | Manual on the owner's PC with a production build and the real keyboard and mouse: the accelerators again (CDP's key events enter at the renderer's widget, not WebView2's own accelerator path), the default context menu (right-click outside a text field), DevTools (F12, Ctrl+Shift+I), the status bar (hover a link), autofill and password save (the link step's password form), swipe navigation and pinch zoom (touchpad), external drop (drag a file and a link onto the window) |
+| W10 | Pending: `TestWailsChecklist` (owner's PC). The shell uses the main window's HWND for WDA (§11.5) and the pill's owner; W7's check reads the same window: the process's one enabled top-level window of Wails' window class (`WailsWebviewWindow`; beta.34's `initMainLoop` also makes a hidden `WS_DISABLED` top-level window of that class, `__wails_hidden_mainthread`, for its main-thread dispatch, which is left out), not .NET's `MainWindowHandle`, which while a share is live is the topmost pill | `TestWailsChecklist` (`MainWindowHandle()` is a window handle) | `TestWailsChecklist` on the owner's PC; M-DESK-2 (the window is absent from the stream) |
+| W11 | **Holds** without a window (WA48, above) | `TestBindingContextIsTheCalls` (passes, Mac, group 17) | The real webview: `TestWailsChecklist` |
+| W12 | **Holds** without a window (WA48, above) | `TestBindingErrorIsVerbatim` (passes, Mac, group 17) | The real webview: `TestWailsChecklist` |
+| W13 | Written (WA87): a page that no gesture activated (`userActivation.hasBeenActive` false; the check is an init script of a reloaded document, since Playwright's `evaluate` is a gesture) must get `<audio>.play()` resolved for a `blob:` tone; the new `AudioContext`'s state is recorded. The user data folder is the e2e data root's (the fixture refuses a run without it) | CDP spec, pending its first `windows-desktop` run | `TestWailsChecklist` |
+| W14 | **Holds**: `TestShutdownHook` (a quit Wails began stops the share first and closes the audio service) and `TestQuitStopsShareFirst` pass (Mac, group 17) | Go tests | The real app: the CDP spec's end-to-end case (Quit while live: exit 0 within 3 s, the share gone at the viewer), pending its first `windows-desktop` run; M-DESK-4 |
+| W15 | The macOS half holds (above); the ubuntu half is `ci.yml`'s `protocol` job, whose result is pending: the integrator copies it from the group PR's run | CI | The ubuntu half's result |
+| W16 | Written (WA87): `requestFullscreen()` on the page; Wails' `ContainsFullScreenElementChanged` handler makes the window fullscreen (the SPA calls no `Window.SetFullscreen` on its own: beta.34 follows the element's fullscreen itself); the page must fill the screen (`innerWidth`/`innerHeight` equal `screen.width`/`height`), and Esc, a real key press (`SendInput` with the window in the foreground; CDP's key events enter at the renderer, below WebView2's own Esc handling, and the first `windows-desktop` run showed a CDP Escape leaving fullscreen on), must leave it with the window back at its size and visible | CDP spec, pending its first `windows-desktop` run | Manual: F (the stage's fullscreen) on a watched share and Esc, on the owner's PC |
+| W17 | Fallback built (WF13): the heartbeat watchdog, with the hidden-page gap of §20 | Go tests of the watchdog | M-DESK-11 on the owner's PC (kill a renderer; minimized and covered for 10 minutes) |
+| W18 | **View model holds**: `TestTrayMenu` and `TestTrayIcons` pass (Mac, group 17) | Go tests | M-DESK-4 (the live tray: icon, tooltip, menu, left click) |
+| W19 | Written (WA87): the production build started with the three variables must open no port and no pipe, no process below it may carry them on its command line, and its own environment block must hold no `WEBVIEW2_*` beyond Wails' five placeholders (`WEBVIEW2_X` gone), against a control: the e2e build with the same variables keeps `WEBVIEW2_X`. That block is the proof: the WebView2 loader runs in `isshoni.exe` and reads `WEBVIEW2_*` from it. The WebView2 browser process is read too (a block counts as read only when it holds `SYSTEMROOT` or `PATH`), with a marker that isn't a `WEBVIEW2_*` name (`X_ISSHONI_W19`): the second `windows-desktop` run (PR #56) found the control's browser process without the marker: the WebView2 runtime starts its browser process with an environment of its own, so nothing of `isshoni.exe`'s block reaches it. The production build's browser process must show the same inheritance as the control's and never `WEBVIEW2_X`, and the row records which way the runtime went; `TestScrubEnv` passes (Mac, group 17) | CDP spec (CI: the stage's `isshoni.exe`), pending its first `windows-desktop` run | `TestWailsChecklist` with `-tags "isshoni_hw production"` on the owner's PC; M-DESK-13 (the WebView2 browser process's environment, when the runtime drops `WEBVIEW2_*` there on CI too) |
+| W20 | **Holds**: `GOOS=windows govulncheck ./cmd/isshoni-desktop` (no vulnerability the code reaches) and `GOOS=windows go-licenses check ./cmd/isshoni-desktop` pass (Mac, group 17) | CI (`govulncheck`, `licenses`) | — |
+| W21 | **Holds in Chrome** (`desktop-security.spec`, the real Guard, the stub runtime) and in the Guard's tests; the CDP case is written (WA87): the four requests and the query form get 403, no new top-level window of Settings, search or Explorer appears within 3 s, the main window stays visible, `App.Info` answers 200 | e2e; Go tests; CDP spec, pending its first `windows-desktop` run | The full list of objects and wire ids at each pin: `TestWailsChecklist` |
+
 ### 3.3 Bumps
 
 - At most one Wails bump per isshoni minor release, in a PR of its own, with the checklist re-run and the CDP e2e
@@ -160,7 +190,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | Process | Parent | Lifetime | Notes |
 |---|---|---|---|
 | `isshoni.exe` | `explorer.exe`: the Start menu, autostart, Explorer-launched installer starts, or the shell relaunch of §13.4 when a browser, the installer or another non-launcher started it; a launcher of 05 §5.4 (terminal, Steam, …) is kept | until Quit | Loads `isshoni-media.dll` in-process (04). A native crash ends the app and the share; §17 covers crash files |
-| `msedgewebview2.exe` (browser, renderer, GPU, utility/audio, network) | `isshoni.exe` | with the window's environment | Its own user data folder (§14.1), so the WebView2 browser process is always a child of `isshoni.exe`: 05's instance rule "exclude all isshoni.exe descendants" keeps viewer audio out of shares |
+| `msedgewebview2.exe` (browser, renderer, GPU, utility/audio, network) | `isshoni.exe` | with the window; its environment is the runtime's to set (the first `windows-desktop` run found no `WEBVIEW2_X`, the one `WEBVIEW2_*` name it checked, in the control's browser process although `isshoni.exe` had it; W19 records what it inherits) | Its own user data folder (§14.1), so the WebView2 browser process is always a child of `isshoni.exe`: 05's instance rule "exclude all isshoni.exe descendants" keeps viewer audio out of shares |
 | `isshoni.exe --sound-check-helper` | `isshoni.exe` | ≤ 3 s, during a sound check | 05's helper (05 §11.3): plays the chime and exits. `main` dispatches it before anything else (§13.4) |
 | `isshoni.exe` in a one-shot mode (`--version`, `--self-check=…`, `--forget-credentials`, `--purge-data`, `--update-now`, `-Embedding`) | the installer, a test, COM | seconds | No window, no single instance, no mutex (§13.4) |
 | `isshoni.exe <args>` (second instance) | whoever launched it | ≤ 2 s | Forwards its arguments to the first instance (§13.3), calls `AllowSetForegroundWindow(ASFW_ANY)` first, exits 0 |
@@ -718,6 +748,29 @@ registration found; otherwise `idle` for a combination that parses, `invalid` fo
 `Settings.Hotkeys` still answers `not_implemented` until WA84 maps it, so the SPA shows `Settings.Get()`'s
 combinations as `idle` meanwhile.
 
+As built (WA84, group 16; README §3 item 104): **`Settings.Update`, `Hotkeys`, `TestHotkey` and `Updates.*` are
+live.** `Settings.Update` takes every field of §14.2's patch; a changed `autostart` goes to the Run value first
+(`app.App.SetAutostart`, §16.1), so a value Windows refused (`io_error`) is never saved, and is set back when the save
+then fails; after the save `app.App.SettingsChanged(prev)` applies the capture exclusion, a running share's hotkeys, the
+pill's mode, the log level and, for `updates.check` or `updates.channel`, an immediate check (§16.2), and the bridge
+emits `settings.changed` (§6.3). `Settings.Hotkeys` maps `app.App.Hotkeys()`. **The OpenH264 opt-in** (§14.4, 04
+§9.9) is three methods, named here because the table had none: `Settings.OpenH264()`, `Settings.EnableOpenH264()`
+and `Settings.DisableOpenH264()`, each → `OpenH264Status {state: "unavailable" | "off" | "on", version}`
+(`NativeBridge.settings`' `openH264`, `enableOpenH264`, `disableOpenH264`; `openH264Control()` builds the SPA's control
+over them). They run over `bridge.Deps.OpenH264` (`main`'s `OpenH264Codec`, over 04's `native.InstallOpenH264`,
+`VerifyOpenH264`, `RemoveOpenH264` and the engine's `SetOpenH264Path`; an installed file goes to the engine at start);
+without it `OpenH264()` is `unavailable` and the other two `not_implemented`. `EnableOpenH264` (≤ 90 s: the download's
+60 s, then the checks) fails with `engine.dependency` (`params.reason` `download` or `corrupt`, or the engine's
+`missing`, `version`, `blocked_by_policy`) or `engine.timeout` and leaves nothing behind; `DisableOpenH264` answers
+`busy` while a share is live (its encoder may hold the DLL, which Windows then can't delete). `Updates.*` run over the
+app's updater (`bridge.Deps.Updates`, else `*app.App`'s `UpdateStatus`, `CheckUpdate`, `InstallUpdate` and
+`SubscribeUpdates`): **"Restart and update" and a share's start share one gate**, so `Updates.Install` is `busy` while
+a share is live or starting or another install runs, and `Share.Start` is `busy` while an install runs
+(`app.App.Shares()` hands out the gated controller): a share started while `Apply` waits up to 10 s for the
+installer's mutex would otherwise be ended by the Quit that follows. A second instance and the e2e harness have no
+updater, so there `Updates.*` answer `not_implemented`. `bridge.go` gained `Deps.Updates`, `Deps.OpenH264`, the
+`update.state` subscription and the `Settings` fields it needs (the core, the server list, the emitter).
+
 | Service.Method | In → out | Errors | Notes |
 |---|---|---|---|
 | `App.Info()` | → `AppInfo {version, os, osBuild, arch, publisherConnectionId, wizardDone, dev}` | — | `publisherConnectionId` is `core.Status().ConnectionID` of C2, "" while it isn't ready |
@@ -747,7 +800,7 @@ combinations as `idle` meanwhile.
 | `Share.Capabilities()` | → `ShareCaps {canShare, reason?, encoders[], borderless, osBuild, audioBackend}` | — | from the engine's probe (≤ 2 s); `audioBackend` (§6.3) |
 | `Share.Pick()` | → `*Picked {pickId, kind, label, border, confirm[]}` or `null` (cancelled) | `already_sharing`, `engine.<code>` | opens the OS picker owned by the main window (§10.1) |
 | `Share.Release(pickId)` | → — | — | |
-| `Share.Start(req)` | `{pickId, roomId, preset, withAudio}` → `ShareView` | `pick_expired`, `already_sharing`, `not_linked`, `publisher_offline`, `engine.<code>`, wire codes (`share_limit`, `room_full`, `room_not_found`, `forbidden`, …) | resolves at `starting`; `live` comes as an event |
+| `Share.Start(req)` | `{pickId, roomId, preset, withAudio}` → `ShareView` | `pick_expired`, `already_sharing`, `not_linked`, `publisher_offline`, `busy` ("Restart and update" runs, WA84), `engine.<code>`, wire codes (`share_limit`, `room_full`, `room_not_found`, `forbidden`, …) | resolves at `starting`; `live` comes as an event |
 | `Share.Current()` | → `*ShareView` | — | pull for the `share.state` event (§6.3) |
 | `Share.Stop()` | → — | — | never fails; idempotent |
 | `Share.StopOther(roomId, shareId)` | → — | wire codes | 01's `Client.StopOther`: C2 sends `share.stop` for another connection's share of this user (the SPA's role `viewer` may not, 01 §6.3) |
@@ -770,10 +823,12 @@ combinations as `idle` meanwhile.
 | `Settings.Update(patch)` | `SettingsPatch` (every field optional) → `SettingsView` | `invalid_argument` with the field | §14.2 |
 | `Settings.Hotkeys()` | → `[]HotkeyStatus {id, combo, state: "registered"\|"idle"\|"taken"\|"invalid"}` | — | |
 | `Settings.TestHotkey(combo)` | → `HotkeyStatus` | `invalid_argument` | registers and unregisters at once; `HotkeyStatus.typesChar: true` when the combination types a character in the current keyboard layout (`VkKeyScanExW`/`ToUnicodeEx` with `GetKeyboardLayout`; Ctrl+Alt is AltGr), which the hotkey field shows as a warning (§11.2) |
+| `Settings.OpenH264()` | → `OpenH264Status {state: "unavailable" \| "off" \| "on", version}` | — | the Cisco opt-in (§14.4, 04 §9.9); `unavailable` when no engine takes it (WA84) |
+| `Settings.EnableOpenH264()`, `Settings.DisableOpenH264()` | → `OpenH264Status` | `engine.dependency` (`params.reason`), `engine.timeout`; `busy` (disable while a share is live) | download, verify and turn on (≤ 90 s; a failure leaves nothing behind); turn off and delete the file (WA84) |
 | `Window.SetFullscreen(on)` | → — | — | §12.1 |
 | `Updates.Status()` | → `UpdateStatus` | — | §16.2 |
 | `Updates.Check()` | → `UpdateStatus` | `update.<code>` (06 §8.10) | 06's `CheckNow` |
-| `Updates.Install()` | → — | `busy` (a share is live; 03 enforces it, the updater isn't told), `update.not_ready`, `update.not_installed` | 06's `Apply(ctx, u.Ready(), true)`, then Quit (§11.6) within 5 s |
+| `Updates.Install()` | → — | `busy` (a share is live or starting, or another install runs; 03 enforces it, the updater isn't told), `update.not_ready`, `update.not_installed`, `update.<code>` (a failed apply) | 06's `Apply(ctx, u.Ready(), true)`, then Quit (§11.6) within 5 s |
 
 Timeouts inside the methods (W11 fallback and in general): `Probe` 10 s, `Link` 15 s, `Start` 20 s (C2 not ready
 after 10 s → `publisher_offline`), `AccessToken` 15 s, `Updates.Check` 45 s, every other method that does I/O 10 s.
@@ -805,8 +860,17 @@ included; `services_test`'s `TestEvents` checks the list and `bridge.ts`'s `Brid
 | `deeplink.open` | `PendingLink`, exactly one shape: `{roomId}` for the active server (`""` = the SPA's own last room); `{add: {origin, host, hostUnicode, roomId}}` for an unknown server (`host`/`hostUnicode` from `deeplink.Link`); `{switch: {origin, host, hostUnicode, roomId}, live: {roomId}}` for a known server while a share is live (§13.2's question); `{error: "too_many_servers"}` for a 21st server (WA41) | a deep link, `--server` or `PendingServer` (§13.2) | `App.PendingLink()` |
 | `window.state` | `{visible, focused, fullscreen}` | changes | — |
 | `window.notice` | `WindowNotice {code, text}` (`still-sharing`: "isshoni is still sharing. Stop it from the tray icon (^).") | `App.ShowWindow` opens the window with a notice due (§11.6) | `App.WindowNotice()` |
-| `settings.changed` | `SettingsView` | after any change, from any source | `Settings.Get()` |
+| `settings.changed` | `SettingsView` | after any change, from any source (as built: only after `Settings.Update`, WA84; WF18 makes it follow every change) | `Settings.Get()` |
 | `update.state` | `UpdateStatus` | changes | `Updates.Status()` |
+
+As built (WA84 and WF17, group 16; README §3 items 104, 107): **`update.state`** goes out for every status of the
+updater from the app's `Run` on (`bridge.New` subscribes through `app.App.SubscribeUpdates`); without an updater (a
+second instance, the e2e harness) none goes out. **`settings.changed`** goes out only after `Settings.Update`: the
+app's own writes (`tips.firstShareShown` from the share controller, `tips.trayNoticeShown` from
+`App.WindowNoticeShown`, the pill's positions, `autostart` following the Run value at start, §16.1) emit nothing, so
+an open Settings page shows the old value until it pulls `Settings.Get()` again. WF18 (group 17) adds
+`settings.Store.Subscribe(func(Settings)) (cancel func())`, called after every successful save, and the bridge emits
+from it instead (WA84-R6). **`ShareView.lockPrompt`** (WF17) is below.
 
 `ShareView` (the bridge's DTO, TS `ShareView`, mapped from 01's `core.ShareSnapshot` plus the controller's own
 fields; named apart from `core.ShareSnapshot` on purpose):
@@ -837,6 +901,10 @@ fields; named apart from `core.ShareSnapshot` on purpose):
   around 01's `ServerLayerStats[]`, as built by WA58: WA48's DTO types it `map[string]any`; WA65 typed the TS side
   `{layers: ServerLayerStats[]} | null`) while `Share.WatchServerStats` is on, else `null`.
 - `endReason`: `user | hotkey | tray | source-gone | elsewhere | server | server-unreachable | unlinked | system | error`.
+- `lockPrompt` (WF17, README §3 item 107): `true` while the share is paused by a lock that outlasted the auto-resume
+  bound and waits for "Resume sharing?" (§11.6), else `false`: the share controller's `View.LockPrompt`, which the
+  app sets from `App.sys.prompt` (`Controller.SetLockPrompt`) and the view shows only while `paused`. TS
+  `ShareView.lockPrompt` (hand-written in `bridge.ts`).
 - `error`: `{code, params}` per §6.4.
 
 `ShareStatsSample` (`Share.Stats()`, `share.stats`): `layers[]` = `{rid, width, height, fps, kbps: SentBps/1000,
@@ -1971,10 +2039,23 @@ desktop page, lazily through `web/src/desktop/shell.ts`, which re-exports them f
 fetches them; the share panel no longer mounts its own notice, and `desktopShell.test.tsx` checks both in the desktop
 (the `windowNoticeShown` report included) and neither in the browser. A run that quits before the window opens again
 loses the due mark, so a later run's first close sends the toast again. The pill shows the lock prompt (`lockPrompt`,
-"Paused · Resume sharing?") and the tray its Paused menu; **the panel's "Sharing is still paused since you locked your
-PC. [Resume sharing] [Stop]" bar is not built**: it needs a `ShareView.lockPrompt` field filled from `App.sys.prompt`,
-which WF17 (group 16) adds with the bar, along with `desktop-share.spec`'s close-to-tray step (an e2ehost hook that
-calls `WindowClosing`).
+"Paused · Resume sharing?") and the tray its Paused menu; the panel's bar came with WF17 (below).
+
+As built (WF17, group 16; README §3 item 107): **the panel's lock prompt**. `ShareView.lockPrompt` (§6.3) is the share
+controller's `View.LockPrompt`: the app copies `App.sys.prompt` into it (`Controller.SetLockPrompt`) on every tray
+flush, under a mutex of its own so an older read can't overwrite a newer one, and the controller shows it only while
+the view is `paused` and drops it itself when a share starts and when the view turns `live`, `ended` or `failed` (the
+states that end the lock pause), so a pause the user chooses within the tray's 250 ms debounce after "Resume sharing"
+never shows a stale prompt. The bar is the panel's existing status line in a lock-prompt state, not a second bar
+(which would have shown two Stop buttons): "Sharing is still paused since you locked your PC." with **Resume sharing**
+(in place of Resume) and Stop (`desktop.share.panel.lockPrompt`, `.resumeSharing`); the line is always
+`role="status"`, so the text is announced when it replaces the paused line. `safety.test.tsx` covers the bar and its
+buttons, and `desktop-system.spec`'s long-lock cases use its Resume sharing and its Stop. **The close-to-tray e2e
+step**: the harness's `POST /__e2e/window?action=close|open` calls `App.WindowClosing` (as the Wails shell's close
+hook does) or `App.ShowWindow` (the tray's Open), and `desktop-share.spec` closes the window while live: the app hides
+to the tray and stays live, one toast is recorded, no notice shows while hidden, the notice shows on Open, the flag is
+set only after it was shown, and nothing comes again afterwards. `TestHostWindow` covers a close without a share (the
+harness quits).
 
 Quit always stops a share first (`core.Share.Stop`: `share.stop`, engine stop, `room.leave`; then
 `audio.OnShareStopped()`), closes C2 (`core.Client.Close`, 1000) and C1 (1000), calls `audio.Service.Close()`,
@@ -2007,7 +2088,9 @@ disturb), on Windows 10 `ms-settings:quiethours` (Focus assist). isshoni doesn't
   'endpoint')`, and `layerPolicy`'s rule 8 turns every subscription's audio off. It is attached from `ViewerLayout`
   (`useEndpointMute`), because `rooms/runtime.ts` was outside WA77's paths, so the mute holds only while the room
   page's viewer is mounted; it belongs in `rooms/runtime.ts` with the room's viewer store (a later slice that owns
-  that file moves it; `attachEndpointMute` is exported for that).
+  that file moves it; `attachEndpointMute` is exported for that). As built (WA83, group 16; README §3 item 103):
+  `rooms/runtime.ts` attaches it once per runtime, beside the handoff (§12.2), so the mute holds while the room page
+  isn't mounted too; `useEndpointMute` is gone.
 
 ### 12.2 Handoff: `playback.stop` and `playback.state`
 
@@ -2056,6 +2139,28 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
   disappears from that list, the App calls `SetViewerBrowser(fromConnID, …, false)`. 05 also drops every viewer rule
   when the share ends.
 
+As built (WA83, group 16; README §3 item 103): `web/src/rooms/handoff.ts`, attached by `rooms/runtime.ts` once per
+page for the runtime's life (so it works while the room page isn't mounted), keeps C1's `user.connections` in a store
+and, in the desktop page, sends the online ids to `App.OwnConnections` whenever they change.
+- **The stop's sender**: `RoomSession` gained a `'join'` event, emitted for a `join()` that asks for a room (another
+  room, or the same one after a refusal or a leave), not for one the welcome is already re-joining; the next
+  `room.state` of that room sends `playback.stop`. A deep link to the room the app is already in sends it again
+  (`requestStop`, §13.2). The web client asks for `agent.relay` and `user.connections` in its hello
+  (`WebHelloFeatures`, `SignalClient.featureActive()`); nothing is sent while the relay isn't active.
+- **The receiver**: a stop whose sender the snapshot doesn't list yet (its `room.state` may come after the message) is
+  checked again with each snapshot of the next 3 s (`HANDOFF_VERIFY_MS`), then dropped. `viewerStore.handedOff` makes
+  `layerPolicy`'s rule 9 subscribe nothing, and the stage shows "Now watching in the isshoni app" with **Watch here
+  instead**; the tab's own share keeps its preview tile. `desktop-handoff.spec` asserts that the handed-off tab's
+  video and audio are both off.
+- **`playback.state`**: audible means a subscription with audio on in the layer policy's set (so neither a handed-off
+  tab nor the endpoint mute counts) and the element playing unmuted. Besides every change, a tab sends it to all
+  online desktop connections after each welcome (its connection id may be new) and to a desktop connection that
+  appears, **and once more 3 s later** (`PLAYBACK_STATE_REPEAT_MS`): `App.followPlayback` subscribes to C2's core
+  events only after `Ready` returns, so a report decoded right after C2's welcome is dropped (without the repeat
+  `desktop-handoff.spec` failed 2 runs in 3). The repeat is a stopgap that covers only that moment, not a report during
+  a later C2 reconnect; WF18 (group 17) makes Go subscribe before `Ready` and removes it, and the sender above says
+  "once" until then.
+
 ### 12.3 Browser-side entries
 
 - **"Get the desktop app (keeps Discord out of your audio)"** stays in the browser's ShareSheet and in the whole-screen
@@ -2077,6 +2182,14 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
   one of the rare host names its stricter rules refuse although Go's `Parse` would take them, 02 §10.2's as-built note
   from WA74), there is no link and the line isn't shown (WA83). The app then joins the room and sends `playback.stop`
   (§12.2).
+
+As built (WA83, group 16; README §3 item 103): **"Open in the isshoni app"** is `web/src/rooms/OpenInApp.tsx`, shown
+in the header of the browser's room page (`RoomPage`) while the room is current, because `web/src/share/` was outside
+WA83's paths; its "Nothing happened?" line links the server's `/download?room=<roomId>` (`downloadPath`, plain
+`/download` for an id that fails the room-id rule), and the line doesn't come once the tab was handed off.
+`downloadPath` and `appLinkFor` are ready for the sheet. **Not built yet** (WA83-R1, WF18 in group 17): ShareSheet's
+and ScreenAudioWarning's "Get the desktop app" still opens a plain `/download`, the Windows-only rule and its key
+`share.sheet.desktopAppWindowsOnly` don't exist, and `OpenInApp` isn't mounted above that link.
 
 ---
 
@@ -2127,6 +2240,23 @@ handles it like any deep link. A `PendingServer` value counts as the wizard's si
 | more than 20 servers | "You've added 20 servers. Remove one first." |
 
 Links are handled at most once per second; extra ones within that second are dropped.
+
+As built (WA83, group 16; README §3 item 103): the page's side is `web/src/rooms/DesktopLinks.tsx`, mounted once for
+every desktop page by `InRoomBar` (lazily, a chunk of its own; `app/App.tsx` was outside WA83's paths), with its texts
+as `room.deepLink.*` keys of the main catalog. It acts on `deeplink.open` and on `App.PendingLink()`
+(`desktopLinkAction`, with `DesktopLinks.test` over this table): `{roomId}` navigates to the room (for `""` the SPA's
+own last room, else `/`, which picks the server's default) and then calls `App.LinkHandled()`, asking M1's switch
+question first when the page's share is live in another room, and sending `playback.stop` again for the room the page
+is already in (§12.2); `{add}` goes to `/desktop/setup?add=<origin>`; `{switch, live}` asks "You're sharing in
+{room}. Open {target}? Your share will stop.", whose Open calls `Share.Stop` then `Auth.SwitchServer` and whose Cancel
+calls `App.LinkHandled()`; `{error: too_many_servers}` goes to `/desktop/setup`, whose server step shows the 20-server
+text. While the user isn't signed in, or the wizard or the relink page shows, the page does nothing (SetupPage reads the
+pending link itself), and it pulls `App.PendingLink()` again each time it becomes ready, so a room link that came
+meanwhile still opens; those later pulls leave `{add}` and `{error}` to the wizard. **Open** (WF18, group 17): Go's
+`SwitchServer` passes no next link and so clears the pending `{switch}` link, and the confirmed question's room is
+never opened after the reload (WA83-R2: Go keeps `{roomId: switch.roomId}` pending for that path); and a
+`{error: too_many_servers}` link is never cleared (neither `DesktopLinks` nor `SetupPage` calls `App.LinkHandled()`
+for it), so every later reload sends the page back to the setup page (WA83-R4).
 
 ### 13.3 Single instance
 
@@ -2252,6 +2382,22 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    gap in which another start could become the first instance. No window or connection is opened first. If `Apply`
    returns an error, it is logged and the start continues with step 6 (which then handles the link from the Pending
    values just written).
+   As built (WA84, group 16; README §3 item 104): `startTimeUpdate` in `cmd/isshoni-desktop/update.go`. Step 5 opens
+   `settings.json` and the updater (`earlyParts`; 06's `Enabled`, `Channel` and `WizardDone` read `settings.json` before
+   every check), and step 7 goes on with both instead of opening them again. `PendingAtStartup(autostart)` is 06's and
+   answers nil at an `--autostart` start. **The link it keeps** is the newest one: this start's own `--open-url`, or the
+   newest a second launch forwarded since step 3 (`fwd`'s queue), so the relaunched app opens what the user clicked
+   last; it is never logged. **A failed `Apply`** (`startApplyTimeout`, 30 s) is logged and the Pending values it just
+   wrote are **taken back**, and the start goes on: the link reaches this start's app from where it came (its own
+   `--open-url` or the forwarded queue), so step 6 would otherwise hand it over twice (two `deeplink.open`, and two Add
+   questions for an unknown server). This replaces the sentence above about step 6 handling it. `TestInstallerHandover`
+   runs with a pending update, so a step-5 call moved before step 2a fails it; `TestStartTimeUpdate*` cover the newest
+   link and the take-back. **`--update-now`** (step 1) is compiled only into `updatetest` builds (`updatenow_on.go`; in
+   every other build `updatenow_off.go` leaves it out, so `--update-now` logs an error and exits 2 with no window): one
+   `CheckNow`, then `Apply(ctx, Ready(), true)` when `ready`; exit 0 when the installer runs or the app is up to date,
+   else 1, within 10 minutes. It builds 06's updater with its default options (enabled unless the machine policy says
+   otherwise, the stable channel, which a test build widens to every channel) and opens no `settings.json`, as a
+   one-shot mode.
 6. **Pending values**: read and delete `PendingServer` and `PendingRoom` (§13.2).
 7. **The app**: env scrub (§5.4), `SetCurrentProcessExplicitAppUserModelID("io.isshoni.desktop")`, the WebView2
    runtime check (§5.4), settings, logs, the services of §6.1, Wails; then `HandleArgs(os.Args[1:])` and
@@ -2454,6 +2600,19 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 - Started with `--autostart`, the app creates the tray and C2's session (no room, so no presence) but **no window**
   until the user opens one; it handles deep links and update checks meanwhile, and never applies a pending update at
   that start (§13.4 step 5). No SPA runs, so the user is never shown in a room just because the PC started.
+- As built (WA84, group 16; README §3 items 104, 108): `winos` writes the value `isshoni` = `"<exe>" --autostart` under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`RunCommand`: an absolute path without a quote) and deletes it
+  when off; elsewhere `Autostart`/`SetAutostart` answer `ErrNotSupported` (`not_implemented` at the bridge). **The
+  deferred window**: an `--autostart` start builds the shell without the main window (`newDeferredShell`): the tray icon
+  exists for the app's whole life, and the window is created the first time one is asked for (`ShowWindow`: the tray's
+  Open, a toast, a link, a second launch); until then `Reload` has no page to reload, and the window loads the start
+  page when it opens. A ready update is offered in the tray then (06 §8.7 (b)). **The OS is the truth**: at `Run`'s
+  start `settings.json`'s `autostart` follows the Run value (`syncAutostart`), since the value can go without the app
+  (06's uninstaller deletes it while a keep-data reinstall keeps `settings.json`, or another tool removes it), and the
+  app never writes the Run value behind the user's back. `TestDeferredShellOpensNoWindow` checks the shell everywhere;
+  `TestAutostartRoundTrip` (Windows, the e2e build with `web/dist` and a WebView2 runtime: started with `--autostart` it
+  shows no window, and a second launch shows one) runs in ci.yml's `windows-desktop` and nightly's `windows-full` with
+  `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, which turns its skips into failures (06 §10.1).
 
 ### 16.2 Updates (the UI; 06 owns the updater)
 
@@ -2483,6 +2642,17 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   - `off` with `policyOff`: the setting greyed out with "Turned off by your administrator"; `off` without it: "Turned
     off";
   - `disabled` (not a release build): "Updates are off in this build".
+- As built (WA84, group 16; README §3 item 104): `internal/desktop/app/updates.go` runs 06's schedule from `Run`,
+  follows the updater's status (the tray's "Restart and update to X" while one is ready, the ready toast once per
+  version with **Restart now** while no share is live, `update.state`) and owns "Restart and update" for Settings, the
+  required banner, the tray and the toast. **A change of `updates.check` or `updates.channel`** in Settings runs 06's
+  `CheckNow` at once (≤ 45 s, a download included): turned off it publishes `off`, so the ready offer and the tray's
+  item go and Settings shows "Turned off"; turned on, or another channel, it checks now, since 06 reads `Enabled` and
+  `Channel` only when a check runs and the next scheduled one may be a day away. **Never while a share is live** is a
+  gate shared with the share's start: `Updates.Install()` is `busy` while a share is live or starting, and a share
+  started while `Apply` waits for the installer's mutex (up to 10 s) is refused with `busy`; a share found live after
+  `Apply` (the gate rules it out) ends with cause `system`. When the tray's or the toast's Restart is refused or fails,
+  the window opens, and Settings → Updates says why. The end to end in a test channel is WA88's (06 §8.11, §16).
 
 ### 16.3 Version skew between the app and a server
 
@@ -2651,7 +2821,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | `-Embedding` start without an `open` action | exits within 5 s |
 | `--forget-credentials`, `--purge-data` | revokes ≤ 5 s in all (one budget); `--purge-data`'s locked files retried ≤ 10 s |
 | `--self-check` probe | 20 s |
-| Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s |
+| Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s. Checked (README WA87): the CDP spec's end-to-end case sends `App.Quit(true)` while live and asserts exit code 0 within 3 s and the share gone at the viewer, recording the time as "Budget (03 §20)"; pending its first `windows-desktop` run |
 | End of session | share stopped within 2 s |
 | WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni". As built (WF13, `app.HeartbeatEvery`/`HeartbeatTimeout`; README §3 item 84): the page beats at once at boot, every 5 s, and again at once when it becomes visible; Go's watchdog arms with the first beat, checks every 5 s, watches only a visible window (one just shown gets a fresh 15 s) and waits another 15 s after a reload; when that reload brought no beat back, the next timeout loads the start page (`ReturnHome`, W5's and W17's fallbacks at beta.34). The cap of 3 reloads per 5 min and the error page are not built yet. **Known gap while hidden**: Go asks `Shell.WindowVisible()` (Wails' `IsVisible`, which reads the window's `WS_VISIBLE` style bit (beta.34's `webview_window_windows.go`)), which stays true for a minimized window and one fully covered by a full-screen game, the main case while sharing, while WebView2 marks such a page hidden and, after 5 min hidden, Chromium's intensive throttling runs chained timers about once a minute. The page then beats less often than every 15 s, and the watchdog may reload it every 15–60 s while the user plays (WF13's review, R2; not reproduced on a Mac). A dedicated Worker's timer isn't throttled that way, but §5.3's CSP has `worker-src 'none'`. The fix belongs to the app or the shell, in a later slice: watch only a page that isn't minimized or occluded (`IsIconic`, or the page's own `visibilitychange` sent with the beat), or start WebView2 with `--disable-background-timer-throttling`; M-DESK-11's variant checks it (§22.5) |
 | Settings write debounce | 500 ms |
@@ -2662,9 +2832,9 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | `/wails/runtime` request body read by the Guard | ≤ 64 KiB (413 above); chunked runtime requests refused (§5.6) |
 | `App.OwnConnections` | ≤ 64 ids |
 | Window | min 800 × 560 px, default 1200 × 760 px |
-| Startup to window | ≤ 1.5 s warm, ≤ 3 s cold on the owner's PC, the shell relaunch included (measured in DK13) |
+| Startup to window | ≤ 1.5 s warm, ≤ 3 s cold on the owner's PC, the shell relaunch included (measured in DK13). **Measured** (README WA87, group 17): on the owner's PC not yet (M-DESK-12: Task Manager's startup, cold after a reboot and warm, from a Start menu launch, which includes the shell relaunch; the result goes here). The CDP spec records the CI runner's number at every start as the annotation "Budget (03 §20)": the e2e build's spawn (`--relaunched`, so without the relaunch) to `DOMContentLoaded` at the asset origin (the page's own navigation timing, so the spec's polling and attach aren't counted; the time to Playwright attached is recorded beside it) with a new WebView2 profile, a cold start of the webview on a GPU-less `windows-2025`; it is a trend line, not the budget's measurement |
 | Pill shown after `live` | ≤ 300 ms |
-| Memory (budget, measured in DK13) | `isshoni.exe` ≤ 120 MB private working set while sharing 1080p60 (engine buffers included, GPU memory excluded); the WebView2 processes ≤ 350 MB together while watching one focused share and 8 thumbnails |
+| Memory (budget, measured in DK13) | `isshoni.exe` ≤ 120 MB private working set while sharing 1080p60 (engine buffers included, GPU memory excluded); the WebView2 processes ≤ 350 MB together while watching one focused share and 8 thumbnails. **Measured** (README WA87, group 17): on the owner's PC not yet (M-DESK-12, after 30 minutes of sharing 1080p60 while watching one focused share and 8 thumbnails; the result goes here). The CDP spec's end-to-end case records the CI runner's private working sets (`Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`, Task Manager's column) of `isshoni.exe` and of its `msedgewebview2.exe` processes together ("unreadable", with how many processes were read, when the provider had no row for one), while the fake engine shares 640×360 to one Chrome viewer: the annotation "Budget (03 §20)", a trend line on the fake engine, not the budget's case |
 
 ---
 
@@ -2873,15 +3043,18 @@ uploads it as `e2ehost-linux-amd64`; the `e2e` job downloads it and sets `DESKTO
 | Spec | Asserts |
 |---|---|
 | `desktop-link.spec` | wizard: server address → confirm → device code, QR code and short URL shown → a second browser context signed in on the server approves at `/link` → sound step (05's fake: `captured`) → voice step (`voiceApps` from the scenario) → the room; a denied code shows "declined"; the password path: "Sign in with username and password instead", a wrong password shows the error and clears the field, the right one links; an unknown server delivered as `--server` shows "Add server {host}?" and the harness records no request to it before Add, and after Add (same host) the link step follows with no confirm step. **Second server, no token crosses**: with the page in a room on server A (C1 open) and a second e2e server B from `fixtures.ts` (its own port and data dir), the harness started with `-reload-delay=2s`: add B through `--server`, Add; during the delay the spec creates a room on A (A's `invalidate` makes the page refetch `['rooms']` from A) and closes C1 through Playwright's `page.routeWebSocket` (C1 reconnects and resumes), so the page's refetch and C1's resume hello reach A while B is active; then B's link step renders on B's `bridge.js` and is approved. Asserted: no request to A (`page.on('request')`, the `Authorization` header) and no `hello` to A (`page.on('websocket')`, `framesent`) carries a token whose hash `/__e2e/state` lists for B; the harness lists no token handed out for origin A while B was active; the window reloaded exactly once, at `/desktop/setup?link=1` |
-| `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off. As built (WA65): Share → sheet → fake pick → first-share sheet ("Friends will see: Fake window") → Go live; the log check also covers the `normal` scenario's apps; the viewer, the own tile ("Preview: what friends see") and the panel's Stop; a second share needs no first-share sheet. The tray step is a note until the harness has the tray (WA68; WA80 then asserts "Live, 1 watching", adjusting the expected names if WA68 names them differently); Pause, the late joiner, the hotkeys and the mic prompt step (WA77's card) come with WA80, which extends the spec (README's WA80 row). As built (WA80): the tray says "Live, 1 watching"; the hotkeys are registered while live (the harness's state) and named in the panel's tooltips; Pause and Resume from the panel, then Pause by `/__e2e/hotkey?id=pause` (the tray then `tray-paused`), each time with the friend's tile "Paused", no new frames and no audio energy, and a friend who joins while paused decodes no frame; Resume by hotkey brings frames back to both; the Stop hotkey ends the share for both, empties the registered hotkeys and releases keep-awake. The `normal` scenario's mic prompt is checked as its card at the top of the panel; the harness's window never hides, so the toast a hidden window gets is `internal/desktop/app`'s `TestMicPromptToast`. The close-to-tray step (WindowClosing while live, the notice's handshake) is WF17's (§11.6) |
+| `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off. As built (WA65): Share → sheet → fake pick → first-share sheet ("Friends will see: Fake window") → Go live; the log check also covers the `normal` scenario's apps; the viewer, the own tile ("Preview: what friends see") and the panel's Stop; a second share needs no first-share sheet. The tray step is a note until the harness has the tray (WA68; WA80 then asserts "Live, 1 watching", adjusting the expected names if WA68 names them differently); Pause, the late joiner, the hotkeys and the mic prompt step (WA77's card) come with WA80, which extends the spec (README's WA80 row). As built (WA80): the tray says "Live, 1 watching"; the hotkeys are registered while live (the harness's state) and named in the panel's tooltips; Pause and Resume from the panel, then Pause by `/__e2e/hotkey?id=pause` (the tray then `tray-paused`), each time with the friend's tile "Paused", no new frames and no audio energy, and a friend who joins while paused decodes no frame; Resume by hotkey brings frames back to both; the Stop hotkey ends the share for both, empties the registered hotkeys and releases keep-awake. The `normal` scenario's mic prompt is checked as its card at the top of the panel; the harness's window never hides, so the toast a hidden window gets is `internal/desktop/app`'s `TestMicPromptToast`. The close-to-tray step (WindowClosing while live, the notice's handshake) is WF17's (§11.6). As built (WF17, group 16; README §3 item 107): the step posts `/__e2e/window?action=close` while live: the app stays live in the tray, one toast is recorded, no notice shows while the window is hidden, the notice shows after `action=open`, `tips.trayNoticeShown` is set only once it was shown, and a second close sends nothing |
 | `desktop-share.spec` (audio alert case) | with `ISSHONI_FAKE_AUDIO=degrade-live`: Share → live; 5 s later the fake degrades to `endpoint`; the harness's debug endpoint shows `tray.Render` with `tray-warn`, the first menu line "Friends hear voice apps" and, with a scripted prompt, "1 question waiting"; `PillState` with `VoiceAppsHeard` and `Questions` 1; exactly one recorded `desktop.native.toast.voiceAppsHeard` toast; a second degrade within 60 s records none. As built (WA80; README §3 item 95): the two states can't be on screen together in this scenario: the degrade to `endpoint` makes the prompting app (the fake's Chrome) heard, so 05 drops its mic row and prompt (05 §14.6). So the spec makes the prompt pending before the share (a test-held `Audio.Watch(true)` through the harness's bridge call, until `FriendsHear.prompts` has one), checks "1 question waiting" right after the share's line in the tray menu and `PillState` `{Mode: live, Questions: 1, Text.Questions: "1 question waiting"}` while live before the degrade, then, after it, `tray-warn` with the tooltip and first menu line "Friends hear voice apps", `PillState` `{VoiceAppsHeard: true, Text.Line: "Sharing · Friends hear voice apps"}`, exactly one `voice-apps-heard` toast with Open, and still one after 6 s more; the Stop hotkey then hides the pill and sets `tray-idle`. Both states together are `internal/desktop/app`'s `TestAudioAlertOutsideWindow`. "A second degrade within 60 s records none" can't happen in the e2e (the fake degrades once per share, and 05 resets its alert memory per share), so the spec checks no second toast in the same share, and the 60 s rule is 05's own unit test |
-| `desktop-handoff.spec` | a web tab of the same user watches Lounge; the desktop page joins Lounge → the tab shows "Now watching in the isshoni app" and its subscriptions are all off; "Watch here instead" resumes and the tab's `playback.state {playing: true}` reaches the app (`/__e2e/state` shows 05's viewer rule input); closing the tab sets it to `playing: false`; a phone-emulated tab (role `viewer`) keeps playing |
+| `desktop-handoff.spec` | a web tab of the same user watches Lounge; the desktop page joins Lounge → the tab shows "Now watching in the isshoni app" and its subscriptions are all off; "Watch here instead" resumes and the tab's `playback.state {playing: true}` reaches the app (`/__e2e/state` shows 05's viewer rule input); closing the tab sets it to `playing: false`; a phone-emulated tab (role `viewer`) keeps playing. As built (WA83, group 16; README §3 item 103): the handed-off tab's video and audio subscriptions are both asserted off; it passes with the tab's `playback.state` repeat (§12.2), which WF18 removes once Go subscribes before `Ready`, and WF18's acceptance is 5 green runs in a row without it |
 | `desktop-reload.spec` | reload the desktop page while sharing → the share continues for viewers and the page adopts it (panel back, live). As built (WA65): the adopted panel passes axe in both color schemes, the own tile is local at the low layer again, and its Stop ends the share |
 | `desktop-security.spec` | the HTML response carries the CSP; `/sw.js` 404; an external link click records an `OpenURL` and the page stays; no `isa_` in `localStorage`; `/wails/runtime` with a foreign Origin 403 (assets handler mounted the same way); same-origin runtime requests from the page for `Browser.OpenURL('ms-settings:display')`, `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403 and reach no handler, while a bound-method `Call` reaches the stub; `/link` opens the browser |
 | `desktop-relink.spec` | revoke the device from the web Devices page → C1 and C2 closed → `Auth.SessionEnded` → the desktop shows `/desktop/relink` with the `signed_out` text; Link again works |
-| `desktop-system.spec` | with `-lock-resume=2s -lock-stop=6s`: lock pauses and keep-awake goes off; unlock within 2 s resumes and keep-awake is on again; unlock after 3 s stays paused with "Resume sharing?" in the panel, the pill state, the tray menu and a recorded toast, and Resume makes it live; left locked for 6 s it stops with `endReason: system` and the toast "Sharing stopped while your PC was locked"; suspend stops with `endReason: system` and a recorded toast |
+| `desktop-system.spec` | with `-lock-resume=2s -lock-stop=6s`: lock pauses and keep-awake goes off; unlock within 2 s resumes and keep-awake is on again; unlock after 3 s stays paused with "Resume sharing?" in the panel, the pill state, the tray menu and a recorded toast, and Resume makes it live; left locked for 6 s it stops with `endReason: system` and the toast "Sharing stopped while your PC was locked"; suspend stops with `endReason: system` and a recorded toast. As built (WF17, group 16; README §3 item 107): the long-lock cases find the panel's lock prompt ("Sharing is still paused since you locked your PC."), and one resumes with its **Resume sharing**, the other stops with its Stop |
 
-Every spec also runs `axe` on its desktop pages (05's `a11y` helper) in both color schemes.
+Every spec also runs `axe` on its desktop pages (05's `a11y` helper) in both color schemes. As built (WF17, group 16):
+`a11y.spec.ts`'s `/desktop/settings` case runs axe in light and dark as the page opens, with the hotkey recorder
+open and with the licenses dialog open; the required-update banner and the desktop version screen join it in WF18
+(group 17), since `Updates.*` work since WA84.
 
 **B. The real app over CDP** (CI windows, owner's PC). 06's `task desktop:exe:windows TAGS=e2e` builds `isshoni.exe`
 with `-tags e2e`: the fake engine with 05's audio scenarios (as in A), http servers on loopback allowed, the
@@ -2901,7 +3074,8 @@ through `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`**: at beta.34 Wails overwrites t
 Wails' `WindowsOptions.AdditionalBrowserArgs`, next to the autoplay argument; no other build compiles that file
 (README WA72). The spec checks W1–W3, W5, W7, W9 (observable rows), W13, W16; then a device-flow link approved by a
 second browser context, a fake share seen by a Chrome viewer, close-to-tray while live (the window hides, the share
-continues), and Quit (share ended, process exited 0 within 3 s). W21: from the page, raw runtime
+continues, the Sharing pill shows: §11.4, unless the app's log shows `SetWindowDisplayAffinity` failed on the runner,
+when it is recorded), and Quit (share ended, process exited 0 within 3 s). W21: from the page, raw runtime
 requests built as the pinned runtime builds them for `Browser.OpenURL('ms-settings:display')`,
 `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403, no Settings or search window
 opens (no new top-level window of `SystemSettings.exe` or `SearchHost.exe` appears) and the main window stays
@@ -2910,8 +3084,15 @@ starts it with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<p
 `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER=isshoni-test-<random>` and an arbitrary `WEBVIEW2_X=1` and asserts that no
 debugging port is open, no pipe `\\.\pipe\isshoni-test-<random>` exists and the webview's process command lines carry
 none of them. Because Wails overwrites the first two in every build, "no port, no pipe" would pass even without the
-scrub; what proves the scrub is `WEBVIEW2_X` (and any other `WEBVIEW2_*` Wails doesn't set) missing from the
-webview processes' environment and command lines, and the unit test of `scrubEnv`. e2e builds keep the variables.
+scrub; what proves the scrub is `WEBVIEW2_X` (and any other `WEBVIEW2_*` Wails doesn't set) missing from
+`isshoni.exe`'s own environment block, which the WebView2 loader reads in that process, against the e2e build's,
+which keeps it; the webview processes' command lines; and the unit test of `scrubEnv`. The WebView2 browser
+process's block (read only when it holds `SYSTEMROOT` or `PATH`) is read with a marker no scrub touches,
+`X_ISSHONI_W19`: on the runner it holds neither the marker nor `WEBVIEW2_X` (PR #56's second run), because the
+WebView2 runtime starts its browser process with an environment of its own. So the production build's browser process
+must match the control's (marker present exactly when the control's is) and hold no `WEBVIEW2_X`, and the browser
+side shows the scrub only where the control's inherits `WEBVIEW2_X`; elsewhere that half is M-DESK-13's (§22.5).
+e2e builds keep the variables.
 
 ### 22.5 Manual (owner's PC; recorded in the PR and in the release checklist)
 
@@ -2929,6 +3110,7 @@ webview processes' environment and command lines, and the unit test of `scrubEnv
 | M-DESK-10 | High contrast on; text size 150 %; 200 % display scaling | Pill, tray menu and SPA readable and usable |
 | M-DESK-11 | Kill a `msedgewebview2.exe` renderer while live (W17); then, while live, minimize the window for 10 minutes, and cover it with a full-screen game for 10 minutes | The page comes back; the share never stopped. Minimized or covered, the page is not reloaded (the app's log has no "the page sent no heartbeat; reloading it"): until the hidden-page gap of §20 is fixed this part is expected to fail, and its result is recorded |
 | M-DESK-12 | Measure startup and memory (§20) with Task Manager after 30 minutes of sharing 1080p60 while watching | Within §20's budgets; numbers recorded |
+| M-DESK-13 | W19's browser side, when CI's row says the runtime dropped `WEBVIEW2_X` from the e2e build's WebView2 browser process: start the e2e build and then the production build, each from a terminal with `WEBVIEW2_X=1` and `X_ISSHONI_W19=1`; in Process Explorer open each one's `msedgewebview2.exe` without `--type=` (Properties → Environment) | Both show the same inheritance (`X_ISSHONI_W19` in both or in neither); the production build's has no `WEBVIEW2_*` beyond Wails' five placeholders. If the e2e build's has no `WEBVIEW2_X` either (as on CI, where the runtime gives its browser process an environment of its own), the browser side can't show the scrub on this PC too: record that, and `isshoni.exe`'s own block (CI's W19) stays the proof |
 
 Discord exclusion is 05's audiotest. Glass-to-glass is 01 §12.2's run: a Chrome viewer on the same PC and monitor,
 measured with `tools/g2g`. This doc's shell takes part in both: the share starts from the app, the Details disclosure

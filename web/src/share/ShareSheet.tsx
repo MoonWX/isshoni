@@ -1,5 +1,6 @@
 // ShareSheet (05 §13.1): what the Share button opens. A preset picker, the tip that steers towards a window with
-// its own sound, and the Share button that opens the browser's picker.
+// its own sound, the desktop app's entries (DesktopAppEntry, M2 03 §12.3), and the Share button that opens the
+// browser's picker.
 import { Lightbulb, MonitorUp } from 'lucide-react';
 import { useId, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
@@ -9,6 +10,8 @@ import { useApp, usePrefs } from '../app/context';
 import { errorMessage } from '../lib/errorText';
 import type { PickedSource, SharingProvider } from '../platform/types';
 import type { Preset } from '../protocol/types.gen';
+import { downloadPath, OpenInApp } from '../rooms/OpenInApp';
+import { peekRoomRuntime } from '../rooms/runtime';
 import { Button } from '../ui/Button';
 import { Sheet } from '../ui/Sheet';
 import { PRESETS } from './presets';
@@ -36,6 +39,46 @@ export interface ShareSheetProps {
   onPick: (picking: Promise<PickedSource | null>, preset: Preset) => void;
   /** Set while room.state has a share of this user from another tab or device. */
   elsewhere?: ShareElsewhere | null;
+}
+
+export interface DesktopAppEntryProps {
+  /** The link's text: share.sheet.desktopApp in the sheet, share.warning.desktopApp in the warning. */
+  label: string;
+  /** Called when the link is followed (the warning gives its pick up). */
+  onFollow?: () => void;
+  /** The class of the link's paragraph. */
+  className?: string;
+}
+
+/**
+ * The desktop app's entries in the browser's sheet and whole-screen warning (M2 03 §12.3): "Open in the isshoni app"
+ * (OpenInApp: only when the user probably has the app) above "Get the desktop app", which opens the server's
+ * download page for the room the user is in (/download?room=<roomId>, plain /download for a room id that isn't
+ * one). The link renders only on Windows, the one OS /download offers until M3/M4; other OSes get the plain text
+ * share.sheet.desktopAppWindowsOnly instead. Nothing in the desktop app, which is the app.
+ */
+export function DesktopAppEntry({ label, onFollow, className }: DesktopAppEntryProps) {
+  const { t } = useTranslation();
+  const app = useApp();
+  const { platform } = app;
+  if (platform.desktop != null) return null;
+  // The room the sheet was opened in: the room page's runtime (none outside a room).
+  const runtime = peekRoomRuntime(app);
+  const roomId = runtime?.session.roomId ?? null;
+  return (
+    <>
+      {runtime !== undefined && roomId !== null && <OpenInApp runtime={runtime} roomId={roomId} />}
+      <p className={className}>
+        {platform.client.os === 'windows' ? (
+          <Link to={downloadPath(roomId ?? '')} onClick={onFollow}>
+            {label}
+          </Link>
+        ) : (
+          t('share.sheet.desktopAppWindowsOnly')
+        )}
+      </p>
+    </>
+  );
 }
 
 function ElsewhereNotice({ elsewhere }: { elsewhere: ShareElsewhere }) {
@@ -130,9 +173,7 @@ export function ShareSheet({ open, onClose, sharing, onPick, elsewhere = null }:
           </span>
         </p>
         {!tested && <p className={styles.muted}>{t('share.sheet.bestInChrome')}</p>}
-        <p className={styles.muted}>
-          <Link to="/download">{t('share.sheet.desktopApp')}</Link>
-        </p>
+        <DesktopAppEntry label={t('share.sheet.desktopApp')} className={styles.muted} />
       </div>
     </Sheet>
   );

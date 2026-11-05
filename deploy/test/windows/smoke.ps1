@@ -47,7 +47,34 @@ release build as a user gets it, on a runner where only that build is installed:
      later", testHooks false);
   5. after seeding a Credential Manager entry and the toast keys (as -Mode ci's case 12), uninstall.exe /S /PURGE:
      nothing of 06 sections 2.2 and 2.3 left, no isshoni:v1: credential.
--Mode update (the updater e2e, README WA88) is declared here and filled by that slice.
+-Mode update (the updater e2e, README WA88; 06 sections 8.7, 8.11 and 16) runs two updatetest builds (-tags
+production,updatetest): -Setup at -Version (0.0.1-ci.1) and -NewerSetup at -NewerVersion (0.0.1-ci.2), with update
+manifests that the caller made with tools/desktoppkg manifest -releases, signed with an ephemeral key of the run
+(-Signers, the allowed-signers file ISSHONI_UPDATE_TEST_SIGNERS names) and served by tools/relserve under
+-UpdateBase (ISSHONI_UPDATE_TEST_BASE), whose TLS the caller made trusted. Three release roots: -UpdateBase itself
+(the -NewerVersion manifest), <base>/badsha (the same manifest with a wrong SHA-256) and <base>/ci0 (a manifest for
+0.0.1-ci.0 as the latest). On a runner where isshoni is not installed:
+  0. a de-elevated start is no administrator: every install and app start of this mode runs with the standard-user
+     token that SAFER's Normal User level computes from this process's token, at medium integrity, as on a friend's
+     PC (the hosted runner's job is elevated, and an elevated installer starts the app through explorer.exe, which
+     drops --updated-from, 06 section 6.4);
+  1. a fresh silent install of -Setup;
+  2. isshoni.exe --update-now against <base>/ci0 exits 0 (up to date): the manifest for 0.0.1-ci.0 is ignored, and
+     nothing is downloaded or installed;
+  3. isshoni.exe --update-now against <base>/badsha exits 1 with hash_mismatch: -Version stays installed, the
+     installed isshoni.exe is unchanged, no installer file is left in the updates folder and nothing is pending;
+  4. isshoni.exe --update-now against the base: within 120 s of its start the registry says -NewerVersion,
+     --version agrees, and an isshoni.exe from InstallDir runs with --updated-from=<-Version>; then the app is
+     stopped and uninstalled (/PURGE);
+  5. a fresh install of -Setup again, with -NewerSetup staged as the pending update (updates\state.json, attempts
+     0): while a helper holds Local\io.isshoni.desktop.installing, a start through the registered protocol command
+     with isshoni://smoke.invalid/r/abc exits 0 within 10 s, never creates the running mutex, leaves attempts at 0,
+     starts no process from the staged installer's path, leaves -Version installed and writes PendingServer and
+     PendingRoom;
+  6. after the helper released the mutex, a plain start applies the pending update at start and exits 0 (attempts
+     1, the Pending values still there); within 120 s the registry says -NewerVersion, an isshoni.exe runs with
+     --updated-from=<-Version>, and it has read and deleted PendingServer and PendingRoom (the link handed over);
+     then the app is stopped and uninstalled (/PURGE).
 
 Exit status 0 when every case passed; a failed case throws (exit 1). Windows PowerShell 5.1 and PowerShell 7.
 
@@ -55,6 +82,8 @@ Exit status 0 when every case passed; a failed case throws (exit 1). Windows Pow
 pwsh -File deploy/test/windows/smoke.ps1 -Mode ci -Setup setup.exe -Version 0.0.0-ci.5 -OldSetup old.exe -NewerSetup newer.exe -Stage dist-desktop/stage
 .EXAMPLE
 pwsh -File deploy/test/windows/smoke.ps1 -Mode release -Version 0.2.0 -Stage stage
+.EXAMPLE
+pwsh -File deploy/test/windows/smoke.ps1 -Mode update -Setup ci1.exe -Version 0.0.1-ci.1 -NewerSetup ci2.exe -NewerVersion 0.0.1-ci.2 -UpdateBase https://127.0.0.1:8443 -Signers update_signers
 #>
 [CmdletBinding()]
 param(
@@ -69,7 +98,13 @@ param(
     [string]$OldSetup = '',
     [string]$NewerSetup = '',
     [string]$Stage = '',
-    # A scratch folder (default: RUNNER_TEMP or TEMP).
+    # -Mode update: -NewerSetup's version, the releases URL the updater asks (ISSHONI_UPDATE_TEST_BASE) and the
+    # allowed-signers file with the run's update key (ISSHONI_UPDATE_TEST_SIGNERS).
+    [string]$NewerVersion = '',
+    [string]$UpdateBase = '',
+    [string]$Signers = '',
+    # A scratch folder (default: RUNNER_TEMP or TEMP; -Mode update: a folder under LOCALAPPDATA, which the
+    # de-elevated processes can write).
     [string]$WorkDir = ''
 )
 
@@ -223,8 +258,10 @@ if ($mapped.Count -gt 0) { Start-Sleep -Seconds $KeepMappedSec }
 foreach ($h in $mapped) { $null = [SmokeImage]::FreeLibrary($h) }
 '@
 
+# -Deelevated starts the helper with the standard-user token of Invoke-Deelevated (-Mode update), so the mutex it
+# creates carries that token's default DACL, as an installer started by a de-elevated app would.
 function Invoke-Helper {
-    param([string]$Name, [string[]]$Dlls = @(), [int]$KeepMappedSec = 0, [string]$Lock = '')
+    param([string]$Name, [string[]]$Dlls = @(), [int]$KeepMappedSec = 0, [string]$Lock = '', [switch]$Deelevated)
     $dir = Get-WorkDir
     $id = [guid]::NewGuid().ToString('N')
     $helperFile = Join-Path -Path $dir -ChildPath 'mutex-helper.ps1'
@@ -236,7 +273,11 @@ function Invoke-Helper {
         '-Name', $Name, '-Ready', "`"$ready`"", '-Release', "`"$release`"", '-KeepMappedSec', $KeepMappedSec)
     if ($Dlls.Count -gt 0) { $arguments += @('-Dlls', "`"$($Dlls -join '|')`"") }
     if ($Lock) { $arguments += @('-Lock', "`"$Lock`"") }
-    $p = Start-Process -FilePath $shell -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    if ($Deelevated) {
+        $p = Invoke-Deelevated -Path $shell -Arguments ($arguments -join ' ')
+    } else {
+        $p = Start-Process -FilePath $shell -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    }
     $deadline = (Get-Date).AddSeconds(60)
     while (-not (Test-Path -LiteralPath $ready)) {
         if ($p.HasExited) { throw "smoke: the mutex helper exited with $($p.ExitCode) before it was ready" }
@@ -312,6 +353,199 @@ function Invoke-Captured {
         throw "smoke: $Path $Arguments did not exit within $TimeoutSec s"
     }
     return [pscustomobject]@{ ExitCode = $p.ExitCode; Output = $out.Result }
+}
+
+# ---- de-elevated starts (-Mode update) ----
+
+# The hosted runner's job is elevated (one full administrator token), and an elevated installer starts the app
+# through explorer.exe without arguments (06 section 6.4), so --updated-from would never reach it. -Mode update starts
+# the installers, the app and its mutex helper as a friend's PC does: with the standard-user token that SAFER's Normal
+# User level computes from this process's token (BUILTIN\Administrators deny-only, no administrator privileges, as
+# runas /trustlevel:0x20000 does), lowered to medium integrity, in the same session, desktop and environment, and
+# never with this process's handles. Each start is a console program (cmd.exe or the shell) without a window.
+$script:DeelevatedSource = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace IsshoniSmoke {
+    public sealed class DeelevatedProcess : IDisposable {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short wShowWindow, cbReserved2;
+            public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation {
+            public IntPtr hProcess, hThread;
+            public int dwProcessId, dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenMandatoryLabel {
+            public IntPtr Sid;
+            public uint Attributes;
+        }
+
+        private const uint SaferScopeIdUser = 2;
+        private const uint SaferLevelIdNormalUser = 0x20000;
+        private const uint SaferLevelOpen = 1;
+        private const int TokenIntegrityLevel = 25;
+        private const uint SeGroupIntegrity = 0x20;
+        private const uint CreateNoWindow = 0x08000000;
+        private const uint WaitTimeout = 0x102;
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SaferCreateLevel(uint scopeId, uint levelId, uint openFlags, out IntPtr level, IntPtr reserved);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SaferComputeTokenFromLevel(IntPtr level, IntPtr inToken, out IntPtr outToken, uint flags, IntPtr reserved);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SaferCloseLevel(IntPtr level);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
+        [DllImport("advapi32.dll")]
+        private static extern int GetLengthSid(IntPtr sid);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SetTokenInformation(IntPtr token, int infoClass, ref TokenMandatoryLabel info, int length);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcessAsUserW(IntPtr token, string application, StringBuilder commandLine,
+            IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags,
+            IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr mem);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint code);
+
+        private IntPtr handle;
+        private readonly int id;
+
+        private DeelevatedProcess(IntPtr handle, int id) {
+            this.handle = handle;
+            this.id = id;
+        }
+
+        public int Id { get { return id; } }
+
+        private static Win32Exception Failed(string what) {
+            int code = Marshal.GetLastWin32Error();
+            return new Win32Exception(code, what + " failed (" + code + ")");
+        }
+
+        // Start runs "path" arguments in directory with the standard-user token at medium integrity. The environment
+        // is this process's; no handle is inherited.
+        public static DeelevatedProcess Start(string path, string arguments, string directory) {
+            IntPtr level;
+            if (!SaferCreateLevel(SaferScopeIdUser, SaferLevelIdNormalUser, SaferLevelOpen, out level, IntPtr.Zero)) {
+                throw Failed("SaferCreateLevel");
+            }
+            IntPtr token = IntPtr.Zero;
+            IntPtr sid = IntPtr.Zero;
+            try {
+                if (!SaferComputeTokenFromLevel(level, IntPtr.Zero, out token, 0, IntPtr.Zero)) {
+                    throw Failed("SaferComputeTokenFromLevel");
+                }
+                if (!ConvertStringSidToSidW("S-1-16-8192", out sid)) {
+                    throw Failed("ConvertStringSidToSid");
+                }
+                TokenMandatoryLabel label = new TokenMandatoryLabel();
+                label.Sid = sid;
+                label.Attributes = SeGroupIntegrity;
+                int size = Marshal.SizeOf(typeof(TokenMandatoryLabel)) + GetLengthSid(sid);
+                if (!SetTokenInformation(token, TokenIntegrityLevel, ref label, size)) {
+                    throw Failed("SetTokenInformation(TokenIntegrityLevel)");
+                }
+                StartupInfo si = new StartupInfo();
+                si.cb = Marshal.SizeOf(typeof(StartupInfo));
+                ProcessInformation pi;
+                StringBuilder line = new StringBuilder("\"" + path + "\"" + (arguments.Length > 0 ? " " + arguments : ""));
+                if (!CreateProcessAsUserW(token, path, line, IntPtr.Zero, IntPtr.Zero, false, CreateNoWindow,
+                        IntPtr.Zero, directory, ref si, out pi)) {
+                    throw Failed("CreateProcessAsUser");
+                }
+                CloseHandle(pi.hThread);
+                return new DeelevatedProcess(pi.hProcess, pi.dwProcessId);
+            } finally {
+                if (sid != IntPtr.Zero) { LocalFree(sid); }
+                if (token != IntPtr.Zero) { CloseHandle(token); }
+                SaferCloseLevel(level);
+            }
+        }
+
+        public bool WaitForExit(int milliseconds) {
+            uint r = WaitForSingleObject(handle, (uint)milliseconds);
+            if (r == 0) { return true; }
+            if (r == WaitTimeout) { return false; }
+            throw Failed("WaitForSingleObject");
+        }
+
+        public bool HasExited { get { return WaitForExit(0); } }
+
+        public int ExitCode {
+            get {
+                uint code;
+                if (!GetExitCodeProcess(handle, out code)) { throw Failed("GetExitCodeProcess"); }
+                return unchecked((int)code);
+            }
+        }
+
+        public void Kill() {
+            if (!TerminateProcess(handle, 1) && !HasExited) { throw Failed("TerminateProcess"); }
+        }
+
+        public void Dispose() {
+            if (handle != IntPtr.Zero) {
+                CloseHandle(handle);
+                handle = IntPtr.Zero;
+            }
+        }
+    }
+}
+'@
+
+# Invoke-Deelevated starts Path with Arguments as a standard user (above) in the work folder and returns the
+# process, which has Id, HasExited, WaitForExit(ms), ExitCode and Kill(). With -Log the start goes through cmd.exe,
+# which writes the program's stdout and stderr to that file (the app logs JSON lines to stderr in a one-shot mode
+# and before its log file opens); cmd.exe exits with the program's exit code.
+function Invoke-Deelevated {
+    param([string]$Path, [string]$Arguments = '', [string]$Log = '')
+    if (-not ('IsshoniSmoke.DeelevatedProcess' -as [type])) {
+        Add-Type -TypeDefinition $script:DeelevatedSource
+    }
+    $dir = Get-WorkDir
+    if ($Log) {
+        $cmd = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cmd.exe'
+        return [IsshoniSmoke.DeelevatedProcess]::Start($cmd, "/d /s /c `"`"$Path`" $Arguments > `"$Log`" 2>&1`"", $dir)
+    }
+    return [IsshoniSmoke.DeelevatedProcess]::Start($Path, $Arguments, $dir)
+}
+
+# Confirm-Deelevated: a de-elevated shell is not in the Administrators role (what the installer's IsUserAnAdmin
+# asks), so the setup it starts launches the app itself, with --updated-from, never through explorer.exe.
+function Confirm-Deelevated {
+    $shell = (Get-Process -Id $PID).Path
+    $probe = 'if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(' +
+        '[Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 3 } else { exit 0 }'
+    $p = Invoke-Deelevated -Path $shell -Arguments "-NoProfile -NonInteractive -Command `"$probe`""
+    try {
+        Confirm-That ($p.WaitForExit(60000)) 'the de-elevated probe did not exit within 60 s'
+        Confirm-That ($p.ExitCode -ne 3) 'a de-elevated start is still in the Administrators role'
+        Confirm-That ($p.ExitCode -eq 0) "the de-elevated probe exited $($p.ExitCode)"
+    } finally {
+        $p.Dispose()
+    }
 }
 
 # ---- what the installer wrote ----
@@ -728,11 +962,385 @@ function Invoke-ReleaseMode {
     Write-Step 'every -Mode release case passed'
 }
 
+# ---- the updater e2e (-Mode update) ----
+
+# 06 section 16: the update must be installed and the new version running within this many seconds of the start.
+$script:UpdateWithinSec = 120
+
+function Get-InstallerName {
+    param([string]$Ver)
+    return "isshoni-desktop_$($Ver)_windows_amd64_setup.exe"
+}
+
+function Get-UpdateFolder {
+    return (Join-Path -Path $script:DataRoot -ChildPath 'updates')
+}
+
+# Get-PendingUpdate: state.json's pending record (06 section 8.7), or $null when there is none. The app replaces
+# state.json by renaming a temp file over it, which fails on Windows while a handle without FILE_SHARE_DELETE is
+# open, so the file is opened sharing ReadWrite and Delete. A read that lands mid-replace (a sharing violation, a
+# missing or partly read file) is retried a few times, 50 ms apart, before it fails the case.
+function Get-PendingUpdate {
+    $file = Join-Path -Path (Get-UpdateFolder) -ChildPath 'state.json'
+    $st = $null
+    for ($try = 1; $try -le 5; $try++) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $null }
+        try {
+            $fs = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+            try {
+                $reader = New-Object -TypeName IO.StreamReader -ArgumentList $fs
+                $text = $reader.ReadToEnd()
+            } finally {
+                $fs.Dispose()
+            }
+            $st = $text | ConvertFrom-Json
+            break
+        } catch {
+            if ($try -eq 5) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    $prop = $st.PSObject.Properties['pending']
+    if ($null -eq $prop) { return $null }
+    return $prop.Value
+}
+
+# Initialize-PendingUpdate stages Setup as the pending update of Ver, the way a check leaves a verified download:
+# the installer in the updates folder under its release name and state.json's pending record with attempts 0.
+function Initialize-PendingUpdate {
+    param([string]$Setup, [string]$Ver, [string]$Base)
+    $dir = Get-UpdateFolder
+    $null = New-Item -ItemType Directory -Force -Path $dir
+    $name = Get-InstallerName $Ver
+    $file = Join-Path -Path $dir -ChildPath $name
+    Copy-Item -LiteralPath $Setup -Destination $file -Force
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $state = [ordered]@{
+        v           = 1
+        pending     = [ordered]@{
+            version   = $Ver
+            file      = $name
+            size      = (Get-Item -LiteralPath $file).Length
+            sha256    = (Get-Sha256 $file).ToLowerInvariant()
+            expiresAt = (Get-Date).ToUniversalTime().AddDays(30).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", $inv)
+            attempts  = 0
+            required  = $false
+            notesUrl  = "$Base/tag/v$Ver"
+        }
+        revokedKeys = @()
+    }
+    # UTF-8 without a BOM: Go's encoding/json refuses one.
+    [IO.File]::WriteAllText((Join-Path -Path $dir -ChildPath 'state.json'), ($state | ConvertTo-Json -Depth 4),
+        (New-Object -TypeName Text.UTF8Encoding -ArgumentList $false))
+    return $file
+}
+
+# Invoke-AppStart starts the installed isshoni.exe (or the registry's protocol command) de-elevated with the update
+# test variables in its environment, its stdout and stderr in <Label>.log; Wait-AppExit waits for it.
+function Invoke-AppStart {
+    param([string]$Path, [string]$Arguments, [string]$Label, [hashtable]$Environment)
+    $log = Join-Path -Path (Get-WorkDir) -ChildPath "$Label.log"
+    $saved = @{}
+    foreach ($name in $Environment.Keys) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name], 'Process')
+    }
+    try {
+        $p = Invoke-Deelevated -Path $Path -Arguments $Arguments -Log $log
+    } finally {
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+    }
+    return [pscustomobject]@{ Process = $p; Log = $log; Label = $Label }
+}
+
+function Wait-AppExit {
+    param($Start, [int]$TimeoutSec)
+    if (-not $Start.Process.WaitForExit($TimeoutSec * 1000)) {
+        $Start.Process.Kill()
+        throw "smoke: FAILED: $($Start.Label) did not exit within $TimeoutSec s"
+    }
+    return $Start.Process.ExitCode
+}
+
+# Write-AppLog prints what a start wrote to stdout and stderr (the app's JSON log lines).
+function Write-AppLog {
+    param($Start)
+    if (Test-Path -LiteralPath $Start.Log -PathType Leaf) {
+        foreach ($line in [IO.File]::ReadAllLines($Start.Log)) { Write-Output "  $($Start.Label): $line" }
+    }
+}
+
+function Get-AppLog {
+    param($Start)
+    if (-not (Test-Path -LiteralPath $Start.Log -PathType Leaf)) { return '' }
+    return [IO.File]::ReadAllText($Start.Log)
+}
+
+# Confirm-InstalledVersion: the registry's Version and the installed isshoni.exe --version are Ver.
+function Confirm-InstalledVersion {
+    param([string]$InstallDir, [string]$Ver, [string]$Label)
+    $reg = [string](Get-RegValue -Key $script:AppKey -Name 'Version')
+    Confirm-That ($reg -ceq $Ver) "${Label}: the registry's Version is '$reg', not $Ver"
+    $r = Invoke-Captured -Path (Join-Path -Path $InstallDir -ChildPath 'isshoni.exe') -Arguments '--version'
+    Confirm-That ($r.ExitCode -eq 0) "${Label}: isshoni.exe --version exited $($r.ExitCode)"
+    $line = @($r.Output -split "`r?`n" | Where-Object { $_ -ne '' })
+    Confirm-That ($line.Count -eq 1) "${Label}: --version printed $($line.Count) lines: $($r.Output)"
+    $v = ($line[0] | ConvertFrom-Json).version
+    Confirm-That ($v -ceq $Ver) "${Label}: --version says $v, not $Ver"
+}
+
+# Confirm-NothingDownloaded: no installer (or partial download) in the updates folder and nothing pending.
+function Confirm-NothingDownloaded {
+    param([string]$Label)
+    $dir = Get-UpdateFolder
+    if (Test-Path -LiteralPath $dir) {
+        $files = @(Get-ChildItem -LiteralPath $dir -File -Force | Where-Object { $_.Name -ne 'state.json' })
+        Confirm-That ($files.Count -eq 0) "${Label}: the updates folder holds $(($files | ForEach-Object { $_.Name }) -join ', ')"
+    }
+    Confirm-That ($null -eq (Get-PendingUpdate)) "${Label}: state.json has a pending update"
+}
+
+# Get-ProcessFrom: the processes whose executable is Path.
+function Get-ProcessFrom {
+    param([string]$Path)
+    return @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ExecutablePath -eq $Path })
+}
+
+# Wait-Updated waits until the registry says Ver and an isshoni.exe from InstallDir runs with --updated-from=From
+# (the installer's relaunch, 06 section 6.4), and with -PendingGone also until PendingServer and PendingRoom are
+# deleted (the relaunched app read them, 03 section 13.4 step 6); it fails after Deadline.
+function Wait-Updated {
+    param([string]$InstallDir, [string]$Ver, [string]$From, [datetime]$Deadline, [switch]$PendingGone)
+    $exe = Join-Path -Path $InstallDir -ChildPath 'isshoni.exe'
+    $flag = '(^|\s)"?--updated-from=' + [regex]::Escape($From) + '"?(\s|$)'
+    $seen = $false
+    while ($true) {
+        $installed = [string](Get-RegValue -Key $script:AppKey -Name 'Version')
+        if (-not $seen) {
+            $seen = @(Get-AppProcess -InstallDir $InstallDir | Where-Object {
+                    $_.ExecutablePath -eq $exe -and [string]$_.CommandLine -match $flag }).Count -gt 0
+        }
+        $pending = (Test-RegValue $script:AppKey 'PendingServer') -or (Test-RegValue $script:AppKey 'PendingRoom')
+        if ($installed -ceq $Ver -and $seen -and -not ($PendingGone -and $pending)) { return }
+        if ((Get-Date) -gt $Deadline) {
+            $what = "the registry says '$installed' (want $Ver)"
+            if (-not $seen) { $what += ", no isshoni.exe from $InstallDir ran with --updated-from=$From" }
+            if ($PendingGone -and $pending) { $what += ', PendingServer or PendingRoom is still there' }
+            throw "smoke: FAILED: by the deadline $what"
+        }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+# Stop-App ends the installed app (it has no quit command line) and waits for its running mutex and its WebView2
+# processes to go, so the uninstall that follows can remove the data root.
+function Stop-App {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string]$InstallDir)
+    if (-not $PSCmdlet.ShouldProcess($InstallDir, 'stop isshoni.exe')) { return }
+    $deadline = (Get-Date).AddSeconds(30)
+    while ($true) {
+        $running = @(Get-AppProcess -InstallDir $InstallDir)
+        if ($running.Count -eq 0 -and -not (Test-Mutex $script:RunningMutex)) { break }
+        foreach ($p in $running) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+        if ((Get-Date) -gt $deadline) { throw 'smoke: isshoni.exe or its running mutex is left 30 s after Stop-Process' }
+        Start-Sleep -Milliseconds 250
+    }
+    $deadline = (Get-Date).AddSeconds(30)
+    while ($true) {
+        $left = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'msedgewebview2.exe'" | Where-Object {
+                ([string]$_.CommandLine).IndexOf($script:DataRoot + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        if ($left.Count -eq 0) { return }
+        if ((Get-Date) -gt $deadline) {
+            foreach ($p in $left) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# Confirm-Removed: after a /PURGE uninstall nothing of the install, its registry keys or the data root is left.
+function Confirm-Removed {
+    param([string]$InstallDir, [string]$Label)
+    Confirm-That (-not (Test-Path -LiteralPath $InstallDir)) "${Label}: $InstallDir is left"
+    Confirm-That (-not (Test-RegKey $script:AppKey)) "${Label}: HKCU\Software\isshoni is left"
+    Confirm-That (-not (Test-RegKey $script:UninstallKey)) "${Label}: the Uninstall key is left"
+    Confirm-That (-not (Test-RegKey $script:ProtocolKey)) "${Label}: the isshoni: protocol key is left"
+    Confirm-That (-not (Test-Path -LiteralPath $script:DataRoot)) "${Label}: the data root $($script:DataRoot) is left"
+}
+
+function Invoke-DeelevatedInstall {
+    param([string]$Path)
+    $p = Invoke-Deelevated -Path $Path -Arguments '/S'
+    try {
+        if (-not $p.WaitForExit($script:SetupTimeoutSec * 1000)) {
+            $p.Kill()
+            throw "smoke: $Path /S did not exit within $($script:SetupTimeoutSec) s"
+        }
+        Confirm-That ($p.ExitCode -eq 0) "$(Split-Path -Leaf $Path) /S exited $($p.ExitCode), not 0"
+    } finally {
+        $p.Dispose()
+    }
+}
+
+function Invoke-UpdateMode {
+    param([string]$Setup, [string]$Version, [string]$NewerSetup, [string]$NewerVersion, [string]$UpdateBase,
+        [string]$Signers)
+    foreach ($p in @(@('-Setup', $Setup), @('-Version', $Version), @('-NewerSetup', $NewerSetup),
+            @('-NewerVersion', $NewerVersion), @('-UpdateBase', $UpdateBase), @('-Signers', $Signers))) {
+        if (-not $p[1]) { throw "smoke: -Mode update needs $($p[0])" }
+    }
+    foreach ($f in @($Setup, $NewerSetup, $Signers)) { Confirm-That (Test-Path -LiteralPath $f -PathType Leaf) "$f is missing" }
+    Confirm-That ($UpdateBase -notmatch '/$') "-UpdateBase $UpdateBase ends with a slash"
+    $dir = $script:DefaultDir
+    Confirm-That (-not (Test-RegKey $script:AppKey)) 'isshoni is installed already: -Mode update needs a PC without it'
+    Confirm-That (-not (Test-Path -LiteralPath $dir)) "$dir exists already"
+    if (Test-Path -LiteralPath $script:DataRoot) {
+        # A kept data root (an earlier keep-data uninstall) could hold an updates\state.json of its own.
+        Write-Step "the data root $($script:DataRoot) is there from before; removing it"
+        Remove-Item -LiteralPath $script:DataRoot -Recurse -Force
+    }
+
+    # The de-elevated processes read their inputs from a folder of the user's profile.
+    if (-not $script:WorkRoot) { $script:WorkRoot = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'smoke-update' }
+    $work = Get-WorkDir
+    $old = Join-Path -Path $work -ChildPath (Get-InstallerName $Version)
+    $new = Join-Path -Path $work -ChildPath (Get-InstallerName $NewerVersion)
+    $signersFile = Join-Path -Path $work -ChildPath 'update_signers'
+    Copy-Item -LiteralPath $Setup -Destination $old -Force
+    Copy-Item -LiteralPath $NewerSetup -Destination $new -Force
+    Copy-Item -LiteralPath $Signers -Destination $signersFile -Force
+    $exe = Join-Path -Path $dir -ChildPath 'isshoni.exe'
+    $updates = Get-UpdateFolder
+    $env1 = @{ ISSHONI_UPDATE_TEST_BASE = ''; ISSHONI_UPDATE_TEST_SIGNERS = $signersFile }
+
+    Write-Step '0. a de-elevated start is not an administrator'
+    Confirm-Deelevated
+
+    Write-Step "1. a fresh silent install of $Version (de-elevated)"
+    Invoke-DeelevatedInstall -Path $old
+    Confirm-That ((Get-RegValue $script:AppKey 'InstallDir') -eq $dir) "InstallDir is not $dir"
+    Confirm-InstalledVersion -InstallDir $dir -Ver $Version -Label 'the install'
+    $exeHash = Get-Sha256 $exe
+
+    Write-Step '2. --update-now: a manifest for 0.0.1-ci.0 is ignored'
+    $env1.ISSHONI_UPDATE_TEST_BASE = "$UpdateBase/ci0"
+    $s = Invoke-AppStart -Path $exe -Arguments '--update-now' -Label 'update-now-ci0' -Environment $env1
+    $code = Wait-AppExit -Start $s -TimeoutSec $script:UpdateWithinSec
+    Write-AppLog -Start $s
+    Confirm-That ($code -eq 0) "--update-now against a manifest for 0.0.1-ci.0 exited $code, not 0 (up to date)"
+    Confirm-That ((Get-AppLog -Start $s).Contains('up to date')) '--update-now against a manifest for 0.0.1-ci.0 did not log up to date'
+    Confirm-InstalledVersion -InstallDir $dir -Ver $Version -Label 'after the ci.0 manifest'
+    Confirm-That ((Get-Sha256 $exe) -eq $exeHash) 'the ci.0 manifest changed isshoni.exe'
+    Confirm-NothingDownloaded -Label 'the ci.0 manifest'
+
+    Write-Step '3. --update-now: a manifest with a wrong SHA-256 leaves the installed version intact'
+    $env1.ISSHONI_UPDATE_TEST_BASE = "$UpdateBase/badsha"
+    $s = Invoke-AppStart -Path $exe -Arguments '--update-now' -Label 'update-now-badsha' -Environment $env1
+    $code = Wait-AppExit -Start $s -TimeoutSec $script:UpdateWithinSec
+    Write-AppLog -Start $s
+    Confirm-That ($code -eq 1) "--update-now against a wrong SHA-256 exited $code, not 1"
+    Confirm-That ((Get-AppLog -Start $s) -match '"code":"hash_mismatch"') '--update-now against a wrong SHA-256 did not fail with hash_mismatch'
+    Confirm-That (@(Get-ProcessFrom (Join-Path -Path $updates -ChildPath (Get-InstallerName $NewerVersion))).Count -eq 0) 'an installer runs from the updates folder'
+    Confirm-InstalledVersion -InstallDir $dir -Ver $Version -Label 'after the wrong SHA-256'
+    Confirm-That ((Get-Sha256 $exe) -eq $exeHash) 'the wrong SHA-256 manifest changed isshoni.exe'
+    Confirm-NothingDownloaded -Label 'the wrong SHA-256'
+
+    Write-Step "4. --update-now: $Version updates to $NewerVersion within $($script:UpdateWithinSec) s and relaunches with --updated-from=$Version"
+    $env1.ISSHONI_UPDATE_TEST_BASE = $UpdateBase
+    $started = Get-Date
+    $deadline = $started.AddSeconds($script:UpdateWithinSec)
+    $s = Invoke-AppStart -Path $exe -Arguments '--update-now' -Label 'update-now' -Environment $env1
+    $code = Wait-AppExit -Start $s -TimeoutSec $script:UpdateWithinSec
+    Write-AppLog -Start $s
+    Confirm-That ($code -eq 0) "--update-now exited $code, not 0"
+    Wait-Updated -InstallDir $dir -Ver $NewerVersion -From $Version -Deadline $deadline
+    Confirm-InstalledVersion -InstallDir $dir -Ver $NewerVersion -Label 'after --update-now'
+    $took = ((Get-Date) - $started).TotalSeconds
+    Confirm-That ($took -le $script:UpdateWithinSec) "the update took $([int]$took) s, more than $($script:UpdateWithinSec) s"
+    Write-Step ("   updated in {0:N1} s" -f $took)
+    Stop-App -InstallDir $dir
+    Invoke-Uninstall -InstallDir $dir -Arguments @('/PURGE')
+    Confirm-Removed -InstallDir $dir -Label 'the uninstall after --update-now'
+
+    Write-Step "5. a start while an installer runs leaves the staged $NewerVersion alone and keeps the link"
+    Invoke-DeelevatedInstall -Path $old
+    Confirm-InstalledVersion -InstallDir $dir -Ver $Version -Label 'the second install'
+    $staged = Initialize-PendingUpdate -Setup $new -Ver $NewerVersion -Base $UpdateBase
+    $helper = Invoke-Helper -Name $script:InstallingMutex -Deelevated
+    $start = Get-ProtocolStart -Link 'isshoni://smoke.invalid/r/abc'
+    $s = Invoke-AppStart -Path $start.Path -Arguments $start.Arguments -Label 'start-while-installing' -Environment $env1
+    $sawRunning = $false
+    $sawInstaller = $false
+    $deadline = (Get-Date).AddSeconds(10)
+    while (-not $s.Process.HasExited -and (Get-Date) -lt $deadline) {
+        if (Test-Mutex $script:RunningMutex) { $sawRunning = $true }
+        if (@(Get-ProcessFrom $staged).Count -gt 0) { $sawInstaller = $true }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $s.Process.HasExited) {
+        $s.Process.Kill()
+        Write-AppLog -Start $s
+        throw 'smoke: FAILED: a link start during an install did not exit within 10 s'
+    }
+    Write-AppLog -Start $s
+    Confirm-That ($s.Process.ExitCode -eq 0) "a link start during an install exited $($s.Process.ExitCode), not 0"
+    Confirm-That (-not $sawRunning) 'a link start during an install created the running mutex'
+    Confirm-That (-not $sawInstaller) 'a link start during an install started the staged installer'
+    Confirm-That (@(Get-ProcessFrom $staged).Count -eq 0) 'a process runs from the staged installer'
+    Confirm-That (@(Get-AppProcess -InstallDir $dir).Count -eq 0) 'an isshoni.exe is left running'
+    $pending = Get-PendingUpdate
+    Confirm-That ($null -ne $pending) 'the staged update is no longer pending'
+    Confirm-That ($pending.attempts -eq 0) "attempts is $($pending.attempts) after a start during an install, not 0"
+    Confirm-InstalledVersion -InstallDir $dir -Ver $Version -Label 'after a start during an install'
+    Confirm-That ((Get-RegValue $script:AppKey 'PendingServer') -ceq 'https://smoke.invalid') "PendingServer is '$(Get-RegValue $script:AppKey 'PendingServer')'"
+    Confirm-That ((Get-RegValue $script:AppKey 'PendingRoom') -ceq 'abc') "PendingRoom is '$(Get-RegValue $script:AppKey 'PendingRoom')'"
+    Stop-Helper -Helper $helper
+
+    Write-Step "6. the next start applies the pending $NewerVersion, and the relaunched app takes the link"
+    $started = Get-Date
+    $deadline = $started.AddSeconds($script:UpdateWithinSec)
+    $s = Invoke-AppStart -Path $exe -Arguments '' -Label 'start-applies' -Environment $env1
+    $code = Wait-AppExit -Start $s -TimeoutSec $script:UpdateWithinSec
+    # Apply counts the attempt before it starts the installer, and the relaunched app clears the record once it runs
+    # the new version (06 section 8.7): attempts 1 is read in between (the installer first waits for this start's
+    # running mutex, then installs). The start's PendingServer and PendingRoom are still there then.
+    $attempts = $null
+    $pendingThen = $false
+    $wait = (Get-Date).AddSeconds(30)
+    while ($null -eq $attempts -and (Get-Date) -lt $wait) {
+        $pending = Get-PendingUpdate
+        if ($null -eq $pending) { break }
+        if ($pending.attempts -ne 0) {
+            $attempts = $pending.attempts
+            $pendingThen = (Test-RegValue $script:AppKey 'PendingServer') -and (Test-RegValue $script:AppKey 'PendingRoom')
+        } else {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Write-AppLog -Start $s
+    Confirm-That ($code -eq 0) "the start that applies the update exited $code, not 0"
+    Confirm-That ($attempts -eq 1) "attempts is '$attempts' after the start-time apply, not 1 (or the pending record went before it was read)"
+    Confirm-That $pendingThen 'PendingServer or PendingRoom was gone before the installer relaunched the app'
+    Wait-Updated -InstallDir $dir -Ver $NewerVersion -From $Version -Deadline $deadline -PendingGone
+    Confirm-InstalledVersion -InstallDir $dir -Ver $NewerVersion -Label 'after the start-time apply'
+    $took = ((Get-Date) - $started).TotalSeconds
+    Write-Step ("   updated at start in {0:N1} s; PendingServer and PendingRoom read by the relaunched app" -f $took)
+    Stop-App -InstallDir $dir
+    Invoke-Uninstall -InstallDir $dir -Arguments @('/PURGE')
+    Confirm-Removed -InstallDir $dir -Label 'the last uninstall'
+
+    Write-Step 'every -Mode update case passed'
+}
+
 try {
     switch ($Mode) {
         'ci' { Invoke-CiMode -Setup $Setup -Version $Version -OldSetup $OldSetup -NewerSetup $NewerSetup -Stage $Stage }
         'release' { Invoke-ReleaseMode -Setup $Setup -Version $Version -Stage $Stage }
-        'update' { throw 'smoke: -Mode update is not implemented yet (README WA88, the updater e2e)' }
+        'update' {
+            Invoke-UpdateMode -Setup $Setup -Version $Version -NewerSetup $NewerSetup -NewerVersion $NewerVersion `
+                -UpdateBase $UpdateBase -Signers $Signers
+        }
     }
 } finally {
     foreach ($h in $script:Helpers) {

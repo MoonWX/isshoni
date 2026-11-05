@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/MoonWX/isshoni/internal/client/core"
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/desktop/session"
 	"github.com/MoonWX/isshoni/internal/desktop/share"
@@ -61,14 +62,33 @@ type audioConfigSource interface {
 	AudioConfig() media.AudioConfig
 }
 
+// newCoreClient builds one of C2's core clients (01's core.New); tests replace it.
+var newCoreClient = func(o core.Options) (session.Client, error) {
+	c, err := core.New(o)
+	if err != nil {
+		return nil, err // no typed nil inside the interface
+	}
+	return c, nil
+}
+
 // newSession is C2 for d's engine and servers (03 §6.1's wiring): hello client {desktop, the app's version, the
-// core's OS}, and 05's AudioConfig when Deps.Audio has it.
-func newSession(d Deps) (*session.Session, error) {
+// core's OS}, and 05's AudioConfig when Deps.Audio has it. built gets each core client the session builds before
+// the session runs it, so that the app's subscription to its events (followClient, audio.go) is in place before C2's
+// welcome: an event the core decodes right after the welcome can't be missed (README WA83-R3).
+func newSession(d Deps, built func(session.Client)) (*session.Session, error) {
 	o := session.Options{
 		Servers: session.ServersOf(d.Servers),
 		Engine:  d.Engine,
 		Client:  protocol.ClientInfo{Kind: protocol.ClientKindDesktop, Version: version.Version()},
 		Log:     d.Log,
+		NewClient: func(co core.Options) (session.Client, error) {
+			c, err := newCoreClient(co)
+			if err != nil {
+				return nil, err
+			}
+			built(c)
+			return c, nil
+		},
 	}
 	if p, ok := d.Audio.(audioConfigSource); ok {
 		o.AudioConfig = p.AudioConfig

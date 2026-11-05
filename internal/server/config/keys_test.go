@@ -324,6 +324,7 @@ var devEnvNames = []struct{ name, readBy string }{
 	{"ISSHONI_E2E_CDP_PORT", "web/e2e/cdp, and cmd/isshoni-desktop/flavor_e2e.go from WA72 on (M2 03 §22.4)"},
 	{"ISSHONI_E2E_DATA_DIR", "web/e2e/cdp, and cmd/isshoni-desktop/flavor_e2e.go from WA72 on (M2 03 §22.4)"},
 	{"ISSHONI_DESKTOP_EXE", "web/e2e/cdp: the e2e build of isshoni.exe the CDP spec starts"},
+	{"ISSHONI_DESKTOP_PROD_EXE", "web/e2e/cdp: the production build W19 runs outside CI (M2 03 §22.4)"},
 	{"ISSHONI_CDP_ENDPOINT", "web/e2e/cdp: a running app the CDP spec attaches to"},
 	{"ISSHONI_NATIVE_PRESETS", "Taskfile.yml native:build"},
 	{"ISSHONI_NATIVE_TEST", "Taskfile.yml native:build"},

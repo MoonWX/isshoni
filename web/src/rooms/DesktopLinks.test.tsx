@@ -3,7 +3,7 @@
 // question when a share is live in another room, playback.stop again for the room the app is in), an unknown server
 // (the wizard's add question), another known server while a share is live (02 §12.3's question), 20 servers, and a
 // link while a question is open. Go's side of the table is internal/desktop/app's HandleLink tests.
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { createMemoryRouter, Outlet, RouterProvider, useLocation, type DataRouter } from 'react-router';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -288,5 +288,43 @@ describe('DesktopLinks', () => {
       d.fake.calls.map((c) => c.method).filter((m) => m.startsWith('share.') || m.startsWith('auth.switch')),
     ).toEqual(['share.stop', 'auth.switchServer']);
     expect(d.fake.callsOf('auth.switchServer')).toEqual([['https://other.example.com']]);
+  });
+
+  it('a confirmed {switch} opens its room after the reload (WA83-R2)', async () => {
+    // Go: the question stays pending until it is answered; SwitchServer keeps its room as {roomId} for the page
+    // after the reload (internal/desktop/app's TestConfirmedSwitchOpensRoom).
+    let pending: AnyPendingLink | null = { switch: target, live: { roomId: 'lounge' } };
+    d.fake.answers['app.pendingLink'] = () => Promise.resolve(pending);
+    d.fake.answers['app.linkHandled'] = () => {
+      pending = null;
+      return Promise.resolve(null);
+    };
+    d.fake.answers['auth.switchServer'] = (origin: string) => {
+      if (pending !== null && 'switch' in pending && pending.switch.origin === origin) {
+        pending = { roomId: pending.switch.roomId };
+      }
+      return Promise.resolve(null);
+    };
+    await show('/r/lounge');
+    await act(() => tick()); // the room list, for the room's name
+    fireEvent.click(screen.getByRole('button', { name: 'Stop sharing and open' }));
+    await act(() => tick());
+    expect(d.fake.callsOf('auth.switchServer')).toEqual([['https://other.example.com']]);
+    // Open didn't answer the link: its room is for the next page.
+    expect(d.fake.callsOf('app.linkHandled')).toEqual([]);
+    expect(pending).toEqual({ roomId: 'den' });
+
+    // The window reloads (Go's activeChanged): a new page, which pulls the link first and opens its room.
+    cleanup();
+    h.close();
+    const { kind, client, role, serverOrigin } = d.platform;
+    h = createHarness({
+      platform: { kind, client, role, serverOrigin, versionActions: () => ({}), desktop: d.platform.desktop ?? null },
+    });
+    stubRest(h.platform, { rooms: twoRooms() });
+    await show('/');
+    expect(where()).toBe('/r/den');
+    expect(d.fake.callsOf('app.linkHandled')).toHaveLength(1);
+    expect(pending).toBeNull();
   });
 });
