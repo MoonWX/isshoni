@@ -986,8 +986,9 @@ of §14's `avsync` (05 §19.3) and of E14's pause check. It is asked for per ses
 - **The packet.** `kind` `IM_PACKET_DEBUG` (100), `layer` `IM_NO_LAYER`, `capture_ts_ns` the frame's capture time,
   `flags` 0 or `DISCONTINUITY`. Its ring holds 64 readings (64 KiB) with the audio rings' overflow rule (the newest is
   dropped and the next one that gets in carries `DISCONTINUITY`) and the pump's 1 s stale rule (§6.2). A reading the
-  ring dropped is not counted in `missed` (nor in a `RING_OVERFLOW` event): `DISCONTINUITY` alone tells of it. `data`
-  is 48 bytes, little endian:
+  ring dropped is not counted in `missed` (nor in a `RING_OVERFLOW` event): `DISCONTINUITY` alone tells of it
+  (`avsync.json` reports both losses as `lumaMissed` and `lumaRingDrops`, WF17; §14). `data` is 48 bytes, little
+  endian:
 
   | Offset | Size | Field | Meaning |
   |---|---|---|---|
@@ -2954,7 +2955,7 @@ kind, no GPU), **64** usage. At startup, before loading the DLL, it calls
 | `bench` | `capture` without files, `-seconds 30` | prints encode and capture-to-packet percentiles and the process CPU |
 | `sessions -count N` | N sessions of `test:pattern` at 1080p60 with two layers, through `StartExtra` | reports each layer's encoder; passes when every session started (fallbacks allowed) |
 | `soak -hours H` | one session; samples private bytes, handles, GDI objects, threads every 60 s | after the first 10 min, growth ≤ 5 %; no `RING_OVERFLOW`; no `ENDED` |
-| `avsync [-source pick\|mon:<id>] [-seconds 25]` | 05 §19.3: starts the flash window (a borderless 1280×720 flip-model swap chain, white for 100 ms once a second; each white frame's `SyncQPCTime` from `IDXGISwapChain::GetFrameStatistics` is `P_k`) and the click process (`im_test_render_bursts`, 5 ms clicks once a second, predicted times `A_k`) as children of `explorer.exe`; captures with real capture and `-audio mix` (`TapPCM`) at 1080p60; `V_k` = `capture_ts_ns` of the first frame after each flash whose mean luma in the luma tap exceeds 50 %, `U_k` = each click's PCM-tap onset; pairs each flash with the nearest click. Needs a DLL with `IM_TEST_HOOKS` (the luma tap): `-dll` points at the `win-x64-ci` DLL (06 §5.1's `isshoni-native-tools` carries it in `ci\`) | over ≥ 15 pairs, \|median((U_k − V_k) − (A_k − P_k))\| ≤ 20 ms (05 §19.3); writes `avsync.json` with every pair |
+| `avsync [-source pick\|mon:<id>] [-seconds 25]` | 05 §19.3: starts the flash window (a borderless 1280×720 flip-model swap chain, white for 100 ms once a second; each white frame's `SyncQPCTime` from `IDXGISwapChain::GetFrameStatistics` is `P_k`) and the click process (`im_test_render_bursts`, 5 ms clicks once a second, predicted times `A_k`) as children of `explorer.exe`; captures with real capture and `-audio mix` (`TapPCM`) at 1080p60; `V_k` = `capture_ts_ns` of the first frame after each flash whose mean luma in the luma tap exceeds 50 %, `U_k` = each click's PCM-tap onset; pairs each flash with the nearest click. Needs a DLL with `IM_TEST_HOOKS` (the luma tap): `-dll` points at the `win-x64-ci` DLL (06 §5.1's `isshoni-native-tools` carries it in `ci\`) | over ≥ 15 pairs, \|median((U_k − V_k) − (A_k − P_k))\| ≤ 20 ms (05 §19.3); writes `avsync.json` with every pair and the tap's losses (`edgesDiscarded`, `lumaMissed`, `lumaRingDrops`; WF16, WF17) |
 | `protect-check [-seconds S] [-wgc pick\|off]` | creates a window with a known pattern, protects it, captures its monitor with DD (the listed `mon:` source) and with WGC (a monitor pick); then unprotects and captures again. As built (WA70): see below | the pattern is absent while protected and present after |
 | `openh264 install\|verify\|remove [-dir DIR] [-engine]` | the app's own Go code; as built (WA51), `verify -engine` also hands the verified file to the engine (`SetOpenH264Path`) and runs a full probe | hash checks; with `-engine`, the engine reports the pinned version loaded and OpenH264 tested (CB only); exit 1 for a file that is not the pinned release or an engine that refuses it, 2 for the environment |
 
@@ -3052,6 +3053,19 @@ owner's first `avsync -dll ci` run on Windows 11 (M-AVSYNC's first record, §18.
 (`edgesDiscarded`) and R3 (§12.1's `luma.go` row and §12.2's `WithLumaTap`, `LumaTapOf` and `LumaSample`) before the
 merge; the C++ (`luma_tap.cpp`, `session_object.cpp` and the two tests) had not been compiled with MSVC `/W4 /WX` as
 group 15 merged, so the group PR's first `windows-native` run is its first check there.
+
+**As built (WF17, group 16; README §3 item 107)**: the flash window's placement is the portable `flashWindowPos(mon)`
+(`avsync.go`, which `avsync_windows.go` calls with the monitor's `GetMonitorInfoW` rect): centered on the captured
+monitor of `-source mon:<id>` (the primary one for `-source pick`), but never left of or above the monitor's own
+corner when the monitor is narrower or shorter than 1280×720, so the window always holds the monitor's centered box of
+up to 256 pixels a side, the tap's region (§5.8). `avsync_test.go` checks it on synthetic monitor rects (a monitor
+left of or above the primary, one smaller than the window) against `lumaBox`. **The tap's losses** are counted in
+`avsync.json` and the text report (`lumaLosses`): `lumaMissed` is the sum of the readings' `Missed` (captured frames
+without a reading: all 8 staging copies busy, or the frame replaced in its slot first) and `lumaRingDrops` the number
+of readings with `DISCONTINUITY` (each follows readings the debug ring dropped, which no engine counter reports, not
+even `RING_OVERFLOW`). They are the tap's health beside `edgesDiscarded`: a loss at a flash's rising edge discards that
+edge, and many make unpaired flashes likely. The exit run reads them from `avsync-<win11|win10>.json` in the record
+(README §6 D).
 
 ## 15. Glass-to-glass latency (M2 exit criterion)
 

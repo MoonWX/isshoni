@@ -1137,7 +1137,10 @@ Group 10's integration added the two names WA44 started to read, so the list end
 `ISSHONI_ENGINETEST_TEST_CHILD` (the child switch of `cmd/isshoni-enginetest`'s process-default test, beside the other
 test-child names) and `ISSHONI_TEST_FFMPEG_DIR` (the FFmpeg folder of the native encoder tests `ffmpeg_load_test` and
 `mf_sw_test`, which `windows-native` sets to the locked zip's `bin`; 04 §9.10, §18.2). M1 04 §4.2's documented list
-matches `reservedEnv` again since WB9 (group 11).
+matches `reservedEnv` again since WB9 (group 11). Group 16's integration added `ISSHONI_REQUIRE_AUTOSTART_E2E` (README
+§3 item 108), which `cmd/isshoni-desktop`'s `TestAutostartRoundTrip` reads: set to `1` (ci.yml's `windows-desktop`,
+nightly's `windows-full`), a missing prerequisite fails the test instead of skipping it; M1 04 §4.2's list gains it in
+its next change.
 
 ### 7.4 Server: `GET /install-desktop.ps1`
 
@@ -1831,6 +1834,11 @@ New `changes` filters:
   `lint:keys` in `lint-deploy` (§8.3).
 - M1's `protocol` filter also counts `internal/desktop/bridge/**`, `cmd/isshoni-desktop/**`, `tools/wails3/**` and
   `web/src/platform/desktop/**`.
+- M1's `site` filter also counts `web/src/**/*.ts`, `web/src/**/*.tsx` and `.goreleaser.yaml` (group 16's
+  integration, README §3 item 108): `TestDocsAnchors`' product-links scan (WA85, §13) reads them, so a pull request
+  that only changes a site link in the SPA or the release notes runs the `site` job's anchor test. `deploy/**` (the
+  ps1, the NSIS script and the shell scripts the scan reads too) already runs the `site` job through the `deploy`
+  filter, and `docs/m1/**`, `docs/m2/**` and `docs/PLAN.md` stay excluded.
 
 | Job | Runs when | Runner | Steps and assertions | Timeout | Gates |
 |---|---|---|---|---|---|
@@ -1843,7 +1851,7 @@ New `changes` filters:
 | `native-host` | native | ubuntu-24.04, macos-15 (matrix) | `task native:test PRESET=host-debug` and `PRESET=host-tsan` with `VCPKG_DIR=$RUNNER_TEMP/vcpkg` (the task clones vcpkg at `native/vcpkg.json`'s baseline, bootstraps it with metrics off, then runs `cmake --preset`, `cmake --build --preset` and `ctest --preset`; 04 §18.1: `native/common` tests, the libopus host build of 04 E3/E4), with vcpkg's `files` binary cache keyed by OS, image and manifest (no restore keys); on ubuntu `vm.mmap_rnd_bits=28` before `host-tsan` (TSan's fixed shadow layout fails with Ubuntu 24.04's 32-bit mmap randomization), and `task lint:native CLANG_FORMAT=clang-format-18` (`clang-format --dry-run --Werror` over the tracked `native/**/*.{h,c,cpp}` with `native/.clang-format`). The clang-format version is the ubuntu image's `clang-format-18` (installed with apt if the image lacks it), not pinned in a repository file | 20 | yes |
 | `windows-go` | desktop | windows-2025 | no `needs`, no DLL: `go test -race ./internal/client/... ./internal/update/... ./internal/media/...` with the image's MinGW gcc (as M1's nightly), the fake engine (04's DLL tests skip without `ISSHONI_TEST_ENGINE_DLL`), then `CGO_ENABLED=0 go test ./internal/client/... ./internal/update/...` (the shipped build mode; this is the Windows job 02 §16.1 expects, on `windows-2025` rather than `windows-latest`, which moves). Runs 02's credstore and deviceauth tests (DA9, DA10) and this document's R7/R8 on Windows from R1 on | 15 | yes |
 | `windows-native` | desktop, native (as built, README WA24: the `native` filter adds only `Taskfile.yml` to `desktop`'s paths, and the job runs `task native:dist`; README §3 item 54) | windows-2025 | §5.1 with the vcpkg cache: FFmpeg from the lock (and its staleness check, §4.1), the MSVC environment, `win-x64-ci` build and `ctest` (outbound network for 04's `openh264_test`), `win-x64-release` build, the DLL checks on the release output; uploads `windows-native` (`release\` and `ci\`, kept 1 day) and `isshoni-native-tools` (§17 `native:dist`, kept 7 days). As built (README WA24): the `windows-native` artifact is assembled before the Go DLL tests, which run here against its `ci\` folder until `windows-desktop` exists (README WA72); `isshoni-native-tools` is the `native:dist` zip plus that `ci\` folder | 30 | yes |
-| `windows-desktop` | desktop | windows-2025 | needs `windows-native` and `web`: only the DLL-dependent Go tests, `go test -race ./internal/media/...` with `ISSHONI_TEST_ENGINE_DLL=<artifact>\ci\isshoni-media.dll` (04 §18.2, `TestNativeIntoPublisher`; everything else is in `windows-go`); `task desktop:exe:windows`; NSIS (pinned zip); desktop notices and the native gate (§9.3); `stage -release`, prebuilt uninstaller, installer; `deploy/test/windows/smoke.ps1` (§16); Pester under Windows PowerShell 5.1 (`ps` filter); the updater e2e (`update` filter, §8.11, §16); the server-rendered ps1 test (§16); then, before the CDP spec, a step that reads the WebView2 `pv` from §6.5's keys and, when it is missing or below 120.0, runs the checked `MicrosoftEdgeWebview2Setup.exe /silent /install` from the `windows-native` artifact (so the CDP spec doesn't depend on `smoke.ps1`'s install having run first); **03's CDP spec** (03 §22.4 B): `task desktop:exe:windows TAGS=e2e`, `go build ./cmd/isshoni`, `npm ci` in `web/`, then the CDP Playwright config (`connectOverCDP`, no browser download); uploads `isshoni-desktop-windows-pr` (installer and symbols, kept 7 days, for manual tests on the owner's PC) | 50 | yes |
+| `windows-desktop` | desktop | windows-2025 | needs `windows-native` and `web`: only the DLL-dependent Go tests, `go test -race ./internal/media/...` with `ISSHONI_TEST_ENGINE_DLL=<artifact>\ci\isshoni-media.dll` (04 §18.2, `TestNativeIntoPublisher`; everything else is in `windows-go`); `task desktop:exe:windows`; NSIS (pinned zip); desktop notices and the native gate (§9.3); `stage -release`, prebuilt uninstaller, installer; `deploy/test/windows/smoke.ps1` (§16); Pester under Windows PowerShell 5.1 (`ps` filter); the updater e2e (`update` filter, §8.11, §16); the server-rendered ps1 test (§16); then, before the CDP spec, a step that reads the WebView2 `pv` from §6.5's keys and, when it is missing or below 120.0, runs the checked `MicrosoftEdgeWebview2Setup.exe /silent /install` from the `windows-native` artifact (so the CDP spec doesn't depend on `smoke.ps1`'s install having run first); **03's CDP spec** (03 §22.4 B): `task desktop:exe:windows TAGS=e2e`, `go build ./cmd/isshoni`, `npm ci` in `web/`, then the CDP Playwright config (`connectOverCDP`, no browser download); as built (group 16's integration, README §3 item 108), after the `-tags e2e` tests and gated on the steps `go`, `webdist` and `webview2`, **the autostart round trip**: `CGO_ENABLED=0`, `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, `go test -v -count=1 -run '^TestAutostartRoundTrip$' ./cmd/isshoni-desktop/`, and the step fails without a `--- PASS: TestAutostartRoundTrip` line (03 §16.1; it fails, rather than skips, when an isshoni instance still holds the running mutex, which a smoke that left a process behind would cause); uploads `isshoni-desktop-windows-pr` (installer and symbols, kept 7 days, for manual tests on the owner's PC) | 50 | yes |
 | `lint-deploy` (changed) | deploy, readme, repocheck, ps, pins | ubuntu-24.04 | M1's tasks plus `lint:ps` (PSScriptAnalyzer at Warning and Error and the ASCII check over `deploy/install-desktop.ps1`, `deploy/test/windows/*.ps1`, `deploy/windows/msvc-env.ps1` and `native/windows/tools/*.ps1`; the PowerShell 5.1 grammar check is in `windows-desktop`) and `test:ps` (Pester under `pwsh`). As built (WA49): `lint:ps` also ASCII-checks `deploy/test/install-desktop.Tests.ps1`, fails on CRLF in `deploy/install-desktop.ps1` and enables `PSUseCompatibleSyntax` for 5.1; both tasks take `PWSH=<binary>` (like `lint:native`'s `CLANG_FORMAT`) and fetch their module at `tools.json`'s version into `.deps/psmodules/` (§3), which the job caches by `tools.json`'s hash; `lint:keys` now also checks the ps1 key block, `internal/update/signers.go` and the update keys' README rows; `lint:pins` (§3) | 10 | yes |
 | `goreleaser-check` (changed) | as M1 | ubuntu-24.04 | `task release:snapshot` creates stub desktop files (`ISSHONI-DESKTOP-STUB`) when `dist-desktop/` has none, so the goreleaser config's desktop `extra_files` are checked by name; `release:assets` checks the names; `FULL=true` refuses stubs | 20 | yes |
 | `ci-ok` | always | | needs the new jobs too (`native-host`, `windows-go`, `windows-native`, `windows-desktop`, `desktop-macos`) | 2 | the only required check |
@@ -1908,6 +1916,40 @@ The FFmpeg zip is not cached: it is a 1-second download from the deps release, v
 The tests log in with it through `POST /api/v1/auth/login` to get the cookie session that the `UserSession` routes
 `/device/lookup` and `/device/decide` need (02 §6.4) to approve the device code they start. The server is
 `ISSHONI_COMPAT_SERVER_URL` (`http://127.0.0.1:<port>`), its only source (README §3 item 24).
+
+**As built (WA86 and group 16's integration; README §3 items 106, 108)**: every job runs every night, whatever
+changed, without caches (§10.2), at the version `0.0.0-nightly.<run>`.
+- **`windows-full` is three jobs**, as ci.yml splits its Windows half: `web` (ubuntu, 10 min: `web/dist` as
+  release.yml's `web` job builds it), `windows-full-native` (ci.yml's `windows-native` without its Go, vcpkg and
+  `openh264_test` caches, so vcpkg builds every port from source; 60 min; uploads `windows-native`, `ffmpeg-source` and
+  `isshoni-native-tools`) and `windows-full` (needs both; ci.yml's `windows-desktop` without its Go, NSIS and npm
+  caches, every check, the autostart round trip included, and from the installer that passed the smoke the desktop
+  release files of release.yml's `desktop-pkg`: the update manifest, the symbols zip, the FFmpeg source tar and the
+  stamped `install-desktop.ps1`, uploaded as `desktop-release` with the stage as `desktop-stage`; 75 min; the output
+  `desktop-files` is `true` once both are uploaded, also when a later check fails). Their artifacts are kept 1 day
+  (release.yml keeps its 7). Each keeps in step with its ci.yml twin: a change there belongs here too.
+- **The updater e2e** is a placeholder step in `windows-full` ("The updater e2e (README WA88)", a notice) until WA88
+  replaces it.
+- **`goreleaser-full`** needs `windows-full` and runs `if: !cancelled()`, about 1.5 h into the night. With its real
+  files (`desktop-release` into `dist-desktop/`, the stage into `dist-desktop/stage/`, syft's desktop SBOM over the
+  stage with `--source-name isshoni-desktop --source-version <v>`) it runs `release:assets FULL=true DESKTOP=true`, so
+  no stub is accepted and the desktop files themselves are checked (7z's listing of the installer against the stage's
+  `install-files.txt` included). On a night when `windows-full` uploaded none (`web`, `windows-full-native` or an early
+  step of `windows-full` failed), it still checks the server half: `release:desktop-stubs` writes the stand-ins,
+  `release:assets FULL=true DESKTOP_STUBS=true` runs, and the job's last step fails because the desktop files were
+  missing (every independent failure in one round, §10.1). Not signed (`--skip=sign`; the cosign bundle's stand-in
+  stays, M1 06 §8.5). No workflow passes `DESKTOP_STUBS=true` otherwise.
+- **`compat-servers`** starts each release with the tag's own `deploy/dev/isshoni.e2e.toml` (fetched with a
+  depth-1 `git fetch` of the tag; the checkout's when the tag has none), since an older server may not accept a key
+  added since; each release is tested also when the other failed.
+- `windows-asan` 45 min, `native-fuzz` 20 min (a crash input uploaded as `native-fuzz-crashes`, kept 30 days), and
+  `go-cross-os`' legs (Windows: the desktop packages also with `CGO_ENABLED=0`; macOS: the darwin app's build) as the
+  table says.
+- **Not verified until the first nightly runs** (none has: a slice can't dispatch it): `windows-full`'s steps without
+  caches, `goreleaser-full` with real desktop files and with them WA81's two open points, the 7z listing of NSIS files
+  in `release:assets DESKTOP=true` and syft 1.54.1's `--source-name`/`--source-version`, and `compat-servers` (which
+  skips while fewer than two final releases exist). The third, `isshoni serve` on an AF_UNIX socket on
+  `windows-2025`, is the owner's release dry run's (README §3 item 99).
 
 `ffmpeg.yml`'s weekly run is the reproducibility check (§4.6).
 
@@ -2228,6 +2270,13 @@ code signing; until then Windows doesn't know the publisher", and how to check t
 `#windows-smart-app-control` (as above, honestly); `#windows-powershell` (the one-liner, what it checks, the OpenSSH
 Client requirement, running it elevated, what each error means); `#windows-verify` (PowerShell commands, §13).
 
+As built (WA85, group 16; README §3 item 105): `#windows-smartscreen` gives the exact clicks as text; its screenshots
+can only be taken on a real Windows PC, so the owner adds them with the first release (WA91's checklist; a comment in
+`docs/download.md` marks the spot). `#windows-verify` also says what to do without the OpenSSH Client (add it,
+`/troubleshooting#desktop-openssh`, or check `checksums.txt`'s signature on a Linux or Mac computer,
+`/security#verify-desktop`, and compare only the hash with `Get-FileHash` on the PC), since `install-desktop.ps1`
+sends a reader there when `ssh-keygen` is missing.
+
 ### 12.3 The SignPath Foundation application (owner, right after `v0.2.0`)
 
 **Prerequisites and their status:**
@@ -2282,8 +2331,8 @@ application sent.
 | `docs/security.md` | the update keys in `#keys`; `#verify-desktop`: verifying the installer on Windows (below) and a manifest with `ssh-keygen`; the limit of key revocation (§8.12) |
 | `docs/troubleshooting.md` | `#desktop-update-failed`, `#desktop-smart-app-control`, `#desktop-webview2`, `#desktop-openssh`; `#desktop-windows-n` (Windows N or KN: viewing H.264 fails in the app and in Edge until the Media Feature Pack is installed; 03 links it from its codec-banner text, 03 §5.4, and from its N-edition guided fix); `#desktop-media-feature-pack` (installing the Media Feature Pack and what it restores: H.264 decoding for viewing and the MF encoders for sharing, 04 §9.1); `#desktop-gpu-driver` (NVIDIA 531.61 or newer for NVENC, current AMD and Intel drivers, what 03's `driver_too_old` fix means); `#desktop-fullscreen-games` (full-screen exclusive games may capture black or the desktop; use borderless, 04 §7.7); `#desktop-crash-dumps` (Windows Error Reporting `LocalDumps` steps and the release's `…_symbols.zip`, 04 §13.4); `#desktop-windows10-border` (the yellow border around a shared window on Windows 10, expected); and **`#desktop-linking`**, a fixed anchor for 02's "Linking the app" section (02 DA12 writes the section's content; this document fixes the anchor and checks it) |
 | root `README.md` | the update keys in "Release signing keys"; the Windows app in Install |
-| `site.yml` | serves `/keys/update_signers` (verified against main's file like `allowed_signers`); `release.json` gains `{"desktop": {"windowsInstaller": "<name>", "sha256": "<hex>"}, "updateKeyFingerprints": […]}` from the verified `checksums.txt` and `update_signers` |
-| `internal/server/ops/doctor/docsanchors_test.go` | the new fixed anchors above join the checked list (M1 06 §10.4: `TestDocsAnchors`), since the app (03), the SPA, the installer and the ps1 link to them: every anchor of §17's "Site anchors", including `/troubleshooting#desktop-linking`, `#desktop-windows-n`, `#desktop-media-feature-pack`, `#desktop-gpu-driver`, `#desktop-fullscreen-games`, `#desktop-crash-dumps` and `#desktop-windows10-border` |
+| `site.yml` | serves `/keys/update_signers` (verified against main's file like `allowed_signers`); `release.json` gains `{"desktop": {"windowsInstaller": "<name>", "sha256": "<hex>"}, "updateKeyFingerprints": […]}` from the verified `checksums.txt` and `update_signers`. As built (WA85, group 16; README §3 item 105): the build copies main's `deploy/keys/update_signers` to `/keys/update_signers` only while the file exists, and the step after the build checks the served copy's SHA-256 against main's (and fails a site that serves one without it); `desktop` is `null` for a 0.1.x release, and a 0.2.0 or later release whose signed `checksums.txt` doesn't list its installer exactly once fails the build, as does a release with the app while main has no `update_signers`. **The site does not check the update manifest's signature**: `check-draft.sh` checks it before a release is published (§11.3) and every app checks it before it trusts a manifest (§8), while the site neither serves nor uses the manifest, so a check there would protect nothing it shows. It would only break the build when the owner drops a key from `update_signers` ahead of the release signed with the next one (`deploy/keys/README.md`: a rotation, or a leak, exactly when the site's security text must go out). `/download` and `/security` read the new fields with an inline `<script setup>` over `.vitepress/release.json` |
+| `internal/server/ops/doctor/docsanchors_test.go` | the new fixed anchors above join the checked list (M1 06 §10.4: `TestDocsAnchors`), since the app (03), the SPA, the installer and the ps1 link to them: every anchor of §17's "Site anchors", including `/troubleshooting#desktop-linking`, `#desktop-windows-n`, `#desktop-media-feature-pack`, `#desktop-gpu-driver`, `#desktop-fullscreen-games`, `#desktop-crash-dumps` and `#desktop-windows10-border` (as built, WA85: and `#desktop-sound`, which 03's sound check links). As built (WA85; README §3 item 105): beyond §17's list, a "product links" subtest scans the anchor links of `web/src`, `deploy/`'s `.ps1`, `.nsi` and `.sh` files, `.goreleaser.yaml` and the site's own pages, so every anchor the app, the installer, the release notes or the docs link to must exist; ci.yml's `site` filter counts those inputs (§10.1) |
 
 `#verify-desktop`:
 
