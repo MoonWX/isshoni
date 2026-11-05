@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/MoonWX/isshoni/internal/desktop/winos"
 )
@@ -43,7 +44,17 @@ func run(args []string) int {
 	return 0
 }
 
-// write writes text to the test's file; false when it couldn't.
+// write writes text to the test's file; false when it couldn't. A failed write is reported next to the temp root
+// (FallbackPath), which the test reads to say why its file never appeared.
 func write(path, text string) bool {
-	return os.WriteFile(path, []byte(text), 0o600) == nil //nolint:gosec // G703: the file the test named, in its temp dir
+	err := os.WriteFile(path, []byte(text), 0o600) //nolint:gosec // G703: the file the test named, in its temp dir
+	if err != nil {
+		_ = os.WriteFile(FallbackPath(path), []byte(text+"\nwrite: "+err.Error()), 0o600) //nolint:gosec // G703: as above
+	}
+	return err == nil
+}
+
+// FallbackPath is where write reports a failed write of out: in the temp root, named after out's folder.
+func FallbackPath(out string) string {
+	return filepath.Join(os.TempDir(), "relaunchee-"+filepath.Base(filepath.Dir(out))+".txt")
 }

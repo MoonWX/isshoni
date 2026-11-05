@@ -340,8 +340,11 @@ tasks:
             echo "test:ps: skipped, $pwsh is not installed here (CI runs the tests; PWSH=<binary> picks another PowerShell)"
             exit 0
           fi
-          # Task's shell on Windows has no /tmp, so mktemp needs a folder: TMPDIR, else Windows' TEMP.
-          tmp=$(mktemp -d "${TMPDIR:-${TEMP:-/tmp}}/test-ps.XXXXXX")
+          # Task's shell on Windows has no /tmp and its mktemp takes no folder in the template: a folder of its own
+          # in TMPDIR, else Windows' TEMP.
+          tmp="${TMPDIR:-${TEMP:-/tmp}}/test-ps.$$"
+          rm -rf "$tmp"
+          mkdir -p "$tmp"
           trap 'rm -rf "$tmp"' EXIT
           cat >"$tmp/test-ps.ps1" <<'EOF'
           $ErrorActionPreference = 'Stop'

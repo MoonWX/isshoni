@@ -160,7 +160,15 @@ func TestRelaunchUnderShell(t *testing.T) {
 		b, _ := os.ReadFile(out) //nolint:gosec // G304: the helper's file in this test's temp dir
 		t.Fatalf("relaunchee: %v, wrote %q (%s)", err, b, where)
 	}
-	got := readWhenWritten(t, out, func() string { return where + "; " + processesNamed(filepath.Base(exe)) })
+	got := readWhenWritten(t, out, func() string {
+		fb := filepath.Join(os.TempDir(), "relaunchee-"+filepath.Base(dir)+".txt")
+		b, err := os.ReadFile(fb) //nolint:gosec // G304: the helper's report in the temp root
+		if err != nil {
+			b = []byte("no report in the temp root: " + err.Error())
+		}
+		return fmt.Sprintf("%s; %s; elevated %v; the helper's report: %q", where, processesNamed(filepath.Base(exe)),
+			windows.GetCurrentProcessToken().IsElevated(), b)
+	})
 	if got = strings.ToLower(got); got != "explorer.exe" {
 		t.Fatalf("the relaunched helper's parent is %q, want explorer.exe", got)
 	}
