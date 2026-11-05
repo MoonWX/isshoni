@@ -291,6 +291,36 @@ describe('Settings → Sharing', () => {
     expect(d.fake.callsOf('settings.testHotkey')).toEqual([['Ctrl+F11']]);
   });
 
+  it('HotkeyField closes the recorder on blur while TestHotkey is in flight, and keeps its answer', async () => {
+    const user = userEvent.setup();
+    const { d } = renderSettings();
+    let answer: (v: unknown) => void = () => undefined;
+    d.fake.answers['settings.testHotkey'] = () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      });
+    const sharing = await section('Sharing');
+    await user.click(await within(sharing).findByRole('button', { name: 'Change the hotkey: Stop sharing' }));
+    const recorder = within(sharing).getByRole('textbox', { name: /New combination for Stop sharing/ });
+    await waitFor(() => {
+      expect(recorder).toHaveFocus();
+    });
+    fireEvent.keyDown(recorder, { code: 'F11', key: 'F11', ctrlKey: true });
+    expect(d.fake.callsOf('settings.testHotkey')).toEqual([['Ctrl+F11']]);
+    act(() => {
+      recorder.blur();
+    });
+    const change = await within(sharing).findByRole('button', { name: 'Change the hotkey: Stop sharing' });
+    expect(within(sharing).queryByRole('textbox', { name: /New combination for Stop sharing/ })).toBeNull();
+    act(() => {
+      answer({ id: '', combo: 'Ctrl+F11', state: 'taken' });
+    });
+    expect(await within(sharing).findByText('Unavailable: another app uses Ctrl+F11')).toBeInTheDocument();
+    expect(change).toBeInTheDocument();
+    expect(change).not.toHaveFocus();
+    expect(d.fake.callsOf('settings.update')).toEqual([]);
+  });
+
   it('Show the first-share sheet again clears tips.firstShareShown', async () => {
     const user = userEvent.setup();
     const { d } = renderSettings();
@@ -482,6 +512,15 @@ describe('Settings → Updates (03 §16.2)', () => {
     d.fake.answers['updates.install'] = () => Promise.reject(new BridgeError('busy'));
     await user.click(within(await statusLine()).getByRole('button', { name: 'Restart and update' }));
     expect(await within(await statusLine()).findByRole('button', { name: 'Finish sharing first' })).toBeDisabled();
+    // The share Go saw ends: the button works again without a remount.
+    act(() => {
+      d.fake.emit('share.state', shareView({ state: 'live' }));
+    });
+    expect(within(await statusLine()).getByRole('button', { name: 'Finish sharing first' })).toBeDisabled();
+    act(() => {
+      d.fake.emit('share.state', null);
+    });
+    expect(await within(await statusLine()).findByRole('button', { name: 'Restart and update' })).toBeEnabled();
   });
 
   it('error manifest_expired: the out-of-date text, the clock line and the help link', async () => {

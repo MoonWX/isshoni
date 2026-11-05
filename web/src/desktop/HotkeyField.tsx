@@ -56,7 +56,8 @@ export function HotkeyField({ id, bridge, combo, other, status, save, onSaved }:
   }, [recording]);
 
   const stop = (): void => {
-    refocus.current = true;
+    // Focus goes back to Change only from the recorder: after a blur, it stays where the user put it.
+    refocus.current = recorder.current !== null && document.activeElement === recorder.current;
     setRecording(false);
   };
 
@@ -137,7 +138,8 @@ export function HotkeyField({ id, bridge, combo, other, status, save, onSaved }:
             aria-describedby={note !== null ? noteId : undefined}
             aria-busy={busy || undefined}
             onBlur={() => {
-              if (!busy) setRecording(false);
+              // Closes even while TestHotkey is in flight; its answer still saves or leaves its note.
+              setRecording(false);
             }}
             onKeyDown={(ev) => {
               if (busy) {

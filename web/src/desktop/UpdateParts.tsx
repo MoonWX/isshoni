@@ -12,7 +12,8 @@
 //   disabled     "Updates are off in this build" (not a release build)
 //   idle         "Not checked yet"; checking: "Checking for updates…"
 // Restart and update runs Updates.Install(); never while a share is live: the button says "Finish sharing first" and
-// is disabled, and Go answers busy if a share starts meanwhile (03 enforces it, the updater isn't told).
+// is disabled, and Go answers busy if a share starts meanwhile (03 enforces it, the updater isn't told); the button
+// works again once that share ends.
 import { RefreshCw } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -53,6 +54,13 @@ export function RestartButton({ bridge }: { bridge: NativeBridge }) {
   const [busy, setBusy] = useState(false);
   const [refused, setRefused] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Go's busy refusal lasts as long as the share it saw: once a share has ended, the button works again (the
+  // required update's banner never remounts). Adjusted while rendering, React's pattern for state that follows input.
+  const [sawSharing, setSawSharing] = useState(sharing);
+  if (sawSharing !== sharing) {
+    setSawSharing(sharing);
+    if (!sharing) setRefused(false);
+  }
   const blocked = sharing || refused;
   return (
     <>
