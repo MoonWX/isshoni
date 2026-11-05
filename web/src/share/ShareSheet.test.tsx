@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PREFS_KEY } from '../app/prefs';
 import { LocalError } from '../lib/errors';
-import type { PickedSource } from '../platform/types';
+import type { DesktopFeatures, PickedSource } from '../platform/types';
 import type { ClientOS, OwnConnection, Preset } from '../protocol/types.gen';
 import { createHarness, tick, type Harness } from '../rooms/testing/harness';
 import { stubRest } from '../rooms/testing/page';
@@ -208,12 +208,19 @@ describe('ShareSheet in a room: the desktop app’s entries (M2 03 §12.3)', () 
   });
 
   /** The sheet over a room runtime in `roomId`, in a Chrome on `os` of https://watch.example.com. */
-  async function inRoom(roomId: string, os: ClientOS = 'windows', desktop = false): Promise<HTMLElement> {
+  async function inRoom(
+    roomId: string,
+    os: ClientOS = 'windows',
+    desktop = false,
+    inApp = false,
+  ): Promise<HTMLElement> {
     h = createHarness({
       server: { welcome: { features: ['agent.relay', 'user.connections'] } },
       platform: {
         serverOrigin: 'https://watch.example.com',
-        client: { kind: 'web', version: '0.2.0', os, browser: 'chrome' },
+        client: { kind: inApp ? 'desktop' : 'web', version: '0.2.0', os, browser: 'chrome' },
+        // DesktopAppEntry looks only at whether platform.desktop is set.
+        desktop: inApp ? ({} as unknown as DesktopFeatures) : null,
       },
     });
     stubRest(h.platform);
@@ -256,5 +263,18 @@ describe('ShareSheet in a room: the desktop app’s entries (M2 03 §12.3)', () 
     expect(within(sheet).getByRole('button', { name: 'Open in the isshoni app' })).toBeInTheDocument();
     expect(within(sheet).queryByRole('link')).not.toBeInTheDocument();
     expect(within(sheet).getByText('Desktop app: Windows now, Mac soon')).toBeInTheDocument();
+  });
+
+  it('a room id that is not one: the plain /download', async () => {
+    const sheet = await inRoom('a.b');
+    const link = within(sheet).getByRole('link', { name: 'Get the desktop app (keeps Discord out of your audio)' });
+    expect(link).toHaveAttribute('href', '/download');
+  });
+
+  it('in the desktop app: none of the entries, even with a desktop connection online', async () => {
+    const sheet = await inRoom('lounge', 'windows', true, true);
+    expect(within(sheet).queryByRole('link', { name: /Get the desktop app/ })).not.toBeInTheDocument();
+    expect(within(sheet).queryByText('Desktop app: Windows now, Mac soon')).not.toBeInTheDocument();
+    expect(within(sheet).queryByRole('button', { name: 'Open in the isshoni app' })).not.toBeInTheDocument();
   });
 });
