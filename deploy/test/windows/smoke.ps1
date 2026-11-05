@@ -976,11 +976,30 @@ function Get-UpdateFolder {
     return (Join-Path -Path $script:DataRoot -ChildPath 'updates')
 }
 
-# Get-PendingUpdate: state.json's pending record (06 section 8.7), or $null when there is none.
+# Get-PendingUpdate: state.json's pending record (06 section 8.7), or $null when there is none. The app replaces
+# state.json by renaming a temp file over it, which fails on Windows while a handle without FILE_SHARE_DELETE is
+# open, so the file is opened sharing ReadWrite and Delete. A read that lands mid-replace (a sharing violation, a
+# missing or partly read file) is retried a few times, 50 ms apart, before it fails the case.
 function Get-PendingUpdate {
     $file = Join-Path -Path (Get-UpdateFolder) -ChildPath 'state.json'
-    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $null }
-    $st = [IO.File]::ReadAllText($file) | ConvertFrom-Json
+    $st = $null
+    for ($try = 1; $try -le 5; $try++) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $null }
+        try {
+            $fs = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+            try {
+                $reader = New-Object -TypeName IO.StreamReader -ArgumentList $fs
+                $text = $reader.ReadToEnd()
+            } finally {
+                $fs.Dispose()
+            }
+            $st = $text | ConvertFrom-Json
+            break
+        } catch {
+            if ($try -eq 5) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
     $prop = $st.PSObject.Properties['pending']
     if ($null -eq $prop) { return $null }
     return $prop.Value

@@ -211,14 +211,18 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'Taskfile.yml'
             # The updater end to end (windows-desktop's updater e2e step, README WA88): M2 06 §10.1's three paths, and
-            # what else the e2e runs: the app's start-time apply and --update-now (step 2a, step 5), the smoke
-            # script, relserve and this workflow.
+            # what else the e2e runs: the app's start-time apply and --update-now (step 2a, step 5; main.go's
+            # installerRunning, writePending, takePending and early open), the installing mutex and WritePending
+            # (internal/desktop/winos), the smoke script, relserve and this workflow. The plan below starts
+            # windows-native and windows-desktop on it too, so a change to any of these runs the e2e.
             update:
               - 'internal/update/**'
               - 'deploy/windows/nsis/**'
               - 'tools/desktoppkg/**'
               - 'cmd/isshoni-desktop/update*.go'
               - 'cmd/isshoni-desktop/start.go'
+              - 'cmd/isshoni-desktop/main.go'
+              - 'internal/desktop/winos/**'
               - 'deploy/test/windows/smoke.ps1'
               - 'tools/relserve/**'
               - '.github/workflows/ci.yml'
@@ -419,8 +423,9 @@ jobs:
           # is one of its inputs too (the native filter adds only Taskfile.yml to desktop's paths).
           # The ps filter too: windows-desktop, which needs this job's artifact, runs the Pester tests and the
           # grammar check under Windows PowerShell 5.1 (README WA72).
+          # And on the update filter, as windows-desktop (its updater e2e needs this job's DLLs; README WA88).
           windows_native_when=$desktop
-          if [ "$native" = true ] || [ "$ps" = true ]; then windows_native_when=true; fi
+          if [ "$native" = true ] || [ "$ps" = true ] || [ "$update" = true ]; then windows_native_when=true; fi
           decide windows-native "$windows_native_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
             deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions
@@ -430,8 +435,10 @@ jobs:
           # deploy/test/windows/*.ps1) the desktop filter doesn't all list. And on the native filter, as windows-native:
           # that filter adds Taskfile.yml, whose test:ps, desktop:exe:windows, desktop:package:windows and native:dist
           # bodies this job runs, and the DLL-dependent Go tests moved here from windows-native.
+          # And on the update filter (README WA88): the updater e2e's inputs (tools/relserve, internal/desktop/winos)
+          # start the job that runs it.
           windows_desktop_when=$desktop
-          if [ "$native" = true ] || [ "$ps" = true ]; then windows_desktop_when=true; fi
+          if [ "$native" = true ] || [ "$ps" = true ] || [ "$update" = true ]; then windows_desktop_when=true; fi
           decide windows-desktop "$windows_desktop_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
             deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions \
@@ -3061,55 +3068,17 @@ jobs:
           $pub = (Get-Content -Raw -LiteralPath "$key.pub").Trim()
           [IO.File]::WriteAllText($signers, "isshoni-update namespaces=`"isshoni-update`" $pub`n", $utf8)
 
-          # relserve's port first: every URL in a manifest is under the base (06 §8.2, §8.11).
-          $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
-          $l.Start()
-          $port = $l.LocalEndpoint.Port
-          $l.Stop()
-          $base = "https://127.0.0.1:$port"
-          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
-          function New-SignedManifest {
-            param([string]$Version, [string]$Installer, [string]$Releases, [string]$Dir, [string]$BadSha = '')
-            New-Item -ItemType Directory -Force -Path $Dir | Out-Null
-            $m = Join-Path $Dir 'isshoni-desktop-update.json'
-            go -C tools run ./desktoppkg manifest -version $Version -installer $Installer -date $date -releases $Releases -out $m
-            if ($LASTEXITCODE -ne 0) { throw "desktoppkg manifest exited $LASTEXITCODE for $Version" }
-            if ($BadSha) {
-              $good = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
-              $text = [IO.File]::ReadAllText($m)
-              if (-not $text.Contains("`"sha256`": `"$good`"")) { throw "$m has no sha256 $good" }
-              [IO.File]::WriteAllText($m, $text.Replace("`"sha256`": `"$good`"", "`"sha256`": `"$BadSha`""), $utf8)
-            }
-            & $sk -Y sign -f $key -n isshoni-update $m 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$m.sig")) { throw "ssh-keygen -Y sign failed for $m" }
-          }
-          $name = "isshoni-desktop_$($new)_windows_amd64_setup.exe"
-          foreach ($root in '', 'badsha') {
-            $d = [IO.Path]::Combine($rel, $root, 'download', "v$new")
-            New-Item -ItemType Directory -Force -Path $d | Out-Null
-            Copy-Item -LiteralPath $setups[$new] -Destination (Join-Path $d $name)
-            $bad = ''
-            if ($root) { $bad = (Get-FileHash -Algorithm SHA256 -LiteralPath $setups[$old]).Hash.ToLowerInvariant() }
-            $releases = $base
-            if ($root) { $releases = "$base/$root" }
-            New-SignedManifest -Version $new -Installer (Join-Path $d $name) -Releases $releases -Dir $d -BadSha $bad
-          }
-          # ci0/: relserve's latest URL (ci.2's folder) answers with a manifest for ci.0, built over a copy of ci.1's
-          # installer under ci.0's name (the app never downloads it).
-          $ci0Dir = Join-Path $work 'ci0-installer'
-          New-Item -ItemType Directory -Force -Path $ci0Dir | Out-Null
-          $ci0Setup = Join-Path $ci0Dir "isshoni-desktop_$($ci0)_windows_amd64_setup.exe"
-          Copy-Item -LiteralPath $setups[$old] -Destination $ci0Setup
-          New-SignedManifest -Version $ci0 -Installer $ci0Setup -Releases "$base/ci0" `
-            -Dir ([IO.Path]::Combine($rel, 'ci0', 'download', "v$new"))
-
+          # relserve first, on a port the system picks (no probe that another process could take in between): it
+          # opens the files under -dir on each request, so the manifests, whose URLs are all under the base (06 §8.2,
+          # §8.11), are written once its address is known.
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
           $relserve = Join-Path $work 'relserve.exe'
           go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') build -o $relserve ./relserve
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $ca = Join-Path $work 'ca.pem'
           $ready = Join-Path $work 'addr'
           $rs = Start-Process -FilePath $relserve -PassThru -NoNewWindow `
-            -ArgumentList @('-dir', "`"$rel`"", '-latest', $new, '-addr', "127.0.0.1:$port", '-ca-out', "`"$ca`"",
+            -ArgumentList @('-dir', "`"$rel`"", '-latest', $new, '-addr', '127.0.0.1:0', '-ca-out', "`"$ca`"",
               '-ready-file', "`"$ready`"") `
             -RedirectStandardOutput (Join-Path $work 'relserve.out') -RedirectStandardError (Join-Path $work 'relserve.err')
           $store = $null
@@ -3121,6 +3090,45 @@ jobs:
               if ((Get-Date) -gt $deadline) { throw 'relserve did not start within 30 s' }
               Start-Sleep -Milliseconds 200
             }
+            $addr = (Get-Content -Raw -LiteralPath $ready).Trim()
+            if ($addr -notmatch '^127\.0\.0\.1:\d+$') { throw "relserve's ready file holds '$addr', not 127.0.0.1:port" }
+            $base = "https://$addr"
+            $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+            function New-SignedManifest {
+              param([string]$Version, [string]$Installer, [string]$Releases, [string]$Dir, [string]$BadSha = '')
+              New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+              $m = Join-Path $Dir 'isshoni-desktop-update.json'
+              go -C tools run ./desktoppkg manifest -version $Version -installer $Installer -date $date -releases $Releases -out $m
+              if ($LASTEXITCODE -ne 0) { throw "desktoppkg manifest exited $LASTEXITCODE for $Version" }
+              if ($BadSha) {
+                $good = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+                $text = [IO.File]::ReadAllText($m)
+                if (-not $text.Contains("`"sha256`": `"$good`"")) { throw "$m has no sha256 $good" }
+                [IO.File]::WriteAllText($m, $text.Replace("`"sha256`": `"$good`"", "`"sha256`": `"$BadSha`""), $utf8)
+              }
+              & $sk -Y sign -f $key -n isshoni-update $m 2>&1 | Out-Null
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$m.sig")) { throw "ssh-keygen -Y sign failed for $m" }
+            }
+            $name = "isshoni-desktop_$($new)_windows_amd64_setup.exe"
+            foreach ($root in '', 'badsha') {
+              $d = [IO.Path]::Combine($rel, $root, 'download', "v$new")
+              New-Item -ItemType Directory -Force -Path $d | Out-Null
+              Copy-Item -LiteralPath $setups[$new] -Destination (Join-Path $d $name)
+              $bad = ''
+              if ($root) { $bad = (Get-FileHash -Algorithm SHA256 -LiteralPath $setups[$old]).Hash.ToLowerInvariant() }
+              $releases = $base
+              if ($root) { $releases = "$base/$root" }
+              New-SignedManifest -Version $new -Installer (Join-Path $d $name) -Releases $releases -Dir $d -BadSha $bad
+            }
+            # ci0/: relserve's latest URL (ci.2's folder) answers with a manifest for ci.0, built over a copy of ci.1's
+            # installer under ci.0's name (the app never downloads it).
+            $ci0Dir = Join-Path $work 'ci0-installer'
+            New-Item -ItemType Directory -Force -Path $ci0Dir | Out-Null
+            $ci0Setup = Join-Path $ci0Dir "isshoni-desktop_$($ci0)_windows_amd64_setup.exe"
+            Copy-Item -LiteralPath $setups[$old] -Destination $ci0Setup
+            New-SignedManifest -Version $ci0 -Installer $ci0Setup -Releases "$base/ci0" `
+              -Dir ([IO.Path]::Combine($rel, 'ci0', 'download', "v$new"))
+
             $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ca)
             $store = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
             $store.Open('ReadWrite')

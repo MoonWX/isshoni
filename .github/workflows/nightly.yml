@@ -1810,55 +1810,17 @@ jobs:
           $pub = (Get-Content -Raw -LiteralPath "$key.pub").Trim()
           [IO.File]::WriteAllText($signers, "isshoni-update namespaces=`"isshoni-update`" $pub`n", $utf8)
 
-          # relserve's port first: every URL in a manifest is under the base (06 §8.2, §8.11).
-          $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
-          $l.Start()
-          $port = $l.LocalEndpoint.Port
-          $l.Stop()
-          $base = "https://127.0.0.1:$port"
-          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
-          function New-SignedManifest {
-            param([string]$Version, [string]$Installer, [string]$Releases, [string]$Dir, [string]$BadSha = '')
-            New-Item -ItemType Directory -Force -Path $Dir | Out-Null
-            $m = Join-Path $Dir 'isshoni-desktop-update.json'
-            go -C tools run ./desktoppkg manifest -version $Version -installer $Installer -date $date -releases $Releases -out $m
-            if ($LASTEXITCODE -ne 0) { throw "desktoppkg manifest exited $LASTEXITCODE for $Version" }
-            if ($BadSha) {
-              $good = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
-              $text = [IO.File]::ReadAllText($m)
-              if (-not $text.Contains("`"sha256`": `"$good`"")) { throw "$m has no sha256 $good" }
-              [IO.File]::WriteAllText($m, $text.Replace("`"sha256`": `"$good`"", "`"sha256`": `"$BadSha`""), $utf8)
-            }
-            & $sk -Y sign -f $key -n isshoni-update $m 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$m.sig")) { throw "ssh-keygen -Y sign failed for $m" }
-          }
-          $name = "isshoni-desktop_$($new)_windows_amd64_setup.exe"
-          foreach ($root in '', 'badsha') {
-            $d = [IO.Path]::Combine($rel, $root, 'download', "v$new")
-            New-Item -ItemType Directory -Force -Path $d | Out-Null
-            Copy-Item -LiteralPath $setups[$new] -Destination (Join-Path $d $name)
-            $bad = ''
-            if ($root) { $bad = (Get-FileHash -Algorithm SHA256 -LiteralPath $setups[$old]).Hash.ToLowerInvariant() }
-            $releases = $base
-            if ($root) { $releases = "$base/$root" }
-            New-SignedManifest -Version $new -Installer (Join-Path $d $name) -Releases $releases -Dir $d -BadSha $bad
-          }
-          # ci0/: relserve's latest URL (ci.2's folder) answers with a manifest for ci.0, built over a copy of ci.1's
-          # installer under ci.0's name (the app never downloads it).
-          $ci0Dir = Join-Path $work 'ci0-installer'
-          New-Item -ItemType Directory -Force -Path $ci0Dir | Out-Null
-          $ci0Setup = Join-Path $ci0Dir "isshoni-desktop_$($ci0)_windows_amd64_setup.exe"
-          Copy-Item -LiteralPath $setups[$old] -Destination $ci0Setup
-          New-SignedManifest -Version $ci0 -Installer $ci0Setup -Releases "$base/ci0" `
-            -Dir ([IO.Path]::Combine($rel, 'ci0', 'download', "v$new"))
-
+          # relserve first, on a port the system picks (no probe that another process could take in between): it
+          # opens the files under -dir on each request, so the manifests, whose URLs are all under the base (06 §8.2,
+          # §8.11), are written once its address is known.
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
           $relserve = Join-Path $work 'relserve.exe'
           go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') build -o $relserve ./relserve
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $ca = Join-Path $work 'ca.pem'
           $ready = Join-Path $work 'addr'
           $rs = Start-Process -FilePath $relserve -PassThru -NoNewWindow `
-            -ArgumentList @('-dir', "`"$rel`"", '-latest', $new, '-addr', "127.0.0.1:$port", '-ca-out', "`"$ca`"",
+            -ArgumentList @('-dir', "`"$rel`"", '-latest', $new, '-addr', '127.0.0.1:0', '-ca-out', "`"$ca`"",
               '-ready-file', "`"$ready`"") `
             -RedirectStandardOutput (Join-Path $work 'relserve.out') -RedirectStandardError (Join-Path $work 'relserve.err')
           $store = $null
@@ -1870,6 +1832,45 @@ jobs:
               if ((Get-Date) -gt $deadline) { throw 'relserve did not start within 30 s' }
               Start-Sleep -Milliseconds 200
             }
+            $addr = (Get-Content -Raw -LiteralPath $ready).Trim()
+            if ($addr -notmatch '^127\.0\.0\.1:\d+$') { throw "relserve's ready file holds '$addr', not 127.0.0.1:port" }
+            $base = "https://$addr"
+            $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+            function New-SignedManifest {
+              param([string]$Version, [string]$Installer, [string]$Releases, [string]$Dir, [string]$BadSha = '')
+              New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+              $m = Join-Path $Dir 'isshoni-desktop-update.json'
+              go -C tools run ./desktoppkg manifest -version $Version -installer $Installer -date $date -releases $Releases -out $m
+              if ($LASTEXITCODE -ne 0) { throw "desktoppkg manifest exited $LASTEXITCODE for $Version" }
+              if ($BadSha) {
+                $good = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+                $text = [IO.File]::ReadAllText($m)
+                if (-not $text.Contains("`"sha256`": `"$good`"")) { throw "$m has no sha256 $good" }
+                [IO.File]::WriteAllText($m, $text.Replace("`"sha256`": `"$good`"", "`"sha256`": `"$BadSha`""), $utf8)
+              }
+              & $sk -Y sign -f $key -n isshoni-update $m 2>&1 | Out-Null
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$m.sig")) { throw "ssh-keygen -Y sign failed for $m" }
+            }
+            $name = "isshoni-desktop_$($new)_windows_amd64_setup.exe"
+            foreach ($root in '', 'badsha') {
+              $d = [IO.Path]::Combine($rel, $root, 'download', "v$new")
+              New-Item -ItemType Directory -Force -Path $d | Out-Null
+              Copy-Item -LiteralPath $setups[$new] -Destination (Join-Path $d $name)
+              $bad = ''
+              if ($root) { $bad = (Get-FileHash -Algorithm SHA256 -LiteralPath $setups[$old]).Hash.ToLowerInvariant() }
+              $releases = $base
+              if ($root) { $releases = "$base/$root" }
+              New-SignedManifest -Version $new -Installer (Join-Path $d $name) -Releases $releases -Dir $d -BadSha $bad
+            }
+            # ci0/: relserve's latest URL (ci.2's folder) answers with a manifest for ci.0, built over a copy of ci.1's
+            # installer under ci.0's name (the app never downloads it).
+            $ci0Dir = Join-Path $work 'ci0-installer'
+            New-Item -ItemType Directory -Force -Path $ci0Dir | Out-Null
+            $ci0Setup = Join-Path $ci0Dir "isshoni-desktop_$($ci0)_windows_amd64_setup.exe"
+            Copy-Item -LiteralPath $setups[$old] -Destination $ci0Setup
+            New-SignedManifest -Version $ci0 -Installer $ci0Setup -Releases "$base/ci0" `
+              -Dir ([IO.Path]::Combine($rel, 'ci0', 'download', "v$new"))
+
             $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ca)
             $store = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
             $store.Open('ReadWrite')
