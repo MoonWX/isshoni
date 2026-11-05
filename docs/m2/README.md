@@ -656,11 +656,12 @@ the named sections)
     `test_encode_failed`, as designed, because a session never drains. A likely cause, not proven: FFmpeg's `mfenc`
     sets `CODECAPI_AVLowLatencyMode` as `VT_UI4`, while Microsoft documents the property as `VT_BOOL`; a patch that
     sets it as `VT_BOOL` is a candidate for a later FFmpeg revision (06 §4.1's patch rule, a new publish), not part of
-    r2. `mf_sw_test` skips on Windows Server only, and only for an MFT refusal (an `h264_mf` error line with the MFT's
-    HRESULT inside MF software's own probe); a probe that failed because the AU came only on drain is not a refusal
-    and fails the test, so if the merged tree's first `windows-native` run shows only that outcome, a `WF` slice
-    decides between the patch and naming this outcome a Windows Server skip too. The owner's PC shows whether a
-    client Windows behaves the same (04 §9.10, §17, §18.2; §8).
+    r2. `mf_sw_test` skips on Windows Server only: for an MFT refusal (an `h264_mf` error line with the MFT's HRESULT
+    inside MF software's own probe), and, since `ed2b4f0` on `m2/windows-app` (merged at group 13's integration),
+    also when MF software's `probe: first AU only on drain` record shows complete drained AUs (`sps`, `pps` and `idr`
+    all true); the skip prints that record. On a client Windows this outcome still fails the test, and the `VT_BOOL`
+    patch stays a candidate. The owner's PC shows whether a client Windows behaves the same (04 §9.10, §17, §18.2;
+    §8).
 69. **FFmpeg r2 is published and locked** (the owner, 2026-11-04): `ffmpeg.yml`'s publish run from `m2/windows-app` at
     `957cce6` (the libvpl patch of item 64 and `build.sh`'s fallback to the published source archive when an upstream
     tarball download fails, 06 §4.3, since ffmpeg.org was unreachable from the runners) created `deps-ffmpeg-9.0.2-r2`,
