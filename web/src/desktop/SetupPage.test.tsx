@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createDesktopTestPlatform } from '../app/testing/desktop';
-import type { AuthState } from '../platform/desktop/bridge';
+import type { AuthState, PendingLink } from '../platform/desktop/bridge';
 import { BridgeError } from '../platform/desktop/errors';
 import { authState } from '../platform/desktop/testing/fakeBridge';
 import { testOrigin } from '../test/platform';
@@ -145,6 +145,48 @@ describe('server step', () => {
     expect(await screen.findByLabelText('Your isshoni server')).toHaveAccessibleDescription(
       "You've added 20 servers. Remove one first.",
     );
+  });
+
+  it('too_many_servers shows once: Go forgets it once it is shown, so the next visit shows none (WA83-R4)', async () => {
+    const d = createDesktopTestPlatform({ server: null });
+    // Go's PendingLink: kept until App.LinkHandled.
+    let pending: { error: string } | null = { error: 'too_many_servers' };
+    d.fake.answers['app.pendingLink'] = () => Promise.resolve(pending);
+    d.fake.answers['app.linkHandled'] = () => {
+      pending = null;
+      return Promise.resolve(null);
+    };
+    const first = renderDesktopPage('/desktop/setup', d);
+    expect(await screen.findByLabelText('Your isshoni server')).toHaveAccessibleDescription(
+      "You've added 20 servers. Remove one first.",
+    );
+    await waitFor(() => {
+      expect(d.fake.callsOf('app.linkHandled')).toHaveLength(1);
+    });
+    first.unmount();
+
+    // Settings → Add server, or a reload: the page asks Go again and finds nothing.
+    renderDesktopPage('/desktop/setup', d);
+    const field = await screen.findByLabelText('Your isshoni server');
+    expect(d.fake.callsOf('app.pendingLink')).toHaveLength(2);
+    expect(field).not.toHaveAccessibleDescription(expect.stringContaining('20 servers'));
+    expect(field).not.toHaveAttribute('aria-invalid', 'true');
+
+    // One that comes while the server step is open (deeplink.open) is shown and forgotten the same way.
+    pending = { error: 'too_many_servers' };
+    act(() => {
+      d.fake.emit('deeplink.open', { error: 'too_many_servers' } as unknown as PendingLink);
+    });
+    await waitFor(() => {
+      // The step starts again with the error: a field of its own.
+      expect(screen.getByLabelText('Your isshoni server')).toHaveAccessibleDescription(
+        "You've added 20 servers. Remove one first.",
+      );
+    });
+    await waitFor(() => {
+      expect(d.fake.callsOf('app.linkHandled')).toHaveLength(2);
+    });
+    expect(pending).toBeNull();
   });
 });
 

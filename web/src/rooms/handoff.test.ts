@@ -9,15 +9,7 @@ import { BackoffMaxMs } from '../protocol/signal-client';
 import { makeError } from '../protocol/testing';
 import type { AgentSend, OwnConnection, ParticipantInfo } from '../protocol/types.gen';
 import { queryKeys } from '../protocol/queryKeys';
-import {
-  browserFamily,
-  fromOwnDesktop,
-  HANDOFF_VERIFY_MS,
-  onlineDesktops,
-  PLAYBACK_STATE_REPEAT_MS,
-  playsAudibly,
-  stopForRoom,
-} from './handoff';
+import { browserFamily, fromOwnDesktop, HANDOFF_VERIFY_MS, onlineDesktops, playsAudibly, stopForRoom } from './handoff';
 import { SUBSCRIBE_DEBOUNCE_MS } from './subscriptionSync';
 import { createHarness, participant, shareInfo, tick, type Harness, type HarnessOptions } from './testing/harness';
 
@@ -196,19 +188,19 @@ describe('a browser tab', () => {
     ]);
   });
 
-  it('tells a desktop connection that appeared once more after PLAYBACK_STATE_REPEAT_MS', async () => {
+  it('tells a desktop connection that appeared once, and never repeats it (03 §12.2; README WA83-R3)', async () => {
     await inLounge();
     await playing();
     h.server.send('user.connections', { connections: [own('c_c2', 'desktop')] });
     await tick();
     expect(states().map((s) => s.to)).toEqual(['c_c2']);
-    await tick(PLAYBACK_STATE_REPEAT_MS);
-    expect(states()).toHaveLength(2);
-    expect(states()[1]).toEqual(states()[0]);
-    // Only for one that appeared: an unchanged list repeats nothing.
+    // Go follows C2's events from before its welcome: no repeat is due, however long the tab waits.
+    await tick(10_000);
+    expect(states()).toHaveLength(1);
+    // An unchanged list sends nothing either.
     h.server.send('user.connections', { connections: [own('c_c2', 'desktop')] });
-    await tick(PLAYBACK_STATE_REPEAT_MS);
-    expect(states()).toHaveLength(2);
+    await tick(10_000);
+    expect(states()).toHaveLength(1);
   });
 
   it('tells the desktops again after a new welcome, and never without agent.relay', async () => {
@@ -216,13 +208,11 @@ describe('a browser tab', () => {
     h.server.send('user.connections', { connections: [own('c_c1', 'desktop')] });
     await tick();
     expect(states()).toHaveLength(1);
-    await tick(PLAYBACK_STATE_REPEAT_MS);
-    expect(states()).toHaveLength(2); // the repeat for a desktop that appeared
     h.server.restart();
     h.server.drop();
     await tick(BackoffMaxMs);
     expect(h.runtime.signal.state).toBe('ready');
-    expect(states()).toHaveLength(3);
+    expect(states()).toHaveLength(2);
 
     h.close();
     await inLounge({ server: {} });

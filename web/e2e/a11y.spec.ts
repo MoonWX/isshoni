@@ -3,9 +3,11 @@
 // invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), the admin's user
 // list, and every state of the device-link page (M2 02 §10.1: enter, invalid, confirm on the same, a different and an
 // unknown network, linked, denied, rate_limited, error), and the desktop app's settings page (M2 03 §14.4, in the
-// e2e harness's desktop app) as it opens, with the hotkey recorder open and with the licenses dialog open. In the room
-// the tile list is reachable with the keyboard and F switches the stage's fullscreen, and the overlay shows the
-// friend's tile as the page receives it and as the server forwards it, with no IP address.
+// e2e harness's desktop app) as it opens, with the hotkey recorder open and with the licenses dialog open, and with
+// the banner of a required update (03 §16.2), and the desktop's version screen (03 §16.3) for a newer and an older
+// server and with the outcome of Update the app. In the room the tile list is reachable with the keyboard and F
+// switches the stage's fullscreen, and the overlay shows the friend's tile as the page receives it and as the server
+// forwards it, with no IP address.
 //
 // What axe can't judge (a screen reader's reading order, the live regions' timing) is the manual matrix's and the
 // component tests' (05 §19.2, §19.4).
@@ -320,6 +322,100 @@ test('the desktop settings page (M2 03 §14.4), with the hotkey recorder and the
   await expect(dialog.getByRole('textbox', { name: 'Web app licenses' })).toBeVisible({ timeout: MEDIA_TIMEOUT_MS });
   await expectAccessible(page, 'the desktop settings page with the licenses dialog open');
   await expectAccessible(page, 'the licenses dialog', 'dialog[open]');
+});
+
+/** An update status of 06 §8.9 that Updates.Status answers in the banner's test: ready, and required. */
+const REQUIRED_UPDATE = {
+  state: 'ready',
+  current: '0.2.0',
+  available: '0.2.1',
+  required: true,
+  notesUrl: 'https://github.com/MoonWX/isshoni/releases/tag/v0.2.1',
+  progress: 0,
+  checkedAt: '2026-11-01T12:00:00Z',
+  errorCode: '',
+  policyOff: false,
+};
+
+/**
+ * Answers the page's hello itself with error {protocol_unsupported} and close 4426 (01 §6.1), as a server that speaks
+ * the protocols of `params()` does (version.spec's routeUnsupported); no socket reaches the server.
+ */
+async function routeUnsupported(page: Page, params: () => { serverMin: number; serverMax: number }): Promise<void> {
+  await page.routeWebSocket(/\/ws$/, (ws) => {
+    ws.onMessage((message) => {
+      const env = JSON.parse(String(message)) as { type: string; id?: string };
+      if (env.type !== 'hello') return;
+      ws.send(
+        JSON.stringify({
+          type: 'error',
+          ...(env.id !== undefined ? { re: env.id } : {}),
+          data: {
+            code: 'protocol_unsupported',
+            scope: 'connection',
+            retryable: false,
+            params: { ...params(), serverVersion: '9.9.9' },
+          },
+        }),
+      );
+      void ws.close({ code: 4426, reason: 'protocol_unsupported' });
+    });
+  });
+}
+
+test('the desktop app’s required-update banner and version screen (M2 03 §16.2, §16.3)', async ({
+  startDesktop,
+  server,
+}) => {
+  const account = await server.createUser();
+  const desktop = await startDesktop({ server: server.url });
+  const linked = await desktop.call<{ status: string }>('Auth', 'LinkWithPassword', account.username, account.password);
+  expect(linked.status).toBe('linked');
+  const { page, context } = desktop;
+
+  // The banner of a required update, at the top of every page (03 §16.2): the harness has no updater, so its
+  // Updates.Status answers for 06's, ready and required.
+  const status = '**/__bridge/call';
+  await context.route(status, async (route) => {
+    const call = route.request().postDataJSON() as { service?: string; method?: string } | null;
+    if (call?.service === 'Updates' && call.method === 'Status') {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(REQUIRED_UPDATE) });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.goto(`${desktop.origin}/desktop/settings`);
+  await pageReady(page, 'Settings');
+  const banner = page.getByRole('region', { name: 'Important update' });
+  await expect(banner).toContainText('An important update is ready');
+  await expect(banner.getByRole('button', { name: 'Restart and update' })).toBeVisible();
+  await expectAccessible(page, 'the desktop settings page with the required-update banner');
+  await expectAccessible(page, 'the required-update banner', 'section[aria-label="Important update"]');
+  await context.unroute(status);
+
+  // The version screen (03 §16.3, 02 §13.3) when the room's socket is refused with protocol_unsupported: a newer
+  // server (update_app), then an older one (update_server).
+  let params = { serverMin: 2, serverMax: 3 };
+  await routeUnsupported(page, () => params);
+  await page.goto(`${desktop.origin}/r/lounge`);
+  await expect(page.getByRole('heading', { name: 'This server needs a newer isshoni app' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Update the app' })).toBeVisible();
+  await expectAccessible(page, 'the desktop version screen (update_app)');
+  // Update the app: the harness has no updater, so the screen says what went wrong, with the Download page.
+  await page.getByRole('button', { name: 'Update the app' }).click();
+  await expect(page.getByRole('alert')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Download page/ })).toBeVisible();
+  await expectAccessible(page, 'the desktop version screen with the update’s outcome');
+
+  // The refusal went to Go (Auth.HelloRefused), which keeps the server incompatible until it asks /info again:
+  // Try again's Auth.Recheck finds the real server compatible, and the next page meets the older one.
+  const rechecked = await desktop.call<{ status: string }>('Auth', 'Recheck');
+  expect(rechecked.status).toBe('linked');
+  params = { serverMin: 0, serverMax: 0 };
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'This server needs an update' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Update the app' })).toHaveCount(0);
+  await expectAccessible(page, 'the desktop version screen (update_server)');
 });
 
 /** Clicks Share in the header and Share in the sheet, with the page in front (05 §19.3); returns once it is live. */

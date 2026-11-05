@@ -2,16 +2,17 @@
 //
 // System audio is everything the computer plays, the sharer's voice call included, so the friends in that call
 // would hear themselves. A browser can't leave single apps out of it; Discord Web's own screen share has the same
-// echo (PLAN, "Discord Web's own screen share"). Keeping voice apps out is what isshoni's desktop app is for.
+// echo (PLAN, "Discord Web's own screen share"). Keeping voice apps out is what isshoni's desktop app is for: the
+// warning offers it as the sheet does (DesktopAppEntry, M2 03 §12.3), and following its link gives the pick up.
 import { TriangleAlert } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Link } from 'react-router';
 
 import type { PickedSource, SharingProvider } from '../platform/types';
 import type { Preset } from '../protocol/types.gen';
 import { Button } from '../ui/Button';
 import { Dialog } from '../ui/Dialog';
 import styles from './ScreenAudioWarning.module.css';
+import { DesktopAppEntry } from './ShareSheet';
 
 export interface ScreenAudioWarningProps {
   open: boolean;
@@ -82,11 +83,7 @@ export function ScreenAudioWarning({
           <span>{t('share.warning.body')}</span>
         </p>
         <p className={styles.why}>{t('share.warning.why')}</p>
-        <p className={styles.why}>
-          <Link to="/download" onClick={onCancel}>
-            {t('share.warning.desktopApp')}
-          </Link>
-        </p>
+        <DesktopAppEntry label={t('share.warning.desktopApp')} onFollow={onCancel} className={styles.why} />
       </div>
     </Dialog>
   );
