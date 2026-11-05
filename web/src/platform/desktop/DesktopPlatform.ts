@@ -48,6 +48,13 @@ export interface DesktopPlatformOptions {
   interceptLinks?: boolean;
 }
 
+/**
+ * W17's watchdog (docs/m2/03 §3.2, §20): the page calls App.Heartbeat this often, and Go reloads a visible window
+ * whose page sent none for 15 s (app.HeartbeatEvery and HeartbeatTimeout). The watchdog arms with the first beat,
+ * which goes out at once.
+ */
+export const HeartbeatEveryMs = 5000;
+
 const noPushError = (): Promise<never> => Promise.reject(new Error('desktop: no push notifications'));
 
 /** No Web Push in WebView2: the push card never shows (docs/m2/03 §7.3). */
@@ -79,6 +86,7 @@ export class DesktopPlatform implements Platform {
   private readonly tokens: Tokens;
   private readonly log = createLogger('desktop');
   private readonly disposeLinks: () => void;
+  private readonly heartbeat: ReturnType<typeof setInterval>;
   /** The URL openExternal opened in this task (see there). */
   private lastExternal: string | null = null;
 
@@ -113,6 +121,15 @@ export class DesktopPlatform implements Platform {
       signalStopped: (err) => import('./actions').then((m) => m.signalStopped(desktop, err)),
     };
     this.desktop = desktop;
+    const beat = (): void => {
+      try {
+        bridge.app.heartbeat();
+      } catch {
+        // The transport logs a failed beat (a void call); the next one goes out anyway.
+      }
+    };
+    beat();
+    this.heartbeat = setInterval(beat, HeartbeatEveryMs);
     this.sharing = opts.sharing
       ? opts.sharing(bridge)
       : lazySharing(bridge, (err) => {
@@ -128,8 +145,12 @@ export class DesktopPlatform implements Platform {
           });
   }
 
-  /** Removes the link interception and the auth.state listener (tests; the page never disposes its platform). */
+  /**
+   * Removes the link interception and the auth.state listener and stops the heartbeat (tests; the page never disposes
+   * its platform).
+   */
   dispose(): void {
+    clearInterval(this.heartbeat);
     this.disposeLinks();
     this.tokens.dispose();
   }

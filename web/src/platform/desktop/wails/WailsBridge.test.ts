@@ -158,10 +158,12 @@ describe('WailsBridge', () => {
     b.app.log('error', 'x', { k: 'v' });
     expect(fakes.App['Log']).toHaveBeenLastCalledWith('error', 'x', { k: 'v' });
     b.app.ownConnections(['c_1']);
+    b.app.heartbeat();
     b.share.release('p_1');
     b.share.watchServerStats(true);
     b.audio.watchLevels(false);
     expect(fakes.App['OwnConnections']).toHaveBeenCalledWith(['c_1']);
+    expect(fakes.App['Heartbeat']).toHaveBeenCalledWith();
     expect(fakes.Share['Release']).toHaveBeenCalledWith('p_1');
     expect(fakes.Share['WatchServerStats']).toHaveBeenCalledWith(true);
     expect(fakes.Audio['WatchLevels']).toHaveBeenCalledWith(false);

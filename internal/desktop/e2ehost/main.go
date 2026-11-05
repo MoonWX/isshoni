@@ -12,16 +12,19 @@
 //	GET  /__bridge/events                   the app's events as an event stream
 //	POST /wails/runtime                     a stub behind the real assets.Guard: what passes the Guard is recorded
 //	GET  /__e2e/state                       the recording Shell and OSHooks: window, URLs opened, toasts, hotkeys,
-//	                                        keep-awake, pill, reloads, the tokens handed out (hashes), runtime calls
+//	                                        keep-awake, pill, reloads, the tokens handed out (hashes), runtime calls,
+//	                                        the page's heartbeats (W17) and the end-of-session acknowledgements
 //	POST /__e2e/hotkey?id=pause|stop        a hotkey press
-//	POST /__e2e/system?event=lock|unlock|suspend|resume|end-session|display-change   an OS event
+//	POST /__e2e/system?event=<event>        an OS event: lock, unlock, suspend, resume, end-session
+//	                                        (WM_QUERYENDSESSION), end-session-confirmed (WM_ENDSESSION with TRUE: the
+//	                                        app quits) or display-change
 //	POST /__e2e/args                        {"args": [...]}: a command line as a second instance would forward it
 //
 // Flags (e2e only; no other build has them): -listen (default 127.0.0.1:0), -data (default: a new temporary folder,
 // removed at exit), -server <origin> (added and made active at start, which the add step would do in the app),
-// -reload-delay (Shell.Reload waits that long), -lock-resume and -lock-stop (03 §11.6's 5 min and 30 min, for
-// desktop-system.spec once the share controller takes them, README WA68). Arguments after the flags are the app's
-// command line (App.Boot). The log is at debug level in <data>/logs/isshoni.log.
+// -reload-delay (Shell.Reload waits that long), -lock-resume and -lock-stop (03 §11.6's 5 min and 30 min, the app's
+// LockResume and LockStop: desktop-system.spec's long-lock cases shorten them). Arguments after the flags are the
+// app's command line (App.Boot). The log is at debug level in <data>/logs/isshoni.log.
 //
 // Once it listens it prints one JSON line to stdout: {"addr": "127.0.0.1:<port>", "origin": …, "log": <file>}.
 // SIGINT or SIGTERM stops it.
@@ -308,6 +311,11 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 		return activeOrigin()
 	}
 	d.observe = func(service, method string, args []json.RawMessage, pre, result any) {
+		if service == "App" && method == "Heartbeat" {
+			// W17's watchdog beat (03 §3.2, §20): the page sends one at once and then every 5 s.
+			rec.update(func(s *hostState) { s.Heartbeats++ })
+			return
+		}
 		if service != "Auth" || method != "AccessToken" {
 			return
 		}
@@ -346,7 +354,7 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 		ev := app.SystemEvent(r.URL.Query().Get("event"))
 		switch ev {
 		case app.EventLock, app.EventUnlock, app.EventSuspend, app.EventResume, app.EventEndSession,
-			app.EventDisplayChange:
+			app.EventEndSessionConfirmed, app.EventDisplayChange:
 		default:
 			http.Error(w, "unknown event", http.StatusBadRequest)
 			return

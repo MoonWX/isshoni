@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"go.uber.org/goleak"
+
+	"github.com/MoonWX/isshoni/internal/desktop/app"
 )
 
 func TestMain(m *testing.M) {
@@ -334,5 +336,86 @@ func TestRun(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("run didn't stop")
+	}
+}
+
+// waitState polls /__e2e/state until ok holds, at most within.
+func waitState(t *testing.T, h *host, within time.Duration, what string, ok func(hostState) bool) hostState {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		s := state(t, h)
+		if ok(s) {
+			return s
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within %v (state %+v)", what, within, s)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestHostHeartbeat is W17's watchdog through the harness (03 §3.2, §20): App.Heartbeat over the HTTP transport
+// reaches the app and is counted, and once the beats stop, the app's own watchdog (app.HeartbeatEvery ticks,
+// app.HeartbeatTimeout) reloads the visible page. It waits for the real ticker: about 20 s.
+func TestHostHeartbeat(t *testing.T) {
+	t.Parallel()
+	h := newTestHost(t)
+	for range 2 {
+		if w := call(t, h, "App", "Heartbeat"); w.Code != http.StatusOK || w.Body.String() != "null" {
+			t.Fatalf("App.Heartbeat: %d %s", w.Code, w.Body)
+		}
+	}
+	beat := time.Now()
+	if s := state(t, h); s.Heartbeats != 2 || s.Reloads != 0 {
+		t.Fatalf("heartbeats %d, reloads %d", s.Heartbeats, s.Reloads)
+	}
+	s := waitState(t, h, app.HeartbeatTimeout+3*app.HeartbeatEvery, "a reload without beats",
+		func(s hostState) bool { return s.Reloads > 0 })
+	if since := time.Since(beat); since < app.HeartbeatTimeout {
+		t.Fatalf("reloaded %v after the last beat, before %v", since, app.HeartbeatTimeout)
+	}
+	if s.Reloads != 1 || s.Heartbeats != 2 {
+		t.Fatalf("reloads %d, heartbeats %d", s.Reloads, s.Heartbeats)
+	}
+}
+
+// TestHostEndSession: end-session (WM_QUERYENDSESSION) is acknowledged and the app keeps running, since the end may
+// still be cancelled; end-session-confirmed (WM_ENDSESSION with TRUE) quits the app, and the acknowledgement comes
+// once it has (03 §11.6).
+func TestHostEndSession(t *testing.T) {
+	h := newTestHost(t)
+	if w := do(t, h, http.MethodPost, "/__e2e/system?event=end-session", "", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("end-session: %d %s", w.Code, w.Body)
+	}
+	s := waitState(t, h, 10*time.Second, "the end-session acknowledgement",
+		func(s hostState) bool { return s.EndSessionAcks == 1 })
+	if s.Quit {
+		t.Fatal("the app quit at WM_QUERYENDSESSION")
+	}
+	if w := do(t, h, http.MethodPost, "/__e2e/system?event=end-session-confirmed", "", ""); w.Code !=
+		http.StatusNoContent {
+		t.Fatalf("end-session-confirmed: %d %s", w.Code, w.Body)
+	}
+	s = waitState(t, h, 10*time.Second, "the quit's acknowledgement",
+		func(s hostState) bool { return s.EndSessionAcks == 2 })
+	if !s.Quit {
+		t.Fatal("acknowledged WM_ENDSESSION before the quit")
+	}
+}
+
+// TestRecorderRemoveToasts: the recording winos removal records the IDs of toasts it saw, once each.
+func TestRecorderRemoveToasts(t *testing.T) {
+	r := newRecorder(testOrigin, 0)
+	_ = r.Notify(app.Notification{ID: "lock-paused-1", Kind: app.ToastLockPaused})
+	_ = r.Notify(app.Notification{ID: "stopped-sleep-2", Kind: app.ToastStoppedSleep})
+	if n, err := r.RemoveToasts("lock-paused-1", "unknown-9"); n != 1 || err != nil {
+		t.Fatalf("%d %v", n, err)
+	}
+	if n, _ := r.RemoveToasts("lock-paused-1"); n != 0 {
+		t.Fatalf("removed twice: %d", n)
+	}
+	if s := r.snapshot(); len(s.RemovedToasts) != 1 || s.RemovedToasts[0] != "lock-paused-1" || len(s.Toasts) != 2 {
+		t.Fatalf("%+v", s)
 	}
 }
