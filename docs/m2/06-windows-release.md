@@ -1834,11 +1834,15 @@ New `changes` filters:
   `lint:keys` in `lint-deploy` (§8.3).
 - M1's `protocol` filter also counts `internal/desktop/bridge/**`, `cmd/isshoni-desktop/**`, `tools/wails3/**` and
   `web/src/platform/desktop/**`.
-- M1's `site` filter also counts `web/src/**/*.ts`, `web/src/**/*.tsx` and `.goreleaser.yaml` (group 16's
-  integration, README §3 item 108): `TestDocsAnchors`' product-links scan (WA85, §13) reads them, so a pull request
-  that only changes a site link in the SPA or the release notes runs the `site` job's anchor test. `deploy/**` (the
-  ps1, the NSIS script and the shell scripts the scan reads too) already runs the `site` job through the `deploy`
-  filter, and `docs/m1/**`, `docs/m2/**` and `docs/PLAN.md` stay excluded.
+- M1's `site` filter also counts `web/src/**/*.ts`, `web/src/**/*.tsx` and `.goreleaser.yaml` (group 16's integration,
+  README §3 item 108): `TestDocsAnchors`' product-links scan (WA85, §13) reads them, so a pull request that only changes
+  a site link in the SPA's TypeScript or the release notes runs the `site` job's anchor test. `deploy/**` (the scan
+  reads its `.ps1`, `.nsi`, `.nsh`, `.sh`, `.yaml` and other text files too) already runs the `site` job through the
+  `deploy` filter, and a Go file under `cmd/` or `internal/` runs the test through `test-go`; `docs/m1/**`, `docs/m2/**`
+  and `docs/PLAN.md` stay excluded. The scan covers more than these filters do: web/src's `.js`, `.mjs` and `.json`
+  files (other than `conntest/codes.json`) and the non-Go files under `cmd/` and `internal/` outside `testdata` start no
+  job that runs `TestDocsAnchors` (an open point for ci.yml's next owner, §13; none of them carries an anchor link
+  today).
 
 | Job | Runs when | Runner | Steps and assertions | Timeout | Gates |
 |---|---|---|---|---|---|
@@ -1926,8 +1930,10 @@ changed, without caches (§10.2), at the version `0.0.0-nightly.<run>`.
   caches, every check, the autostart round trip included, and from the installer that passed the smoke the desktop
   release files of release.yml's `desktop-pkg`: the update manifest, the symbols zip, the FFmpeg source tar and the
   stamped `install-desktop.ps1`, uploaded as `desktop-release` with the stage as `desktop-stage`; 75 min; the output
-  `desktop-files` is `true` once both are uploaded, also when a later check fails). Their artifacts are kept 1 day
-  (release.yml keeps its 7). Each keeps in step with its ci.yml twin: a change there belongs here too.
+  `desktop-files` is `true` once both are uploaded, also when a later check fails). The artifacts handed between the
+  jobs (`web-dist`, `windows-native`, `ffmpeg-source`, `desktop-release`, `desktop-stage`) are kept 1 day (release.yml
+  keeps its 7); `isshoni-native-tools`, `isshoni-desktop-windows-pr` and the CDP results (`cdp-test-results`) keep
+  ci.yml's 7 days. Each keeps in step with its ci.yml twin: a change there belongs here too.
 - **The updater e2e** is a placeholder step in `windows-full` ("The updater e2e (README WA88)", a notice) until WA88
   replaces it.
 - **`goreleaser-full`** needs `windows-full` and runs `if: !cancelled()`, about 1.5 h into the night. With its real
@@ -2332,7 +2338,7 @@ application sent.
 | `docs/troubleshooting.md` | `#desktop-update-failed`, `#desktop-smart-app-control`, `#desktop-webview2`, `#desktop-openssh`; `#desktop-windows-n` (Windows N or KN: viewing H.264 fails in the app and in Edge until the Media Feature Pack is installed; 03 links it from its codec-banner text, 03 §5.4, and from its N-edition guided fix); `#desktop-media-feature-pack` (installing the Media Feature Pack and what it restores: H.264 decoding for viewing and the MF encoders for sharing, 04 §9.1); `#desktop-gpu-driver` (NVIDIA 531.61 or newer for NVENC, current AMD and Intel drivers, what 03's `driver_too_old` fix means); `#desktop-fullscreen-games` (full-screen exclusive games may capture black or the desktop; use borderless, 04 §7.7); `#desktop-crash-dumps` (Windows Error Reporting `LocalDumps` steps and the release's `…_symbols.zip`, 04 §13.4); `#desktop-windows10-border` (the yellow border around a shared window on Windows 10, expected); and **`#desktop-linking`**, a fixed anchor for 02's "Linking the app" section (02 DA12 writes the section's content; this document fixes the anchor and checks it) |
 | root `README.md` | the update keys in "Release signing keys"; the Windows app in Install |
 | `site.yml` | serves `/keys/update_signers` (verified against main's file like `allowed_signers`); `release.json` gains `{"desktop": {"windowsInstaller": "<name>", "sha256": "<hex>"}, "updateKeyFingerprints": […]}` from the verified `checksums.txt` and `update_signers`. As built (WA85, group 16; README §3 item 105): the build copies main's `deploy/keys/update_signers` to `/keys/update_signers` only while the file exists, and the step after the build checks the served copy's SHA-256 against main's (and fails a site that serves one without it); `desktop` is `null` for a 0.1.x release, and a 0.2.0 or later release whose signed `checksums.txt` doesn't list its installer exactly once fails the build, as does a release with the app while main has no `update_signers`. **The site does not check the update manifest's signature**: `check-draft.sh` checks it before a release is published (§11.3) and every app checks it before it trusts a manifest (§8), while the site neither serves nor uses the manifest, so a check there would protect nothing it shows. It would only break the build when the owner drops a key from `update_signers` ahead of the release signed with the next one (`deploy/keys/README.md`: a rotation, or a leak, exactly when the site's security text must go out). `/download` and `/security` read the new fields with an inline `<script setup>` over `.vitepress/release.json` |
-| `internal/server/ops/doctor/docsanchors_test.go` | the new fixed anchors above join the checked list (M1 06 §10.4: `TestDocsAnchors`), since the app (03), the SPA, the installer and the ps1 link to them: every anchor of §17's "Site anchors", including `/troubleshooting#desktop-linking`, `#desktop-windows-n`, `#desktop-media-feature-pack`, `#desktop-gpu-driver`, `#desktop-fullscreen-games`, `#desktop-crash-dumps` and `#desktop-windows10-border` (as built, WA85: and `#desktop-sound`, which 03's sound check links). As built (WA85; README §3 item 105): beyond §17's list, a "product links" subtest scans the anchor links of `web/src`, `deploy/`'s `.ps1`, `.nsi` and `.sh` files, `.goreleaser.yaml` and the site's own pages, so every anchor the app, the installer, the release notes or the docs link to must exist; ci.yml's `site` filter counts those inputs (§10.1) |
+| `internal/server/ops/doctor/docsanchors_test.go` | the new fixed anchors above join the checked list (M1 06 §10.4: `TestDocsAnchors`), since the app (03), the SPA, the installer and the ps1 link to them: every anchor of §17's "Site anchors", including `/troubleshooting#desktop-linking`, `#desktop-windows-n`, `#desktop-media-feature-pack`, `#desktop-gpu-driver`, `#desktop-fullscreen-games`, `#desktop-crash-dumps` and `#desktop-windows10-border` (as built, WA85: and `#desktop-sound`, which 03's sound check links). As built (WA85; README §3 item 105): beyond §17's list, a "product links" subtest scans every `.go`, `.ts`, `.tsx`, `.js`, `.mjs`, `.json`, `.ps1`, `.nsi`, `.nsh`, `.sh`, `.yaml`, `.yml`, `.txtar` and `.txt` file under `cmd/`, `internal/`, `web/src/` and `deploy/` (skipping `node_modules`, `dist` and dot-folders), `.goreleaser.yaml`, web/src's `anchor: '<id>'` entries (the engine errors' troubleshooting sections) and the site's own pages, so every anchor the app, the installer, the release notes or the docs link to must exist. Which ci.yml jobs run it on a change of those inputs (§10.1): Go files through `test-go`, `deploy/**` through the `deploy` filter (the `site` job), `web/src/**/*.ts(x)` and `.goreleaser.yaml` through the `site` filter. **Open point for ci.yml's next owner**: web/src's `.js`, `.mjs` and `.json` files (other than `conntest/codes.json`, which the `site` filter lists) and the non-Go files under `cmd/` and `internal/` outside `testdata` are scanned but start no job that runs `TestDocsAnchors`; none of them carries an anchor link today |
 
 `#verify-desktop`:
 

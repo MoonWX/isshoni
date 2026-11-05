@@ -2412,8 +2412,7 @@ Items 3 and 4 stand on both. As written into the exit run book (WA79, `docs/m2/e
 README §3 item 102): the replacement is of items 1 and 2 as a whole, so on Win10 `run -gate`'s exit code is recorded,
 not judged (cases 1 `baseline-endpoint` and 19 `probe-fallback` must PASS, with the report's `dll.sha256` still the
 rc's), and **no R row is required on Win10**, R5's other half (the game heard again) included, whatever §18.9's OS
-column lists. Item 3 (`avsync`, with Desktop Duplication on Win10) and item 4
-(the committed report) stand on both.
+column lists. Item 3 (`avsync`, with Desktop Duplication on Win10) and item 4 (the committed report) stand on both.
 
 **Release tiers** (plan "Verification"; 06 runs the checklist): every release: `run -gate` and R1 on Win11, report
 attached to the GitHub Release as `audiotest-win11.json`. Minor releases: the full gate on Win11 and, in the reduced form above, on Win10, R1–R6

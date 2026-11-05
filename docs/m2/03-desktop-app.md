@@ -2353,21 +2353,21 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    returns an error, it is logged and the start continues with step 6 (which then handles the link from the Pending
    values just written).
    As built (WA84, group 16; README §3 item 104): `startTimeUpdate` in `cmd/isshoni-desktop/update.go`. Step 5 opens
-   `settings.json` and the updater (`earlyParts`; 06's `Enabled`, `Channel` and `WizardDone` read `settings.json`
-   before every check), and step 7 goes on with both instead of opening them again. `PendingAtStartup(autostart)` is
-   06's and answers nil at an `--autostart` start. **The link it keeps** is the newest one: this start's own
-   `--open-url`, or the newest a second launch forwarded since step 3 (`fwd`'s queue), so the relaunched app opens
-   what the user clicked last; it is never logged. **A failed `Apply`** (`startApplyTimeout`, 30 s) is logged and the
-   Pending values it just wrote are **taken back**, and the start goes on: the link reaches this start's app from where
-   it came (its own `--open-url` or the forwarded queue), so step 6 would otherwise hand it over twice (two
-   `deeplink.open`, and two Add questions for an unknown server). This replaces the sentence above about step 6
-   handling it. `TestInstallerHandover` runs with a pending update, so a step-5 call moved before step 2a fails it;
-   `TestStartTimeUpdate*` cover the newest link and the take-back. **`--update-now`** (step 1) is compiled only into
-   `updatetest` builds (`updatenow_on.go`; in every other build `updatenow_off.go` leaves it out, so `--update-now`
-   logs an error and exits 2 with no window): one `CheckNow`, then
-   `Apply(ctx, Ready(), true)` when `ready`; exit 0 when the installer runs or the app is up to date, else 1, within
-   10 minutes. It builds 06's updater with its default options (enabled unless the machine policy says otherwise, the
-   stable channel, which a test build widens to every channel) and opens no `settings.json`, as a one-shot mode.
+   `settings.json` and the updater (`earlyParts`; 06's `Enabled`, `Channel` and `WizardDone` read `settings.json` before
+   every check), and step 7 goes on with both instead of opening them again. `PendingAtStartup(autostart)` is 06's and
+   answers nil at an `--autostart` start. **The link it keeps** is the newest one: this start's own `--open-url`, or the
+   newest a second launch forwarded since step 3 (`fwd`'s queue), so the relaunched app opens what the user clicked
+   last; it is never logged. **A failed `Apply`** (`startApplyTimeout`, 30 s) is logged and the Pending values it just
+   wrote are **taken back**, and the start goes on: the link reaches this start's app from where it came (its own
+   `--open-url` or the forwarded queue), so step 6 would otherwise hand it over twice (two `deeplink.open`, and two Add
+   questions for an unknown server). This replaces the sentence above about step 6 handling it. `TestInstallerHandover`
+   runs with a pending update, so a step-5 call moved before step 2a fails it; `TestStartTimeUpdate*` cover the newest
+   link and the take-back. **`--update-now`** (step 1) is compiled only into `updatetest` builds (`updatenow_on.go`; in
+   every other build `updatenow_off.go` leaves it out, so `--update-now` logs an error and exits 2 with no window): one
+   `CheckNow`, then `Apply(ctx, Ready(), true)` when `ready`; exit 0 when the installer runs or the app is up to date,
+   else 1, within 10 minutes. It builds 06's updater with its default options (enabled unless the machine policy says
+   otherwise, the stable channel, which a test build widens to every channel) and opens no `settings.json`, as a
+   one-shot mode.
 6. **Pending values**: read and delete `PendingServer` and `PendingRoom` (§13.2).
 7. **The app**: env scrub (§5.4), `SetCurrentProcessExplicitAppUserModelID("io.isshoni.desktop")`, the WebView2
    runtime check (§5.4), settings, logs, the services of §6.1, Wails; then `HandleArgs(os.Args[1:])` and
@@ -2570,20 +2570,19 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 - Started with `--autostart`, the app creates the tray and C2's session (no room, so no presence) but **no window**
   until the user opens one; it handles deep links and update checks meanwhile, and never applies a pending update at
   that start (§13.4 step 5). No SPA runs, so the user is never shown in a room just because the PC started.
-- As built (WA84, group 16; README §3 items 104, 108): `winos` writes the value `isshoni` =
-  `"<exe>" --autostart` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`RunCommand`: an absolute path
-  without a quote) and deletes it when off;
-  elsewhere `Autostart`/`SetAutostart` answer `ErrNotSupported` (`not_implemented` at the bridge). **The deferred
-  window**: an `--autostart` start builds the shell without the main window (`newDeferredShell`): the tray icon
-  exists for the app's whole life, and the window is created the first time one is asked for (`ShowWindow`: the
-  tray's Open, a toast, a link, a second launch); until then `Reload` has no page to reload, and the window loads the
-  start page when it opens. A ready update is offered in the tray then (06 §8.7 (b)). **The OS is the truth**: at
-  `Run`'s start `settings.json`'s `autostart` follows the Run value (`syncAutostart`), since the value can go without
-  the app (06's uninstaller deletes it while a keep-data reinstall keeps `settings.json`, or another tool removes it),
-  and the app never writes the Run value behind the user's back. `TestDeferredShellOpensNoWindow` checks the shell
-  everywhere; `TestAutostartRoundTrip` (Windows, the e2e build with `web/dist` and a WebView2 runtime: started with
-  `--autostart` it shows no window, and a second launch shows one) runs in ci.yml's `windows-desktop` and nightly's
-  `windows-full` with `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, which turns its skips into failures (06 §10.1).
+- As built (WA84, group 16; README §3 items 104, 108): `winos` writes the value `isshoni` = `"<exe>" --autostart` under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`RunCommand`: an absolute path without a quote) and deletes it
+  when off; elsewhere `Autostart`/`SetAutostart` answer `ErrNotSupported` (`not_implemented` at the bridge). **The
+  deferred window**: an `--autostart` start builds the shell without the main window (`newDeferredShell`): the tray icon
+  exists for the app's whole life, and the window is created the first time one is asked for (`ShowWindow`: the tray's
+  Open, a toast, a link, a second launch); until then `Reload` has no page to reload, and the window loads the start
+  page when it opens. A ready update is offered in the tray then (06 §8.7 (b)). **The OS is the truth**: at `Run`'s
+  start `settings.json`'s `autostart` follows the Run value (`syncAutostart`), since the value can go without the app
+  (06's uninstaller deletes it while a keep-data reinstall keeps `settings.json`, or another tool removes it), and the
+  app never writes the Run value behind the user's back. `TestDeferredShellOpensNoWindow` checks the shell everywhere;
+  `TestAutostartRoundTrip` (Windows, the e2e build with `web/dist` and a WebView2 runtime: started with `--autostart` it
+  shows no window, and a second launch shows one) runs in ci.yml's `windows-desktop` and nightly's `windows-full` with
+  `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, which turns its skips into failures (06 §10.1).
 
 ### 16.2 Updates (the UI; 06 owns the updater)
 

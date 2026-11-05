@@ -1094,8 +1094,8 @@ the named sections)
      (R8): `internal/desktop/bridge/bridge.go` (`Deps.Updates`, `Deps.OpenH264`, the `update.state` subscription, the
      `Settings` fields), `internal/desktop/app/share.go` (`Shares()` gated), `internal/desktop/winos/oshooks_other.go`
      and `winos_other_test.go` (03 §6.2, §6.3, §13.4, §16.1, §16.2; the WA84 row, §5's shared files).
-105. **WA85 is built; the site serves `update_signers` and does not check the update manifest** (group 16's WA85
-     review; WA85-1 to 3 were fixed, 4 and 5 by item 108): `site.yml` copies main's `deploy/keys/update_signers` to
+105. **WA85 is built; the site serves `update_signers` and does not check the update manifest** (group 16's WA85 review;
+     WA85-1 to 3 were fixed, 4 and 5 by item 108): `site.yml` copies main's `deploy/keys/update_signers` to
      `/keys/update_signers` (checked after the build against main's file, like `allowed_signers`), fills
      `release.json`'s `desktop {windowsInstaller, sha256}` from the verified `checksums.txt` (`null` before 0.2.0; a
      0.2.0 or later release without the installer fails the build) and `updateKeyFingerprints`, and fails when the
@@ -1104,25 +1104,32 @@ the named sections)
      the site**: the site neither serves nor uses the manifest, so checking it there protects nothing the site shows,
      and it would break the build whenever the owner drops a key from `update_signers` ahead of the release signed with
      the next one (a rotation, or a leak, when the site's security text matters most; WA85-1). `TestDocsAnchors` also
-     scans the product's and the site's links for anchors (web/src, deploy's ps1, nsi and sh, `.goreleaser.yaml`, the
-     pages). `#windows-verify` says what to do without the OpenSSH Client (WA85-2); `#windows-smartscreen`'s
-     screenshots are owed by the owner with the first release (WA91; a comment in `docs/download.md` marks the spot,
-     WA85-3). `/security#keys` says a rotated-out key is removed (06 §7.2 bans `valid-before`) (06 §13; §8).
+     scans the product's and the site's links for anchors: every `.go`, `.ts`, `.tsx`, `.js`, `.mjs`, `.json`, `.ps1`,
+     `.nsi`, `.nsh`, `.sh`, `.yaml`, `.yml`, `.txtar` and `.txt` file under `cmd/`, `internal/`, `web/src/` and
+     `deploy/` (skipping `node_modules`, `dist` and dot-folders), `.goreleaser.yaml`, web/src's `anchor: '<id>'` entries
+     and the site's own pages. Go files run it through `test-go`, `deploy/**` through the deploy filter,
+     `web/src/**/*.ts(x)` and `.goreleaser.yaml` through the site filter (item 108); web/src's `.js`, `.mjs` and `.json`
+     files (other than `conntest/codes.json`) and the non-Go files under `cmd/` and `internal/` outside `testdata` are
+     scanned but start no job that runs it, an open point for ci.yml's next owner (none carries an anchor link today).
+     `#windows-verify` says what to do without the OpenSSH Client (WA85-2); `#windows-smartscreen`'s screenshots are
+     owed by the owner with the first release (WA91; a comment in `docs/download.md` marks the spot, WA85-3).
+     `/security#keys` says a rotated-out key is removed (06 §7.2 bans `valid-before`) (06 §13; §8).
 106. **WA86 is built: the nightly as it runs** (group 16's WA86 review; WA86-1 was adopted, WA86-2 is item 108's):
-     `windows-full` is two jobs, `windows-full-native` (ci.yml's `windows-native`, no caches, 60 min) and
-     `windows-full` (ci.yml's `windows-desktop` without caches plus release.yml `desktop-pkg`'s release files, 75 min,
-     output `desktop-files`), with a `web` job for `web/dist`, all at version `0.0.0-nightly.<run>`; their artifacts
-     are kept 1 day. **`goreleaser-full`** runs after `windows-full` (`if: !cancelled()`): with its real files
-     `release:assets FULL=true DESKTOP=true`; on a night without them it still checks the server half over
-     `release:desktop-stubs` with `FULL=true DESKTOP_STUBS=true` and then fails (06 §10.1's one-round rule; item 99's
-     open point is settled this way). **`compat-servers`** starts each release with the tag's own
-     `deploy/dev/isshoni.e2e.toml` (the checkout's when the tag lacks it). `windows-asan` (45 min), `native-fuzz` (20
-     min, crashes kept 30 days) and the cross-OS legs are as 06 §10.3. The updater e2e is a placeholder step ("The
-     updater e2e (README WA88)") that WA88 replaces. **Still unverified until the first nightly** (its
-     `goreleaser-full` with real desktop files runs both): WA81's 7z listing of NSIS files in
-     `release:assets DESKTOP=true` and syft 1.54.1's `--source-name`/`--source-version` for the desktop SBOM; item
-     99's third point, `isshoni serve` on an AF_UNIX socket on `windows-2025`, stays the owner's dry run's (06 §10.3;
-     the WA86 and WA88 rows).
+     `windows-full` is two jobs, `windows-full-native` (ci.yml's `windows-native`, no caches, 60 min) and `windows-full`
+     (ci.yml's `windows-desktop` without caches plus release.yml `desktop-pkg`'s release files, 75 min, output
+     `desktop-files`), with a `web` job for `web/dist`, all at version `0.0.0-nightly.<run>`; the artifacts handed
+     between the jobs (`web-dist`, `windows-native`, `ffmpeg-source`, `desktop-release`, `desktop-stage`) are kept 1 day
+     (release.yml keeps its 7); `isshoni-native-tools`, `isshoni-desktop-windows-pr` and the CDP results keep ci.yml's 7
+     days. **`goreleaser-full`** runs after `windows-full` (`if: !cancelled()`): with its real files `release:assets
+     FULL=true DESKTOP=true`; on a night without them it still checks the server half over `release:desktop-stubs` with
+     `FULL=true DESKTOP_STUBS=true` and then fails (06 §10.1's one-round rule; item 99's open point is settled this
+     way). **`compat-servers`** starts each release with the tag's own `deploy/dev/isshoni.e2e.toml` (the checkout's
+     when the tag lacks it). `windows-asan` (45 min), `native-fuzz` (20 min, crashes kept 30 days) and the cross-OS legs
+     are as 06 §10.3. The updater e2e is a placeholder step ("The updater e2e (README WA88)") that WA88 replaces.
+     **Still unverified until the first nightly** (its `goreleaser-full` with real desktop files runs both): WA81's 7z
+     listing of NSIS files in `release:assets DESKTOP=true` and syft 1.54.1's `--source-name`/`--source-version` for the
+     desktop SBOM; item 99's third point, `isshoni serve` on an AF_UNIX socket on `windows-2025`, stays the owner's dry
+     run's (06 §10.3; the WA86 and WA88 rows).
 107. **WF17 is built, with four paths outside its listed ones** (group 16's WF17 review; R1–R4 were fixed or are this
      item): `ShareView.lockPrompt` is the share controller's `View.LockPrompt` (`Controller.SetLockPrompt`, shown only
      while paused), set by the app from `App.sys.prompt` on every tray flush under a mutex of its own, and dropped by
