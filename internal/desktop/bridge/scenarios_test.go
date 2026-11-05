@@ -63,7 +63,9 @@ func scenarioFriendsHear(t *testing.T, name string) []byte {
 		eng := fake.NewEngine(fake.EngineConfig{AudioScenario: name})
 		defer func() { _ = eng.Close() }()
 		svc := audio.New(eng, &scenarioStore{s: audio.DefaultSettings()},
-			audio.SelfInfo{PID: 4242, WebViewDataDir: `C:\isshoni-test\WebView2`}, nil)
+			// NoDucking: the fixtures must not depend on the host's registry (Windows' default preference ducks,
+			// which adds the ducking tip on a Windows runner only).
+			audio.SelfInfo{PID: 4242, WebViewDataDir: `C:\isshoni-test\WebView2`, NoDucking: true}, nil)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() {

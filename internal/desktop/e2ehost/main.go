@@ -239,7 +239,9 @@ func newHost(ctx context.Context, o options, log *slog.Logger) (*host, error) {
 	closers = append(closers, func() { _ = eng.Close() })
 	webviewData := filepath.Join(o.dataDir, "WebView2")
 	audioSvc := audio.New(eng, settings.NewAudioStore(st, audio.DefaultSettings),
-		audio.SelfInfo{PID: uint32(os.Getpid()), WebViewDataDir: webviewData}, log) //nolint:gosec // a pid fits
+		// NoDucking: the same answers on a Windows machine as on CI's Linux (05 §14.7).
+		audio.SelfInfo{PID: uint32(os.Getpid()), WebViewDataDir: webviewData, //nolint:gosec // a pid fits
+			NoDucking: true}, log)
 	a, err := app.New(app.Deps{
 		Settings:         st,
 		Servers:          srv,

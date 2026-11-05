@@ -1952,7 +1952,9 @@ Example (Discord in a call, KOOK just opened the mic, sharing a game window):
 
 The ducking preference is read in `internal/desktop/audio/ducking_windows.go` from
 `HKCU\Software\Microsoft\Multimedia\Audio\UserDuckingPreference` (REG_DWORD; absent = Windows' default, "Reduce the
-volume of other sounds by 80%"). `ducking_other.go` (Linux, macOS: e2ehost, CI) reports "unknown", which hides the tip.
+volume of other sounds by 80%"). `ducking_other.go` (Linux, macOS: e2ehost, CI) reports "unknown", which hides the tip. `SelfInfo.NoDucking` skips the
+read (unknown) where the output must not depend on the host's registry: the share sheet's scenario fixtures
+(`internal/desktop/bridge/scenarios_test.go`) and e2ehost.
 
 **Outside the window** (plan: "Degraded modes are always shown, never silent"). A sharer in a game sees neither the
 hidden window's banners nor, under Windows' automatic Do-not-disturb rules for games and full-screen apps, most toasts.

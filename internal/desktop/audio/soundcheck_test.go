@@ -154,3 +154,18 @@ func TestDuckingStub(t *testing.T) {
 		t.Errorf("tips %+v", fh.Tips)
 	}
 }
+
+// TestNoDucking: SelfInfo.NoDucking makes the preference unknown on every platform (not the registry's), and without
+// it New reads the platform's preference.
+func TestNoDucking(t *testing.T) {
+	s := New(newStub(), newStore(DefaultSettings()), SelfInfo{PID: 1, NoDucking: true}, nil)
+	defer func() { _ = s.Close() }()
+	if got := s.ducking0(); got != duckingUnknown {
+		t.Errorf("NoDucking: ducking0() = %v, want unknown", got)
+	}
+	s2 := New(newStub(), newStore(DefaultSettings()), SelfInfo{PID: 1}, nil)
+	defer func() { _ = s2.Close() }()
+	if got, want := s2.ducking0(), readDucking(); got != want {
+		t.Errorf("without NoDucking: ducking0() = %v, want readDucking()'s %v", got, want)
+	}
+}
