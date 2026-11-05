@@ -129,7 +129,9 @@ recorded result; "Still to record" names the run that records the rest. The CDP 
 writes one annotation per row ("Wails checklist") in `windows-desktop`'s CDP step; the green run passed every case
 (W1/W2, W3, W5, W7, W9, W13, W16, W21, the end-to-end case and W19), but printed none of the annotations (the config's
 `list` reporter doesn't print them, and `cdp-test-results` is uploaded only on failure), so a detail that only an
-annotation holds is "to be read from the next run's summary (WF19)", the slice that prints them. The same run passed
+annotation holds is "to be read from the next run's summary (WF19)", the slice that prints them: since WF19 each
+annotation is a line of the CDP step's log, a row of the job summary's table and a row of `annotations.md` in
+`cdp-test-results`, which is uploaded on success too (`web/e2e/cdp/annotations.ts`). The same run passed
 `TestAutostartRoundTrip` twice, before and after the updater e2e (§16.1). The owner's `TestWailsChecklist` (`go test
 -tags isshoni_hw -run TestWailsChecklist ./cmd/isshoni-desktop`, and once more with `-tags "isshoni_hw production"` for
 W19) prints its rows the same way.
@@ -141,7 +143,7 @@ W19) prints its rows the same way.
 | W3 | **Holds**: an injected inline script doesn't run and reports a `script-src` violation of the header policy (again in PR #56's green `windows-desktop` run) | CDP spec (as W1); `desktop-security.spec` in Chrome | `TestWailsChecklist`'s header-only page (`testdata/checklist/w3.html`) |
 | W4 | **Go half holds**: the Guard's tests (`internal/desktop/assets`, `TestGuard*`: foreign and missing `Origin`, the runtime's objects, chunked and oversized bodies, both request forms) pass (Mac, group 17); `desktop-security.spec` gets 403 for a foreign `Origin` through the real Guard in Chrome | Go tests; e2e | The real webview's half (the middleware sees the runtime's requests): `TestWailsChecklist`. The CDP spec can't send a foreign `Origin` to `wails.localhost`: nothing outside the webview reaches that host, and the page's CSP (`frame-src 'none'`) admits no other origin's frame |
 | W5 | **Fails; fallback taken and holds** (above; PR #53, README §3 item 92; the fallback passed again in PR #56's green `windows-desktop` run) | CDP spec | Re-check at every bump |
-| W6 | **Fallback taken (WA41)** (above): `winos`' mutex and pipe; `TestSingleInstanceAndRunningMutex` passed in PR #53's green `windows-go` run, and the forward held end to end in PR #56's green `windows-desktop` run (`TestAutostartRoundTrip`, twice, §16.1); the mutex/pipe scope mismatch is WF19's (§13.3, README §3 item 115) | Windows Go test | — |
+| W6 | **Fallback taken (WA41)** (above): `winos`' mutex and pipe; `TestSingleInstanceAndRunningMutex` passed in PR #53's green `windows-go` run, and the forward held end to end in PR #56's green `windows-desktop` run (`TestAutostartRoundTrip`, twice, §16.1); the mutex/pipe scope mismatch found there is gone since WF19, which made both per user (§13.3, README §3 item 115); the per-user names are `winos`' `TestSingleInstanceNames` (Mac) and `TestSingleInstanceNamesOfThisUser` (`windows-go`, to be read from the next run) | Windows Go test | — |
 | W7 | **Holds** (PR #53; again in PR #56's green `windows-desktop` run, with `WM_CLOSE` posted to the main window found by its class, README §3 item 113): hidden, not destroyed, `visibilityState` `hidden`, process alive; `TestWindowClosing` passes (Mac, group 17) | CDP spec; Go hook test | — |
 | W8 | Registry half **holds (windows-go, PR #53)**: `TestToastRegistryKeys` passed in PR #53's green `windows-go` run (made to run there by PR #53's lesson (c): the test process carries its random AppUserModelID, README §3 item 90) | Windows Go test | The buttons: M-DESK-5 on the owner's PC |
 | W9 | Zoom control (Ctrl + wheel, Ctrl+=, Ctrl+numpad +) and the browser accelerator keys (F5, Ctrl+R, Ctrl+P, Ctrl+F, Ctrl+U, Ctrl+Shift+I, F12): **the CDP-observable checks hold** (PR #56's green `windows-desktop` run): no zoom change, no reload, no `beforeprint`, no new DevTools or view-source target. CDP's key and wheel events enter at the renderer, so this says nothing about WebView2's own accelerator path (W16's lesson, README §3 item 113) | CDP spec (WA87) | Manual on the owner's PC with a production build and the real keyboard and mouse: the accelerators again (CDP's key events enter at the renderer's widget, not WebView2's own accelerator path), the default context menu (right-click outside a text field), DevTools (F12, Ctrl+Shift+I), the status bar (hover a link), autofill and password save (the link step's password form), swipe navigation and pinch zoom (touchpad), external drop (drag a file and a link onto the window) |
@@ -2643,15 +2645,15 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, which turns its skips into failures (06 §10.1).
 - As run (PR #56; README §3 item 114): the test checks each link of the chain on its own, since its first failure
   after the updater e2e only said "the window didn't open after a second launch": it refuses to start while anything
-  holds the running mutex, the single-instance mutex (`Local\io.isshoni.desktop.v1`) or the user's single-instance pipe
+  holds the running mutex, the user's single-instance mutex (`Global\io.isshoni.desktop.v1.<user SID>` since WF19) or the user's single-instance pipe
   (listed through `FindFirstFile` on `\\.\pipe\`, where a missing name answers `ERROR_NO_MORE_FILES`, not
   `ERROR_FILE_NOT_FOUND`); it fails when the first instance serves no pipe ("second launches can't reach this one"),
   when the second launch logs a failed forward or step 2a's installer handover ("couldn't tell whether an installer
   runs" still forwards), and when the first instance exits while the window is awaited, and its timeout says whether
   `winos`' `serveLoop` logged the forward as arrived (it logs each delivered command line by its count only, never its
   arguments). A failure prints both starts' stderr and the first instance's log files. CI runs it twice, before and
-  after the updater e2e (06 §10.1), and PR #56's green run passed both. The mutex is per session and the pipe per user,
-  a scope mismatch that WF19 resolves (§13.3; README §3 item 115).
+  after the updater e2e (06 §10.1), and PR #56's green run passed both. PR #56's runs had a per-session mutex and a per-user pipe,
+  a scope mismatch that WF19 resolved: both are per user now (§13.3; README §3 item 115).
 
 ### 16.2 Updates (the UI; 06 owns the updater)
 
