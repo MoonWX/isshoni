@@ -796,15 +796,15 @@ the named sections)
 84. **WF13 is built; the heartbeat has a gap while the window is hidden, and the app's toast removal is WF14's**
     (group 13's WF13 review and integration): the page beats at once, every 5 s and again when it becomes visible, so
     W17's watchdog arms. Open (R2, plausible, not reproduced on a Mac): Go treats a minimized or fully covered window as
-    visible (`IsWindowVisible`) while Chromium throttles the hidden page's timers to about once a minute after 5 min,
-    so during a full-screen game the watchdog may reload the page every 15–60 s; a Worker is ruled out by the CSP's
-    `worker-src 'none'`, so the fix is the app's or the shell's (watch only a page that isn't minimized or occluded,
-    or `--disable-background-timer-throttling`), in a later slice, checked by M-DESK-11's variant. 03 §20's cap of 3
-    reloads per 5 min and its error page are not built either. `winos.Hooks.RemoveToasts` removes toasts from Action
-    Center (an untagged one by clearing and re-delivering the others, so callers serialize it with `Shell.Notify` and
-    never hold `App.mu`), but the app doesn't call it yet (R3), so WF13's acceptance item for stale toasts stays
-    failed until WF14 (group 14) wires it and `desktop-system.spec` expects the removed id. Fixed in the slice: R1, R4,
-    R5, R6 (03 §11.6, §15, §20, §22.5; the WF13 and WF14 rows).
+    visible (Wails' `IsVisible` reads the `WS_VISIBLE` style bit) while Chromium throttles the hidden page's timers to
+    about once a minute after 5 min, so during a full-screen game the watchdog may reload the page every 15–60 s; a
+    Worker is ruled out by the CSP's `worker-src 'none'`, so the fix is the app's or the shell's (watch only a page that
+    isn't minimized or occluded, or `--disable-background-timer-throttling`), in a later slice, checked by M-DESK-11's
+    variant. 03 §20's cap of 3 reloads per 5 min and its error page are not built either. `winos.Hooks.RemoveToasts`
+    removes toasts from Action Center (an untagged one by clearing and re-delivering the others, so callers serialize
+    it with `Shell.Notify` and never hold `App.mu`), but the app doesn't call it yet (R3), so WF13's acceptance item
+    for stale toasts stays failed until WF14 (group 14) wires it and `desktop-system.spec` expects the removed id. Fixed
+    in the slice: R1, R4, R5, R6 (03 §11.6, §15, §20, §22.5; the WF13 and WF14 rows).
 85. **Group 14 as run**: WA70 (which waited for WA60), WA76 (WA60, WA61), WA77 (WA71), WA78 (WA72), two fix slices,
     WF14 (items 80 and 84: the app's toast removal and the desktop account menu) and WF15 (item 83: the repocheck
     workflow guards), and WB12 (§5 "As run").
