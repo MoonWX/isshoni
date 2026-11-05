@@ -55,9 +55,14 @@ func NewSingleInstance(id string, log *slog.Logger) (*SingleInstance, error) {
 		return nil, fmt.Errorf("winos: the user's SID: %w", err)
 	}
 	sid := u.User.Sid.String()
+	var session uint32
+	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil {
+		return nil, fmt.Errorf("winos: the session id: %w", err)
+	}
+	mutex, pipe := singleInstanceNames(id, sid, session)
 	return &SingleInstance{
-		mutexName: `Local\` + id + ".v1",
-		pipeName:  `\\.\pipe\` + id + ".v1." + sid,
+		mutexName: mutex,
+		pipeName:  pipe,
 		sid:       sid,
 		log:       log.With("component", "winos"),
 	}, nil

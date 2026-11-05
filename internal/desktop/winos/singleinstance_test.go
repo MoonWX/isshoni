@@ -222,6 +222,35 @@ func receive(t *testing.T, got <-chan []string, want ...string) {
 	}
 }
 
+// TestSingleInstanceNames: the mutex and the pipe have the same scope, one user session (03 §13.3; README WF19). The
+// mutex is Local\ (the session's namespace) and the pipe, in the namespace all sessions share, carries the user's SID
+// and the session id, so two sessions of one user get two pipes and two users in one session two as well.
+func TestSingleInstanceNames(t *testing.T) {
+	const sid = "S-1-5-21-1004336348-1177238915-682003330-1001"
+	mutex, pipe := singleInstanceNames(InstanceID, sid, 1)
+	if want := `Local\io.isshoni.desktop.v1`; mutex != want {
+		t.Errorf("mutex %q, want %q", mutex, want)
+	}
+	if want := `\\.\pipe\io.isshoni.desktop.v1.` + sid + ".1"; pipe != want {
+		t.Errorf("pipe %q, want %q", pipe, want)
+	}
+	_, other := singleInstanceNames(InstanceID, sid, 4294967295)
+	if want := `\\.\pipe\io.isshoni.desktop.v1.` + sid + ".4294967295"; other != want {
+		t.Errorf("pipe %q, want %q", other, want)
+	}
+	_, otherUser := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002", 1)
+	if m, _ := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002", 4); m != mutex {
+		t.Errorf("the mutex depends on the session or the user: %q", m)
+	}
+	if other == pipe || otherUser == pipe {
+		t.Errorf("two sessions or two users share the pipe %q", pipe)
+	}
+	// The CI cleanup's pattern (ci.yml and nightly.yml's windows-desktop) still matches the name below \\.\pipe\.
+	if !strings.Contains(strings.TrimPrefix(pipe, `\\.\pipe\`), "io.isshoni.desktop.") {
+		t.Errorf("pipe %q no longer matches *io.isshoni.desktop.*", pipe)
+	}
+}
+
 // heldFirst returns an onArgs that holds its first call until release is closed, and closes entered when that call
 // starts; later calls aren't held. Each call's arguments go to got.
 func heldFirst(calls *atomic.Int32, entered, release chan struct{}, got chan<- []string) func([]string) {

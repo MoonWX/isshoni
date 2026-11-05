@@ -5,20 +5,38 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 )
 
 // Single instance (03 §13.3): one instance per Windows user session. The first instance holds a named mutex and
 // serves a named pipe; a second launch finds the mutex, sends its arguments (os.Args[1:], unchanged) through the
-// pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback: the mutex Local\<id>.v1 and the pipe
-// \\.\pipe\<id>.v1.<user SID>, distinct from the running mutex. The pinned Wails' own single-instance option can't
-// be used: it acquires its lock inside application.New, after 03 §13.4's steps 4–6, so a second instance would
-// read and delete the Pending values and take the running mutex's place in the order (README WA41's PR).
+// pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback (singleInstanceNames): the mutex Local\<id>.v1
+// and the pipe \\.\pipe\<id>.v1.<user SID>.<session id>, distinct from the running mutex. The pinned Wails' own
+// single-instance option can't be used: it acquires its lock inside application.New, after 03 §13.4's steps 4–6, so
+// a second instance would read and delete the Pending values and take the running mutex's place in the order (README
+// WA41's PR).
+//
+// Both names have one scope, the user session. A Local\ object lives in its session's own namespace, but all sessions
+// share \\.\pipe\: with only the user's SID in the pipe's name, a second session of the same user (fast user
+// switching to the same account, RDP beside the console, a leftover of another session) took the mutex as a first
+// instance yet couldn't create the pipe, which the other session's instance held, so its second launches forwarded
+// into that session's window or failed. The session id in the name gives each session its own pipe. The scope is
+// the session, not the user (a Global\ mutex), because the rest of 03 §13.4's contract is per session: the running
+// mutex and the installer's mutex are Local\, so an installer waits for the app of its own session, and a link
+// clicked in one session must open in a window that session shows.
 //
 // The pipe accepts only the current user (its DACL) and no remote client; the first instance treats what arrives as
 // untrusted arguments (app.HandleArgs). The first instance creates the next pipe instance before it closes the one it
 // served, so the name is never free while it serves; a second launch connects at identification level only (the
 // server can't impersonate it) and forwards nothing to a server that runs as another account.
+
+// singleInstanceNames derives the single-instance names of id (InstanceID; tests use their own) for the user whose
+// SID is sid, in the session of id session (ProcessIdToSessionId): the mutex Local\<id>.v1 and the pipe
+// \\.\pipe\<id>.v1.<sid>.<session>, the session in decimal.
+func singleInstanceNames(id, sid string, session uint32) (mutex, pipe string) {
+	return `Local\` + id + ".v1", `\\.\pipe\` + id + ".v1." + sid + "." + strconv.FormatUint(uint64(session), 10)
+}
 
 // ForwardTimeout bounds a second instance's forward (03 §13.3, §20).
 const ForwardTimeout = 2 * time.Second

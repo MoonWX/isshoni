@@ -1915,8 +1915,8 @@ jobs:
             # run, the CDP spec) need neither. smoke.ps1 ends the installed app and uninstalls it when every case
             # passed, so any isshoni.exe still running here, in any folder or session, outlived the test: it is named
             # and ended, and the step FAILS for it (after this cleanup, so the later steps still get a clean session).
-            # The single-instance pipe (per user, not per session) must be gone with them: a holder would take a later
-            # start's forward, so one that outlives every isshoni.exe fails the step too.
+            # The single-instance pipes (one per user session, all matched here) must be gone with them:
+            # a holder would take a later start's forward, so one that outlives every isshoni.exe fails the step too.
             $outlived = New-Object System.Collections.ArrayList
             foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'")) {
               $m = "the updater e2e left isshoni.exe $($p.ProcessId) running (session $($p.SessionId)): $($p.ExecutablePath) $($p.CommandLine)"
@@ -2021,7 +2021,9 @@ jobs:
       - name: The CDP spec (web/e2e/cdp, 03 §22.4 B)
         # The real app over the Chrome DevTools Protocol of its own WebView2 (connectOverCDP: no browser download):
         # the fixture starts the e2e isshoni.exe with --relaunched, ISSHONI_E2E_CDP_PORT and a temporary
-        # ISSHONI_E2E_DATA_DIR, and fails unless the app wrote into that folder.
+        # ISSHONI_E2E_DATA_DIR, and fails unless the app wrote into that folder. Its reporter (e2e/cdp/annotations.ts)
+        # prints each "Wails checklist" and "Budget (03 §20)" annotation as one line and appends them to the job
+        # summary (GITHUB_STEP_SUMMARY) as a table.
         id: cdp
         if: ${{ !cancelled() && steps.npmci.outcome == 'success' }}
         working-directory: web
@@ -2031,9 +2033,11 @@ jobs:
           npx playwright test -c e2e/cdp/playwright.config.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload the CDP spec's results (on failure)
+      - name: Upload the CDP spec's results
         # playwright.config.ts's outputDir is relative to web/e2e/cdp/; upload-artifact's path to the workspace.
-        if: ${{ failure() && steps.cdp.outcome == 'failure' }}
+        # Whenever the spec ran, passed or failed: besides a failure's traces, the folder holds annotations.md, the
+        # spec's "Wails checklist" and "Budget (03 §20)" rows (e2e/cdp/annotations.ts), which a green run records too.
+        if: ${{ always() && (steps.cdp.outcome == 'success' || steps.cdp.outcome == 'failure') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cdp-test-results

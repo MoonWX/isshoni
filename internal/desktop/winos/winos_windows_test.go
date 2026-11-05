@@ -16,7 +16,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
@@ -110,6 +112,58 @@ func childCmd(t *testing.T, role, id, out string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(t.Context(), os.Args[0], append([]string{"-test.run=^$", "--"}, args...)...)
 	cmd.Env = append(os.Environ(), childEnv+"="+role, idEnv+"="+id, outEnv+"="+out)
 	return cmd
+}
+
+// TestSingleInstanceNamesOfThisSession: NewSingleInstance names the mutex and the pipe after this process's user and
+// session (03 §13.3; README WF19), the session read here from the token (TokenSessionId) rather than as the code reads
+// it (ProcessIdToSessionId), and the serving pipe has that name below \\.\pipe\.
+func TestSingleInstanceNamesOfThisSession(t *testing.T) {
+	tok := windows.GetCurrentProcessToken()
+	u, err := tok.GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var session, n uint32
+	if err := windows.GetTokenInformation(tok, windows.TokenSessionId, (*byte)(unsafe.Pointer(&session)),
+		uint32(unsafe.Sizeof(session)), &n); err != nil {
+		t.Fatalf("TokenSessionId: %v", err)
+	}
+	id := randomID(t)
+	si, err := NewSingleInstance(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `Local\` + id + ".v1"; si.mutexName != want {
+		t.Errorf("mutex %q, want %q", si.mutexName, want)
+	}
+	want := fmt.Sprintf(`\\.\pipe\%s.v1.%s.%d`, id, u.User.Sid.String(), session)
+	if si.pipeName != want {
+		t.Errorf("pipe %q, want %q", si.pipeName, want)
+	}
+	if first, err := si.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire: %v %v", first, err)
+	}
+	t.Cleanup(func() { _ = si.Close() })
+	if err := si.Serve(func([]string) {}); err != nil {
+		t.Fatal(err)
+	}
+	pattern, err := windows.UTF16PtrFromString(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var fd windows.Win32finddata
+		h, err := windows.FindFirstFile(pattern, &fd)
+		if err == nil {
+			_ = windows.FindClose(h)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no pipe %s while serving: %v", want, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // TestSingleInstanceInProcess: the second holder of the lock forwards to the first, which receives the arguments
