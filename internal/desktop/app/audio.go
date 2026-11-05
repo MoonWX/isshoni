@@ -64,7 +64,8 @@ func (a *App) startAudio() {
 			cancel()
 		})
 	}
-	if vp, ok := a.d.Audio.(viewerPolicy); ok && a.pub != nil {
+	// The session New built hands each core client to followClient itself; a Deps.Session's are asked for.
+	if vp, ok := a.d.Audio.(viewerPolicy); ok && a.pub != nil && !a.ownSession {
 		a.wg.Go(func() { a.followPlayback(vp) })
 	}
 }
@@ -165,8 +166,25 @@ func (a *App) ToastDismissed(nonce string) {
 	}
 }
 
-// followPlayback passes C2's EventPlaybackState to 05 (03 §12.2): it follows C2's core client while one is online,
-// and the next one after it stops. It returns with the app's context.
+// followClient passes the EventPlaybackState of one of C2's core clients to 05 (03 §12.2). The session New built
+// calls it with each core client it builds, before the client runs: the subscription is in place before C2's
+// welcome, so a tab's report that the core decodes right after it, or during a reconnect of the same client, reaches
+// 05 (README WA83-R3; the tab sends it once, 03 §12.2). It follows the client until it stops or the app ends.
+func (a *App) followClient(c session.Client) {
+	vp, ok := a.d.Audio.(viewerPolicy)
+	if !ok {
+		return
+	}
+	events, unsubscribe := c.Subscribe()
+	a.wg.Go(func() {
+		defer unsubscribe()
+		a.readPlayback(c, events, vp)
+	})
+}
+
+// followPlayback is followClient for a Deps.Session (tests' C2), whose clients the app gets only from Ready: it
+// follows C2's core client while one is online, and the next one after it stops. A report that the core decodes
+// before Ready returns is missed. It returns with the app's context.
 func (a *App) followPlayback(vp viewerPolicy) {
 	for a.ctx.Err() == nil {
 		c, _, err := a.pub.Ready(a.ctx)
@@ -197,6 +215,12 @@ func (a *App) waitPlayback() bool {
 func (a *App) watchPlayback(c session.Client, vp viewerPolicy) {
 	events, unsubscribe := c.Subscribe()
 	defer unsubscribe()
+	a.readPlayback(c, events, vp)
+}
+
+// readPlayback reads a core client's events until it stops (a stopped status, read at each status event and every
+// playbackRetry), its channel closes or the app ends.
+func (a *App) readPlayback(c session.Client, events <-chan core.Event, vp viewerPolicy) {
 	t := time.NewTicker(playbackRetry)
 	defer t.Stop()
 	for {
@@ -207,8 +231,11 @@ func (a *App) watchPlayback(c session.Client, vp viewerPolicy) {
 			if !ok {
 				return
 			}
-			if ev.Kind == core.EventPlaybackState && ev.Playback != nil {
+			switch {
+			case ev.Kind == core.EventPlaybackState && ev.Playback != nil:
 				a.playbackState(*ev.Playback, vp)
+			case ev.Kind == core.EventStatus && ev.Status != nil && ev.Status.Conn == core.ConnStopped:
+				return
 			}
 		case <-t.C:
 			if c.Status().Conn == core.ConnStopped {

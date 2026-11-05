@@ -1133,3 +1133,146 @@ func TestMergeKnownBound(t *testing.T) {
 		t.Errorf("known past the bound: %v", err)
 	}
 }
+
+// TestSubscribe is 03 §6.3's "after any change, from any source" (README WA84-R6): every change reaches Subscribe's
+// functions with the settings before and after it, Update's and SetAudioSection's alike, in order; an Update that
+// changes nothing and a refused one call nothing; a change made inside a call is handed out after it, without a
+// deadlock; cancel stops the calls.
+func TestSubscribe(t *testing.T) {
+	s := open(t, Options{Dir: t.TempDir()})
+	type call struct {
+		who        string
+		prev, next Settings
+	}
+	var (
+		mu    sync.Mutex
+		calls []call
+	)
+	record := func(who string) func(prev, next Settings) {
+		return func(prev, next Settings) {
+			mu.Lock()
+			calls = append(calls, call{who, prev, next})
+			mu.Unlock()
+		}
+	}
+	got := func() []call {
+		mu.Lock()
+		defer mu.Unlock()
+		out := calls
+		calls = nil
+		return out
+	}
+	cancelA := s.Subscribe(record("a"))
+	cancelB := s.Subscribe(record("b"))
+
+	// The app's own write (a tip shown), as the share controller makes it.
+	if err := s.Update(func(st *Settings) { st.Tips.FirstShareShown = true }); err != nil {
+		t.Fatal(err)
+	}
+	c := got()
+	if len(c) != 2 || c[0].who != "a" || c[1].who != "b" {
+		t.Fatalf("calls %+v, want a then b", c)
+	}
+	if c[0].prev.Tips.FirstShareShown || !c[0].next.Tips.FirstShareShown {
+		t.Errorf("prev %+v next %+v", c[0].prev.Tips, c[0].next.Tips)
+	}
+	// What a function gets is its own copy.
+	c[0].next.ServerPrefs["https://x.example.com"] = ServerPrefs{Preset: "game"}
+	if _, ok := c[1].next.ServerPrefs["https://x.example.com"]; ok {
+		t.Error("the subscribers share a map")
+	}
+	if _, ok := s.Get().ServerPrefs["https://x.example.com"]; ok {
+		t.Error("a subscriber changed the store's settings")
+	}
+
+	if err := s.Update(func(*Settings) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(func(st *Settings) { st.Tips.FirstShareShown = true }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(func(st *Settings) { st.Pill.Mode = "sometimes" }); err == nil {
+		t.Fatal("an invalid pill mode was taken")
+	}
+	if c := got(); len(c) != 0 {
+		t.Fatalf("calls for no change: %+v", c)
+	}
+
+	// 05's section (SetAudioSection) is a change too.
+	if err := s.SetAudioSection(json.RawMessage(`{"appRules": []}`)); err != nil {
+		t.Fatal(err)
+	}
+	c = got()
+	if len(c) != 2 || string(c[0].next.Audio) != `{"appRules":[]}` || string(c[0].prev.Audio) != `{}` {
+		t.Fatalf("audio calls %+v", c)
+	}
+
+	// A function that changes the settings itself: its change comes after the one it was called for.
+	cancelB()
+	cancelC := s.Subscribe(func(prev, next Settings) {
+		if !prev.Tips.DNDShown && next.Tips.DNDShown {
+			if err := s.Update(func(st *Settings) { st.Tips.TrayNoticeShown = true }); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err := s.Update(func(st *Settings) { st.Tips.DNDShown = true }); err != nil {
+		t.Fatal(err)
+	}
+	c = got()
+	if len(c) != 2 || c[0].who != "a" || !c[0].next.Tips.DNDShown || c[0].next.Tips.TrayNoticeShown ||
+		!c[1].next.Tips.TrayNoticeShown || !c[1].prev.Tips.DNDShown {
+		t.Fatalf("calls %+v, want the DND change, then the tray notice's", c)
+	}
+	cancelC()
+
+	cancelA()
+	cancelA() // twice is fine
+	if err := s.Update(func(st *Settings) { st.Notifications = !st.Notifications }); err != nil {
+		t.Fatal(err)
+	}
+	if c := got(); len(c) != 0 {
+		t.Fatalf("calls after cancel: %+v", c)
+	}
+}
+
+// TestSubscribeConcurrent: changes from many goroutines each reach a subscriber once, one call at a time, and the
+// last call's settings are the store's.
+func TestSubscribeConcurrent(t *testing.T) {
+	s := open(t, Options{Dir: t.TempDir()})
+	var (
+		mu     sync.Mutex
+		n      int
+		inside atomic.Int32
+		last   Settings
+	)
+	s.Subscribe(func(_, next Settings) {
+		if inside.Add(1) != 1 {
+			t.Error("two calls at once")
+		}
+		mu.Lock()
+		n++
+		last = next
+		mu.Unlock()
+		inside.Add(-1)
+	})
+	const writers = 8
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Go(func() {
+			origin := "https://s" + strconv.Itoa(i) + ".example.com"
+			if err := s.Update(func(st *Settings) { st.ServerPrefs[origin] = ServerPrefs{Preset: "game"} }); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if n != writers {
+		t.Errorf("%d calls, want %d", n, writers)
+	}
+	if !reflect.DeepEqual(last, s.Get()) {
+		t.Errorf("the last call's settings %+v, the store's %+v", last.ServerPrefs, s.Get().ServerPrefs)
+	}
+}

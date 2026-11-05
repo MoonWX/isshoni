@@ -28,6 +28,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/client/core"
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/desktop/i18n"
+	"github.com/MoonWX/isshoni/internal/desktop/session"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
 	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/media"
@@ -152,6 +153,9 @@ type App struct {
 	playing  map[string]bool // the senders whose last playback.state said playing (audio.go)
 
 	playbackKick chan struct{} // wakes followPlayback after a change of the link state; one slot
+	// ownSession: New built the session, which hands each core client to followClient before it runs; a
+	// Deps.Session's clients are followed through Ready (followPlayback).
+	ownSession bool
 }
 
 // New checks d and returns the app; it starts nothing (Run does).
@@ -178,17 +182,22 @@ func New(d Deps) (*App, error) {
 	if d.LockStop <= 0 {
 		d.LockStop = LockStop
 	}
+	// The session the app builds hands each core client to the app before it runs (followClient); a is set below,
+	// before Run can start the session.
+	var a *App
+	built := false
 	if d.Session == nil && d.Engine != nil {
-		s, err := newSession(d)
+		s, err := newSession(d, func(c session.Client) { a.followClient(c) })
 		if err != nil {
 			return nil, err
 		}
 		d.Session = s
+		built = true
 	}
 	pub, _ := d.Session.(publisher)
 	ctx, cancel := context.WithCancel(context.Background())
 	clients := watchClients(sharePublisher{pub})
-	a := &App{
+	a = &App{
 		d:         d,
 		log:       d.Log.With("component", "app"),
 		spa:       d.Log.With("component", "spa"),
@@ -203,6 +212,7 @@ func New(d Deps) (*App, error) {
 		trayEvery: TrayDebounce,
 
 		playbackKick: make(chan struct{}, 1),
+		ownSession:   built,
 	}
 	a.pill = d.OS.Pill()
 	a.sharing = a.shares.Live

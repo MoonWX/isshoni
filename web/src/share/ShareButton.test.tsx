@@ -43,7 +43,9 @@ function Buttons({ mounted, ...props }: ShareButtonProps & { mounted: StoreApi<M
 function renderButton({ sharing = fakeSharing(), second = false, ...props }: Setup = {}) {
   const store = props.store ?? createShareStore();
   const onStart: Mock<StartShare> = vi.fn<StartShare>(() => Promise.resolve());
-  const services = createTestServices({ platform: createTestPlatform({ sharing }) });
+  // A Windows browser: the warning's "Get the desktop app" is a link only there (M2 03 §12.3).
+  const client = { kind: 'web', version: '0.0.0-test', os: 'windows', browser: 'other' } as const;
+  const services = createTestServices({ platform: createTestPlatform({ sharing, client }) });
   const mounted = createStore<Mounted>(() => ({ header: true, emptyState: second }));
   const result = renderRoute({
     services,

@@ -30,6 +30,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -219,7 +220,15 @@ type Store struct {
 	dirty  bool
 	timer  *time.Timer
 	closed bool
+
+	subs    map[int]func(prev, next Settings) // Subscribe's functions, by id
+	nextSub int
+	changes []change // the changes not yet handed to subs, oldest first
+	handing bool     // a goroutine hands changes to subs (deliver)
 }
+
+// change is one change of the settings, as Subscribe's functions get it.
+type change struct{ prev, next Settings }
 
 // Open loads settings.json from o.Dir (03 §14.2). A missing file gives the defaults; a broken one is set aside and
 // the last good copy or the defaults are used, so Open fails only when o.Dir is unusable. When settings.json had no
@@ -574,16 +583,93 @@ func (s *Store) Get() Settings {
 // not call the Store.
 func (s *Store) Update(fn func(*Settings)) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	next := s.cur.clone()
 	fn(&next)
 	next.Schema = s.cur.Schema
 	if err := validate(&s.cur, &next); err != nil {
+		s.mu.Unlock()
 		return err
 	}
+	prev := s.cur
 	s.cur = next
 	s.changedLocked()
+	s.queueLocked(prev)
+	s.mu.Unlock()
+	s.deliver()
 	return nil
+}
+
+// Subscribe calls fn after every change of the settings, whatever made it (03 §6.3: settings.changed goes out
+// "after any change, from any source"): Update from the Settings page, the app's own writes (a tip shown, the
+// pill's position, the window's placement) and SetAudioSection. An Update that changes nothing calls nothing.
+// prev and next are copies of the settings before and after the change. The functions are called in the order of
+// the changes, one change at a time, on the goroutine of a change (or of an earlier one still handing changes out)
+// and outside the store's lock: fn may read and change the settings (a change it makes is handed out after the one
+// it is called for). cancel stops the calls; a call in progress finishes.
+func (s *Store) Subscribe(fn func(prev, next Settings)) (cancel func()) {
+	s.mu.Lock()
+	if s.subs == nil {
+		s.subs = map[int]func(prev, next Settings){}
+	}
+	id := s.nextSub
+	s.nextSub++
+	s.subs[id] = fn
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			delete(s.subs, id)
+			s.mu.Unlock()
+		})
+	}
+}
+
+// queueLocked records the change from prev to s.cur for the subscribers, unless nothing changed or nobody listens.
+func (s *Store) queueLocked(prev Settings) {
+	if len(s.subs) == 0 {
+		return
+	}
+	// Compared as clones: a clone has empty maps where the loaded settings may have none.
+	c := change{prev: prev.clone(), next: s.cur.clone()}
+	if reflect.DeepEqual(c.prev, c.next) {
+		return
+	}
+	s.changes = append(s.changes, c)
+}
+
+// deliver hands the queued changes to the subscribers in order, unless another goroutine already does (it then
+// hands these out too).
+func (s *Store) deliver() {
+	s.mu.Lock()
+	if s.handing {
+		s.mu.Unlock()
+		return
+	}
+	s.handing = true
+	for len(s.changes) > 0 {
+		c := s.changes[0]
+		s.changes[0] = change{}
+		s.changes = s.changes[1:]
+		ids := slices.Sorted(maps.Keys(s.subs))
+		fns := make([]func(prev, next Settings), 0, len(ids))
+		for _, id := range ids {
+			fns = append(fns, s.subs[id])
+		}
+		s.mu.Unlock()
+		for i, fn := range fns {
+			s.mu.Lock()
+			_, live := s.subs[ids[i]]
+			s.mu.Unlock()
+			if live {
+				fn(c.prev.clone(), c.next.clone())
+			}
+		}
+		s.mu.Lock()
+	}
+	s.changes = nil
+	s.handing = false
+	s.mu.Unlock()
 }
 
 // changedLocked marks the settings dirty and arms the debounce timer.
@@ -805,9 +891,12 @@ func (s *Store) SetAudioSection(section json.RawMessage) error {
 		return fieldError("audio")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	prev := s.cur
 	s.cur.Audio = compact.Bytes()
 	s.changedLocked()
+	s.queueLocked(prev)
+	s.mu.Unlock()
+	s.deliver()
 	return nil
 }
 

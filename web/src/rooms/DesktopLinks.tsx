@@ -8,9 +8,10 @@
 // - {add} (an unknown server): /desktop/setup?add=<origin>, the wizard's "Add server {host}?" before any network
 //   request (SetupPage answers it).
 // - {switch, live} (another known server while a share is live): "You're sharing in {room}. Open {target}? Your
-//   share will stop." Open stops the share and makes the server active (the window reloads); Cancel is
-//   App.LinkHandled().
+//   share will stop." Open stops the share and makes the server active (the window reloads); Go keeps the link's
+//   room pending as {roomId}, which the reloaded page opens (its first pull); Cancel is App.LinkHandled().
 // - {error: too_many_servers}: /desktop/setup, whose server step says "You've added 20 servers. Remove one first."
+//   once, then tells Go (App.LinkHandled), so no later reload brings it back.
 //
 // A link that arrives while one of these questions is open is ignored (Go ignores its own; the room question is the
 // page's). Nothing is done while the user isn't signed in or the wizard or the relink page is showing: those pages

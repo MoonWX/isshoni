@@ -282,6 +282,7 @@
       "tip": "Recommended: pick a <b>Window</b> and keep <b>Share audio</b> on. Friends hear only that window.",
       "bestInChrome": "Sharing works best in Chrome or Edge.",
       "desktopApp": "Get the desktop app (keeps Discord out of your audio)",
+      "desktopAppWindowsOnly": "Desktop app: Windows now, Mac soon",
       "share": "Share",
       "elsewhere": "You're already sharing from another tab or device",
       "stopElsewhere": "Stop it"

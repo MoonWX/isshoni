@@ -22,9 +22,10 @@
 // - playback.state, sender (every browser tab): {playing, browser, os} to each online desktop connection in
 //   user.connections, addressed with `to` (never toRole, 01 §11.11), whenever the tab's audible playback starts or
 //   stops (a subscription with audio on, and the element unmuted and playing), and again to a desktop connection
-//   that newly appears in the list (and once more PLAYBACK_STATE_REPEAT_MS later), and to all of them after a
-//   welcome (the tab's connection id may be new). Errors are ignored like playback.stop's. Go's App gets it through
-//   C2 (01's EventPlaybackState) and keeps the browser out of the share (05 §5.9); the desktop's C1 ignores the kind.
+//   that newly appears in the list, once, and to all of them after a welcome (the tab's connection id may be new).
+//   Errors are ignored like playback.stop's. Go's App gets it through C2 (01's EventPlaybackState), whose events it
+//   follows from before C2's welcome, so a report sent as soon as C2 appears isn't missed (README WA83-R3), and
+//   keeps the browser out of the share (05 §5.9); the desktop's C1 ignores the kind.
 //
 // Relay payloads are never logged (01 §11.12): debug lines name the kind only.
 import { createStore, type StoreApi } from 'zustand/vanilla';
@@ -63,16 +64,6 @@ import { viewerWants } from '../viewer/subscriptions';
 import type { ViewerData, ViewerStore } from '../viewer/viewerStore';
 import type { RoomSession } from './RoomSession';
 import type { RoomStore } from './roomStore';
-
-/**
- * A desktop connection that appears in user.connections hears the tab's playback.state again after this long. The
- * app's Go side follows C2's events only once C2 is online, so the report that the tab sends as soon as C2 appears
- * can reach C2 before anyone listens (a race in App.followPlayback, seen in desktop-handoff.spec); the repeat makes
- * sure it lands. Repeating the same value changes nothing in Go. A stopgap that covers only this case (a report
- * during a later C2 reconnect is lost the same way): it goes once Go subscribes to C2's events before its Ready, and
- * 03 §12.2's sender says "once" until then.
- */
-export const PLAYBACK_STATE_REPEAT_MS = 3_000;
 
 /** How long a playback.stop whose sender room.state doesn't list yet waits for a snapshot that does. */
 export const HANDOFF_VERIFY_MS = 3_000;
@@ -262,8 +253,6 @@ export function attachHandoff(deps: HandoffDeps): Handoff {
   let playing: boolean | null = null;
   /** The desktop connections that were sent `playing`. */
   const told = new Set<string>();
-  /** The repeats due for desktop connections that appeared (PLAYBACK_STATE_REPEAT_MS). */
-  const repeats = new Set<ReturnType<typeof setTimeout>>();
   const sendState = (): void => {
     if (desktop || playing === null || signal.state !== 'ready' || !signal.featureActive(FeatureAgentRelay)) return;
     const payload: PlaybackState = {
@@ -298,18 +287,6 @@ export function attachHandoff(deps: HandoffDeps): Handoff {
       store.subscribe((s, prev) => {
         if (s.connections === prev.connections) return;
         sendState();
-        // A desktop connection that just appeared hears the value once more a little later: the app subscribes to
-        // its C2 only after C2's welcome, so a report that comes right with it can be missed (see the header).
-        const before = new Set(onlineDesktops(prev.connections).map((c) => c.id));
-        for (const c of onlineDesktops(s.connections)) {
-          if (before.has(c.id)) continue;
-          const timer = setTimeout(() => {
-            repeats.delete(timer);
-            told.delete(c.id);
-            sendState();
-          }, PLAYBACK_STATE_REPEAT_MS);
-          repeats.add(timer);
-        }
       }),
       signal.onState((state) => {
         // After a welcome the app may know this tab by a new connection id: everyone hears the value again.
@@ -342,8 +319,6 @@ export function attachHandoff(deps: HandoffDeps): Handoff {
     dispose() {
       disposed = true;
       for (const off of offs.splice(0)) off();
-      for (const timer of repeats) clearTimeout(timer);
-      repeats.clear();
     },
   };
 }

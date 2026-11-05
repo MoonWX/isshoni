@@ -30,7 +30,7 @@ import { Actions, Prose } from '../auth/AuthForm';
 import { Notice } from '../auth/Notice';
 import { DOCS_URL } from '../conntest/links';
 import type { DesktopFeatures } from '../platform/types';
-import type { PendingLink, ServerProbe, SettingsPatch } from '../platform/desktop/bridge';
+import type { NativeBridge, PendingLink, ServerProbe, SettingsPatch } from '../platform/desktop/bridge';
 import { queryKeys } from '../protocol/queryKeys';
 import { Button } from '../ui/Button';
 import { TextField } from '../ui/Field';
@@ -72,6 +72,14 @@ function addOf(p: AnyPendingLink | null | undefined): AddTarget | null {
   return p != null && 'add' in p ? p.add : null;
 }
 
+/**
+ * {error: too_many_servers} is a notice, not a question: once the server step shows it, Go may forget it
+ * (App.LinkHandled), so no later reload or visit of this page shows it again (README WA83-R4).
+ */
+function noticeShown(bridge: NativeBridge): void {
+  void bridge.app.linkHandled().catch(() => undefined);
+}
+
 export function SetupPage() {
   const platform = usePlatform();
   const desktop = platform.desktop ?? null;
@@ -98,6 +106,8 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
   /** Counts AddServer's refusals: the add step starts again with the new one (its own state is per mount). */
   const [refusals, setRefusals] = useState(0);
+  /** Counts the too_many_servers notices that came while the server step was open: it starts again with each. */
+  const [notices, setNotices] = useState(0);
 
   // The first step, once: from the address (?link=1, ?add=, ?new=1) and App.PendingLink() (the local link that
   // started the app, --server or PendingServer). No other bridge call before the friend answers (02 §12.3).
@@ -130,6 +140,7 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
         } else if (add !== null) {
           setStep({ kind: 'add', target: add });
         } else if (p?.error === 'too_many_servers') {
+          noticeShown(bridge);
           setStep({ kind: 'server', error: { code: 'too_many_servers', params: {} } });
         } else if (origin === '' || fresh) {
           setStep({ kind: 'server' });
@@ -150,7 +161,12 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
     return bridge.on('deeplink.open', (p: AnyPendingLink) => {
       const add = addOf(p);
       if (add !== null) setStep({ kind: 'add', target: add });
-      else if (p.error === 'too_many_servers') setStep({ kind: 'server', error: { code: p.error, params: {} } });
+      else if (p.error === 'too_many_servers') {
+        noticeShown(bridge);
+        // The open server step starts again, with the notice under its field.
+        setNotices((n) => n + 1);
+        setStep({ kind: 'server', error: { code: p.error, params: {} } });
+      }
     });
   }, [bridge, step.kind]);
 
@@ -265,6 +281,7 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
     case 'server':
       body = (
         <ServerStep
+          key={notices}
           initialError={step.error ?? null}
           appVersion={appVersion}
           probe={(address) => bridge.auth.probe(address)}

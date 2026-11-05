@@ -66,6 +66,11 @@ func (a *App) AddServer(ctx context.Context, origin string) error {
 // SwitchServer makes a listed server active and reloads the window (03 §8.1); the page of a server that isn't linked
 // then shows its link step. Switching to the active server changes nothing. ErrNotFound for an origin that isn't
 // listed; ErrBusy while a share is live.
+//
+// A pending {switch} link for this server is the answer to its question (03 §13.2's "server known, not active, live
+// share" row: the page's Open stops the share, then calls SwitchServer): its room stays pending as {roomId} for the
+// reloaded page, which opens it (README WA83-R2), as HandleLink's own switch does. Any other pending link is
+// dropped: it was about the page that goes.
 func (a *App) SwitchServer(origin string) error {
 	if _, live := a.sharing(); live {
 		return ErrBusy
@@ -77,7 +82,13 @@ func (a *App) SwitchServer(origin string) error {
 	if a.activeOrigin() == o {
 		return nil
 	}
-	return a.switchServer(o, nil)
+	var next *PendingLink
+	a.mu.Lock()
+	if p := a.pending; p != nil && p.Switch != nil && p.Switch.Origin == o {
+		next = &PendingLink{RoomID: p.Switch.RoomID}
+	}
+	a.mu.Unlock()
+	return a.switchServer(o, next)
 }
 
 // RemoveServer signs this PC out of a server and drops it from the list (02's Servers.Remove: Unlink first when
@@ -149,8 +160,15 @@ func (a *App) SubscribeAuth(fn func(deviceauth.State)) (cancel func()) {
 }
 
 // activeChanged follows a change of the active server: the window reloads once, the new active server's manager
-// starts (02 §11.6) and C2 builds a client for it (03 §9).
+// starts (02 §11.6) and C2 builds a client for it (03 §9). A pending {error: too_many_servers} goes: the page it
+// was offered to has shown it (or goes now), and the reloaded one must not send the user back to it (README
+// WA83-R4; SetupPage also calls LinkHandled once it shows it).
 func (a *App) activeChanged() {
+	a.mu.Lock()
+	if p := a.pending; p != nil && p.Error != "" {
+		a.pending = nil
+	}
+	a.mu.Unlock()
 	a.d.Shell.ShowWindow(true)
 	a.d.Shell.Reload()
 	a.startActive()
