@@ -92,6 +92,7 @@ describe('layerInputs', () => {
       fullscreen: true,
       pip: 's_bea',
       audioMuted: false, // M2: the desktop app's endpoint mute (docs/m2/03 §12.1)
+      handedOff: false, // M2: the handoff to the desktop app (docs/m2/03 §12.2)
     });
     expect(layerInputs({ ...state(), pageHiddenSince: null }, 4_500).pageHiddenForMs).toBe(0);
   });
@@ -188,6 +189,33 @@ describe('attachSubscriptions: audio only for the focused share', () => {
     await flush(SUBSCRIBE_DEBOUNCE_MS);
     expect(signal.updates).toHaveLength(2);
     expect(sorted(signal.updates[1] ?? [])).toEqual([want('s_bea', 'off'), want('s_dee', 'high', 'on')]);
+  });
+});
+
+describe('M2: handed off to the desktop app (docs/m2/03 §12.2)', () => {
+  it('shows "Now watching in the isshoni app" with no tiles, subscribes to nothing, and Watch here instead resumes', async () => {
+    render(<ViewerLayout viewer={viewer} />);
+    sync_(BEA, CY);
+    await flush(SUBSCRIBE_DEBOUNCE_MS);
+    const before = sorted(signal.updates.at(-1) ?? []);
+    expect(before).toEqual([want('s_bea', 'low'), want('s_cy', 'high', 'on')]);
+
+    act(() => {
+      state().setHandedOff(true);
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('Now watching in the isshoni app');
+    expect(screen.queryByRole('list', { name: 'Shares' })).toBeNull();
+    // The audio goes at once, the video after the off delay (subscriptionSync): what the server holds in the end.
+    await flush(SUBSCRIBE_OFF_DELAY_MS + SUBSCRIBE_DEBOUNCE_MS);
+    const held = new Map(signal.updates.flat().map((w) => [w.shareId, w]));
+    expect(sorted([...held.values()])).toEqual([want('s_bea', 'off'), want('s_cy', 'off')]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Watch here instead' }));
+    expect(state().handedOff).toBe(false);
+    expect(screen.queryByText('Now watching in the isshoni app')).toBeNull();
+    await flush(SUBSCRIBE_DEBOUNCE_MS);
+    const again = new Map(signal.updates.flat().map((w) => [w.shareId, w]));
+    expect(sorted([...again.values()])).toEqual(before);
   });
 });
 

@@ -1,0 +1,12 @@
+/* "Open in the isshoni app" in the room's header (docs/m2/03 §12.3), with its quiet "Nothing happened?" line. */
+.entry {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  align-items: center;
+}
+
+.nothing {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}

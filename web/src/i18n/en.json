@@ -245,6 +245,10 @@
         "loss": "loss {{percent}} %",
         "limited": "limited by {{reason}}"
       }
+    },
+    "handoff": {
+      "watching": "Now watching in the isshoni app",
+      "watchHere": "Watch here instead"
     }
   },
   "share": {
@@ -443,6 +447,17 @@
       "sharing": "sharing",
       "back": "Back",
       "leave": "Leave"
+    },
+    "openInApp": {
+      "open": "Open in the isshoni app",
+      "nothing": "Nothing happened? <a>Get the desktop app</a>"
+    },
+    "deepLink": {
+      "switch": {
+        "title": "Open {{target}}?",
+        "body": "You're sharing in {{room}}. Open {{target}}? Your share will stop.",
+        "action": "Stop sharing and open"
+      }
     }
   },
   "auth": {

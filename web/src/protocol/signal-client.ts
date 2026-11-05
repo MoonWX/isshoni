@@ -37,6 +37,8 @@ import {
   ShutdownReasonRestart,
   Version,
   type Caps,
+  FeatureAgentRelay,
+  FeatureUserConnections,
   type ClientInfo,
   type Feature,
   type Hello,
@@ -51,6 +53,15 @@ import {
  * platform/types.ts's HelloAuthProvider, declared here so that protocol/ doesn't depend on platform/.
  */
 export type HelloAuthProvider = (o: { forceRefresh: boolean }) => Promise<HelloAuth | undefined>;
+
+/**
+ * The hello.features the web client asks for (M2: docs/m2/03 §7.6), in the browser and in the desktop app's page
+ * alike: agent.relay, so a tab receives the desktop app's playback.stop and sends it playback.state (03 §12.2), and
+ * user.connections, so a page sees the user's own connections (the desktop app online, 03 §12.3; the app's expiry of
+ * playback.state senders, App.OwnConnections). An older server that doesn't know one leaves it out of
+ * welcome.features (01 §6.2): featureActive() says what the server agreed to.
+ */
+export const WebHelloFeatures: readonly Feature[] = [FeatureAgentRelay, FeatureUserConnections];
 
 /** The states of 01 §10.1. A new client is stopped; only start() (or a reload) leaves stopped. */
 export type SignalState = 'connecting' | 'handshaking' | 'ready' | 'backoff' | 'stopped';
@@ -314,6 +325,15 @@ export class SignalClient {
   /** The last welcome, kept through drops until the next one; undefined before the first one after start(). */
   get welcome(): Welcome | undefined {
     return this.#welcome;
+  }
+
+  /**
+   * Whether welcome.features lists the feature (01 §6.2): the server agreed to it on this connection. False before
+   * the first welcome after start(); it follows the last welcome through drops, like `welcome`.
+   */
+  featureActive(feature: Feature): boolean {
+    const features: unknown = this.#welcome?.features;
+    return Array.isArray(features) && features.includes(feature);
   }
 
   /**

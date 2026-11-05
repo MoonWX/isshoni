@@ -47,14 +47,14 @@ const screen = (): AppScreen | null => h.services.ui.getState().screen;
 const banner = () => connectionBanner(connection(), Date.now());
 
 describe('createConnection (05 §7)', () => {
-  it('says hello with the platform’s client, role and caps, and no features', async () => {
+  it('says hello with the platform’s client, role and caps, and the web features (docs/m2/03 §7.6)', async () => {
     await h.connect();
     expect(h.server.socket.url).toBe(h.platform.signaling().url);
     expect(h.server.hellos[0]).toMatchObject({
       client: h.platform.client,
       role: 'full',
       caps: h.platform.capsNow(),
-      features: [],
+      features: ['agent.relay', 'user.connections'],
     });
   });
 
@@ -699,7 +699,8 @@ describe('M2: in the desktop app (docs/m2/03 §7.2, §7.3; 02 §11.8)', () => {
     h.server.error(makeError('too_many_connections', 'connection'));
     await tick();
     expect(screen()).toEqual({ kind: 'fatal', reason: 'too_many_connections' });
-    expect(d.fake.calls).toEqual([]);
+    // No Auth.* call. (The runtime's endpoint mute pulls Audio.FriendsHear once at start, README §3 item 87.)
+    expect(d.fake.calls.filter((c) => c.method !== 'audio.friendsHear')).toEqual([]);
   });
 
   it('calls signalStopped with the stop’s code and params, once per stop; stop() calls nothing', async () => {
