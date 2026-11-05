@@ -1,0 +1,231 @@
+/* The Settings page (docs/m2/03 §14.4) and the update parts around it (§16.2, §16.3). */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+/* The section links: #servers, #sharing, #audio, #app, #updates, #about. */
+.nav ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.nav a {
+  color: var(--color-link);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding-top: var(--space-5);
+  scroll-margin-top: var(--space-4);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+}
+
+.subtitle {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+.group legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+  font-weight: var(--weight-medium);
+}
+
+.switch {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  min-height: var(--tap-target);
+  cursor: pointer;
+}
+
+.switch input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.switch input:disabled + span {
+  color: var(--color-text-muted);
+}
+
+.choice {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  min-height: 2rem;
+  cursor: pointer;
+}
+
+.choice input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.row select {
+  min-height: 2rem;
+}
+
+.muted {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.warning {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* One hotkey: its name, the combination, its status and Change. */
+.hotkey {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.hotkeyHead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+}
+
+.combo {
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  background-color: var(--color-surface-2);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.recorder {
+  min-height: 2.5rem;
+  padding-inline: var(--space-3);
+  font: inherit;
+  color: var(--color-text);
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+}
+
+.recorder:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+/* About's facts: a term and its value per row. */
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+
+.facts dt {
+  font-weight: var(--weight-medium);
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.links a {
+  color: var(--color-link);
+}
+
+.notices {
+  max-height: 60vh;
+  margin: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+}
+
+/* The banner of a required update (03 §16.2): at the top of every page, never dismissed. */
+.banner {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-header);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2) var(--space-4);
+  color: var(--color-text);
+  background-color: var(--color-surface-2);
+  border-bottom: var(--border-width) solid var(--color-warning);
+}
+
+.banner p {
+  margin: 0;
+  font-weight: var(--weight-medium);
+}
+
+/* The version screen's outcome line under its buttons (03 §16.3). */
+.outcome {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: center;
+  margin: 0;
+}
