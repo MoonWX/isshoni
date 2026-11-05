@@ -702,9 +702,10 @@ export type ServerProbe = servers$0.ServerProbe;
 
 /**
  * SettingsPatch is Settings.Update's argument (03 §14.2): every field optional; only these can be changed from the
- * page.
+ * page. WizardDone can only be set (true): the wizard's sound and voice steps were seen once (03 §8.2).
  */
 export class SettingsPatch {
+    "wizardDone"?: boolean | null;
     "closeToTray"?: boolean | null;
     "autostart"?: boolean | null;
     "hideFromCapture"?: boolean | null;
@@ -726,30 +727,30 @@ export class SettingsPatch {
      * Creates a new SettingsPatch instance from a string or object.
      */
     static createFrom($$source: any = {}): SettingsPatch {
-        const $$createField4_0 = $$createType12;
-        const $$createField5_0 = $$createType14;
-        const $$createField6_0 = $$createType16;
-        const $$createField7_0 = $$createType18;
-        const $$createField8_0 = $$createType20;
-        const $$createField9_0 = $$createType22;
+        const $$createField5_0 = $$createType12;
+        const $$createField6_0 = $$createType14;
+        const $$createField7_0 = $$createType16;
+        const $$createField8_0 = $$createType18;
+        const $$createField9_0 = $$createType20;
+        const $$createField10_0 = $$createType22;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("hotkeys" in $$parsedSource) {
-            $$parsedSource["hotkeys"] = $$createField4_0($$parsedSource["hotkeys"]);
+            $$parsedSource["hotkeys"] = $$createField5_0($$parsedSource["hotkeys"]);
         }
         if ("pill" in $$parsedSource) {
-            $$parsedSource["pill"] = $$createField5_0($$parsedSource["pill"]);
+            $$parsedSource["pill"] = $$createField6_0($$parsedSource["pill"]);
         }
         if ("updates" in $$parsedSource) {
-            $$parsedSource["updates"] = $$createField6_0($$parsedSource["updates"]);
+            $$parsedSource["updates"] = $$createField7_0($$parsedSource["updates"]);
         }
         if ("tips" in $$parsedSource) {
-            $$parsedSource["tips"] = $$createField7_0($$parsedSource["tips"]);
+            $$parsedSource["tips"] = $$createField8_0($$parsedSource["tips"]);
         }
         if ("log" in $$parsedSource) {
-            $$parsedSource["log"] = $$createField8_0($$parsedSource["log"]);
+            $$parsedSource["log"] = $$createField9_0($$parsedSource["log"]);
         }
         if ("serverPrefs" in $$parsedSource) {
-            $$parsedSource["serverPrefs"] = $$createField9_0($$parsedSource["serverPrefs"]);
+            $$parsedSource["serverPrefs"] = $$createField10_0($$parsedSource["serverPrefs"]);
         }
         return new SettingsPatch($$parsedSource as Partial<SettingsPatch>);
     }

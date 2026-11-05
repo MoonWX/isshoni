@@ -374,7 +374,8 @@ func TestPublisherOfflineAt10s(t *testing.T) {
 		if waited := time.Since(start); waited != ReadyTimeout {
 			t.Errorf("waited %v, want %v", waited, ReadyTimeout)
 		}
-		if e.log.count("audio.") != 0 || e.log.count("core.") != 0 {
+		// Only the pick's hand-off reached 05: the pick stays held, so its process is the shared app's again.
+		if e.log.count("audio.") != e.log.count("audio.SetSharedPID(4120)") || e.log.count("core.") != 0 {
 			t.Errorf("calls %q", e.log.get())
 		}
 		e.pub.set(func(p *fakePublisher) { p.block = false })
@@ -928,8 +929,80 @@ func TestStopDuringStart(t *testing.T) {
 		if v == nil || v.State != StateEnded || v.EndReason != EndHotkey || v.Err != nil {
 			t.Fatalf("view %+v", v)
 		}
-		if e.log.count("engine.Release(pick:1)") != 1 || e.log.count("audio.") != 0 {
+		if e.log.count("engine.Release(pick:1)") != 1 || e.log.count("audio.") != e.log.count("audio.SetSharedPID") {
 			t.Errorf("calls %q", e.log.get())
+		}
+		e.log.order(t, "engine.Release(pick:1)", "audio.SetSharedPID(0)") // the released pick is no shared app
+	})
+}
+
+// TestSharedPIDHandOff: 05 learns the picked window's process right after the pick, and 0 once the pick is released,
+// expires, is replaced by a pick that was cancelled, or was a monitor; while a share runs only 05's OnShare* calls
+// name it (03 §10.1, 05 §22; README WA77).
+func TestSharedPIDHandOff(t *testing.T) {
+	last := func(e *env) string {
+		calls := e.log.get()
+		for i := len(calls) - 1; i >= 0; i-- {
+			if strings.HasPrefix(calls[i], "audio.SetSharedPID") {
+				return calls[i]
+			}
+		}
+		return ""
+	}
+	t.Run("release", func(t *testing.T) {
+		e := newEnv(t)
+		p := e.pick(t)
+		e.log.order(t, "engine.Pick", "audio.SetSharedPID(4120)")
+		e.ctl.Release(p.PickID)
+		e.log.order(t, "engine.Pick", "audio.SetSharedPID(4120)", "engine.Release", "audio.SetSharedPID(0)")
+	})
+	t.Run("expiry", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t)
+			e.pick(t)
+			time.Sleep(PickHold + time.Second)
+			synctest.Wait()
+			if got := last(e); got != "audio.SetSharedPID(0)" {
+				t.Errorf("after the expiry: %q (calls %q)", got, e.log.get())
+			}
+		})
+	})
+	t.Run("a new pick cancelled", func(t *testing.T) {
+		e := newEnv(t)
+		e.pick(t)
+		e.eng.set(func(f *fakeEngine) { f.err = media.ErrCancelled })
+		if p, err := e.ctl.Pick(context.Background()); p != nil || err != nil {
+			t.Fatalf("Pick = %+v, %v", p, err)
+		}
+		if got := last(e); got != "audio.SetSharedPID(0)" {
+			t.Errorf("after the cancelled pick: %q (calls %q)", got, e.log.get())
+		}
+	})
+	t.Run("monitor", func(t *testing.T) {
+		e := newEnv(t)
+		e.eng.set(func(f *fakeEngine) { f.src.Kind, f.src.PID = media.SourceScreen, 0 })
+		e.pick(t)
+		if got := last(e); got != "audio.SetSharedPID(0)" {
+			t.Errorf("a monitor: %q", got)
+		}
+	})
+	t.Run("share", func(t *testing.T) {
+		e := newEnv(t)
+		sh := e.start(t, "lounge", true)
+		goLive(sh)
+		before := e.log.count("audio.SetSharedPID")
+		e.ctl.Stop(context.Background(), CauseUser)
+		e.log.order(t, "audio.SetSharedPID(4120)", "audio.OnShareStarted(4120,true)", "audio.OnShareStopped")
+		if n := e.log.count("audio.SetSharedPID"); n != before {
+			t.Errorf("SetSharedPID during and after the share: %q", e.log.get())
+		}
+	})
+	t.Run("close", func(t *testing.T) {
+		e := newEnv(t)
+		e.pick(t)
+		e.ctl.Close()
+		if got := last(e); got != "audio.SetSharedPID(0)" {
+			t.Errorf("after Close: %q", got)
 		}
 	})
 }

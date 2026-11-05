@@ -336,8 +336,9 @@ type fakeAudio struct {
 func (a *fakeAudio) OnShareStarted(pid uint32, withAudio bool) {
 	a.log.add("audio.OnShareStarted(%d,%v)", pid, withAudio)
 }
-func (a *fakeAudio) OnShareStopped()       { a.log.add("audio.OnShareStopped") }
-func (a *fakeAudio) SetPaused(paused bool) { a.log.add("audio.SetPaused(%v)", paused) }
+func (a *fakeAudio) SetSharedPID(pid uint32) { a.log.add("audio.SetSharedPID(%d)", pid) }
+func (a *fakeAudio) OnShareStopped()         { a.log.add("audio.OnShareStopped") }
+func (a *fakeAudio) SetPaused(paused bool)   { a.log.add("audio.SetPaused(%v)", paused) }
 func (a *fakeAudio) SetShareSound(on bool) error {
 	a.log.add("audio.SetShareSound(%v)", on)
 	return a.soundErr

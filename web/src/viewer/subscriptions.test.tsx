@@ -91,6 +91,7 @@ describe('layerInputs', () => {
       pageHiddenForMs: 3_500,
       fullscreen: true,
       pip: 's_bea',
+      audioMuted: false, // M2: the desktop app's endpoint mute (docs/m2/03 §12.1)
     });
     expect(layerInputs({ ...state(), pageHiddenSince: null }, 4_500).pageHiddenForMs).toBe(0);
   });

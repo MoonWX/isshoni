@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/url"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -115,8 +116,8 @@ func (a *App) OpenOSSettings(p OSPage) error {
 const MaxOwnConnections = 64
 
 // OwnConnections takes the online connection ids of C1's user.connections, which the SPA sends on every change; a
-// playback.state sender that isn't among them is expired (03 §12.2, README WA77). More than 64 ids, or an id that
-// isn't a connection id's shape, is ErrInvalidArgument.
+// playback.state sender that was among them and no longer is counts as stopped: 05's SetViewerBrowser(id, …, false)
+// (03 §12.2). More than 64 ids, or an id that isn't a connection id's shape, is ErrInvalidArgument.
 func (a *App) OwnConnections(ids []string) error {
 	if len(ids) > MaxOwnConnections {
 		return fmt.Errorf("%w: more than %d connections", ErrInvalidArgument, MaxOwnConnections)
@@ -127,8 +128,10 @@ func (a *App) OwnConnections(ids []string) error {
 		}
 	}
 	a.mu.Lock()
-	a.ownConns = append(a.ownConns[:0], ids...)
+	prev := a.ownConns
+	a.ownConns = slices.Clone(ids)
 	a.mu.Unlock()
+	a.expirePlayback(prev, ids)
 	return nil
 }
 

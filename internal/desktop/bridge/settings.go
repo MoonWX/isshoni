@@ -3,12 +3,14 @@ package bridge
 import (
 	"log/slog"
 	"maps"
+	"reflect"
 
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
 )
 
 // Settings is the bound Settings service (03 §6.2, §14.2): the user-facing part of settings.json, the hotkeys'
-// state and the hotkey field's test. Get works now; Update, Hotkeys and TestHotkey are README WA84's.
+// state and the hotkey field's test. Get works now, and so does Update for wizardDone alone (the wizard's Done after
+// its sound and voice steps, 03 §8.2; README WA77); the rest of Update, Hotkeys and TestHotkey are README WA84's.
 type Settings struct {
 	store     SettingsSource // nil: not_implemented
 	policyOff func() bool    // 06's update.PolicyDisabled; nil: false
@@ -86,8 +88,9 @@ type LogView struct {
 }
 
 // SettingsPatch is Settings.Update's argument (03 §14.2): every field optional; only these can be changed from the
-// page.
+// page. WizardDone can only be set (true): the wizard's sound and voice steps were seen once (03 §8.2).
 type SettingsPatch struct {
+	WizardDone      *bool                           `json:"wizardDone,omitempty"`
 	CloseToTray     *bool                           `json:"closeToTray,omitempty"`
 	Autostart       *bool                           `json:"autostart,omitempty"`
 	HideFromCapture *bool                           `json:"hideFromCapture,omitempty"`
@@ -151,9 +154,30 @@ func (s *Settings) Get() (SettingsView, error) {
 	return settingsView(s.store.Get(), s.policyOff != nil && s.policyOff()), nil
 }
 
-// Update applies a patch and returns the new settings (03 §14.2): invalid_argument with the field. README WA84.
+// settingsWriter is the store's write (*settings.Store's Update), found on Deps.Settings.
+type settingsWriter interface {
+	Update(fn func(*settings.Settings)) error
+}
+
+var _ settingsWriter = (*settings.Store)(nil)
+
+// Update applies a patch and returns the new settings (03 §14.2): invalid_argument with the field. Only a patch of
+// wizardDone alone is applied in this build (wizardDone false is invalid_argument: the steps can't be unseen); any
+// other field is README WA84's, not_implemented.
 func (s *Settings) Update(patch SettingsPatch) (SettingsView, error) {
-	return SettingsView{}, notImplemented("Settings.Update")
+	w, ok := s.store.(settingsWriter)
+	rest := patch
+	rest.WizardDone = nil
+	if patch.WizardDone == nil || !reflect.ValueOf(rest).IsZero() || !ok {
+		return SettingsView{}, notImplemented("Settings.Update")
+	}
+	if !*patch.WizardDone {
+		return SettingsView{}, invalidArgument("wizardDone")
+	}
+	if err := w.Update(func(st *settings.Settings) { st.WizardDone = true }); err != nil {
+		return SettingsView{}, mapError(err, s.log)
+	}
+	return s.Get()
 }
 
 // Hotkeys returns the state of both hotkeys. README WA84.

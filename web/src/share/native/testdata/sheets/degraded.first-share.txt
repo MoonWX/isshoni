@@ -1,0 +1,56 @@
+<dialog class="dialog md" aria-labelledby="ID" open="">
+<div class="frame">
+<header class="header">
+<h2 id="ID" class="title">Ready to go live?</h2>
+<button type="button" class="close" aria-label="Close">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x" aria-hidden="true">
+<path d="M18 6 6 18">
+</path>
+<path d="m6 6 12 12">
+</path>
+</svg>
+</button>
+</header>
+<div class="body">
+<div class="body">
+<p class="lead">Friends will see: Minecraft</p>
+<div class="banners">
+<p class="banner error" role="alert" data-banner="exclusion-unavailable">Voice apps can't be kept out on this PC, so friends hear everything it plays, including your calls. Set your voice app to a different output device, or turn sound off.</p>
+</div>
+<p class="everything">Friends will hear everything on this PC</p>
+<p class="note">Muting your PC doesn't mute your stream. Use Pause or turn Share sound off.</p>
+<fieldset class="presets">
+<legend class="legend">Optimize for</legend>
+<label class="preset">
+<input type="radio" value="auto" checked="" name="ID">
+<span class="presetName">Auto</span>
+<span class="presetHint">A good balance for most things</span>
+</label>
+<label class="preset">
+<input type="radio" value="game" name="ID">
+<span class="presetName">Game</span>
+<span class="presetHint">Smooth motion comes first</span>
+</label>
+<label class="preset">
+<input type="radio" value="movie" name="ID">
+<span class="presetName">Movie</span>
+<span class="presetHint">Smooth motion, and better sound</span>
+</label>
+<label class="preset">
+<input type="radio" value="text" name="ID">
+<span class="presetName">Text</span>
+<span class="presetHint">Sharp text comes first</span>
+</label>
+</fieldset>
+</div>
+</div>
+<footer class="footer">
+<button type="button" class="button ghost md">
+<span class="label">Cancel</span>
+</button>
+<button type="button" class="button primary md">
+<span class="label">Go live</span>
+</button>
+</footer>
+</div>
+</dialog>

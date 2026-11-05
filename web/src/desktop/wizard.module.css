@@ -120,3 +120,60 @@
   flex-wrap: wrap;
   gap: var(--space-2);
 }
+
+/* The sound check's "Playing a test sound…" (03 §8.4): a spinner and the line, no meter. */
+.checking {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* The voice step's and Settings → Audio's lists (03 §8.2, §14.4). */
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-left: var(--space-5);
+  margin: 0;
+}
+
+.toggle {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  min-height: var(--tap-target);
+  cursor: pointer;
+}
+
+.toggle input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+}
+
+.rule {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.rule select {
+  min-height: 2rem;
+}

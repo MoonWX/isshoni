@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/MoonWX/isshoni/internal/desktop/audio"
 	"github.com/MoonWX/isshoni/internal/desktop/share"
 )
 
@@ -17,8 +18,8 @@ import (
 // -Embedding; a protocol activation a web page made up) does nothing. Opening the window, the toast's body and its
 // Open button, needs no nonce.
 
-// The toasts' kinds (Notification.Kind): WA68's here; README WA77, WA80 and WA84 add the mic prompt, audio alert,
-// pause, stopped and update toasts.
+// The toasts' kinds (Notification.Kind): WA68's here and the mic prompt's in audio.go (ToastMicPrompt); README WA80
+// and WA84 add the audio alert, pause, stopped and update toasts.
 const (
 	ToastStillSharing = "still-sharing"  // the first close to the tray while live
 	ToastLockPaused   = "lock-paused"    // an unlock later than LockResume after the lock: Resume · Stop
@@ -54,12 +55,19 @@ type toastBook struct {
 // pendingToast is a sent toast with buttons.
 type pendingToast struct {
 	kind    string
+	ref     string // what the toast asks about: a mic prompt's id; "" for the others
 	actions []string
 }
 
 // notify shows a toast of kind with body; actions are its buttons, ids among the Toast* actions, with their titles
 // (the catalog's desktop.native.toast.*). A failing shell is logged once per toast and never retried.
 func (a *App) notify(kind, body string, actions ...NotificationAction) {
+	a.notifyRef(kind, "", body, actions...)
+}
+
+// notifyRef is notify for a toast about one thing, ref (a mic prompt's id): its buttons act on ref, and dropRefsExcept
+// settles it once ref is gone.
+func (a *App) notifyRef(kind, ref, body string, actions ...NotificationAction) {
 	n := Notification{Kind: kind, Title: toastTitle, Body: body, Actions: actions}
 	b := &a.toasts
 	b.mu.Lock()
@@ -74,7 +82,7 @@ func (a *App) notify(kind, body string, actions ...NotificationAction) {
 		for i, act := range actions {
 			ids[i] = act.ID
 		}
-		b.pending[n.Nonce] = pendingToast{kind: kind, actions: ids}
+		b.pending[n.Nonce] = pendingToast{kind: kind, ref: ref, actions: ids}
 		b.order = append(b.order, n.Nonce)
 		for len(b.order) > maxToasts {
 			delete(b.pending, b.order[0])
@@ -106,6 +114,33 @@ func (b *toastBook) settle(nonce, action string) (pendingToast, bool) {
 	delete(b.pending, nonce)
 	b.order = slices.DeleteFunc(b.order, func(n string) bool { return n == nonce })
 	return p, true
+}
+
+// take settles the pending toast of nonce whatever its buttons are (a dismissal); ok false for an unknown nonce.
+func (b *toastBook) take(nonce string) (pendingToast, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p, ok := b.pending[nonce]
+	if !ok {
+		return pendingToast{}, false
+	}
+	delete(b.pending, nonce)
+	b.order = slices.DeleteFunc(b.order, func(n string) bool { return n == nonce })
+	return p, true
+}
+
+// dropRefsExcept settles every pending toast of kind whose ref isn't in keep: what it asks about was answered
+// another way, or is gone.
+func (b *toastBook) dropRefsExcept(kind string, keep []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.order = slices.DeleteFunc(b.order, func(n string) bool {
+		if p, ok := b.pending[n]; ok && p.kind == kind && !slices.Contains(keep, p.ref) {
+			delete(b.pending, n)
+			return true
+		}
+		return false
+	})
 }
 
 // dropKind settles every pending toast of kind without an action: its question was answered another way (the
@@ -146,8 +181,17 @@ func (a *App) ToastAction(nonce, action string) bool {
 		ctx, cancel := context.WithTimeout(a.ctx, QuitTimeout)
 		defer cancel()
 		a.shares.Stop(ctx, share.CauseUser)
+	case ToastKeepOut, ToastInclude:
+		if p.kind != ToastMicPrompt {
+			return false
+		}
+		d := audio.DecisionKeepOut
+		if action == ToastInclude {
+			d = audio.DecisionInclude
+		}
+		return a.answerPrompt(p.ref, d)
 	default:
-		// keep-out, include (README WA77's mic prompt) and restart (WA84) have no toast in this build yet.
+		// restart (WA84) has no toast in this build yet.
 		a.log.Info("app: a toast action this build doesn't handle", "kind", p.kind, "action", action)
 		return false
 	}

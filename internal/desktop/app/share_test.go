@@ -192,6 +192,7 @@ func (a appAudio) Close() error                  { a.shell.record("audio.close")
 func (a appAudio) OnShareStarted(pid uint32, withAudio bool) {
 	a.shell.record("audio.started")
 }
+func (a appAudio) SetSharedPID(uint32)      {}
 func (a appAudio) OnShareStopped()          { a.shell.record("audio.stopped") }
 func (a appAudio) SetPaused(bool)           {}
 func (a appAudio) SetShareSound(bool) error { return nil }

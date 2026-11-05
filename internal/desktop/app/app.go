@@ -11,7 +11,7 @@
 // Slices fill it in order (README §5): the skeleton, the Shell and OSHooks interfaces, the command line, links and
 // the Pending values first (WA41); C2's session and the share controller (WA58: share.go builds them in New),
 // auth.state, the link page in the browser and server switching from the SPA (WA71: servers.go, which calls the
-// session's Refresh after 02's Add, SetActive and Remove), audio (WA77), the tray, the window's close policy, toasts,
+// session's Refresh after 02's Add, SetActive and Remove), 05's audio service (WA77: audio.go), the tray, the window's close policy, toasts,
 // system events, keep-awake, WDA on the main window and the watchdog (WA68: tray.go, window.go, toasts.go,
 // system.go), hotkeys and the pill (WA80), the updater (WA84).
 package app
@@ -39,7 +39,7 @@ type Deps struct {
 	Servers  *deviceauth.Servers // 02: servers.json, one Manager per server, the credential store
 	Session  Session             // C2 (03 §9); nil: New builds internal/desktop/session for Engine (share.go)
 	Engine   media.Engine        // native.Open on Windows; fake.NewEngine in dev and e2e builds; nil when none opened
-	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio, wired by WA77)
+	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio); nil: no audio policy
 	Updater  Updater             // 06's *update.Updater, built in the first instance only (wired by WA84)
 	Shell    Shell               // cmd/isshoni-desktop over Wails; e2ehost: a recording fake
 	OS       OSHooks             // winos on Windows; stubs elsewhere
@@ -125,9 +125,12 @@ type App struct {
 
 	mu       sync.Mutex
 	running  bool
-	pending  *PendingLink // the link not yet acted on (App.PendingLink)
-	lastLink time.Time    // when the last link was handled (03 §13.2: at most one per second)
-	ownConns []string     // App.OwnConnections: C1's user.connections, for playback.state's expiry (WA77)
+	pending  *PendingLink    // the link not yet acted on (App.PendingLink)
+	lastLink time.Time       // when the last link was handled (03 §13.2: at most one per second)
+	ownConns []string        // App.OwnConnections: C1's user.connections, for playback.state's expiry (audio.go)
+	playing  map[string]bool // the senders whose last playback.state said playing (audio.go)
+
+	playbackKick chan struct{} // wakes followPlayback after a change of the link state; one slot
 }
 
 // New checks d and returns the app; it starts nothing (Run does).
@@ -177,6 +180,8 @@ func New(d Deps) (*App, error) {
 		clients:   clients,
 		after:     afterFunc,
 		trayEvery: TrayDebounce,
+
+		playbackKick: make(chan struct{}, 1),
 	}
 	a.sharing = a.shares.Live
 	return a, nil
@@ -200,6 +205,7 @@ func (a *App) Run(ctx context.Context) error {
 	defer a.cancel()
 
 	a.startActive()
+	a.startAudio()
 	unsubscribe := a.shares.Subscribe(a.onShareEvent)
 	a.flushTray()
 	a.applyCaptureExclusion()
@@ -345,6 +351,7 @@ func (a *App) OnAuthState(s deviceauth.State) {
 	a.log.Debug("app: link state", "state", s)
 	if a.pub != nil {
 		a.pub.OnAuthState(s)
+		a.kickPlayback()
 	}
 	if s.Origin != "" && s.Origin == a.activeOrigin() {
 		a.openLinkPage(s)

@@ -13,8 +13,14 @@
 //   [Share again] and [Pick again] start a new pick here; the page's native Share button shows its sheets, and a pick
 //   that fails (self_window, permission_denied, …) before any share is said as a toast, since the panel goes with it.
 //
-// M1's "No sound captured" line doesn't apply to native shares (05's silent-stream check does). Later slices add:
-// What friends hear, the banners and the mic prompt card (README WA77), and Pause with the hotkeys' tooltips (WA80).
+// - What friends hear (README WA77): 05's mic prompt cards at the top of the panel (Keep out or Include, ✕ and Esc
+//   dismiss) and its banners under the bar, always shown; in the expander the three groups with each app's level bar
+//   and the overall meter (Audio.WatchLevels while the expander is open), Keep out or Include on the rows that have a
+//   toggle, the ducking tip with "Open sound settings", and the volume note under Share sound.
+//
+// M1's "No sound captured" line doesn't apply to native shares (05's silent-stream check does): while sound is on
+// and no heard app plays, the panel says "Nothing is playing right now". A later slice adds Pause with the hotkeys'
+// tooltips (WA80).
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -33,9 +39,20 @@ import { shareStore, type ShareStore, type StartShare } from '../shareStore';
 import { linkShareUi } from '../shareUi';
 import type { ShareWatcher } from '../watchers';
 import { shareFailureText } from './engineErrors';
+import {
+  AppGroups,
+  AudioBanners,
+  AudioTips,
+  MicPromptCards,
+  MixMeter,
+  nothingPlaying,
+  VolumeNote,
+} from './FriendsHear';
 import styles from './native.module.css';
 import { ShareDetails } from './ShareDetails';
 import { ShareErrorNote } from './ShareErrorNote';
+import { useMicPromptHost } from './MicPromptCorner';
+import { useAudioBridge, useFriendsHear, useLevels } from './useAudio';
 import { useEncoderNotice, useShareView } from './useShareView';
 
 const NO_WATCHERS: readonly ShareWatcher[] = [];
@@ -85,6 +102,11 @@ export function NativeSharePanel({
   const [changingPreset, setChangingPreset] = useState(false);
   const expanderId = useId();
   const presetGroup = useId();
+  const audioBridge = useAudioBridge();
+  const showsShare = phase !== 'idle' && phase !== 'picking' && phase !== 'confirming' && phase !== 'failed';
+  const fh = useFriendsHear(showsShare ? audioBridge : null);
+  // The panel shows the mic prompts while it shows the share: the corner card (MicPromptCorner) steps aside.
+  useMicPromptHost(showsShare && audioBridge !== null);
 
   useEffect(() => {
     linkShareUi(store, ui);
@@ -92,6 +114,7 @@ export function NativeSharePanel({
   }, [store, ui]);
 
   const published = phase === 'live' || phase === 'reconnecting';
+  const levels = useLevels(audioBridge, published && open);
 
   // Ctrl+Shift+D toggles the Details disclosure while the window has focus; showing it opens the expander too.
   const detailsShown = useRef(false);
@@ -206,6 +229,7 @@ export function NativeSharePanel({
 
   return (
     <section className={cx(styles.panel, paused && styles.paused)} aria-label={t('share.panel.label')}>
+      {fh !== null && <MicPromptCards fh={fh} bridge={audioBridge} />}
       <div className={styles.bar}>
         <span
           className={cx(styles.dot, phase === 'live' && !paused && styles.dotLive, paused && styles.dotPaused)}
@@ -280,6 +304,7 @@ export function NativeSharePanel({
           {t('desktop.share.panel.encoderFallback', { encoder: encoderNotice })}
         </p>
       )}
+      {fh !== null && <AudioBanners fh={fh} />}
       {expanded && (
         <div id={expanderId} className={styles.expander}>
           <fieldset className={styles.panelPresets} disabled={active === null || changingPreset}>
@@ -318,6 +343,7 @@ export function NativeSharePanel({
             ) : (
               <p className={styles.muted}>{t('share.panel.soundOff')}</p>
             )}
+            {withAudio && <VolumeNote />}
             <h3 className={styles.legend}>{t('share.panel.watchers')}</h3>
             {count === 0 ? (
               <p className={styles.muted}>{t('share.panel.nobodyWatching')}</p>
@@ -329,6 +355,23 @@ export function NativeSharePanel({
               </ul>
             )}
           </div>
+          {withAudio && fh !== null && (
+            <div className={styles.column} data-section="friends-hear">
+              <h3 className={styles.legend}>{t('desktop.audio.title')}</h3>
+              <MixMeter levels={levels} />
+              {nothingPlaying(fh, soundOn) && <p className={styles.muted}>{t('desktop.audio.nothingPlaying')}</p>}
+              <AppGroups fh={fh} bridge={audioBridge} levels={levels} />
+              <AudioTips
+                fh={fh}
+                bridge={audioBridge}
+                openSoundSettings={() => {
+                  audioBridge?.app.openOSSettings('sound-communications').catch((err: unknown) => {
+                    ui.getState().toast({ kind: 'error', message: errorMessage(err, t) });
+                  });
+                }}
+              />
+            </div>
+          )}
           <div className={styles.column}>
             <Button
               variant="ghost"

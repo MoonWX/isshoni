@@ -10,6 +10,7 @@ import { AppProviders } from '../../app/App';
 import { createDesktopTestPlatform, type DesktopTestPlatform } from '../../app/testing/desktop';
 import { createTestServices } from '../../test/render';
 import { RelinkPage } from '../RelinkPage';
+import { SettingsPage } from '../SettingsPage';
 import { SetupPage } from '../SetupPage';
 
 function Room() {
@@ -28,6 +29,7 @@ export function renderDesktopPage(path: string, d = createDesktopTestPlatform(),
     [
       { path: '/desktop/setup', element: <SetupPage /> },
       { path: '/desktop/relink', element: <RelinkPage /> },
+      { path: '/desktop/settings', element: <SettingsPage /> },
       { path: '/', element: <h1>home</h1> },
       { path: '/about', element: <h1>about</h1> },
       { path: '/r/:roomId', element: <Room /> },

@@ -3,7 +3,8 @@
 
 /**
  * Settings is the bound Settings service (03 §6.2, §14.2): the user-facing part of settings.json, the hotkeys'
- * state and the hotkey field's test. Get works now; Update, Hotkeys and TestHotkey are README WA84's.
+ * state and the hotkey field's test. Get works now, and so does Update for wizardDone alone (the wizard's Done after
+ * its sound and voice steps, 03 §8.2; README WA77); the rest of Update, Hotkeys and TestHotkey are README WA84's.
  * @module
  */
 
@@ -44,7 +45,9 @@ export function TestHotkey(combo: string): $CancellablePromise<$models.HotkeySta
 }
 
 /**
- * Update applies a patch and returns the new settings (03 §14.2): invalid_argument with the field. README WA84.
+ * Update applies a patch and returns the new settings (03 §14.2): invalid_argument with the field. Only a patch of
+ * wizardDone alone is applied in this build (wizardDone false is invalid_argument: the steps can't be unseen); any
+ * other field is README WA84's, not_implemented.
  */
 export function Update(patch: $models.SettingsPatch): $CancellablePromise<$models.SettingsView> {
     return $Call.ByID(909379237, patch).then(($result: any) => {

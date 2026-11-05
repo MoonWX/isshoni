@@ -138,6 +138,15 @@ func (s *wailsShell) HideWindow() { s.main.Hide() }
 
 func (s *wailsShell) WindowVisible() bool { return s.main.IsVisible() }
 
+// WindowFocused reports the main window in the foreground: shown, not minimised and focused. A minimised window, or
+// one behind a full-screen game, is visible to Windows but not in front, so a mic prompt then becomes a toast (03 §15).
+func (s *wailsShell) WindowFocused() bool {
+	return s.main.IsVisible() && !s.main.IsMinimised() && s.main.IsFocused()
+}
+
+// The app asks the shell whether its window is in front (app's focusReporter).
+var _ interface{ WindowFocused() bool } = (*wailsShell)(nil)
+
 func (s *wailsShell) SetFullscreen(on bool) {
 	if on {
 		s.main.Fullscreen()
