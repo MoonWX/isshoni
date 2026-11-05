@@ -1088,8 +1088,8 @@ func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, er
 	return e.start(ctx, "start", cfg, false, nil)
 }
 
-// StartWith is Start with native-only options (WithGOP, WithLumaTap), for enginetest (the app never calls it): the same mapping
-// and the same one-session rule.
+// StartWith is Start with native-only options (WithGOP, WithLumaTap), for enginetest (the app never calls it): the same
+// mapping and the same one-session rule.
 func (e *Engine) StartWith(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error) {
 	return e.start(ctx, "start", cfg, false, opts)
 }
@@ -1269,8 +1269,8 @@ func (a *startArgs) str(op, s string) (*byte, error) {
 const maxSourceID = 64
 
 // buildStart is media.Config → im_start_config (04 §12.2's table), with the native-only options of StartWith and
-// StartExtra (WithGOP → layers[i].gop_ms, WithLumaTap → IM_START_TEST_LUMA_TAP). Anything the engine would refuse that Go can tell is CodeInvalid without a
-// DLL call.
+// StartExtra (WithGOP → layers[i].gop_ms, WithLumaTap → IM_START_TEST_LUMA_TAP). Anything the engine would refuse
+// that Go can tell is CodeInvalid without a DLL call.
 func buildStart(op string, cfg media.Config, o startOptions) (*startArgs, error) {
 	a := &startArgs{sc: &imStartConfig{structSize: uint32(unsafe.Sizeof(imStartConfig{}))}}
 	sc := a.sc

@@ -35,6 +35,9 @@ type LumaSample struct {
 	// Missed counts the captured frames since the previous reading that have none (replaced in the engine's frame
 	// slots before its video thread took them, or its readback queue was full).
 	Missed int
+	// Discontinuity is the packet's IM_PKT_DISCONTINUITY: the debug ring dropped one or more readings before this one
+	// (the consumer fell behind, §6.2). Missed doesn't count those.
+	Discontinuity bool
 }
 
 // WithLumaTap asks StartWith or StartExtra for the luma tap of an IM_TEST_HOOKS DLL (04 §5.8): the session's Next
@@ -93,6 +96,7 @@ func (s *session) debug(pk *pulled) (bool, error) {
 		return false, nil
 	}
 	r.CaptureNS = s.captureNS(pk)
+	r.Discontinuity = pk.p.flags&imPktDiscontinuity != 0
 	s.luma(r)
 	return false, nil
 }

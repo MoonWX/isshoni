@@ -222,18 +222,36 @@ func TestOnsetDetector(t *testing.T) {
 
 func TestLumaEdges(t *testing.T) {
 	frames := []lumaSample{
-		{0, 0.9},   // the capture started inside a flash: no edge
-		{16, 0.95}, //
-		{33, 0.1},
-		{50, 0.5}, // not above 50 %
-		{66, 0.51},
-		{83, 0.9},
-		{100, 0.05},
-		{116, 0.8},
+		{CaptureNS: 0, Mean: 0.9},   // the capture started inside a flash: no edge
+		{CaptureNS: 16, Mean: 0.95}, //
+		{CaptureNS: 33, Mean: 0.1},
+		{CaptureNS: 50, Mean: 0.5}, // not above 50 %
+		{CaptureNS: 66, Mean: 0.51},
+		{CaptureNS: 83, Mean: 0.9},
+		{CaptureNS: 100, Mean: 0.05},
+		{CaptureNS: 116, Mean: 0.8},
 	}
-	got := lumaEdges(frames, avsyncLumaLevel)
-	if want := []int64{66, 116}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("edges %v, want %v", got, want)
+	got, discarded := lumaEdges(frames, avsyncLumaLevel)
+	if want := []int64{66, 116}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] || discarded != 0 {
+		t.Errorf("edges %v (%d discarded), want %v (0)", got, discarded, want)
+	}
+
+	// An edge whose reading follows a lost one (a frame without a reading, or readings the ring dropped) may be a
+	// frame late: discarded. A loss that is not at an edge changes nothing.
+	lossy := []lumaSample{
+		{CaptureNS: 0, Mean: 0.1},
+		{CaptureNS: 33, Mean: 0.9, Missed: 1}, // the flash's first frame may be the missed one
+		{CaptureNS: 50, Mean: 0.1},
+		{CaptureNS: 66, Mean: 0.9, Discontinuity: true},
+		{CaptureNS: 83, Mean: 0.1},
+		{CaptureNS: 100, Mean: 0.9},
+		{CaptureNS: 133, Mean: 0.9, Missed: 1}, // inside the flash: no edge either way
+		{CaptureNS: 150, Mean: 0.1, Discontinuity: true},
+		{CaptureNS: 166, Mean: 0.9},
+	}
+	got, discarded = lumaEdges(lossy, avsyncLumaLevel)
+	if want := []int64{100, 166}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] || discarded != 2 {
+		t.Errorf("lossy edges %v (%d discarded), want %v (2)", got, discarded, want)
 	}
 }
 
@@ -290,6 +308,9 @@ type avsyncFakeRun struct {
 	clicks     []int64 // A (engine clock)
 	videoDelay int64
 	audioDelay int64
+	// lost marks the flashes whose white reading follows a lost one: "missed" (a frame without a reading) or
+	// "ring" (the debug ring dropped readings: DISCONTINUITY).
+	lost map[int]string
 
 	mu       sync.Mutex
 	cfg      media.Config
@@ -298,6 +319,7 @@ type avsyncFakeRun struct {
 	stopped  bool
 	clickN   int
 	flashOK  bool
+	monitor  string // StartFlash's monitor
 }
 
 func (f *avsyncFakeRun) now() int64 { return int64(time.Since(f.start)) } // the session clock
@@ -366,7 +388,7 @@ func (s *avsyncSession) Next(ctx context.Context) (media.Packet, error) {
 	for len(s.readings) > 0 && (len(s.packets) == 0 || s.readings[0].CaptureNS <= s.packets[0].CaptureNS) {
 		r := s.readings[0]
 		s.readings = s.readings[1:]
-		s.luma(native.LumaSample{CaptureNS: r.CaptureNS, Mean: r.Mean})
+		s.luma(native.LumaSample{CaptureNS: r.CaptureNS, Mean: r.Mean, Missed: r.Missed, Discontinuity: r.Discontinuity})
 	}
 	if len(s.packets) > 0 {
 		p := s.packets[0]
@@ -395,7 +417,12 @@ func (s *avsyncSession) Stop() error {
 
 type avsyncFakeHelpers struct{ run *avsyncFakeRun }
 
-func (h avsyncFakeHelpers) StartFlash(context.Context) (flashProc, error) { return h, nil }
+func (h avsyncFakeHelpers) StartFlash(_ context.Context, monitor string) (flashProc, error) {
+	h.run.mu.Lock()
+	h.run.monitor = monitor
+	h.run.mu.Unlock()
+	return h, nil
+}
 func (h avsyncFakeHelpers) Stop() (flashResult, error) {
 	h.run.mu.Lock()
 	h.run.flashOK = true
@@ -428,12 +455,19 @@ func (l fakeLumaTap) Samples() []lumaSample {
 	}
 	from := r.flashes[0] - r.epoch - 200*ms
 	to := r.flashes[len(r.flashes)-1] - r.epoch + 300*ms
-	for _, p := range r.flashes {
+	for k, p := range r.flashes {
 		v := p + r.videoDelay - r.epoch
 		for t := from; t < v; t += 16_666_667 {
 			out = append(out, lumaSample{CaptureNS: t, Mean: 0.06})
 		}
-		out = append(out, lumaSample{CaptureNS: v, Mean: 0.93})
+		white := lumaSample{CaptureNS: v, Mean: 0.93}
+		switch r.lost[k] {
+		case "missed":
+			white.Missed = 1
+		case "ring":
+			white.Discontinuity = true
+		}
+		out = append(out, white)
 		from = v + 100*ms
 	}
 	out = append(out, lumaSample{CaptureNS: to, Mean: 0.06})
@@ -471,8 +505,9 @@ func TestRunAVSyncWithFakes(t *testing.T) {
 	if rep.Edges != 18 || rep.Onsets != 18 || rep.Clicks != 18 || rep.Flashes != 18 {
 		t.Errorf("counts: %+v", rep)
 	}
-	if !run.picked || !run.stopped || !run.flashOK {
-		t.Errorf("picked %t, stopped %t, flash stopped %t", run.picked, run.stopped, run.flashOK)
+	if !run.picked || !run.stopped || !run.flashOK || run.monitor != "" {
+		t.Errorf("picked %t, stopped %t, flash stopped %t, monitor %q (want the primary)", run.picked, run.stopped,
+			run.flashOK, run.monitor)
 	}
 	if a := run.cfg.Audio; a == nil || !a.TapPCM || a.Mode != media.AudioExcludeApps || run.cfg.Listed ||
 		run.cfg.Source != "pick:1" || run.cfg.Layers[0].MaxFPS != 60 || run.cfg.Layers[0].MaxPixels != 1920*1080 {
@@ -529,6 +564,33 @@ func TestRunAVSyncWithTheNativeTap(t *testing.T) {
 	if run.picked || run.cfg.Source != "mon:1" || !run.cfg.Listed {
 		t.Errorf("-source mon:1: picked %t, source %q, listed %t", run.picked, run.cfg.Source, run.cfg.Listed)
 	}
+	// The flash window opens centered on the captured monitor, so the tap's centered box sees it (04 §5.8).
+	if run.monitor != "1" {
+		t.Errorf("-source mon:1: the flash window's monitor is %q, want 1", run.monitor)
+	}
+
+	// Edges whose reading follows a lost one may be late: they are discarded and counted, their flashes unpaired.
+	lossy := newAVSyncFakeRun(12*ms, 30*ms)
+	lossy.lost = map[int]string{3: "missed", 9: "ring"}
+	tap, _ = newLumaTap()
+	stdout.Reset()
+	o.out = t.TempDir()
+	code = runAVSync(context.Background(), avsyncEnv{engine: lossy, helpers: avsyncFakeHelpers{lossy}, tap: tap}, o, true,
+		&stdout, &stderr)
+	rep = avsyncReport{}
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("exit %d: no report: %v\n%s", code, err, stderr.String())
+	}
+	if code != exitPass || rep.Edges != 16 || rep.EdgesDropped != 2 || len(rep.Pairs) != 16 || len(rep.Unpaired) != 2 ||
+		math.Abs(rep.MedianMS-18) > 0.05 {
+		t.Errorf("two lost readings: exit %d, %d edges, %d discarded, %d pairs, unpaired %q, median %.3f ms", code,
+			rep.Edges, rep.EdgesDropped, len(rep.Pairs), rep.Unpaired, rep.MedianMS)
+	}
+	for _, p := range rep.Pairs {
+		if p.Flash == 3 || p.Flash == 9 {
+			t.Errorf("flash %d is paired after a lost reading", p.Flash)
+		}
+	}
 
 	// The tap's readings arrive in capture order; Samples keeps that order whatever the arrival.
 	nt := &nativeLumaTap{}
@@ -536,8 +598,8 @@ func TestRunAVSyncWithTheNativeTap(t *testing.T) {
 	fn(native.LumaSample{CaptureNS: 20, Mean: 0.9})
 	fn(native.LumaSample{CaptureNS: 10, Mean: 0.1})
 	fn(native.LumaSample{CaptureNS: 20, Mean: 0.8})
-	if got := nt.Samples(); len(got) != 3 || got[0] != (lumaSample{10, 0.1}) || got[1] != (lumaSample{20, 0.9}) ||
-		got[2] != (lumaSample{20, 0.8}) {
+	if got := nt.Samples(); len(got) != 3 || got[0] != (lumaSample{CaptureNS: 10, Mean: 0.1}) ||
+		got[1] != (lumaSample{CaptureNS: 20, Mean: 0.9}) || got[2] != (lumaSample{CaptureNS: 20, Mean: 0.8}) {
 		t.Errorf("Samples %+v", got)
 	}
 
@@ -612,6 +674,7 @@ func TestRunAVSyncNoLuma(t *testing.T) {
 func TestAVSyncUsage(t *testing.T) {
 	for _, args := range [][]string{
 		{"avsync", "-source", "test:pattern"},
+		{"avsync", "-source", "mon:"},
 		{"avsync", "-seconds", "19"},
 		{"avsync", "-role", "bogus"},
 		{"avsync", "-role", "flash"},

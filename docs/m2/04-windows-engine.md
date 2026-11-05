@@ -969,8 +969,9 @@ of §14's `avsync` (05 §19.3) and of E14's pause check. It is asked for per ses
   BT.709 luma `Y' = 0.2126 R' + 0.7152 G' + 0.0722 B'` of the slot's 8-bit gamma-encoded BGRA values, full range, over
   a **fixed region**: the centered box of `min(256, side)` pixels on each side of the frame's content. A square box
   reads the same whatever the frame's rotation. avsync's 1280×720 flash window covers it both as the picked window
-  and when it is centered on a captured monitor, so the mean is the window's alone. While paused the video thread
-  takes no frame, so there is no reading.
+  and with `-source mon:<id>`, where avsync opens it centered on the captured monitor (whichever it is: the flash
+  helper gets the monitor's device name and centers on its `GetMonitorInfoW` rect), so the mean is the window's alone.
+  While paused the video thread takes no frame, so there is no reading.
 - **How.** `session/luma_tap.h`: the frame's box is copied into one of 8 staging textures behind an event query on the
   session's device. The video thread maps the finished copies oldest first without waiting for the GPU (`GetData`
   with `DONOTFLUSH`, `Map` with `DO_NOT_WAIT`) and polls every 2 ms while copies are in flight, so a static screen's
@@ -981,8 +982,9 @@ of §14's `avsync` (05 §19.3) and of E14's pause check. It is asked for per ses
   log); device loss is the session's to find (§9.8).
 - **The packet.** `kind` `IM_PACKET_DEBUG` (100), `layer` `IM_NO_LAYER`, `capture_ts_ns` the frame's capture time,
   `flags` 0 or `DISCONTINUITY`. Its ring holds 64 readings (64 KiB) with the audio rings' overflow rule (the newest is
-  dropped and the next one that gets in carries `DISCONTINUITY`) and the pump's 1 s stale rule (§6.2). `data` is 48
-  bytes, little endian:
+  dropped and the next one that gets in carries `DISCONTINUITY`) and the pump's 1 s stale rule (§6.2). A reading the
+  ring dropped is not counted in `missed` (nor in a `RING_OVERFLOW` event): `DISCONTINUITY` alone tells of it. `data`
+  is 48 bytes, little endian:
 
   | Offset | Size | Field | Meaning |
   |---|---|---|---|
@@ -1000,7 +1002,8 @@ of §14's `avsync` (05 §19.3) and of E14's pause check. It is asked for per ses
 
 - **Go.** `native.WithLumaTap(fn func(native.LumaSample))` is a `StartOption` of `StartWith` and `StartExtra`. It sets
   the bit and makes `Next` call `fn` with every reading, on the session clock (`CaptureNS = capture_ts_ns −
-  epoch_ns`), on the goroutine that called `Next` and before `Next` returns its next packet. `Next` itself never
+  epoch_ns`, and `Discontinuity` the packet's `DISCONTINUITY`), on the goroutine that called `Next` and before `Next`
+  returns its next packet. `Next` itself never
   returns a debug packet. A payload that isn't 48 bytes with the magic, version 1 and a mean of at most 65535, a
   `capture_ts_ns` other than the packet's, or a time before the epoch is dropped with the warn log of §12.3. Against a
   DLL whose build info says `testHooks: false`, the start is `media.CodeDependency` without a DLL call.
@@ -2300,7 +2303,8 @@ Windows-only extras of §12.2, the OpenH264 helpers and 05's `AudioTest` (05 §1
 | `layout_test.go` | all | sizes and offsets of §5.4 via `unsafe.Sizeof`/`Offsetof` against the golden file |
 | `fakecaller_test.go` | all | the `fakeCaller` (§12.4); `open_test.go`, `logdrain_test.go`, `abi_test.go`, `errors_test.go`, `engine_other_test.go` and `main_test.go` (goleak) drive WA10's half with it |
 | `session_windows.go` | windows | `media.Source.Exe` of a window pick: the base name of `QueryFullProcessImageNameW` for its `PID` (WA23; everything else of `Pick` and the session is portable, in `bridge.go`) |
-| `bridge_test.go` | all | the session logic driven by the `fakeCaller` (§18.3; WA23) |
+| `luma.go` | all | the luma tap's Go side (§5.8; README WF16): `WithLumaTap`, `LumaTapOf`, `LumaSample`, the start flag's constant and the payload's decoding; `bridge.go`'s `Next` hands it the `IM_PACKET_DEBUG` packets |
+| `bridge_test.go`, `luma_test.go` | all | the session logic driven by the `fakeCaller` (§18.3; WA23); `luma_test.go` the luma tap's option, decoding and delivery (WF16) |
 | `dll_windows_test.go` | windows | tests against a real DLL (`ISSHONI_TEST_ENGINE_DLL`, set by CI and enginetest only) |
 | `session_dll_test.go`, `session_windows_test.go` | all; windows | the session tests against a real engine (§18.2's "Go on Windows": `TestDLLConformance`, `TestNativeIntoPublisher`, `TestDLLSession`, `TestDLLStartErrors`); `session_windows_test.go` opens the `ISSHONI_TEST_ENGINE_DLL` DLL for them, and they skip without it (WA23) |
 
@@ -2374,6 +2378,21 @@ func WithGOP(rid string, gop time.Duration) StartOption
 // GOPOf reads back the per-layer GOPs that opts set, by rid (nil when none), without the range check, so callers
 // that build options can test what they pass.
 func GOPOf(opts ...StartOption) map[string]time.Duration
+// WithLumaTap asks for the luma tap of an IM_TEST_HOOKS DLL (§5.8; README WF16): IM_START_TEST_LUMA_TAP, and Next
+// calls fn with every IM_PACKET_DEBUG reading before its next packet (never returning one). A DLL without test hooks
+// is CodeDependency without a DLL call; nil turns it off; the last one wins.
+func WithLumaTap(fn func(LumaSample)) StartOption
+// LumaTapOf is the luma-tap function that opts set (nil when none), for callers' tests and fakes of StartWith.
+func LumaTapOf(opts ...StartOption) func(LumaSample)
+// LumaSample is one reading of the luma tap (§5.8's payload).
+type LumaSample struct {
+	CaptureNS     int64           // the frame's capture time on the session clock
+	Mean          float64         // the region's mean BT.709 luma, 0 black to 1 white
+	Source        image.Point     // the frame's content size
+	Region        image.Rectangle // the centered box the mean is over
+	Missed        int             // captured frames since the previous reading that have none
+	Discontinuity bool            // IM_PKT_DISCONTINUITY: the debug ring dropped readings before this one
+}
 
 // SourceDetail holds only what im_source_info says beyond media.Source (README §3 item 29): monitor_id, capture_path
 // and IM_SRCF_OS_BORDER are media.Source's MonitorID, Capture and OSBorder (01 §5.1). Local data, never logged.
@@ -2935,7 +2954,10 @@ one file each, README §5). Where the merged tool differs from the table:
 **As built (WF16, group 15)**: `avsync`'s luma tap is §5.8's. The run passes `native.WithLumaTap` to `StartWith` and
 pairs the readings' rising edges through 50 % with the PCM tap's click onsets as WA76 wrote it. The tap's centered
 256-pixel box settles WA76's open point about `-source mon:<id>`, where the flash window covers only part of the
-monitor. A DLL without test hooks fails the start with `dependency`, exit 2. `-no-luma` stays as the diagnostic of the
+monitor: avsync opens the window centered on the captured monitor (the flash helper's `-monitor` takes the id after
+`mon:`, a device name, and centers on that monitor's rect; the primary one for `-source pick`), so the box lies inside
+it on any monitor. A rising edge whose reading follows a lost one (`missed` > 0 or `DISCONTINUITY`) may be a frame
+late: avsync discards it (its flash goes unpaired) and counts it in `avsync.json`'s `edgesDiscarded`. A DLL without test hooks fails the start with `dependency`, exit 2. `-no-luma` stays as the diagnostic of the
 Windows half. The owner's first `avsync -dll ci` run on Windows 11 (M-AVSYNC's first record, §18.4) is still manual.
 
 ## 15. Glass-to-glass latency (M2 exit criterion)

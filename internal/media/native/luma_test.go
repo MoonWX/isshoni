@@ -118,8 +118,8 @@ func TestLumaTapOf(t *testing.T) {
 }
 
 // TestStartWithLumaTap: WithLumaTap sets IM_START_TEST_LUMA_TAP and Next hands the readings to its function, in order,
-// on the session clock, and never returns them; malformed readings are dropped. Without it the flag stays clear and
-// debug packets are dropped silently.
+// on the session clock, with the packet's DISCONTINUITY, and never returns them; malformed readings are dropped.
+// Without it the flag stays clear and debug packets are dropped silently.
 func TestStartWithLumaTap(t *testing.T) {
 	sf := newSessionFake(t)
 	e := openFake(t, sf.f, Options{})
@@ -143,7 +143,7 @@ func TestStartWithLumaTap(t *testing.T) {
 	debug := func(ts int64, data []byte) nextItem {
 		return nextItem{st: imOK, kind: imPacketDebug, layer: imNoLayer, ts: ts, data: data}
 	}
-	const ms5, ms21 = 5_000_000, 21_000_000
+	const ms5, ms21, ms25 = 5_000_000, 21_000_000, 25_000_000
 	short := debug(10_000_000, lumaPayload(epoch+10_000_000, 3000, 0)[:40])
 	otherTime := debug(15_000_000, lumaPayload(epoch+16_000_000, 3000, 0))
 	beforeEpoch := debug(-1, lumaPayload(epoch-1, 3000, 0))
@@ -153,6 +153,9 @@ func TestStartWithLumaTap(t *testing.T) {
 		short, otherTime, beforeEpoch,
 		debug(ms21, lumaPayload(epoch+ms21, 65535, 2)), // white, two frames missed
 		oversized,
+		// The debug ring dropped readings before this one.
+		nextItem{st: imOK, kind: imPacketDebug, layer: imNoLayer, flags: imPktDiscontinuity, ts: ms25,
+			data: lumaPayload(epoch+ms25, 65535, 0)},
 		video(0, imPktKeyframe|imPktReinit, 30_000_000),
 	)
 	p := nextN(t, s, 1)[0]
@@ -164,6 +167,8 @@ func TestStartWithLumaTap(t *testing.T) {
 	want := []LumaSample{
 		{CaptureNS: ms5, Mean: 3000.0 / 65535, Source: image.Pt(640, 360), Region: image.Rect(192, 52, 448, 308)},
 		{CaptureNS: ms21, Mean: 1, Source: image.Pt(640, 360), Region: image.Rect(192, 52, 448, 308), Missed: 2},
+		{CaptureNS: ms25, Mean: 1, Source: image.Pt(640, 360), Region: image.Rect(192, 52, 448, 308),
+			Discontinuity: true},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("readings %+v, want %+v", got, want)
