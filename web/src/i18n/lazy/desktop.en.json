@@ -207,6 +207,92 @@
           "deviceRemoved": "Your graphics driver restarted, so the share stopped."
         }
       }
+    },
+    "setup": {
+      "title": "Link isshoni to your server",
+      "start": "Start",
+      "continue": "Continue",
+      "cancel": "Cancel",
+      "back": "Back",
+      "tryAgain": "Try again",
+      "trust": "The server's admin could see streams; there's no recording and no telemetry.",
+      "trustMore": "More",
+      "saveFailed": "Couldn't save the sign-in to Windows Credential Manager. You'll have to link again after restarting the app.",
+      "server": {
+        "fromPage": "Installed from your isshoni page? Go back to it and click <strong>Open isshoni</strong>.",
+        "label": "Your isshoni server",
+        "placeholder": "watch.example.com",
+        "seeWhy": "Opens in your browser but not here? See why",
+        "inviteHint": "This is an invite link. Open it in your browser first to create your account.",
+        "openInvite": "Open in browser"
+      },
+      "add": {
+        "title": "Add server {{host}}?",
+        "trust": "Only add servers you trust. The server's admin can see what you share.",
+        "add": "Add"
+      },
+      "confirm": {
+        "title": "Link isshoni to {{name}} ({{host}})?",
+        "callsItself": "This server calls itself {{host}}.",
+        "link": "Link"
+      },
+      "link": {
+        "title": "{{name}} ({{host}})",
+        "intro": "Link this PC to your account on this server. You approve it in your browser.",
+        "start": "Link",
+        "starting": "Getting a code…",
+        "otherServer": "Use another server",
+        "codeLabel": "Your code",
+        "qr": "QR code of the link page",
+        "expires": "Expires in {{time}}",
+        "short": "or open {{url}} and enter {{code}}",
+        "openAgain": "Open browser again",
+        "copy": "Copy link",
+        "copied": "Link copied",
+        "copyFailed": "Couldn't copy the link. Select it in the line above instead.",
+        "rename": "You can rename this PC on the approval page or later on your Devices page.",
+        "password": "Sign in with username and password instead",
+        "linked": "Linked as {{username}}",
+        "denied": "Linking was declined in the browser.",
+        "expired": "The code expired.",
+        "newCode": "Get a new code",
+        "failed": "Couldn't start linking with this server"
+      },
+      "password": {
+        "title": "Sign in with your username and password",
+        "username": "Username",
+        "password": "Password",
+        "signIn": "Sign in"
+      },
+      "version": {
+        "updateApp": "This server needs a newer isshoni app. You have {{app}}; the server runs {{server}}.",
+        "updateServer": "This server runs isshoni {{server}}, which is too old for this app. Ask your admin to update it."
+      }
+    },
+    "relink": {
+      "title": "Link this PC to {{server}} again",
+      "signedOut": "This PC was signed out of {{server}} (removed on the Devices page, or not used for 90 days)",
+      "refreshReused": "Someone else used this PC's sign-in, so {{server}} signed it out. Link again and check your Devices page",
+      "accountDisabled": "Your account on {{server}} is disabled",
+      "linkAgain": "Link again",
+      "switchServer": "Switch server",
+      "removeServer": "Remove server"
+    },
+    "servers": {
+      "title": "Your servers",
+      "active": "Active",
+      "notLinked": "Not linked",
+      "linkedAs": "Linked as {{username}}",
+      "switch": "Switch",
+      "remove": "Remove",
+      "removeConfirm": "Remove {{server}}?",
+      "removeBody": "isshoni signs this PC out of it and forgets it. You can add it again later.",
+      "signOut": "Sign out of {{server}}",
+      "signOutConfirm": "Sign out isshoni on this PC from {{server}}?",
+      "signOutBody": "The server stays in the list as Not linked. A share on it stops.",
+      "signOutAction": "Sign out",
+      "signOutUnconfirmed": "Remove {{device}} on your Devices page to finish.",
+      "add": "Add a server"
     }
   }
 }

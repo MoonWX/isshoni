@@ -704,13 +704,11 @@ describe('M2: the desktop app’s routes and guards (docs/m2/03 §7.5, §22.3)',
       },
     );
 
-    it('the real desktop/ folder has every page: WA42’s stubs, "Not in this build yet"', async () => {
-      const { router } = renderDesktop('/desktop/setup', undefined, defaultSources());
+    it('the real desktop/ folder has every page: the wizard and the relink page (WA71), the Settings stub', async () => {
+      // The wizard and the relink page render in desktop/SetupPage.test.tsx and RelinkPage.test.tsx: here the
+      // folder comes through a fresh module graph (vi.resetModules above), whose app context isn't this test's.
+      renderDesktop('/desktop/settings', undefined, defaultSources());
       expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
-      for (const path of ['/desktop/relink', '/desktop/settings']) {
-        await act(() => router.navigate(path));
-        expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
-      }
       const mod = await defaultSources().lazy.desktop?.();
       expect(Object.keys(mod ?? {}).sort()).toEqual(['RelinkPage', 'SettingsPage', 'SetupPage']);
     });

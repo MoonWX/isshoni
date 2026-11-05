@@ -131,9 +131,9 @@ func TestHostCalls(t *testing.T) {
 	if w := call(t, h, "Share", "Release", picked.PickID); w.Code != http.StatusOK {
 		t.Fatalf("Share.Release: %d %s", w.Code, w.Body)
 	}
-	// A bridge method still unimplemented answers 422 not_implemented (README WA71).
+	// A bridge error answers 422 with its code: the app's SwitchServer (README WA71) for a server it doesn't list.
 	if w := call(t, h, "Auth", "SwitchServer", "http://127.0.0.1:1"); w.Code != http.StatusUnprocessableEntity ||
-		!strings.Contains(w.Body.String(), `"code":"not_implemented"`) {
+		!strings.Contains(w.Body.String(), `"code":"not_found"`) {
 		t.Fatalf("Auth.SwitchServer: %d %s", w.Code, w.Body)
 	}
 	if w := call(t, h, "Audio", "FriendsHear"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"seq"`) {

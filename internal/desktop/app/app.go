@@ -10,9 +10,10 @@
 //
 // Slices fill it in order (README §5): the skeleton, the Shell and OSHooks interfaces, the command line, links and
 // the Pending values first (WA41); C2's session and the share controller (WA58: share.go builds them in New),
-// auth.state and server switching from the SPA (WA71, which calls the session's Refresh after 02's SetActive), audio
-// (WA77), the tray, the window's close policy, toasts, system events, keep-awake, WDA on the main window and the
-// watchdog (WA68: tray.go, window.go, toasts.go, system.go), hotkeys and the pill (WA80), the updater (WA84).
+// auth.state, the link page in the browser and server switching from the SPA (WA71: servers.go, which calls the
+// session's Refresh after 02's Add, SetActive and Remove), audio (WA77), the tray, the window's close policy, toasts,
+// system events, keep-awake, WDA on the main window and the watchdog (WA68: tray.go, window.go, toasts.go,
+// system.go), hotkeys and the pill (WA80), the updater (WA84).
 package app
 
 import (
@@ -118,6 +119,9 @@ type App struct {
 	sharing func() (roomID string, live bool)
 
 	spaLog spaLog // App.Log's rate limit
+
+	authSubs authSubscribers // SubscribeAuth: the auth.state event's source (servers.go)
+	opened   openedCodes     // the link codes whose approval page was opened (servers.go)
 
 	mu       sync.Mutex
 	running  bool
@@ -335,11 +339,15 @@ func (a *App) quit(stopShare bool, cause share.Cause, shellQuit bool) {
 }
 
 // OnAuthState is deviceauth.ServersOptions.OnState: a server's link changed. C2's session looks again (a relink
-// builds a new core client, an unlinked or incompatible active server closes it, 03 §9). The auth.state event for
-// the active server is README WA71's; until then it is logged at debug only. It never blocks.
+// builds a new core client, an unlinked or incompatible active server closes it, 03 §9), and a state of the active
+// server goes to SubscribeAuth's callbacks: the bridge's auth.state event (03 §6.3). It never blocks.
 func (a *App) OnAuthState(s deviceauth.State) {
 	a.log.Debug("app: link state", "state", s)
 	if a.pub != nil {
 		a.pub.OnAuthState(s)
+	}
+	if s.Origin != "" && s.Origin == a.activeOrigin() {
+		a.openLinkPage(s)
+		a.authSubs.call(s)
 	}
 }

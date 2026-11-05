@@ -1,0 +1,122 @@
+/* The wizard's and the relink page's parts (docs/m2/03 §8.2, §8.3). */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.center {
+  display: flex;
+  justify-content: center;
+  padding-block: var(--space-5);
+}
+
+/* The host of the add and confirm steps, large: against look-alike names (03 §8.2). */
+.host {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  overflow-wrap: anywhere;
+}
+
+.trust {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+/* The code and its QR code, side by side where there is room. */
+.codeBox {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-5);
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background-color: var(--color-surface-2);
+  border-radius: var(--radius-md);
+}
+
+.codeText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: center;
+  text-align: center;
+}
+
+.code {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  line-height: var(--leading-tight);
+  letter-spacing: 0.12em;
+  overflow-wrap: anywhere;
+}
+
+.muted {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* A button that reads as a link: "Sign in with username and password instead". */
+.linkButton {
+  align-self: flex-start;
+  padding: 0;
+  font: inherit;
+  color: var(--color-link, var(--color-accent));
+  text-decoration: underline;
+  cursor: pointer;
+  background: none;
+  border: 0;
+}
+
+.linkButton:focus-visible {
+  outline: 2px solid var(--color-focus, currentcolor);
+  outline-offset: 2px;
+}
+
+/* The server list of the switcher. */
+.servers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.server {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.serverName {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.serverName > strong {
+  overflow-wrap: anywhere;
+}
+
+.serverActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
