@@ -25,8 +25,9 @@ func init() {
 }
 
 // 04 §14's sessions -count N: N sessions of test:pattern at 1080p60 with two layers, through StartExtra, all running
-// at once; it reports each layer's encoder and passes when every session started (fallbacks allowed: NVENC's limit is
-// per system, shared with OBS and others, and a layer past it takes MF, 04 §9.7). The DLL runs at most 4 sessions
+// at once; it reports each layer's encoder and passes when every session started and ran to the end (fallbacks
+// allowed: NVENC's limit is per system, shared with OBS and others, and a layer past it takes MF, 04 §9.7; a session
+// that ENDED mid-run, e.g. a layer out of candidates, isn't one that works at the limit). The DLL runs at most 4 sessions
 // per process (04 §6.4), so sessions beyond the first 4 run in helper processes, copies of this program with the same
 // -dll (`sessions -child`, 4 sessions each at most), started once this process's sessions run and holding theirs for
 // the same time; this process keeps its sessions until every helper is done, so all N run together.
@@ -191,7 +192,8 @@ func sessionsConfig(o sessionsOptions) media.Config {
 }
 
 // runSessionsCommand runs this process's sessions (the first 4, or a helper's share), the helpers for the rest, and
-// prints the report. Exit 0 when every session started, 1 when one didn't (or a helper failed), the environment's
+// prints the report. Exit 0 when every session started and none ended during the run, 1 otherwise (or when a helper
+// failed), the environment's
 // code when none did (no encoder, a DLL without the test pattern).
 func runSessionsCommand(ctx context.Context, st extraStarter, o sessionsOptions, helper helperRunner, asJSON bool,
 	stdout, stderr io.Writer,
@@ -229,6 +231,9 @@ func runSessionsCommand(ctx context.Context, st extraStarter, o sessionsOptions,
 	for _, r := range rep.Sessions {
 		if r.Started {
 			rep.Started++
+			if r.Ended != "" {
+				rep.Failures = append(rep.Failures, fmt.Sprintf("session %d ended during the run: %s", r.Index, r.Ended))
+			}
 		} else {
 			rep.Failures = append(rep.Failures, fmt.Sprintf("session %d didn't start: %s", r.Index, r.Error))
 		}
@@ -395,8 +400,9 @@ func (run *sessionsRun) stop() []sessionResult {
 // their reports and what went wrong running them.
 func runHelpers(ctx context.Context, o sessionsOptions, own int, helper helperRunner) ([]sessionsReport, []string) {
 	type answer struct {
-		rep sessionsReport
-		err string
+		rep    sessionsReport
+		parsed bool // rep is the helper's whole report
+		err    string
 	}
 	var starts []int
 	for first := own; first < o.count; first += maxSessionsPerProcess {
@@ -416,11 +422,15 @@ func runHelpers(ctx context.Context, o sessionsOptions, own int, helper helperRu
 				answers[i].err = fmt.Sprintf("helper process %d didn't run: %v", i+1, err)
 				return
 			}
-			if jerr := json.Unmarshal(out, &answers[i].rep); jerr != nil {
+			var rep sessionsReport
+			if jerr := json.Unmarshal(out, &rep); jerr != nil {
+				// A partly decoded report is no report: rep is dropped, its sessions get placeholders below.
 				answers[i].err = fmt.Sprintf("helper process %d (exit %d) gave no report: %v", i+1, code, jerr)
 				return
 			}
-			if code != exitPass && answers[i].rep.Pass {
+			answers[i].rep = rep
+			answers[i].parsed = true
+			if code != exitPass && rep.Pass {
 				answers[i].err = fmt.Sprintf("helper process %d exited %d", i+1, code)
 			}
 		}()
@@ -431,11 +441,14 @@ func runHelpers(ctx context.Context, o sessionsOptions, own int, helper helperRu
 	for i, a := range answers {
 		if a.err != "" {
 			failures = append(failures, a.err)
-			// Its sessions are unknown: they count as not started.
+		}
+		if !a.parsed {
+			// Its sessions are unknown: they count as not started. (A report that parsed keeps its sessions even when
+			// the exit code disagrees with it; that disagreement is the failure above.)
+			a.rep = sessionsReport{}
 			for first, n := starts[i], min(maxSessionsPerProcess, o.count-starts[i]); n > 0; first, n = first+1, n-1 {
 				a.rep.Sessions = append(a.rep.Sessions, sessionResult{Index: first, Error: "its helper process failed"})
 			}
-			a.rep.Failures = nil
 		}
 		reps = append(reps, a.rep)
 	}

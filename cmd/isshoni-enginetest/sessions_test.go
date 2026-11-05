@@ -22,6 +22,7 @@ type fakeSystem struct {
 	nvenc     int // NVENC sessions left
 	starts    int
 	failAt    map[int]error // start number (from 1) → its error
+	endAt     map[int]error // start number (from 1) → what its Next returns once its events are read (ENDED)
 	live      int
 	maxLive   int
 	lastStops int
@@ -38,7 +39,7 @@ func (f *fakeSystem) StartExtra(_ context.Context, cfg media.Config, _ ...native
 		cfg.Layers[0].MaxPixels != 1920*1080 || cfg.Audio != nil {
 		return nil, &media.Error{Code: media.CodeInvalid, Op: "start_extra", Detail: "not sessions' config"}
 	}
-	s := &fakeSession{sys: f, stopped: make(chan struct{})}
+	s := &fakeSession{sys: f, stopped: make(chan struct{}), ended: f.endAt[f.starts]}
 	for _, l := range cfg.Layers {
 		enc := "mf-sw"
 		if f.nvenc > 0 {
@@ -57,6 +58,7 @@ type fakeSession struct {
 	sys     *fakeSystem
 	mu      sync.Mutex
 	events  []*media.Event
+	ended   error // returned by Next after the events, when set
 	stopped chan struct{}
 	once    sync.Once
 }
@@ -70,6 +72,9 @@ func (s *fakeSession) Next(ctx context.Context) (media.Packet, error) {
 		return media.Packet{Kind: media.KindEvent, Event: ev}, nil
 	}
 	s.mu.Unlock()
+	if s.ended != nil {
+		return media.Packet{}, s.ended
+	}
 	select {
 	case <-ctx.Done():
 		return media.Packet{}, ctx.Err()
@@ -245,6 +250,75 @@ func TestSessionsHelperFailure(t *testing.T) {
 	}
 	if len(rep.Failures) == 0 || !strings.Contains(strings.Join(rep.Failures, "\n"), "helper process 1") {
 		t.Errorf("failures %q: want the helper's", rep.Failures)
+	}
+}
+
+// A session that started but ENDED during the run (a layer out of candidates at the NVENC limit) fails the run.
+func TestSessionsEndedSessionFails(t *testing.T) {
+	lost := &media.Error{Code: media.CodeEncoderLost, Op: "next", Detail: "no_candidates"}
+	sys := &fakeSystem{nvenc: 8, endAt: map[int]error{2: lost}}
+	var out bytes.Buffer
+	o := sessionsOptions{count: 3, seconds: 0.1, encoder: "auto", profile: "high"}
+	if code := runSessionsCommand(context.Background(), sys, o, nil, true, &out, io.Discard); code != exitFail {
+		t.Fatalf("exit %d, want %d\n%s", code, exitFail, out.String())
+	}
+	rep := decodeReport(t, out.Bytes())
+	if rep.Pass || rep.Started != 3 || rep.Sessions[1].Ended == "" {
+		t.Errorf("report %+v: want 3 started, session 1 ended, no pass", rep)
+	}
+	if !strings.Contains(strings.Join(rep.Failures, "\n"), "session 1 ended during the run") {
+		t.Errorf("failures %q: want session 1's end", rep.Failures)
+	}
+}
+
+// A helper whose report passes but whose exit code doesn't fails the run, and its sessions are listed once.
+func TestSessionsHelperExitDisagrees(t *testing.T) {
+	sys := &fakeSystem{nvenc: 100}
+	var calls [][]string
+	var mu sync.Mutex
+	real := inProcessHelper(t, sys, &calls, &mu)
+	disagree := func(ctx context.Context, args []string) ([]byte, int, error) {
+		data, code, err := real(ctx, args)
+		if code != exitPass {
+			t.Errorf("the helper's own run: exit %d", code)
+		}
+		return data, exitFail, err
+	}
+	var out bytes.Buffer
+	o := sessionsOptions{count: 6, seconds: 0.1, encoder: "auto", profile: "high"}
+	if code := runSessionsCommand(context.Background(), sys, o, disagree, true, &out, io.Discard); code != exitFail {
+		t.Fatalf("exit %d, want %d", code, exitFail)
+	}
+	rep := decodeReport(t, out.Bytes())
+	if len(rep.Sessions) != o.count {
+		t.Fatalf("%d sessions listed, want %d: %+v", len(rep.Sessions), o.count, rep.Sessions)
+	}
+	for i, r := range rep.Sessions {
+		if r.Index != i {
+			t.Errorf("session at %d has index %d: want each index once", i, r.Index)
+		}
+	}
+	all := strings.Join(rep.Failures, "\n")
+	if !strings.Contains(all, "helper process 1 exited 1") || strings.Contains(all, "sessions reported") {
+		t.Errorf("failures %q: want only the helper's exit code", rep.Failures)
+	}
+}
+
+// A helper whose JSON breaks off after some sessions: the partial report is dropped, its sessions listed once.
+func TestSessionsHelperPartialReport(t *testing.T) {
+	sys := &fakeSystem{nvenc: 100}
+	partial := func(context.Context, []string) ([]byte, int, error) {
+		return []byte(`{"command":"sessions","sessions":[{"index":4,"started":true},{"index":5,"started":true}],"pass":`),
+			exitFail, nil
+	}
+	var out bytes.Buffer
+	o := sessionsOptions{count: 6, seconds: 0.1, encoder: "auto", profile: "high"}
+	if code := runSessionsCommand(context.Background(), sys, o, partial, true, &out, io.Discard); code != exitFail {
+		t.Fatalf("exit %d, want %d", code, exitFail)
+	}
+	rep := decodeReport(t, out.Bytes())
+	if len(rep.Sessions) != 6 || rep.Started != 4 || rep.Sessions[4].Started || rep.Sessions[5].Index != 5 {
+		t.Errorf("report %+v: want 6 sessions, 4 and 5 not started", rep)
 	}
 }
 

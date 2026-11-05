@@ -980,7 +980,7 @@ im_status Session::OpenLayer(uint32_t layer, const encpolicy::Candidate &c, uint
     if (entry.device.adapter == gpu::DeviceRequest::Adapter::kLuid && p.device->luid() != entry.device.luid) {
       // One device per session, on its first pixel candidate's adapter (§8.1): an encoder of another adapter would get
       // a device it can't use, and the copy across adapters (§9.1 step 3) isn't built, so the order moves on (a
-      // software encoder reads back from any device).
+      // software encoder reads back from any device). Until it is, Candidate::cross_adapter_copy goes unread here.
       log::Info("encode", "encoder skipped",
                 {{"layer", RidView(L.rid)}, {"encoder", encpolicy::EncoderToken(c.kind)}, {"why", "other_adapter"}});
       return abi::Fail(IM_ERR_NO_ENCODER, abi::token::kOpenFailed,
