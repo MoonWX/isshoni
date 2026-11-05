@@ -6,18 +6,27 @@
 // - a friend's web viewer decodes the share's frames and its audio energy (M1's stats.ts);
 // - the desktop's own tile is local: subscribed with the low layer and no audio, shown as "Preview: what friends
 //   see", never heard;
-// - the tray says "Live, 1 watching" once the harness has the tray (README WA68; a null tray view is noted);
+// - the tray says "Live, 1 watching"; the hotkeys are registered while live and named in the panel's tooltips; the
+//   `normal` scenario's mic prompt shows its card in the panel (README WA80);
+// - Pause from the panel, then by hotkey: the friend's tile says "Paused" with no new frames and no sound, a friend
+//   who joins while paused gets no frame, Resume (button, hotkey) brings frames back, and the Stop hotkey ends the
+//   share without asking, unregisters the hotkeys and releases keep-awake (03 §11.2, §11.3, §22.4; README WA80);
 // - the harness's debug-level log names no window title, no share label, no exe and none of the `normal` audio
 //   scenario's apps (03 §17, §22.4);
-// - the panel's Stop ends the share for the friend; a second share needs no first-share sheet (tips.firstShareShown).
+// - a second share needs no first-share sheet (tips.firstShareShown), and the panel's Stop ends it.
 //
-// Pause, the late joiner, the hotkeys and the audio alert case come with README WA80.
+// The audio alert case (05 §14.7 "Outside the window", README WA80): with ISSHONI_FAKE_AUDIO=degrade-live, a mic
+// prompt is pending when the share goes live (the tray's "1 question waiting", the pill's marker), and 5 s into the
+// share the fake loses process loopback: the tray warns with "Friends hear voice apps" first, the pill's state says
+// it in place of the count, and exactly one voiceAppsHeard toast is recorded. In this scenario the degrade also ends
+// the prompt (Chrome is heard then, so its mic row is gone, 05 §14.6), so the two show one after the other here;
+// internal/desktop/app's TestAudioAlertOutsideWindow has them together.
 import AxeBuilder from '@axe-core/playwright';
 import fsp from 'node:fs/promises';
 import type { Page } from '@playwright/test';
 
 import { expect, test, type DesktopApp, type E2EServer } from './fixtures.ts';
-import { audioOf, videoOf, waitForRoom, waitForState, waitForStats } from './stats.ts';
+import { audioOf, readStats, videoOf, waitForRoom, waitForState, waitForStats } from './stats.ts';
 
 /** C2 connects, publishes and goes live; a viewer's sub PC follows. */
 const LIVE_TIMEOUT_MS = 30_000;
@@ -27,7 +36,62 @@ const FAKE_LABEL = 'Fake window';
 /** The display names of the apps in 05's `normal` fake audio scenario (internal/media/fake/audio_ctl.go). */
 const NORMAL_SCENARIO_APPS = ['Spotify', 'Discord', 'Steam', 'Google Chrome'];
 
-test.describe.configure({ timeout: 150_000 });
+/** The default hotkeys, as the harness records them while they are registered (03 §11.2). */
+const HOTKEYS = { pause: 'Ctrl+Alt+Shift+F9', stop: 'Ctrl+Alt+Shift+F10' };
+/** The panel's paused bar (03 §10.3). */
+const PAUSED_BAR = 'Paused · nothing new leaves your PC; friends see "Paused" and hear nothing';
+/** How long a check of "nothing new arrives" watches (the stats are read on demand). */
+const QUIET_MS = 3_000;
+/** What may still be on its way when a pause lands: frames and audio sent just before it. */
+const SETTLE_MS = 1_500;
+
+test.describe.configure({ timeout: 240_000 });
+
+/** The tray's view as the harness recorded it (tray.View: icon, tooltip, menu), or null before the first. */
+interface TrayView {
+  icon: string;
+  tooltip: string;
+  menu: { label?: string; action?: string; enabled: boolean }[];
+}
+
+function trayOf(state: { tray: unknown }): TrayView | null {
+  return state.tray as TrayView | null;
+}
+
+/**
+ * The share is paused on `page` (03 §11.3): its status is `paused`, its tile or stage says "Paused", and once what
+ * was in flight has arrived no new frame is decoded and no sound is heard.
+ */
+async function expectPaused(page: Page, shareId: string, what: string): Promise<void> {
+  await waitForState(page, (s) => s.viewer.shares.find((sh) => sh.id === shareId && sh.status === 'paused'), {
+    timeout: MEDIA_TIMEOUT_MS,
+    message: `${what}: the share's status is paused`,
+  });
+  await expect(page.locator(`[data-share-id="${shareId}"]`).getByText('Paused', { exact: true }).first()).toBeVisible();
+  await page.waitForTimeout(SETTLE_MS);
+  const before = await readStats(page);
+  await page.waitForTimeout(QUIET_MS);
+  const after = await readStats(page);
+  expect(videoOf(after, shareId)?.framesDecoded ?? 0, `${what}: no new frames`).toBe(
+    videoOf(before, shareId)?.framesDecoded ?? 0,
+  );
+  expect(audioOf(after, shareId)?.totalAudioEnergy ?? 0, `${what}: no sound`).toBe(
+    audioOf(before, shareId)?.totalAudioEnergy ?? 0,
+  );
+}
+
+/** Frames of the share are decoded on `page` again, and its status is live. */
+async function expectFrames(page: Page, shareId: string, what: string): Promise<void> {
+  await waitForState(page, (s) => s.viewer.shares.find((sh) => sh.id === shareId && sh.status === 'live'), {
+    timeout: MEDIA_TIMEOUT_MS,
+    message: `${what}: the share is live again`,
+  });
+  const before = videoOf(await readStats(page), shareId)?.framesDecoded ?? 0;
+  await waitForStats(page, (s) => (videoOf(s, shareId)?.framesDecoded ?? 0) > before + 5 && s, {
+    timeout: MEDIA_TIMEOUT_MS,
+    message: `${what}: new frames`,
+  });
+}
 
 /** A desktop app linked to the worker's server as a new member, with its page in `roomId`. */
 async function linkedDesktop(
@@ -130,16 +194,24 @@ test('a fake pick goes live through the first-share sheet; a browser watches; th
   await waitForState(page, (s) => s.viewer.audibleShareId === null && s, { message: 'the desktop hears nothing' });
   await expect(page.getByText('Preview: what friends see').first()).toBeVisible();
 
-  // The panel counts the friend; the tray says the same once the harness has one (README WA68).
+  // The panel counts the friend, and so does the tray: Live, "1 watching" (03 §11.1, WA68's names).
   await expect(panel.getByText(`You're live · ${FAKE_LABEL} · Auto · 1 watching`)).toBeVisible();
-  const { tray } = await desktop.state();
-  if (tray === null) {
-    test.info().annotations.push({ type: 'tray', description: 'the harness has no tray yet (README WA68)' });
-  } else {
-    await expect
-      .poll(async () => JSON.stringify((await desktop.state()).tray))
-      .toMatch(/tray-live[\s\S]*1 watching|1 watching[\s\S]*tray-live/);
-  }
+  await expect
+    .poll(async () => trayOf(await desktop.state()))
+    .toMatchObject({ icon: 'tray-live', tooltip: `Sharing ${FAKE_LABEL} · 1 watching` });
+
+  // The hotkeys are registered while the share is live (03 D9, §11.2), and the panel's buttons name them.
+  await expect.poll(async () => (await desktop.state()).hotkeys).toEqual(HOTKEYS);
+  await expect(panel.getByRole('button', { name: 'Pause' })).toHaveAttribute('title', 'Pause (Ctrl+Alt+Shift+F9)');
+  await expect(panel.getByRole('button', { name: 'Stop sharing' })).toHaveAttribute(
+    'title',
+    'Stop (Ctrl+Alt+Shift+F10)',
+  );
+
+  // The `normal` scenario's mic prompt (Chrome uses the mic 5 s in, 05 §13.3): its card at the top of the panel
+  // (WA77's card). The harness's window never hides, so the toast a hidden window gets is the app's Go test
+  // (internal/desktop/app: TestMicPromptToast).
+  await expect(panel.locator('[data-prompt-kind="browser-mic"]')).toBeVisible({ timeout: MEDIA_TIMEOUT_MS });
 
   // Details (Ctrl+Shift+D): the encoder and the layers, no source name.
   await page.keyboard.press('Control+Shift+D');
@@ -149,13 +221,45 @@ test('a fake pick goes live through the first-share sheet; a browser watches; th
   await expect(details).not.toContainText(FAKE_LABEL);
   await expectAccessible(page, 'the native share panel', 'section[aria-label="Your share"]');
 
-  // Stop: the share ends for the friend, and the panel goes.
-  await panel.getByRole('button', { name: 'Stop sharing' }).click();
+  // Pause from the panel (03 §11.3): nothing new leaves the PC; the friend's tile says "Paused" over the last frame,
+  // with no new frames and no sound. Resume brings both back.
+  await panel.getByRole('button', { name: 'Pause' }).click();
+  await expect(panel.getByText(PAUSED_BAR)).toBeVisible();
+  await expectPaused(friend.page, share.id, 'the friend, paused from the panel');
+  await panel.getByRole('button', { name: 'Resume' }).click();
+  await expectFrames(friend.page, share.id, 'the friend, resumed from the panel');
+
+  // Pause by hotkey; a friend who joins while paused gets no frame, only the "Paused" tile.
+  await desktop.hotkey('pause');
+  await expect(panel.getByText(PAUSED_BAR)).toBeVisible();
+  await expect
+    .poll(async () => trayOf(await desktop.state()))
+    .toMatchObject({ icon: 'tray-paused', tooltip: 'Sharing paused · 1 watching' });
+  await expectPaused(friend.page, share.id, 'the friend, paused by the hotkey');
+  const late = await asUser(server);
+  await late.page.goto(`${server.url}/r/${room}`);
+  await waitForRoom(late.page, room);
+  await expectPaused(late.page, share.id, 'a friend who joined while paused');
+  expect(videoOf(await readStats(late.page), share.id)?.framesDecoded ?? 0, 'the late joiner got a frame').toBe(0);
+
+  // Resume by hotkey: both get frames again (the resume starts from a keyframe).
+  await desktop.hotkey('pause');
+  await expect(panel.getByText(`You're live · ${FAKE_LABEL}`)).toBeVisible();
+  await expectFrames(friend.page, share.id, 'the friend, resumed by the hotkey');
+  await expectFrames(late.page, share.id, 'the late joiner, resumed by the hotkey');
+
+  // Stop by hotkey, without asking: the share ends for both, the hotkeys are unregistered and keep-awake is off.
+  await desktop.hotkey('stop');
   await expect(panel).toBeHidden({ timeout: MEDIA_TIMEOUT_MS });
-  await waitForState(friend.page, (s) => !s.viewer.shares.some((sh) => sh.id === share.id) && s, {
-    timeout: MEDIA_TIMEOUT_MS,
-    message: "the share is gone from the friend's page",
-  });
+  for (const viewer of [friend.page, late.page]) {
+    await waitForState(viewer, (s) => !s.viewer.shares.some((sh) => sh.id === share.id) && s, {
+      timeout: MEDIA_TIMEOUT_MS,
+      message: "the share is gone from a friend's page",
+    });
+  }
+  await expect.poll(async () => (await desktop.state()).hotkeys).toEqual({});
+  await expect.poll(async () => (await desktop.state()).keepAwake).toBe(false);
+  await expect.poll(async () => trayOf(await desktop.state())).toMatchObject({ icon: 'tray-idle' });
 
   // A second share: the first-share sheet was shown once (tips.firstShareShown), so it goes live at once.
   await page.getByRole('banner').getByRole('button', { name: 'Share', exact: true }).click();
@@ -171,4 +275,96 @@ test('a fake pick goes live through the first-share sheet; a browser watches; th
   expect(log).not.toContain(FAKE_LABEL);
   expect(log).not.toMatch(/\.exe\b/i);
   for (const name of NORMAL_SCENARIO_APPS) expect(log, name).not.toContain(name);
+});
+
+/** A recorded toast (app.Notification as the harness's JSON has it). */
+interface Toast {
+  ID: string;
+  Kind: string;
+  Body: string;
+  Actions: { ID: string; Title: string }[] | null;
+}
+
+/** The pill's state as the harness recorded it (app.PillState). */
+interface PillState {
+  Visible: boolean;
+  Mode: string;
+  VoiceAppsHeard: boolean;
+  Questions: number;
+  Text: { Line: string; Questions: string };
+}
+
+test('degrade-live: friends hear voice apps, said outside the window (tray, pill, one toast)', async ({
+  startDesktop,
+  server,
+}) => {
+  const room = 'lounge';
+  const desktop = await linkedDesktop((o) => startDesktop({ ...o, fakeAudio: 'degrade-live' }), server, room);
+  const { page } = desktop;
+
+  // The scripted prompt: the fake's Chrome uses the mic 5 s after 05's watcher starts. A watch of the test's own (as
+  // Settings → Audio holds one) starts it before the share, so the prompt is pending when the share goes live; the
+  // degrade then comes 5 s into the share (the fake's clock for it is the session's).
+  await desktop.call('Audio', 'Watch', true);
+  await expect
+    .poll(async () => (await desktop.call<{ prompts: unknown[] }>('Audio', 'FriendsHear')).prompts.length, {
+      timeout: MEDIA_TIMEOUT_MS,
+    })
+    .toBe(1);
+
+  await page.getByRole('banner').getByRole('button', { name: 'Share', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'Share your screen' });
+  await sheet.getByRole('button', { name: 'Share', exact: true }).click();
+  const first = page.getByRole('dialog', { name: 'Ready to go live?' });
+  // The first-share sheet names the hotkeys the share will have (03 §10.2).
+  await expect(
+    first.getByText('Pause: Ctrl+Alt+Shift+F9 · Stop: Ctrl+Alt+Shift+F10, also from the tray icon'),
+  ).toBeVisible();
+  await first.getByRole('button', { name: 'Go live' }).click();
+  const panel = page.getByRole('region', { name: 'Your share' });
+  await expect(panel.getByText(`You're live · ${FAKE_LABEL}`)).toBeVisible({ timeout: LIVE_TIMEOUT_MS });
+
+  // Live with the question pending: "1 question waiting" right after the share's line, and the pill's marker.
+  const fast = { intervals: [100], timeout: MEDIA_TIMEOUT_MS };
+  await expect
+    .poll(async () => trayOf(await desktop.state())?.menu.slice(0, 2), fast)
+    .toEqual([
+      { label: `Sharing ${FAKE_LABEL} · 0 watching`, enabled: false },
+      { label: '1 question waiting', action: 'questions', enabled: true },
+    ]);
+  await expect
+    .poll(async () => (await desktop.state()).pill as PillState, fast)
+    .toMatchObject({ Mode: 'live', Questions: 1, Text: { Questions: '1 question waiting' } });
+
+  // 5 s in, the fake loses process loopback (engine endpoint: voice apps are heard, Chrome too, so its question is
+  // gone with its mic row, 05 §14.6). The tray warns, with "Friends hear voice apps" first, and the pill says it in
+  // place of the count.
+  const ALERT_TIMEOUT_MS = 20_000;
+  await expect
+    .poll(async () => trayOf(await desktop.state()), { timeout: ALERT_TIMEOUT_MS })
+    .toMatchObject({ icon: 'tray-warn', tooltip: `Friends hear voice apps · Sharing ${FAKE_LABEL} · 0 watching` });
+  expect(trayOf(await desktop.state())?.menu.slice(0, 2)).toEqual([
+    { label: 'Friends hear voice apps', enabled: false },
+    { label: `Sharing ${FAKE_LABEL} · 0 watching`, enabled: false },
+  ]);
+  await expect
+    .poll(async () => (await desktop.state()).pill as PillState)
+    .toMatchObject({ Mode: 'live', VoiceAppsHeard: true, Text: { Line: 'Sharing · Friends hear voice apps' } });
+
+  // Exactly one toast, with Open, whether or not the window is in front; none again while the banner stays.
+  const alerts = async (): Promise<Toast[]> =>
+    ((await desktop.state()).toasts as Toast[]).filter((t) => t.Kind === 'voice-apps-heard');
+  await expect.poll(async () => (await alerts()).length).toBe(1);
+  const [toast] = await alerts();
+  expect(toast?.Body).toBe(
+    "Voice apps can't be kept out right now, so friends hear everything, including your calls. Open isshoni to turn sound off.",
+  );
+  expect(toast?.Actions?.map((a) => a.ID)).toEqual(['open']);
+  await page.waitForTimeout(QUIET_MS * 2);
+  expect(await alerts(), 'a second voiceAppsHeard toast in the same share').toHaveLength(1);
+
+  await desktop.hotkey('stop');
+  await expect(panel).toBeHidden({ timeout: MEDIA_TIMEOUT_MS });
+  await expect.poll(async () => trayOf(await desktop.state())).toMatchObject({ icon: 'tray-idle' });
+  await expect.poll(async () => ((await desktop.state()).pill as PillState).Mode).toBe('');
 });

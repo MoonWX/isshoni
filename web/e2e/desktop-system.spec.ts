@@ -14,7 +14,8 @@
 // - the end of the session: WM_QUERYENDSESSION stops the share and is acknowledged while the app keeps running (the
 //   end may be cancelled); WM_ENDSESSION (end-session-confirmed) quits the app, acknowledged once it has.
 //
-// The panel's "Resume sharing?" bar and the pill's line are README WA80's: it adds them to the long-lock case.
+// The pill's "Paused · Resume sharing?" is in the long-lock case (README WA80). The panel's "Resume sharing?" bar needs
+// a ShareView field of the bridge's (internal/desktop/bridge), which WA80's paths don't include: a later slice adds it.
 import {
   expect,
   test,
@@ -205,6 +206,10 @@ test('an unlock after the first bound asks "Resume sharing?"; a resume ends the 
   // Keep-awake stays off while the question waits.
   expect((await desktop.state()).keepAwake).toBe(false);
   await expect.poll(() => trayText(desktop), { timeout: STATE_TIMEOUT_MS }).toContain('tray-paused');
+  // The pill's state asks too (README WA80; the fake's pick has the OS border, so the pill isn't on screen).
+  await expect
+    .poll(async () => (await desktop.state()).pill, { timeout: STATE_TIMEOUT_MS })
+    .toMatchObject({ Mode: 'lockPrompt', Text: { Line: 'Paused · Resume sharing?', Resume: 'Resume' } });
 
   // Resume from outside the app's own prompt (the panel calls the controller): the lock pause ends.
   await desktop.call('Share', 'SetPaused', false);

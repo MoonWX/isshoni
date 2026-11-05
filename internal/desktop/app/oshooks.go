@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"maps"
 
 	"github.com/MoonWX/isshoni/internal/desktop/hotkey"
 )
@@ -103,7 +104,9 @@ const (
 	PillReconnecting PillMode = "reconnecting" // "Reconnecting…"
 )
 
-// PillState is the pill's content (03 §11.4).
+// PillState is the pill's content (03 §11.4). The fields after Monitor are what the app adds as built (README WA80),
+// so the Windows pill needs neither the settings nor the catalog: the saved positions, whether the share's server
+// has share.pause, and the texts in the catalog's words.
 type PillState struct {
 	Visible        bool
 	Mode           PillMode
@@ -111,6 +114,40 @@ type PillState struct {
 	VoiceAppsHeard bool   // 05's FriendsHear.alert.voiceAppsHeard: "Friends hear voice apps"
 	Questions      int    // 05's FriendsHear.alert.questions: the amber marker
 	Monitor        string // the captured monitor's device name; "" = the primary monitor
+	// Positions are settings.json's pill.positions: the last position per monitor device name, which the pill clamps
+	// to that monitor's work area (03 §11.4); nil when none was saved.
+	Positions map[string]PillPoint
+	// PauseUnavailable: the server has no share.pause; the Pause button is disabled with Text.PauseUnavailable as its
+	// tooltip (03 §11.3).
+	PauseUnavailable bool
+	Text             PillText
+}
+
+// PillPoint is a pill position in screen coordinates (physical pixels): its top left corner.
+type PillPoint struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+}
+
+// PillText is the pill's words, from the catalog (desktop.native.pill.*): its line ("Sharing · 3 watching",
+// "Paused", "Paused · Resume sharing?", "Reconnecting…", or "Sharing · Friends hear voice apps"), the buttons'
+// names, the disabled Pause button's tooltip, the marker's name ("1 question waiting"; "" without a question) and
+// the collapsed dot's name.
+type PillText struct {
+	Line             string
+	Pause            string
+	Resume           string
+	Stop             string
+	PauseUnavailable string
+	Questions        string
+	Collapsed        string
+}
+
+// Equal reports whether s and o draw the same pill.
+func (s PillState) Equal(o PillState) bool {
+	return s.Visible == o.Visible && s.Mode == o.Mode && s.Watching == o.Watching &&
+		s.VoiceAppsHeard == o.VoiceAppsHeard && s.Questions == o.Questions && s.Monitor == o.Monitor &&
+		s.PauseUnavailable == o.PauseUnavailable && s.Text == o.Text && maps.Equal(s.Positions, o.Positions)
 }
 
 // PillActionKind is what the user did on the pill.
@@ -123,6 +160,8 @@ const (
 	PillCollapse PillActionKind = "collapse"
 	PillExpand   PillActionKind = "expand"
 	PillMoved    PillActionKind = "moved" // Monitor, X, Y: the new position, kept in settings (pill.positions)
+	// PillOpen: a click on the amber marker opens the window on the mic prompt card (03 §11.4; as built, README WA80).
+	PillOpen PillActionKind = "open"
 )
 
 // PillAction is one action on the pill.

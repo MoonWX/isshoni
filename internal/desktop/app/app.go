@@ -120,6 +120,9 @@ type App struct {
 
 	spaLog spaLog // App.Log's rate limit
 
+	safe safety // safety.go: the hotkeys, the pill, the pause toast
+	pill Pill   // OSHooks.Pill(); nil when the OS hooks have none
+
 	authSubs authSubscribers // SubscribeAuth: the auth.state event's source (servers.go)
 	opened   openedCodes     // the link codes whose approval page was opened (servers.go)
 
@@ -183,6 +186,7 @@ func New(d Deps) (*App, error) {
 
 		playbackKick: make(chan struct{}, 1),
 	}
+	a.pill = d.OS.Pill()
 	a.sharing = a.shares.Live
 	return a, nil
 }
@@ -207,6 +211,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.startActive()
 	a.startAudio()
 	unsubscribe := a.shares.Subscribe(a.onShareEvent)
+	a.startSafety()
 	a.flushTray()
 	a.applyCaptureExclusion()
 	if ch := a.d.OS.Events(); ch != nil {
@@ -246,6 +251,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.shares.Close() // C2 has closed, so its share has ended: Close finds its watcher done
 	unsubscribe()
 	a.stopTimers()
+	a.stopSafety()
 	return nil
 }
 

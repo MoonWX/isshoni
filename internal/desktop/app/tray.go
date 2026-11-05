@@ -43,7 +43,7 @@ func (a *App) SetUpdateReady(version string) {
 }
 
 // SetTrayHotkeys gives the menu the registered hotkeys' combinations, by id; nil or empty while none is registered
-// (README WA80 registers them while a share is live).
+// (safety.go registers them while a share is live).
 func (a *App) SetTrayHotkeys(combos map[HotkeyID]string) {
 	m := make(map[tray.HotkeyID]string, len(combos))
 	for id, c := range combos {
@@ -56,7 +56,7 @@ func (a *App) SetTrayHotkeys(combos map[HotkeyID]string) {
 }
 
 // SetAudioAlert gives the tray 05's FriendsHear.alert (05 §14.7 "Outside the window"): voiceAppsHeard and the
-// number of pending mic prompts (README WA80 calls it on every audio.report).
+// number of pending mic prompts; the app calls it on every audio.report (audio.go).
 func (a *App) SetAudioAlert(voiceAppsHeard bool, questions int) {
 	a.tray.mu.Lock()
 	a.tray.voiceHeard, a.tray.questions = voiceAppsHeard, max(questions, 0)
@@ -120,8 +120,10 @@ func (a *App) scheduleTray() {
 	})
 }
 
-// flushTray renders the tray and gives the view to the shell when it changed.
+// flushTray renders the tray and gives the view to the shell when it changed; the pill gets its state with it
+// (safety.go).
 func (a *App) flushTray() {
+	a.flushPill()
 	ts, ok := a.d.Shell.(TrayShell)
 	if !ok {
 		return

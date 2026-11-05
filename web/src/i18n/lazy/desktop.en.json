@@ -21,12 +21,14 @@
       },
       "pill": {
         "live": "Sharing · {{count}} watching",
+        "liveAlert": "Sharing · {{alert}}",
         "paused": "Paused",
         "lockPrompt": "Paused · Resume sharing?",
         "reconnecting": "Reconnecting…",
         "pause": "Pause",
         "resume": "Resume",
-        "stop": "Stop"
+        "stop": "Stop",
+        "collapsed": "Sharing"
       },
       "audio": {
         "voiceAppsHeard": "Friends hear voice apps",
@@ -140,6 +142,9 @@
       "first": {
         "title": "Ready to go live?",
         "friendsSee": "Friends will see: {{label}}",
+        "hotkeys": "Pause: {{pause}} · Stop: {{stop}}, also from the tray icon",
+        "hotkeysPause": "Pause: {{pause}}, also from the tray icon",
+        "hotkeysStop": "Stop: {{stop}}, also from the tray icon",
         "goLive": "Go live"
       },
       "dnd": {
@@ -148,10 +153,20 @@
         "openSettings": "Open Do not disturb settings",
         "shareNow": "Share now"
       },
+      "notice": {
+        "dismiss": "Dismiss"
+      },
       "panel": {
         "live": "You're live · {{label}} · {{preset}} · {{watching}}",
         "paused": "Paused · nothing new leaves your PC; friends see \"Paused\" and hear nothing",
+        "pause": "Pause",
         "resume": "Resume",
+        "stop": "Stop",
+        "withHotkey": "{{action}} ({{hotkey}})",
+        "pauseNeedsNewerServer": "Pause needs a newer server",
+        "hotkeyTakenPause": "Pause hotkey unavailable: another app uses {{hotkey}}",
+        "hotkeyTakenStop": "Stop hotkey unavailable: another app uses {{hotkey}}",
+        "hotkeySettings": "Change it in Settings",
         "reconnecting": "Reconnecting…",
         "unreachable": "Can't reach the server's media port",
         "testConnection": "Test connection",

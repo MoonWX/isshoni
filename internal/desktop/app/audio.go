@@ -70,7 +70,8 @@ func (a *App) startAudio() {
 }
 
 // onAudioEvent is 05's event callback: a new prompt goes out as a toast while the window isn't in the foreground,
-// and a report settles the toasts of prompts it no longer lists (answered in the window, dismissed, or gone).
+// a report settles the toasts of prompts it no longer lists (answered in the window, dismissed, or gone) and gives
+// the tray and the pill its alert, and an alert becomes a toast (README WA80).
 func (a *App) onAudioEvent(ev audio.Event) {
 	switch ev.Name {
 	case audio.EventPrompt:
@@ -88,6 +89,12 @@ func (a *App) onAudioEvent(ev audio.Event) {
 			ids = append(ids, p.ID)
 		}
 		a.toasts.dropRefsExcept(ToastMicPrompt, ids)
+		// Outside the window (05 §14.7): the tray's warning and menu line and the pill's text and marker.
+		a.SetAudioAlert(fh.Alert.VoiceAppsHeard, fh.Alert.Questions)
+	case audio.EventAlert:
+		if b, ok := ev.Payload.(audio.Banner); ok {
+			a.onAudioAlert(b)
+		}
 	}
 }
 

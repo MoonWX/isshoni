@@ -52,6 +52,9 @@ type systemState struct {
 	// suspendStopped: a suspend stopped the share; the resume shows the toast.
 	suspendStopped bool
 	closeToastSent bool // window.go: the close-to-tray toast of this run
+	// noticeDue: the close-to-tray toast went out, so the window shows the same line as a notice the next time it
+	// opens, until the SPA reports it shown (safety.go: WindowNotice, WindowNoticeShown).
+	noticeDue bool
 }
 
 // watchdog is W17's heartbeat state, guarded by App.mu.
@@ -107,7 +110,11 @@ func (a *App) handleSystemEvent(ev SystemEvent) {
 	case EventEndSessionConfirmed:
 		a.onEndSessionConfirmed()
 	case EventDisplayChange:
-		// The pill re-clamps its position (README WA80).
+		// The pill re-clamps its position on WM_DISPLAYCHANGE itself; it gets its state again, too (03 §11.4).
+		a.safe.pillMu.Lock()
+		a.safe.pillSet = false
+		a.safe.pillMu.Unlock()
+		a.scheduleTray()
 	}
 }
 
@@ -271,6 +278,7 @@ func (a *App) resume() {
 		a.log.Info("app: the share wasn't resumed", errAttr(err))
 		return
 	}
+	a.followPauseToast(nil) // the next pause may show its toast again
 	a.mu.Lock()
 	a.clearLockLocked()
 	a.mu.Unlock()
@@ -372,6 +380,8 @@ func (a *App) onShareEvent(ev share.Event) {
 	a.mu.Unlock()
 	a.removeStaleToasts()
 	a.syncAwake()
+	a.syncHotkeys(a.shares.Current())
+	a.followPauseToast(v)
 	a.scheduleTray()
 }
 

@@ -133,6 +133,11 @@ describe('freezeWatched', () => {
     expect(freezeWatched(state(), 0)).toEqual(['s_cy']);
   });
 
+  it('M2: leaves out a paused share: its sharer sends nothing on purpose (docs/m2/03 §11.3)', () => {
+    syncRoom(viewer, room(shareInfo('s_bea', 'u_bea', 1, { status: 'paused' }), shareInfo('s_cy', 'u_cy', 3)), SELF);
+    expect(freezeWatched(state(), 0)).toEqual(['s_cy']);
+  });
+
   it('leaves out a share the server doesn’t forward video for, or is still starting', () => {
     state().applyStatus([status('s_cy', { video: 'off', reason: 'codec' })]);
     expect(freezeWatched(state(), 0)).toEqual(['s_bea']);

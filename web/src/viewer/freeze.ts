@@ -10,13 +10,14 @@
 // What is measured, and what is left alone:
 // - Only a share that the layer policy asks video for (layerPolicy.ts), that is live (a stalled share has its own
 //   notice) and that the server forwards (subscribe.status says neither `off` nor `waiting`): those have their own
-//   overlays, and their clock starts again when video is due.
+//   overlays, and their clock starts again when video is due. A paused share (docs/m2/03 §11.3) is never measured:
+//   its sharer sends nothing new on purpose, and its tile says "Paused" over the last frame.
 // - Only while the page is visible: a hidden tab may stop decoding on its own.
 // - Only a share whose stream is in the sample with a frame count. A tile that the stats can't see is never called
 //   frozen: an overlay over a picture that plays would be worse than a missing notice.
 import type { StatsCollector } from '../lib/stats/collector';
 import type { StatsSample } from '../lib/stats/summarize';
-import { ShareStatusStalled, StatusReasonWaiting, VideoLayerOff } from '../protocol/types.gen';
+import { ShareStatusPaused, ShareStatusStalled, StatusReasonWaiting, VideoLayerOff } from '../protocol/types.gen';
 import type { ViewerServices } from './services';
 import { viewerWants } from './subscriptions';
 import type { ViewerData } from './viewerStore';
@@ -66,7 +67,12 @@ export function createFreezeDetector(): FreezeDetector {
 /** The shares whose video should be moving at `now` (Date.now()): the ones a freeze can be told for. */
 export function freezeWatched(s: ViewerData, now: number): string[] {
   if (s.pageHiddenSince !== null) return [];
-  const live = new Set(s.shares.filter((share) => share.info.status !== ShareStatusStalled).map((share) => share.id));
+  // A stalled share has its own notice; a paused one sends nothing on purpose (docs/m2/03 §11.3).
+  const live = new Set(
+    s.shares
+      .filter((share) => share.info.status !== ShareStatusStalled && share.info.status !== ShareStatusPaused)
+      .map((share) => share.id),
+  );
   return viewerWants(s, now)
     .filter((want) => {
       if (want.video === VideoLayerOff || !live.has(want.shareId)) return false;

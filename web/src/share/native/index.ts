@@ -14,7 +14,8 @@
 //   <NativeShareDisabled reason={caps.reason} label="Share" />            // canShare false: the header's Share
 //
 // And once for the whole desktop app (its layout, every page): <MicPromptCorner />, the mic prompts in the window's
-// corner while no panel or sheet shows them (03 §10.3).
+// corner while no panel or sheet shows them (03 §10.3); and <WindowNotice />, the close-to-tray notice at the top of the
+// window (03 §11.6; the panel shows it too).
 import '../../i18n/lazy/desktop';
 
 export {
@@ -28,6 +29,7 @@ export {
 export { NativeShareButton, type NativeShareButtonProps } from './NativeShareButton';
 export { MicPromptCorner } from './MicPromptCorner';
 export { NativeSharePanel, type NativeSharePanelProps } from './NativeSharePanel';
+export { WindowNotice, type WindowNoticeProps } from './WindowNotice';
 export {
   NativeShareDisabled,
   NativeShareUnavailable,
