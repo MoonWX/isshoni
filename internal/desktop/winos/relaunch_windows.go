@@ -18,8 +18,8 @@ import (
 // (os.Args[1:]) unchanged, in the same environment and working directory, lets it take the foreground, and reports
 // true: the caller exits 0. It reports false, nil when no relaunch is needed: args start with RelaunchedFlag, the
 // parent is gone or its PID was reused (it was created after this process), or it is Explorer or a launcher. Any
-// failure (ErrNoShell without a shell window, access denied, CreateProcessW) is false with the error, and the start
-// goes on in place (the caller logs a WARN). The caller skips it while the running mutex exists (this start only
+// failure (ErrNoShell without a shell window, errShellElsewhere for a shell in another session or of another user,
+// access denied, CreateProcessW) is false with the error, and the start goes on in place (the caller logs a WARN). The caller skips it while the running mutex exists (this start only
 // forwards). Nothing names an exe in its errors or logs (README §4 "Logging").
 func RelaunchUnderShell(args []string) (bool, error) {
 	if len(args) > 0 && args[0] == RelaunchedFlag {
@@ -90,15 +90,15 @@ func createdAfterSelf(pid uint32) (bool, error) {
 }
 
 // startUnderShell starts this exe with RelaunchedFlag and args as a child of the shell's process
-// (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS), and lets it take the foreground.
+// (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS), and lets it take the foreground. The shell's process must be in this
+// process's session and run as this process's user (shellIsOurs).
 func startUnderShell(args []string) error {
-	hwnd := windows.GetShellWindow()
-	if hwnd == 0 {
-		return ErrNoShell
+	shellPID, err := shellProcessID()
+	if err != nil {
+		return err
 	}
-	var shellPID uint32
-	if _, err := windows.GetWindowThreadProcessId(hwnd, &shellPID); err != nil || shellPID == 0 {
-		return fmt.Errorf("winos: the shell's process: %w", errors.Join(err, ErrNoShell))
+	if err := shellIsOurs(shellPID); err != nil {
+		return err
 	}
 	shell, err := windows.OpenProcess(windows.PROCESS_CREATE_PROCESS, false, shellPID)
 	if err != nil {
@@ -155,6 +155,61 @@ func startUnderShell(args []string) error {
 	_ = windows.CloseHandle(pi.Process)
 	// The new process shows the window; this one, which the user started, may hand it the foreground.
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(pi.ProcessId))
+	return nil
+}
+
+// errShellElsewhere: the shell window's process is in another session or runs as another user. The child would
+// inherit its token (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the parent's token, so its user and session), so the app
+// would start out of sight or as someone else while this start exits 0. The start goes on in place instead.
+var errShellElsewhere = errors.New("winos: the shell runs in another session or as another user")
+
+// shellProcessID is the PID owning GetShellWindow's window; ErrNoShell without one.
+func shellProcessID() (uint32, error) {
+	hwnd := windows.GetShellWindow()
+	if hwnd == 0 {
+		return 0, ErrNoShell
+	}
+	var pid uint32
+	if _, err := windows.GetWindowThreadProcessId(hwnd, &pid); err != nil || pid == 0 {
+		return 0, fmt.Errorf("winos: the shell's process: %w", errors.Join(err, ErrNoShell))
+	}
+	return pid, nil
+}
+
+// shellIsOurs is nil when the process pid is in this process's session and its token's user is this process's
+// user; errShellElsewhere (wrapped) when it isn't or its token can't be read.
+func shellIsOurs(pid uint32) error {
+	var mine, theirs uint32
+	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &mine); err != nil {
+		return fmt.Errorf("winos: this process's session: %w", err)
+	}
+	if err := windows.ProcessIdToSessionId(pid, &theirs); err != nil {
+		return fmt.Errorf("winos: the shell's session: %w", err)
+	}
+	if mine != theirs {
+		return fmt.Errorf("%w (session %d, this process %d)", errShellElsewhere, theirs, mine)
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return fmt.Errorf("winos: open the shell's process: %w", err)
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	var tok windows.Token
+	if err := windows.OpenProcessToken(h, windows.TOKEN_QUERY, &tok); err != nil {
+		return fmt.Errorf("%w (its token can't be read: %w)", errShellElsewhere, err)
+	}
+	defer func() { _ = tok.Close() }()
+	theirUser, err := tok.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("winos: the shell's user: %w", err)
+	}
+	myUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("winos: this process's user: %w", err)
+	}
+	if !theirUser.User.Sid.Equals(myUser.User.Sid) {
+		return fmt.Errorf("%w (another user)", errShellElsewhere)
+	}
 	return nil
 }
 

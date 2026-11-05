@@ -2058,12 +2058,15 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
    already exists (this start will only forward). Look up the parent with a Toolhelp snapshot
    (`CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, own entry's `th32ParentProcessID`); a parent that is gone, or was
    created after this process (`GetProcessTimes`: a reused PID), needs no relaunch. If the parent's exe (lower case) is
-   neither `explorer.exe` nor in `audiorules.Launchers` (05 §5.4): `GetShellWindow` → `GetWindowThreadProcessId` →
+   neither `explorer.exe` nor in `audiorules.Launchers` (05 §5.4): `GetShellWindow` → `GetWindowThreadProcessId`;
+   the shell's process must be in this process's session (`ProcessIdToSessionId`) and its token's user must be this
+   process's user (the child inherits the parent process's token, so its user and session: a shell elsewhere would
+   start the app out of sight or as someone else while this start exits 0); then
    `OpenProcess(PROCESS_CREATE_PROCESS)`; `CreateProcessW` of the same exe with `--relaunched` first and then the
    same arguments (quoted with `syscall.EscapeArg`), the same environment and working directory,
    `EXTENDED_STARTUPINFO_PRESENT` with `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` = the shell process; then
-   `AllowSetForegroundWindow(childPid)` and exit 0. On any failure (no shell window, access denied), log WARN and
-   continue in place.
+   `AllowSetForegroundWindow(childPid)` and exit 0. On any failure (no shell window, a shell in another session or
+   of another user, access denied), log WARN and continue in place.
 2a. **Installer running** (06 §2.4, §8.7): `OpenMutexW(SYNCHRONIZE, FALSE, "Local\\io.isshoni.desktop.installing")`.
    When it succeeds (an installer runs right now: interactive, `/S`, or a start-time update), a start from
    `--open-url` writes the link's origin to `PendingServer` and its room id to `PendingRoom` (overwriting older
@@ -2516,8 +2519,11 @@ there.
 - Running mutex: the first instance holds `Local\io.isshoni.desktop.running`; one-shot modes never create it.
 - Shell relaunch: a helper (`internal/desktop/winos/internal/relaunchee`) started from the test process (not a
   launcher) calls `winos.RelaunchUnderShell` and the surviving process writes its parent's exe name to a file:
-  `explorer.exe`; started with `--relaunched` it stays; skipped with a reason when `GetShellWindow` returns 0 (no
-  shell on the runner), and run on the owner's PC runner.
+  `explorer.exe`; started with `--relaunched` it stays (every Windows run). When the shell window's process is in
+  another session or of another user than the test (a CI runner's job outside Explorer's session), the helper must
+  refuse the relaunch (exit 3, the refusal in its file) and the explorer-parent half is skipped with the reason;
+  skipped too when `GetShellWindow` returns 0 (no shell on the runner); the explorer-parent half runs on the owner's
+  PC runner.
 - `--version` prints one JSON line with the fields of §13.4 when stdout is redirected; `--self-check=<path>` on a
   GPU-less runner, against `windows-native`'s `release\` DLL and FFmpeg DLLs, writes `ok: true` with `engine.loaded`,
   `ffmpegLoaded`, `testHooks: false` and `spa.ok` (06's smoke runs the same against the install).

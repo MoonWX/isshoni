@@ -3,12 +3,15 @@
 package winos
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -24,50 +27,119 @@ func buildRelaunchee(t *testing.T) string {
 	return exe
 }
 
-// readWhenWritten waits up to 20 s for the helper's file.
-func readWhenWritten(t *testing.T, path string) string {
+// readWhenWritten waits up to 20 s for the helper's file; diag adds what the failure needs to be read.
+func readWhenWritten(t *testing.T, path string, diag func() string) string {
 	t.Helper()
 	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(50 * time.Millisecond) {
 		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
 			return string(b)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the helper wrote no %s", filepath.Base(path))
+			t.Fatalf("the helper wrote no %s (%s)", filepath.Base(path), diag())
 		}
 	}
 }
 
-// TestRelaunchUnderShell is 03 §22.2's shell relaunch test: the helper, started from this test process (not a
-// launcher), relaunches under the shell, and the process that stays sees explorer.exe as its parent; started with
-// --relaunched it stays in place, under this test. Skipped when there is no shell window (a CI runner without an
-// interactive desktop); it runs on the owner's PC runner.
-func TestRelaunchUnderShell(t *testing.T) {
-	if windows.GetShellWindow() == 0 {
-		t.Skip("no shell window (GetShellWindow returns 0): the relaunch has nothing to start under")
+// processesNamed describes the running processes whose exe file name is name: PID, parent PID and session.
+func processesNamed(name string) string {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return "no process snapshot: " + err.Error()
 	}
+	defer func() { _ = windows.CloseHandle(snap) }()
+	var found []string
+	e := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
+	for err = windows.Process32First(snap, &e); err == nil; err = windows.Process32Next(snap, &e) {
+		if strings.EqualFold(windows.UTF16ToString(e.ExeFile[:]), name) {
+			var s uint32
+			_ = windows.ProcessIdToSessionId(e.ProcessID, &s)
+			found = append(found, fmt.Sprintf("pid %d parent %d session %d", e.ProcessID, e.ParentProcessID, s))
+		}
+	}
+	if len(found) == 0 {
+		return "no " + name + " is running"
+	}
+	return name + " running: " + strings.Join(found, "; ")
+}
+
+// processName is the exe file name of the process pid, "?" when it isn't found.
+func processName(pid uint32) string {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return "?"
+	}
+	defer func() { _ = windows.CloseHandle(snap) }()
+	e := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
+	for err = windows.Process32First(snap, &e); err == nil; err = windows.Process32Next(snap, &e) {
+		if e.ProcessID == pid {
+			return windows.UTF16ToString(e.ExeFile[:])
+		}
+	}
+	return "?"
+}
+
+// TestRelaunchUnderShell is 03 §22.2's shell relaunch test. Started with --relaunched the helper stays in place,
+// under this test. Started from this test process (not a launcher) it relaunches under the shell, and the process
+// that stays sees explorer.exe as its parent. When the shell window's process is in another session or runs as
+// another user than this test (a CI runner whose job doesn't run in Explorer's session or as its user), the helper
+// must refuse the relaunch instead (exit 3, the start goes on in place), and the explorer-parent half is skipped
+// with the reason; it runs on the owner's PC. Skipped when there is no shell window.
+func TestRelaunchUnderShell(t *testing.T) {
 	exe := buildRelaunchee(t)
 	dir := t.TempDir()
-
-	out := filepath.Join(dir, "relaunched.txt")
-	cmd := exec.CommandContext(t.Context(), exe, out)
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("relaunchee: %v", err)
-	}
-	if got := strings.ToLower(readWhenWritten(t, out)); got != "explorer.exe" {
-		t.Fatalf("the relaunched helper's parent is %q, want explorer.exe", got)
-	}
-
-	stay := filepath.Join(dir, "stayed.txt")
-	cmd = exec.CommandContext(t.Context(), exe, RelaunchedFlag, stay)
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("relaunchee --relaunched: %v", err)
-	}
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := readWhenWritten(t, stay); !strings.EqualFold(got, filepath.Base(self)) {
+	stay := filepath.Join(dir, "stayed.txt")
+	if err := exec.CommandContext(t.Context(), exe, RelaunchedFlag, stay).Run(); err != nil {
+		t.Fatalf("relaunchee --relaunched: %v", err)
+	}
+	if got := readWhenWritten(t, stay, func() string { return "--relaunched" }); !strings.EqualFold(got,
+		filepath.Base(self)) {
 		t.Fatalf("with --relaunched the helper's parent is %q, want this test (%s)", got, filepath.Base(self))
+	}
+
+	shellPID, err := shellProcessID()
+	if errors.Is(err, ErrNoShell) {
+		t.Skip("no shell window (GetShellWindow returns 0): the relaunch has nothing to start under")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mine, theirs uint32
+	_ = windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &mine)
+	_ = windows.ProcessIdToSessionId(shellPID, &theirs)
+	where := fmt.Sprintf("the shell window's process %d (%s) in session %d; this test in session %d", shellPID,
+		processName(shellPID), theirs, mine)
+	t.Log(where)
+
+	if err := shellIsOurs(shellPID); err != nil {
+		if !errors.Is(err, errShellElsewhere) {
+			t.Fatal(err)
+		}
+		out := filepath.Join(dir, "refused.txt")
+		runErr := exec.CommandContext(t.Context(), exe, out).Run()
+		var exit *exec.ExitError
+		if !errors.As(runErr, &exit) || exit.ExitCode() != 3 {
+			t.Fatalf("with the shell elsewhere (%v) relaunchee returned %v, want exit 3 (refused, in place)", err, runErr)
+		}
+		if got := readWhenWritten(t, out, func() string { return where }); !strings.HasPrefix(got, "error: ") ||
+			!strings.Contains(got, errShellElsewhere.Error()) {
+			t.Fatalf("helper wrote %q, want the errShellElsewhere refusal", got)
+		}
+		t.Skipf("the relaunch was refused as it must be; the explorer-parent half needs a shell in this test's "+
+			"session and user: %v", err)
+	}
+
+	out := filepath.Join(dir, "relaunched.txt")
+	if err := exec.CommandContext(t.Context(), exe, out).Run(); err != nil {
+		b, _ := os.ReadFile(out) //nolint:gosec // G304: the helper's file in this test's temp dir
+		t.Fatalf("relaunchee: %v, wrote %q (%s)", err, b, where)
+	}
+	got := readWhenWritten(t, out, func() string { return where + "; " + processesNamed(filepath.Base(exe)) })
+	if got = strings.ToLower(got); got != "explorer.exe" {
+		t.Fatalf("the relaunched helper's parent is %q, want explorer.exe", got)
 	}
 }
 
