@@ -18,10 +18,10 @@ static:
   d3d11.dll         # the GPU path (04 section 8)
   dxgi.dll          # adapters, outputs and Desktop Duplication (04 sections 7.4, 8.1)
   dwmapi.dll        # window cloaking and frame bounds (04 section 7.6)
-  shcore.dll        # GetDpiForMonitor (04 section 5.6's dpi)
   # synchronization.lib: WaitOnAddress and WakeByAddressSingle for the rings' wake-up (04 section 6.2)
   api-ms-win-core-synch-l1-2-0.dll
-  # windowsapp.lib, through C++/WinRT (Windows.Graphics.Capture and its picker, 04 sections 7.2, 7.3)
+  # runtimeobject.lib, through C++/WinRT (Windows.Graphics.Capture and its picker, 04 sections 7.2, 7.3; umbrella
+  # libraries such as windowsapp.lib are never linked, 04 section 13.1)
   api-ms-win-core-winrt-l1-1-0.dll
   api-ms-win-core-winrt-string-l1-1-0.dll
   api-ms-win-core-winrt-error-l1-1-0.dll

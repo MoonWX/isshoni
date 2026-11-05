@@ -1,8 +1,9 @@
 // C++/WinRT for the capture area (docs/m2/04-windows-engine.md §7.1–§7.3, §13.1): the projection headers from the
-// Windows SDK (10.0.26100 declares the 24H2 capture properties), windowsapp.lib through #pragma comment (searched after
-// the command line's libraries, so only WinRT's own functions resolve to its API sets, deploy/windows/dll-imports.txt),
-// and the helpers the picker and the WGC capture share. Every API newer than the engine's floor (build 19041) is
-// checked at run time with ApiInformation before use. Include this header only from the capture area's .cpp files.
+// Windows SDK (10.0.26100 declares the 24H2 capture properties), runtimeobject.lib through #pragma comment (the
+// desktop import library of the Ro* and Windows*String functions, through the api-ms-win-core-winrt-* sets of
+// deploy/windows/dll-imports.txt; never windowsapp.lib, see native/windows/CMakeLists.txt), and the helpers the picker
+// and the WGC capture share. Every API newer than the engine's floor (build 19041) is checked at run time with
+// ApiInformation before use. Include this header only from the capture area's .cpp files.
 #pragma once
 
 #include <windows.h>
@@ -32,7 +33,9 @@
 
 #include "isshoni_media.h"
 
-#pragma comment(lib, "windowsapp.lib")
+// C++/WinRT's other imports come from the classic libraries on the link line: ole32 (Co*, RoGetAgileReference),
+// oleaut32 (Sys*String), kernel32 and d3d11 (CreateDirect3D11DeviceFromDXGIDevice).
+#pragma comment(lib, "runtimeobject.lib")
 
 namespace im::capture {
 

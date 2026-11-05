@@ -2581,14 +2581,21 @@ which reads `src/encode/openh264_pin.h` and `third_party/openh264/codec_ver.h`.
   /DEF:isshoni-media.def`, output `isshoni-media.dll` and `isshoni-media.pdb`. `/guard:cf` (compiler and linker)
   only when `IM_SANITIZE` is empty (see `win-x64-asan`).
   Libraries (on the engine's object library `im_engine`, which the DLL and every Windows test executable link):
-  `kernel32 user32 ole32 oleaut32 d3d11 dxgi dxguid dwmapi shcore synchronization avrt mfplat delayimp`, plus 05's
+  `kernel32 user32 ole32 oleaut32 d3d11 dxgi dxguid dwmapi synchronization avrt mfplat delayimp`, plus 05's
   audio libraries; an area that needs another one names it in its source with `#pragma comment(lib, …)`, its DLL
-  going onto `dll-imports.txt`. **`windowsapp.lib` is not on the link line**: listed after `kernel32.lib` it changes
-  nothing, but placed earlier it would make kernel32's functions import from `api-ms-win-core-*` API sets. C++/WinRT
-  code (WA50) adds `#pragma comment(lib, "windowsapp.lib")`, which the linker searches after the command-line
-  libraries, so only WinRT's functions resolve to its API sets (`dll-imports.txt` already lists the WinRT and synch
-  API sets). **Delay-loaded**: `mfplat.dll` (absent on N editions; the probe checks it with
-  `__HrLoadAllImportsForDll` before any call) and `avrt.dll` (`/IGNORE:4199` while no code imports them yet). MMCSS
+  going onto `dll-imports.txt`. **Umbrella libraries (`windowsapp`, `onecore`, `onecoreuap`, `mincore`) are never
+  linked**, not even as a default library: the static CRT's kernel32 functions and C++/WinRT's `/alternatename`
+  targets become undefined only after the linker has passed `kernel32.lib`, so they would bind to the umbrella's
+  `api-ms-win-core-*` API sets (PR #53's first `windows-native` run: 15 unlisted sets from WA50's
+  `#pragma comment(lib, "windowsapp.lib")`). `im_engine` passes `/NODEFAULTLIB` for all four, so a header asking for
+  one fails the link with the symbol named. C++/WinRT code (WA50) adds `#pragma comment(lib, "runtimeobject.lib")`,
+  the classic import library of the `Ro*` and `Windows*String` functions (the `api-ms-win-core-winrt-*` sets
+  `dll-imports.txt` lists); its other functions come from `ole32`, `oleaut32`, `kernel32` and `d3d11`. `shcore.dll`
+  is not import-linked: §5.6's `dpi` (WA60, `src/capture/outputs_win.cpp`) gets `GetDpiForMonitor` from System32's
+  `shcore.dll` with `LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_SYSTEM32)` and `GetProcAddress` (its import came out as
+  `api-ms-win-shcore-scaling-l1-1-1.dll`), falling back to 96 dpi with one log line if either is missing.
+  **Delay-loaded**: `mfplat.dll` (absent on N editions; the probe checks it with `__HrLoadAllImportsForDll` before
+  any call) and `avrt.dll` (`/IGNORE:4199` while no code imports them yet). MMCSS
   does not import `avrt.dll` at all: the session threads (WA23, `src/engine/os_windows.cpp`) load it on first use with
   `LoadLibraryExW(L"avrt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and `GetProcAddress`
   (`AvSetMmThreadCharacteristicsW`, `AvRevertMmThreadCharacteristics`), so it adds no import and no delay-load

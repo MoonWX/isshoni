@@ -72,10 +72,32 @@ uint32_t RefreshHz(const wchar_t *device_name) noexcept {
   return dm.dmDisplayFrequency > 1 ? dm.dmDisplayFrequency : 0; // 0 and 1 mean "the hardware's default"
 }
 
+// GetDpiForMonitor from System32's shcore.dll, loaded on first use rather than imported (04 §13.1): the import
+// linked through the SDK came out as api-ms-win-shcore-scaling-l1-1-1.dll, an API set deploy/windows/dll-imports.txt
+// doesn't list. user32 has no per-monitor DPI without a window. shcore.dll is on every supported Windows (build 19041
+// up); if it or the function is missing, that is logged once and every output reports 96 dpi.
+using GetDpiForMonitorFn = HRESULT(WINAPI *)(HMONITOR, MONITOR_DPI_TYPE, UINT *, UINT *);
+
+GetDpiForMonitorFn DpiForMonitorFn() noexcept {
+  static const GetDpiForMonitorFn fn = []() noexcept -> GetDpiForMonitorFn {
+    GetDpiForMonitorFn f = nullptr;
+    if (const HMODULE m = ::LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+      f = reinterpret_cast<GetDpiForMonitorFn>(reinterpret_cast<void *>(::GetProcAddress(m, "GetDpiForMonitor")));
+    }
+    if (f == nullptr) {
+      log::Warn("capture", "GetDpiForMonitor unavailable, outputs report 96 dpi",
+                {{"error", static_cast<uint32_t>(::GetLastError())}});
+    }
+    return f;
+  }();
+  return fn;
+}
+
 uint32_t EffectiveDpi(HMONITOR monitor) noexcept {
+  const GetDpiForMonitorFn get_dpi = DpiForMonitorFn();
   UINT x = 0;
   UINT y = 0;
-  if (FAILED(::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &x, &y)) || x == 0) {
+  if (get_dpi == nullptr || FAILED(get_dpi(monitor, MDT_EFFECTIVE_DPI, &x, &y)) || x == 0) {
     return 96;
   }
   return x;

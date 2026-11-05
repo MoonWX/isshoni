@@ -604,7 +604,7 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   - **Imports**: `deploy/windows/dll-imports.txt` has two sections, `static:` and `delay:`. Every imported DLL must
     be listed in the section that matches how it is imported. `mfplat.dll` and `avrt.dll` are allowed only under
     `delay:` (04 §13.1; mfplat is absent on N editions and Windows Server). The `api-ms-win-core-*` API sets that
-    `windowsapp.lib` and `synchronization.lib` pull in are listed by 04 in slice E2; 05's audio DLLs by 05; any other
+    `runtimeobject.lib` and `synchronization.lib` pull in are listed by 04 in slice E2; 05's audio DLLs by 05; any other
     system DLL by PR with a reason. An import of `avcodec-*` or `avutil-*` **always fails**, like the C runtime
     (`VCRUNTIME*`, `MSVCP*`, `MSVCR*` such as `msvcrt.dll`, `api-ms-win-crt-*`, `ucrtbase*`, `concrt*`, `vccorlib*`,
     their debug builds) and `opus*.dll`: the engine must load, probe and capture audio when FFmpeg is missing or
