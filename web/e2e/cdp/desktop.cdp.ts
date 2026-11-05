@@ -28,6 +28,10 @@
 // builds), and so do the browser contexts of the people (Google Chrome). The W19 case runs a production build too:
 // ISSHONI_DESKTOP_PROD_EXE, or in CI the stage's dist-desktop/stage/isshoni.exe. A production build has no e2e data
 // folder: it runs on the PC's real %LOCALAPPDATA%\isshoni, which is why it never runs unless asked for outside CI.
+// It also runs under the real app id (winos.InstanceID): an installed isshoni that is running takes the
+// single-instance forward and the build exits 0 at once (quit the installed app first), and Wails' notifications
+// service rewrites HKCU\Software\Classes\CLSID\{GUID}\LocalServer32 to this build's path, so the installed app's toast
+// activator points at it until the installed app next starts.
 //
 // What the runner can't show stays manual (03 §22.5, the owner's PC): W9's status bar, autofill and password save,
 // swipe, external drop, the default context menu and DevTools of a production build, and the real keyboard's
@@ -50,6 +54,7 @@ import { REPO_ROOT } from '../global-setup.ts';
 import { audioOf, readStats, waitForRoom, waitForState, waitForStats, videoOf } from '../stats.ts';
 import {
   closeMainWindow,
+  type ChildProcessInfo,
   descendants,
   environmentNames,
   mainWindow,
@@ -307,9 +312,19 @@ async function launch(options: LaunchOptions): Promise<RealApp> {
     await assertUsedDataDir(dataDir);
     const attached = await attachPage(endpoint);
     browser = attached.browser;
+    const attachedAt = Date.now();
+    // DOMContentLoaded as the page itself timed it (epoch ms on this machine's clock, as `started` is): the attach
+    // time adds this spec's endpoint poll, the data-folder check and connectOverCDP, so it is recorded on its own.
+    const dcl = await attached.page.evaluate(() => {
+      const n = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
+      return n === undefined || n.domContentLoadedEventEnd === 0
+        ? null
+        : performance.timeOrigin + n.domContentLoadedEventEnd;
+    });
     budget(
       `startup to the page (spawn of the e2e build, --relaunched, to DOMContentLoaded at the asset origin, a new ` +
-        `WebView2 profile; CI runner): ${String(Date.now() - started)} ms`,
+        `WebView2 profile; CI runner): ${dcl === null ? 'unreadable (no navigation timing)' : `${String(Math.round(dcl - started))} ms`}; ` +
+        `to Playwright attached: ${String(attachedAt - started)} ms`,
     );
     return { browser, page: attached.page, process: child, exited, stop };
   } catch (err) {
@@ -876,8 +891,12 @@ test('the app end to end: a device-flow link, a fake share watched in Chrome, cl
   const mem = await memory(pid);
   budget(
     `while sharing the fake engine's 640×360 with 1 watching (CI runner, not the budget's 1080p60): isshoni.exe ` +
-      `${mib(mem.app)} private working set; its ${String(mem.webviewProcesses)} WebView2 processes ${mib(mem.webview)} ` +
-      `together (the budget's own case, watching one focused share and 8 thumbnails, is M-DESK-12's)`,
+      `${mem.app === null ? 'unreadable' : mib(mem.app)} private working set; its ${String(mem.webviewProcesses)} ` +
+      `WebView2 processes ${
+        mem.webview === null
+          ? `unreadable (${String(mem.webviewRead)} of ${String(mem.webviewProcesses)} processes read)`
+          : `${mib(mem.webview)} together`
+      } (the budget's own case, watching one focused share and 8 thumbnails, is M-DESK-12's)`,
   );
 
   // Close the window while live (03 §11.6): it hides to the tray, the process lives and the share goes on.
@@ -957,7 +976,10 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
   const prod = productionExe();
   test.skip(
     prod === null,
-    `set ${PROD_EXE_ENV} to a production isshoni.exe: it runs on this PC's real %LOCALAPPDATA%\\isshoni`,
+    `set ${PROD_EXE_ENV} to a production isshoni.exe: it runs on this PC's real %LOCALAPPDATA%\\isshoni under ` +
+      `the real app id, so quit any installed isshoni first (else the single-instance forward ends the build at once), ` +
+      `and the installed app's toast activator (HKCU CLSID LocalServer32) points at this build until the installed ` +
+      `app next starts`,
   );
   if (prod === null) return;
   if (!fs.existsSync(prod)) throw new Error(`no production build at ${prod} (task desktop:package:windows stages it)`);
@@ -973,11 +995,26 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
 
   // The control: the e2e build, which keeps WEBVIEW2_*, started with the same variables, still has WEBVIEW2_X in its
   // environment block, so the reader below sees what a parent passed (a scrub-less production build would look so).
+  // Its WebView2 browser process (no --type=) is read too, so the reader is proven on the webview side as well.
+  const browserOf = (tree: readonly ChildProcessInfo[]): ChildProcessInfo[] =>
+    webviewProcesses(tree).filter((p) => !p.commandLine.includes('--type='));
   const control = await launchApp({ env: vars });
-  const controlNames = await environmentNames(control.process?.pid ?? 0);
+  const controlPid = control.process?.pid ?? 0;
+  const controlNames = await environmentNames(controlPid);
+  const controlBrowserEnvs = await Promise.all(
+    browserOf(await descendants(controlPid)).map((p) => environmentNames(p.pid)),
+  );
   await control.stop();
   expect(controlNames, "the e2e build's environment can be read").not.toBeNull();
   expect(upperNames(controlNames ?? [])).toContain('WEBVIEW2_X');
+  const controlBrowserRead = controlBrowserEnvs.filter((e): e is string[] => e !== null);
+  expect(controlBrowserRead.length, "the e2e build's WebView2 browser process environment can be read").toBeGreaterThan(
+    0,
+  );
+  expect(
+    controlBrowserRead.some((e) => upperNames(e).includes('WEBVIEW2_X')),
+    "the e2e build's WebView2 browser process has WEBVIEW2_X",
+  ).toBe(true);
 
   // The production build. It has no e2e data folder: remember whether %LOCALAPPDATA%\isshoni was there before.
   const localAppData = process.env['LOCALAPPDATA'] ?? '';
@@ -988,6 +1025,12 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
     const pid = child.pid ?? 0;
     const deadline = Date.now() + START_TIMEOUT_MS;
     for (;;) {
+      if (child.exitCode === 0) {
+        throw new Error(
+          'the production build exited 0 at once: another isshoni (same single-instance id) is probably running; ' +
+            'quit it (tray → Quit) and run again',
+        );
+      }
       if (child.exitCode !== null) throw new Error(`the production build exited (${String(child.exitCode)})`);
       if (webviewProcesses(await descendants(pid)).length > 0 && (await mainWindow(pid)) !== '0') break;
       if (Date.now() > deadline) throw new Error('the production build showed no window with a WebView2 within 60 s');
@@ -1008,7 +1051,7 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
     const names = await environmentNames(pid);
     const left = upperNames(names ?? []).filter((n) => n.startsWith('WEBVIEW2_') && !WAILS_PLACEHOLDERS.includes(n));
     // WebView2's browser process (no --type=): its environment too, where it can be read.
-    const browserProcs = webviews.filter((p) => !p.commandLine.includes('--type='));
+    const browserProcs = browserOf(tree);
     const browserEnvs = await Promise.all(browserProcs.map((p) => environmentNames(p.pid)));
     const browserX = browserEnvs.filter((e) => e !== null && upperNames(e).includes('WEBVIEW2_X')).length;
     row(
@@ -1020,7 +1063,7 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
         `${String(webviews.length)} WebView2 processes, command lines naming the port, the pipe or WEBVIEW2_: ${String(leaking.length)}`,
         `isshoni.exe's environment: WEBVIEW2_* beyond Wails' five placeholders: ${left.length === 0 ? 'none' : left.join(', ')}`,
         `WebView2 browser processes read: ${String(browserEnvs.filter((e) => e !== null).length)}/${String(browserProcs.length)}, with WEBVIEW2_X: ${String(browserX)}`,
-        'control: the e2e build kept WEBVIEW2_X',
+        `control: the e2e build kept WEBVIEW2_X (its own block and ${String(controlBrowserRead.length)} WebView2 browser process read)`,
       ].join('; '),
     );
     expect(open, 'the debugging port is open').toBe(false);
@@ -1028,6 +1071,11 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
     expect(leaking.map((p) => p.name)).toEqual([]);
     expect(names, "the production build's environment can be read").not.toBeNull();
     expect(left).toEqual([]);
+    // Not vacuous: at least one browser process's environment was read (it is the user's own, unsandboxed process).
+    expect(
+      browserEnvs.filter((e) => e !== null).length,
+      "a WebView2 browser process's environment can be read",
+    ).toBeGreaterThan(0);
     expect(browserX).toBe(0);
   } finally {
     await kill(child, exited);

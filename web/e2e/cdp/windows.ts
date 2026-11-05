@@ -214,10 +214,13 @@ try { ConvertTo-Json -Compress -InputObject @([IsshoniCdpPeb]::Names(${String(pi
 
 /** Private working sets in bytes (Task Manager's "Memory (private working set)"): the app's and its WebView2's. */
 export interface Memory {
-  readonly app: number;
-  /** The sum over the app's msedgewebview2.exe processes. */
-  readonly webview: number;
+  /** null when the perf provider had no row for the app (not picked up yet, or gone). */
+  readonly app: number | null;
+  /** The sum over the app's msedgewebview2.exe processes; null unless every one of them had a row. */
+  readonly webview: number | null;
   readonly webviewProcesses: number;
+  /** How many of the WebView2 processes had a row. */
+  readonly webviewRead: number;
 }
 
 /** The private working set of the app and the sum of its WebView2 processes' (Win32_PerfFormattedData_PerfProc_Process). */
@@ -231,11 +234,15 @@ $rows = @(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process |
   ForEach-Object { [pscustomobject]@{ pid = [int]$_.IDProcess; ws = [int64]$_.WorkingSetPrivate } })
 ConvertTo-Json -Compress -InputObject $rows`);
   const rows = jsonArray<{ pid: number; ws: number }>(out);
-  const of = (id: number): number => rows.find((r) => r.pid === id)?.ws ?? 0;
+  // A pid without a row is unreadable, never 0 bytes: the annotation must not record it as a measurement.
+  const of = (id: number): number | null => rows.find((r) => r.pid === id)?.ws ?? null;
+  const webview = tree.map((p) => of(p.pid));
+  const read = webview.filter((ws): ws is number => ws !== null);
   return {
     app: of(pid),
-    webview: tree.reduce((sum, p) => sum + of(p.pid), 0),
+    webview: tree.length > 0 && read.length === tree.length ? read.reduce((sum, ws) => sum + ws, 0) : null,
     webviewProcesses: tree.length,
+    webviewRead: read.length,
   };
 }
 
