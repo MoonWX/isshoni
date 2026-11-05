@@ -1,0 +1,80 @@
+<dialog class="dialog md sheet bottom" aria-labelledby="ID" open="">
+<div class="frame">
+<header class="header">
+<h2 id="ID" class="title">Share your screen</h2>
+<button type="button" class="close" aria-label="Close">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x" aria-hidden="true">
+<path d="M18 6 6 18">
+</path>
+<path d="m6 6 12 12">
+</path>
+</svg>
+</button>
+</header>
+<div class="body">
+<div class="body">
+<fieldset class="presets">
+<legend class="legend">Optimize for</legend>
+<label class="preset">
+<input type="radio" value="auto" checked="" name="ID">
+<span class="presetName">Auto</span>
+<span class="presetHint">A good balance for most things</span>
+</label>
+<label class="preset">
+<input type="radio" value="game" name="ID">
+<span class="presetName">Game</span>
+<span class="presetHint">Smooth motion comes first</span>
+</label>
+<label class="preset">
+<input type="radio" value="movie" name="ID">
+<span class="presetName">Movie</span>
+<span class="presetHint">Smooth motion, and better sound</span>
+</label>
+<label class="preset">
+<input type="radio" value="text" name="ID">
+<span class="presetName">Text</span>
+<span class="presetHint">Sharp text comes first</span>
+</label>
+</fieldset>
+<label class="switch">
+<input type="checkbox" checked="">
+<span>Share sound</span>
+</label>
+<p class="note">Muting your PC doesn't mute your stream. Use Pause or turn Share sound off.</p>
+<div class="summary">
+<p class="summaryLine">
+<span>Friends will hear everything on this PC</span> <button type="button" class="linkButton" aria-expanded="true" aria-controls="ID">Details</button>
+</p>
+<div id="ID">
+<p class="everything">Friends will hear everything on this PC</p>
+</div>
+</div>
+<div class="banners">
+<p class="banner error" role="alert" data-banner="windows-too-old">Update Windows to keep voice apps out. Until then, friends hear everything this PC plays.</p>
+</div>
+</div>
+</div>
+<footer class="footer">
+<button type="button" class="button ghost md">
+<span class="label">Cancel</span>
+</button>
+<button type="button" class="button primary md">
+<span class="icon" aria-hidden="true">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-monitor-up" aria-hidden="true">
+<path d="m9 10 3-3 3 3">
+</path>
+<path d="M12 13V7">
+</path>
+<rect width="20" height="14" x="2" y="3" rx="2">
+</rect>
+<path d="M12 17v4">
+</path>
+<path d="M8 21h8">
+</path>
+</svg>
+</span>
+<span class="label">Share</span>
+</button>
+</footer>
+</div>
+</dialog>

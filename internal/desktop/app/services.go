@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/url"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -60,9 +61,6 @@ func clientOS() string {
 	return runtime.GOOS
 }
 
-// Heartbeat is the SPA's watchdog beat (W17's fallback, 03 §20): every 5 s. The watchdog itself is README WA68's.
-func (a *App) Heartbeat() {}
-
 // Live reports a share being started or running, and its room (03 §11.6's "while live"): the bridge answers busy
 // for what a live share forbids. It is the share controller's Live.
 func (a *App) Live() (roomID string, live bool) { return a.sharing() }
@@ -114,18 +112,12 @@ func (a *App) OpenOSSettings(p OSPage) error {
 	return a.d.OS.OpenSettingsPage(p)
 }
 
-// OpenLogsFolder opens Explorer at the logs folder (03 §6.2); README WA68 adds the shell open.
-func (a *App) OpenLogsFolder() error { return ErrNotImplemented }
-
-// OpenNotices opens <exe dir>\licenses\THIRD_PARTY_NOTICES.txt (03 §6.2, 06 §2.2); README WA68 adds it.
-func (a *App) OpenNotices() error { return ErrNotImplemented }
-
 // MaxOwnConnections bounds App.OwnConnections (03 §20).
 const MaxOwnConnections = 64
 
 // OwnConnections takes the online connection ids of C1's user.connections, which the SPA sends on every change; a
-// playback.state sender that isn't among them is expired (03 §12.2, README WA77). More than 64 ids, or an id that
-// isn't a connection id's shape, is ErrInvalidArgument.
+// playback.state sender that was among them and no longer is counts as stopped: 05's SetViewerBrowser(id, …, false)
+// (03 §12.2). More than 64 ids, or an id that isn't a connection id's shape, is ErrInvalidArgument.
 func (a *App) OwnConnections(ids []string) error {
 	if len(ids) > MaxOwnConnections {
 		return fmt.Errorf("%w: more than %d connections", ErrInvalidArgument, MaxOwnConnections)
@@ -136,8 +128,10 @@ func (a *App) OwnConnections(ids []string) error {
 		}
 	}
 	a.mu.Lock()
-	a.ownConns = append(a.ownConns[:0], ids...)
+	prev := a.ownConns
+	a.ownConns = slices.Clone(ids)
 	a.mu.Unlock()
+	a.expirePlayback(prev, ids)
 	return nil
 }
 

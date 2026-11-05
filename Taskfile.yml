@@ -340,7 +340,11 @@ tasks:
             echo "test:ps: skipped, $pwsh is not installed here (CI runs the tests; PWSH=<binary> picks another PowerShell)"
             exit 0
           fi
-          tmp=$(mktemp -d)
+          # Task's shell on Windows has no /tmp and its mktemp takes no folder in the template: a folder of its own
+          # in TMPDIR, else Windows' TEMP.
+          tmp="${TMPDIR:-${TEMP:-/tmp}}/test-ps.$$"
+          rm -rf "$tmp"
+          mkdir -p "$tmp"
           trap 'rm -rf "$tmp"' EXIT
           cat >"$tmp/test-ps.ps1" <<'EOF'
           $ErrorActionPreference = 'Stop'
@@ -577,7 +581,26 @@ tasks:
             exit 0
           fi
           status=0
-          for f in $files deploy/test/install-desktop.Tests.ps1; do
+          # grep, cut and tr come from PATH (Task's own coreutils on Windows have none of them); without them the
+          # byte checks below would pass silently. A Windows PC without Git's usr\bin on PATH skips them with a note
+          # (lint-deploy runs them on Linux); CI must have them.
+          bytechecks=1
+          for tool in grep cut tr; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              if [ -n "${CI:-}" ]; then
+                echo "lint:ps: $tool is not on PATH" >&2
+                exit 1
+              fi
+              bytechecks=0
+            fi
+          done
+          if [ "$bytechecks" = 0 ]; then
+            echo "lint:ps: skipped the ASCII and LF checks, grep, cut or tr is not on PATH (Git's usr\bin; CI runs them)"
+            files_bytes=''
+          else
+            files_bytes="$files deploy/test/install-desktop.Tests.ps1"
+          fi
+          for f in $files_bytes; do
             if [ ! -f "$f" ]; then continue; fi
             # Bytes other than tab, CR, LF and printable ASCII (-a: a NUL byte counts too, not "binary file"). grep
             # exits 1 when it finds none, which Task's errexit and pipefail would take for a failure.
@@ -589,7 +612,8 @@ tasks:
           done
           # The server embeds install-desktop.ps1 and serves its bytes (docs/m2/06 §7.1, §7.4): LF line ends. A Git
           # for Windows checkout keeps them only with the file's `text eol=lf` line in .gitattributes.
-          if [ -f deploy/install-desktop.ps1 ] && LC_ALL=C grep -q "$(printf '\r')" deploy/install-desktop.ps1; then
+          if [ "$bytechecks" = 1 ] && [ -f deploy/install-desktop.ps1 ] &&
+            LC_ALL=C grep -q "$(printf '\r')" deploy/install-desktop.ps1; then
             echo 'lint:ps: deploy/install-desktop.ps1 has CRLF line ends; it must have LF' >&2
             status=1
           fi
@@ -602,7 +626,11 @@ tasks:
             echo "lint:ps: ASCII check done; skipped PSScriptAnalyzer, $pwsh is not installed here (CI runs it; PWSH=<binary> picks another PowerShell)"
             exit $status
           fi
-          tmp=$(mktemp -d)
+          # Task's shell on Windows has no /tmp and its mktemp takes no folder in the template: a folder of its own
+          # in TMPDIR, else Windows' TEMP (as test:ps).
+          tmp="${TMPDIR:-${TEMP:-/tmp}}/lint-ps.$$"
+          rm -rf "$tmp"
+          mkdir -p "$tmp"
           trap 'rm -rf "$tmp"' EXIT
           cat >"$tmp/lint-ps.ps1" <<'EOF'
           $ErrorActionPreference = 'Stop'
@@ -815,13 +843,15 @@ tasks:
     desc: >-
       Cross-build isshoni.exe (GOOS=windows, no cgo) into dist-desktop/windows_amd64/, stamped with VERSION; TAGS
       defaults to production, and other tags build into dist-desktop/windows_amd64-test/ (docs/m2/06 §5.2)
-    # 06 §5.2 steps 1 and 2 (README WA67 adds step 3's checks): the exe's resources (icon, manifest, version info),
-    # then the cross-build, then a check that the exe carries app.manifest unchanged. The resources come from
-    # cmd/isshoni-desktop/build/windows/syso.go, built in the tools/wails3 module (its graph pins tc-hib/winres for
-    # wails3's own syso step), not from `wails3 generate syso`: that one parses the manifest and writes it back
-    # without <activeCodePage> and with a System instead of a PerMonitor DPI fallback. The .syso exists only during
-    # the build and is git-ignored (cmd/isshoni-desktop/.gitignore), so the exe's vcs.modified stays false on a clean
-    # checkout. The version resource's four-part number follows 06 §5.3 (WA67 moves it to tools/desktoppkg winver).
+    # 06 §5.2: step 1, the exe's resources (icon, manifest, version info); step 2, the cross-build, then a check that
+    # the exe carries app.manifest unchanged; step 3 (README WA67), on a default-TAGS build, `desktoppkg check -exe`:
+    # -trimpath, CGO_ENABLED=0, GOOS=windows, the tags exactly production, the version stamped, no test or dev
+    # strings. The resources come from cmd/isshoni-desktop/build/windows/syso.go, built in the tools/wails3 module
+    # (its graph pins tc-hib/winres for wails3's own syso step), not from `wails3 generate syso`: that one parses the
+    # manifest and writes it back without <activeCodePage> and with a System instead of a PerMonitor DPI fallback.
+    # The .syso exists only during the build and is git-ignored (cmd/isshoni-desktop/.gitignore), so the exe's
+    # vcs.modified stays false on a clean checkout. The version resource's four-part number is `desktoppkg winver`
+    # (06 §5.3), which also refuses a VERSION that isn't X.Y.Z[-pre][+build].
     preconditions:
       - sh: '[ -f web/dist/index.html ]'
         msg: >-
@@ -837,24 +867,10 @@ tasks:
       - cmd: |
           set -e
           v='{{.VERSION}}'
-          bad() { echo "desktop:exe:windows: VERSION $v is not X.Y.Z[-pre][+build]" >&2; exit 1; }
-          case $v in *-|*-+*|*+|*-.*|*.) bad ;; esac
-          core=${v%%+*}
-          pre=
-          case $core in *-*) pre=${core#*-}; core=${core%%-*} ;; esac
-          x=${core%%.*}; rest=${core#*.}
-          case $rest in *.*) ;; *) bad ;; esac
-          y=${rest%%.*}; z=${rest#*.}
-          for n in "$x" "$y" "$z"; do
-            case $n in ''|*[!0-9]*) bad ;; esac
-            if [ "$n" -gt 65535 ]; then echo "desktop:exe:windows: VERSION $v has a part above 65535" >&2; exit 1; fi
-          done
-          w=65000
-          if [ -n "$pre" ]; then
-            last=${pre##*.}
-            case $last in ''|*[!0-9]*) w=0 ;; *) w=$((last % 65000)) ;; esac
-          fi
-          winver="$x.$y.$z.$w"
+          winver=$(go -C tools run ./desktoppkg winver "$v") || {
+            echo "desktop:exe:windows: VERSION $v has no Windows version (06 §5.3)" >&2
+            exit 1
+          }
           mkdir -p dist-desktop/.build '{{.OUT}}'
           cat > dist-desktop/.build/info.json <<EOF
           {"fixed": {"file_version": "$winver", "product_version": "$winver"},
@@ -876,6 +892,9 @@ tasks:
           rm -f '{{.SYSO}}'
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           '{{.SYSO_TOOL}}' -check '{{.OUT}}/isshoni.exe' -manifest '{{.MANIFEST}}'
+          if [ '{{.TAGS}}' = production ]; then
+            go -C tools run ./desktoppkg check -exe '{{.ROOT_DIR}}/{{.OUT}}/isshoni.exe' -version "$v"
+          fi
           echo "desktop:exe:windows: {{.OUT}}/isshoni.exe ($v, file version $winver, tags {{.TAGS}})"
 
   desktop:build:e2e:
@@ -886,11 +905,90 @@ tasks:
 
   desktop:package:windows:
     desc: >-
-      Build the NSIS installer from dist-desktop/ and the engine DLLs in NATIVE_DIR (on the Mac with Homebrew's
-      makensis and a plain WriteUninstaller; never released, docs/m2/06 §5.4, §6)
+      Build the NSIS installer dist-desktop/isshoni-desktop_<VERSION>_windows_amd64_setup.exe from isshoni.exe and
+      the engine DLLs in NATIVE_DIR (on the Mac with Homebrew's makensis and a plain WriteUninstaller; never
+      released, docs/m2/06 §5.4, §6)
+    # 06 §5.4, §6, §9.2: isshoni.exe (desktop:exe:windows, unless SKIP_EXE=true), the desktop THIRD_PARTY_NOTICES
+    # (tools/notices for cmd/isshoni-desktop on windows, with the native section and its gate, 06 §9), the stage
+    # (`desktoppkg stage`, -release with RELEASE=true), the installer (`desktoppkg nsis`: makensis -WX), then
+    # `desktoppkg check` (the strings rule, the stage's binaries, the size budget). Variables:
+    #   NATIVE_DIR=<dir>           isshoni-media.dll, the FFmpeg DLLs that native/ffmpeg/lock.json names and
+    #                              licenses/ffmpeg/: the windows-native artifact's release\ folder (from a CI run's
+    #                              artifact, or the owner's PC's build) (required)
+    #   WEBVIEW2=<file>            the WebView2 bootstrapper (default NATIVE_DIR/MicrosoftEdgeWebview2Setup.exe)
+    #   MAKENSIS=<binary>          default makensis from PATH (brew install makensis on the Mac)
+    #   PREBUILT_UNINSTALLER=true  Windows only (CI, 06 §6.9): compile uninst-gen.nsi, run it with /S and pack the
+    #                              uninstall.exe it writes instead of calling WriteUninstaller
+    #   RELEASE=true               stage -release (06 §6.2): the windows-desktop smoke installer and release.yml
+    #   SKIP_EXE=true              use the isshoni.exe already in dist-desktop/windows_amd64/
+    #   OUT=<file>                 the installer (default dist-desktop/isshoni-desktop_<VERSION>_windows_amd64_setup.exe)
+    # Relative paths are relative to the repository root.
+    vars:
+      NATIVE_DIR: '{{.NATIVE_DIR | default ""}}'
+      WEBVIEW2: '{{.WEBVIEW2 | default (print .NATIVE_DIR "/MicrosoftEdgeWebview2Setup.exe")}}'
+      MAKENSIS: '{{.MAKENSIS | default "makensis"}}'
+      OUT: '{{.OUT | default (print "dist-desktop/isshoni-desktop_" .VERSION "_windows_amd64_setup.exe")}}'
+      RELEASE: '{{.RELEASE | default "false"}}'
+      PREBUILT_UNINSTALLER: '{{.PREBUILT_UNINSTALLER | default "false"}}'
+      SKIP_EXE: '{{.SKIP_EXE | default "false"}}'
+    preconditions:
+      - sh: '[ -n "{{.NATIVE_DIR}}" ] && [ -d "{{.NATIVE_DIR}}" ]'
+        msg: >-
+          NATIVE_DIR=<dir> must name the folder with isshoni-media.dll, the FFmpeg DLLs and licenses/ffmpeg/
+          (the windows-native artifact's release folder).
+      - sh: '[ -f web/dist/licenses.txt ]'
+        msg: 'web/dist/licenses.txt is missing (the desktop notices need it). Run "task build:web" first.'
+      - sh: 'command -v "{{.MAKENSIS}}" >/dev/null 2>&1 || [ -f "{{.MAKENSIS}}" ]'
+        msg: 'makensis ({{.MAKENSIS}}) is not on PATH: on the Mac "brew install makensis", or pass MAKENSIS=<binary>.'
     cmds:
-      - cmd: "echo 'desktop:package:windows: note: not implemented yet; README WA67 adds it with deploy/windows/nsis/. Nothing was built.'"
-        silent: true
+      - task: desktop:exe:windows
+        vars: {VERSION: '{{.VERSION}}'}
+        if: '{{if eq .SKIP_EXE "true"}}false{{else}}true{{end}}'
+      - cmd: |
+          set -e
+          abs() {
+            case $1 in /* | [A-Za-z]:*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' '{{.ROOT_DIR}}' "$1" ;; esac
+          }
+          v='{{.VERSION}}'
+          native=$(abs '{{.NATIVE_DIR}}')
+          webview2=$(abs '{{.WEBVIEW2}}')
+          out=$(abs '{{.OUT}}')
+          makensis='{{.MAKENSIS}}'
+          case $makensis in */*) makensis=$(abs "$makensis") ;; esac
+          build='{{.ROOT_DIR}}/dist-desktop/.build'
+          mkdir -p "$build"
+          go -C tools run ./notices -root .. -pkg ./cmd/isshoni-desktop -goos windows -goarch amd64 \
+            -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt \
+            -native ../deploy/notices/native-windows.json -native-root "$native" -version "$v" \
+            -o "$build/THIRD_PARTY_NOTICES-desktop"
+          release=
+          if [ '{{.RELEASE}}' = true ]; then release=-release; fi
+          go -C tools run ./desktoppkg stage $release -version "$v" -native "$native" \
+            -notices "$build/THIRD_PARTY_NOTICES-desktop"
+          prebuilt=
+          if [ '{{.PREBUILT_UNINSTALLER}}' = true ]; then
+            if [ '{{OS}}' != windows ]; then
+              echo 'desktop:package:windows: PREBUILT_UNINSTALLER=true runs the uninstaller generator, on Windows only' >&2
+              exit 1
+            fi
+            rm -rf "$build/uninst"
+            mkdir -p "$build/uninst"
+            go -C tools run ./desktoppkg nsis -uninstaller-generator -version "$v" -makensis "$makensis" \
+              -out "$build/uninst/uninst-gen.exe"
+            "$build/uninst/uninst-gen.exe" /S || {
+              echo "desktop:package:windows: the uninstaller generator exited $?" >&2
+              exit 1
+            }
+            if [ ! -f "$build/uninst/uninstall.exe" ]; then
+              echo 'desktop:package:windows: the uninstaller generator wrote no uninstall.exe' >&2
+              exit 1
+            fi
+            prebuilt=$build/uninst/uninstall.exe
+          fi
+          go -C tools run ./desktoppkg nsis -version "$v" -webview2 "$webview2" -makensis "$makensis" \
+            -out "$out" ${prebuilt:+-prebuilt-uninstaller "$prebuilt"}
+          go -C tools run ./desktoppkg check -stage '{{.ROOT_DIR}}/dist-desktop/stage' -installer "$out"
+          echo "desktop:package:windows: $out"
 
   # ---------------------------------------------------------------------------------------------------------------
   # Native engine and FFmpeg (docs/m2/04-windows-engine.md §13, docs/m2/06-windows-release.md §4, §5.1, §17)
@@ -1110,11 +1208,13 @@ tasks:
   native:dist:
     desc: >-
       Zip the Windows test tools for the owner's PC into dist-desktop/isshoni-native-tools.zip (OUT=<file>), flat -
-      GOOS=windows isshoni-enginetest.exe (once cmd/isshoni-enginetest exists), the release isshoni-media.dll
-      (DLL=<file>; default native/build/win-x64-release/) and the two FFmpeg DLLs of native/ffmpeg/lock.json, checked
-      against its SHA-256s (FFMPEG_ROOT=<dir>; default the ffmpeg:fetch output) (docs/m2/06 §5.1, §17)
-    # CI's windows-native uploads the zip as isshoni-native-tools (06 §5.1). README WA76 adds g2g.exe and
-    # native/windows/tools/hwcheck.ps1. The FFmpeg DLLs sit next to isshoni-media.dll because the engine loads them
+      GOOS=windows isshoni-enginetest.exe (once cmd/isshoni-enginetest exists), g2g.exe (tools/g2g), hwcheck.ps1
+      (native/windows/tools), the release isshoni-media.dll (DLL=<file>; default native/build/win-x64-release/) and
+      the two FFmpeg DLLs of native/ffmpeg/lock.json, checked against its SHA-256s (FFMPEG_ROOT=<dir>; default the
+      ffmpeg:fetch output) (docs/m2/06 §5.1, §17)
+    # CI's windows-native uploads the zip as isshoni-native-tools (06 §5.1). README WA76 added g2g.exe (01 §12.2's
+    # glass-to-glass tool, from the tools module) and native/windows/tools/hwcheck.ps1 (04 §14, §18.4), which runs the
+    # tool next to it. The FFmpeg DLLs sit next to isshoni-media.dll because the engine loads them
     # from its own folder (04 §9.2). Relative paths are relative to the repository root. On Windows the task runs in
     # Windows PowerShell 5.1 (Compress-Archive: Windows has no zip), elsewhere in Task's shell with zip, so a zip for
     # the owner's PC can also be made on the Mac from a downloaded windows-native artifact
@@ -1190,6 +1290,16 @@ tasks:
         } else {
           Write-Host 'native:dist: note: cmd/isshoni-enginetest does not exist yet (README WA44 adds it), so the zip has no isshoni-enginetest.exe'
         }
+        # g2g (tools module, 01 section 12.2) and the hardware run script (04 section 14).
+        $saved = @($env:GOOS, $env:GOARCH, $env:CGO_ENABLED)
+        $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
+        try {
+          Invoke-Native 'go build ./g2g' 'go' @('-C', 'tools', 'build', '-trimpath', '-ldflags',
+            "-s -w -X main.version=$env:NATIVE_DIST_VERSION", '-o', (Join-Path $stage 'g2g.exe'), './g2g')
+        } finally {
+          $env:GOOS, $env:GOARCH, $env:CGO_ENABLED = $saved
+        }
+        Copy-Item -LiteralPath (Join-Path $root 'native\windows\tools\hwcheck.ps1') -Destination $stage
 
         $out = Get-RepoPath $env:NATIVE_DIST_OUT
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
@@ -1255,6 +1365,10 @@ tasks:
           else
             echo 'native:dist: note: cmd/isshoni-enginetest does not exist yet (README WA44 adds it), so the zip has no isshoni-enginetest.exe'
           fi
+          # g2g (tools module, 01 §12.2) and the hardware run script (04 §14).
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C tools build -trimpath \
+            -ldflags "-s -w -X main.version=$NATIVE_DIST_VERSION" -o "$(abs "$stage")/g2g.exe" ./g2g
+          cp native/windows/tools/hwcheck.ps1 "$stage/"
 
           out=$(abs "$NATIVE_DIST_OUT")
           mkdir -p "$(dirname "$out")"

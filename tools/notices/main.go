@@ -24,7 +24,20 @@
 // (a Go module they name is gated on its own when it is linked). Every "License:" line of extra.txt must name an
 // allowlisted license.
 //
-// Relative paths in -npm, -extra, -exceptions and -o are relative to the working directory (tools/ under
+// The desktop app's file (docs/m2/06-windows-release.md §9.2, "M2 06" below) is written by the packaging job:
+//
+//	go -C tools run ./notices -root .. -pkg ./cmd/isshoni-desktop -goos windows -goarch amd64 \
+//		-npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt \
+//		-native ../deploy/notices/native-windows.json -native-root <the windows-native artifact's release folder> \
+//		-version <v> -o ../dist-desktop/.build/THIRD_PARTY_NOTICES-desktop
+//
+// With -native (which needs -native-root) the file has a fourth section, "Native components", before the adapted
+// code: every entry of native-windows.json with its license files from -native-root's licenses/ folder, under the
+// native gate of M2 06 §9.3 (native.go): an allowlisted license, LGPL-2.1-or-later only for FFmpeg's DLLs linked
+// dynamically with the LGPL compliance files present, or a LicenseRef-* with a row in exceptions.md's "Native
+// component" table; and the vcpkg ports that -native-root carries copyright files for are exactly those listed.
+//
+// Relative paths in -npm, -extra, -exceptions, -native, -native-root and -o are relative to the working directory (tools/ under
 // `go -C tools`); -pkg patterns are relative to -root. The output is deterministic: sorted, no dates and no local
 // paths, with the version only in the header. It is written only when the gate passes.
 //
@@ -56,10 +69,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	npm := fs.String("npm", "", "the web client's license list, web/dist/licenses.txt (required)")
 	extra := fs.String("extra", "", "the hand-kept notices for adapted code and data, deploy/notices/extra.txt (required)")
 	exceptions := fs.String("exceptions", "", "the license exceptions with reasons (default <root>/deploy/notices/exceptions.md)")
+	native := fs.String("native", "", "the desktop app's native components, deploy/notices/native-windows.json: "+
+		"adds the native section and its gate (needs -native-root)")
+	nativeRoot := fs.String("native-root", "", "the windows-native artifact's release folder, whose licenses/ holds "+
+		"the license files that -native names")
 	version := fs.String("version", "", "the version shown in the header (required)")
 	out := fs.String("o", "-", "the output file; - is standard output")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: notices -npm FILE -extra FILE -version V [-root DIR] [-pkg PATTERNS] [-goos LIST] [-goarch LIST] [-exceptions FILE] [-o FILE]")
+		fmt.Fprintln(stderr, "usage: notices -npm FILE -extra FILE -version V [-root DIR] [-pkg PATTERNS] [-goos LIST] [-goarch LIST] [-exceptions FILE] [-native FILE -native-root DIR] [-o FILE]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -83,6 +100,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 2
 	}
+	if (*native == "") != (*nativeRoot == "") {
+		fmt.Fprintln(stderr, "notices: -native and -native-root go together")
+		fs.Usage()
+		return 2
+	}
 
 	cfg := config{
 		root:           *root,
@@ -92,6 +114,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		npmPath:        *npm,
 		extraPath:      *extra,
 		exceptionsPath: *exceptions,
+		nativePath:     *native,
+		nativeRoot:     *nativeRoot,
 		version:        *version,
 		goCmd:          runGo,
 	}
@@ -110,7 +134,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		var gate *gateError
 		if errors.As(err, &gate) {
-			fmt.Fprintf(stderr, "notices: the license gate failed (docs/m1/06-deploy-and-ci.md §8.3):\n")
+			ref := "docs/m1/06-deploy-and-ci.md §8.3"
+			if cfg.nativePath != "" {
+				ref += ", docs/m2/06-windows-release.md §9.3"
+			}
+			fmt.Fprintf(stderr, "notices: the license gate failed (%s):\n", ref)
 			for _, p := range gate.problems {
 				fmt.Fprintf(stderr, "  %s\n", p)
 			}
@@ -131,8 +159,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "notices: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "notices: wrote %s: %d Go modules, the Go runtime (%s), the web client's packages and %d adapted-code entries\n",
-		*out, res.modules, res.goVersion, res.extraEntries)
+	natives := ""
+	if cfg.nativePath != "" {
+		natives = fmt.Sprintf(", %d native components", res.native)
+	}
+	fmt.Fprintf(stdout, "notices: wrote %s: %d Go modules, the Go runtime (%s), the web client's packages%s and %d adapted-code entries\n",
+		*out, res.modules, res.goVersion, natives, res.extraEntries)
 	return 0
 }
 

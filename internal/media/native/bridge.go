@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -370,8 +371,8 @@ type Options struct {
 }
 
 // Engine is the Windows media engine, opened by Open: a media.Engine and 05's media.AudioController (audio.go), with
-// the Windows-only extras BuildInfo, Clock, SetOpenH264Path, ProtectWindow, SourceDetail and StartExtra, which 03
-// and the tools reach by type assertion (04 §12.2). It is safe for concurrent use. There is one per process: the
+// the Windows-only extras BuildInfo, Clock, SetOpenH264Path, ProtectWindow, SourceDetail, StartExtra and StartWith,
+// which 03 and the tools reach by type assertion (04 §12.2). It is safe for concurrent use. There is one per process: the
 // engine's state (im_init) is process-wide.
 type Engine struct {
 	c    caller
@@ -617,10 +618,27 @@ func (e *Engine) cancelPicks(locked <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-// ProtectWindow is im_protect_window (04 §11): enginetest's protect-check only (the app's WDA is 03's winos). Not
-// implemented yet (README WA70).
+// ProtectWindow is im_protect_window(hwnd, 0) (04 §11): WDA_EXCLUDEFROMCAPTURE on a top-level window of this process,
+// which the engine verifies with GetWindowDisplayAffinity. Its only caller in M2 is enginetest's protect-check (the
+// app's own windows get their affinity from 03's winos, which never imports this package). There is no Go call for
+// IM_PROTECT_OFF: protect-check undoes the affinity with SetWindowDisplayAffinity(WDA_NONE) itself, and the C++ tests
+// cover the flag. Errors: *media.Error with Op "protect_window": invalid for hwnd 0 (no DLL call), a handle that is no
+// window, a child window or a window of another process; unsupported_os (os_too_old) below build 19041; internal
+// when Windows refused the affinity or didn't keep it.
 func (e *Engine) ProtectWindow(hwnd uintptr) error {
-	return notImplemented("protect_window")
+	const op = "protect_window"
+	if hwnd == 0 {
+		return codeError(media.CodeInvalid, op, "", "no window")
+	}
+	if err := e.begin(op); err != nil {
+		return err
+	}
+	defer e.end()
+	r, lastErr := e.c.call(procProtectWindow, hwnd, 0)
+	if st := int32(r); st != imOK {
+		return e.failed(statusError(op, procProtectWindow.String(), st, lastErr))
+	}
+	return nil
 }
 
 // The log drain (04 §5.6, §12.3).
@@ -1067,21 +1085,73 @@ func (e *Engine) SourceDetail(id string) (SourceDetail, bool) {
 // Conformance check 9); the DLL's own limits (4 sessions, 1 with audio) are busy too. im_start takes up to 3 s and
 // can't be interrupted, so ctx is checked before it starts.
 func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
-	return e.start(ctx, "start", cfg, false)
+	return e.start(ctx, "start", cfg, false, nil)
+}
+
+// StartWith is Start with native-only options (WithGOP), for enginetest (the app never calls it): the same mapping
+// and the same one-session rule.
+func (e *Engine) StartWith(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error) {
+	return e.start(ctx, "start", cfg, false, opts)
 }
 
 // StartExtra is Start without the one-session check, for enginetest's sessions only (the app never calls it): up to
-// the DLL's 4 sessions, video only (audio is one per process), so a cfg with Audio is invalid (04 §12.2).
-func (e *Engine) StartExtra(ctx context.Context, cfg media.Config) (media.Session, error) {
+// the DLL's 4 sessions, video only (audio is one per process), so a cfg with Audio is invalid (04 §12.2). opts are
+// StartWith's.
+func (e *Engine) StartExtra(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error) {
 	const op = "start_extra"
 	if cfg.Audio != nil {
 		return nil, codeError(media.CodeInvalid, op, "", "StartExtra runs video-only sessions (Audio must be nil)")
 	}
-	return e.start(ctx, op, cfg, true)
+	return e.start(ctx, op, cfg, true, opts)
 }
 
-func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra bool) (media.Session, error) {
-	args, err := buildStart(op, cfg)
+// StartOption is a native-only setting of StartWith and StartExtra beyond media.Config, for enginetest. media.Config
+// itself has no GOP field (01 §5.1): the app's sessions always run the engine's defaults.
+type StartOption func(*startOptions)
+
+// startOptions is what the StartOption values of one start set.
+type startOptions struct {
+	gop map[string]time.Duration // by rid
+}
+
+// WithGOP sets the GOP of the layer whose RID is rid (im_layer_config.gop_ms, 04 §9.4): from 1 s to 10 s in whole
+// milliseconds (04 §6.4), or 0 for the engine's default (f 4 s, the others 2 s). A rid that isn't one of
+// Config.Layers, or a GOP outside the range, makes the start CodeInvalid without a DLL call. The last WithGOP of a
+// rid wins. enginetest's capture -bitrate-steps sets f's to 10 s (04 §14).
+func WithGOP(rid string, gop time.Duration) StartOption {
+	return func(o *startOptions) {
+		if o.gop == nil {
+			o.gop = map[string]time.Duration{}
+		}
+		o.gop[rid] = gop
+	}
+}
+
+// The GOP range of 04 §6.4 (im_layer_config.gop_ms; 0 is the engine's default).
+const (
+	minGOP = time.Second
+	maxGOP = 10 * time.Second
+)
+
+// GOPOf is the per-layer GOP that opts set, by rid (nil when none does), with the last WithGOP of a rid winning as
+// in StartWith; it does not check the range. It lets callers that build options test what they pass.
+func GOPOf(opts ...StartOption) map[string]time.Duration {
+	return collectOptions(opts).gop
+}
+
+func collectOptions(opts []StartOption) startOptions {
+	var o startOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra bool,
+	opts []StartOption) (media.Session, error) {
+	args, err := buildStart(op, cfg, collectOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -1183,9 +1253,10 @@ func (a *startArgs) str(op, s string) (*byte, error) {
 // maxSourceID is im_source_info.id's size: an id fits with its NUL.
 const maxSourceID = 64
 
-// buildStart is media.Config → im_start_config (04 §12.2's table). Anything the engine would refuse that Go can tell
-// is CodeInvalid without a DLL call.
-func buildStart(op string, cfg media.Config) (*startArgs, error) {
+// buildStart is media.Config → im_start_config (04 §12.2's table), with the native-only options of StartWith and
+// StartExtra (WithGOP → layers[i].gop_ms). Anything the engine would refuse that Go can tell is CodeInvalid without a
+// DLL call.
+func buildStart(op string, cfg media.Config, o startOptions) (*startArgs, error) {
 	a := &startArgs{sc: &imStartConfig{structSize: uint32(unsafe.Sizeof(imStartConfig{}))}}
 	sc := a.sc
 	if cfg.Source == "" {
@@ -1246,6 +1317,9 @@ func buildStart(op string, cfg media.Config) (*startArgs, error) {
 		sc.layers[i] = lc
 	}
 	sc.layerCount = uint32(len(cfg.Layers))
+	if err := applyGOPs(op, cfg.Layers, o.gop, sc); err != nil {
+		return nil, err
+	}
 	if cfg.Audio != nil {
 		// 05's half of the table: the single mode mapping and the exclusions (audio.go).
 		ac, ex, err := buildAudioConfig(op, cfg.Audio)
@@ -1261,8 +1335,26 @@ func buildStart(op string, cfg media.Config) (*startArgs, error) {
 	return a, nil
 }
 
+// applyGOPs sets layers[i].gop_ms from WithGOP's values (by rid); a layer without one keeps 0, the engine's default.
+func applyGOPs(op string, layers []media.LayerConfig, gops map[string]time.Duration, sc *imStartConfig) error {
+	for _, rid := range slices.Sorted(maps.Keys(gops)) { // sorted: the same error for the same bad options
+		gop := gops[rid]
+		i := slices.IndexFunc(layers, func(l media.LayerConfig) bool { return l.RID == rid })
+		if i < 0 {
+			return codeError(media.CodeInvalid, op, "", "WithGOP(%q): no layer of Config.Layers has that rid", rid)
+		}
+		if gop != 0 && (gop < minGOP || gop > maxGOP || gop%time.Millisecond != 0) {
+			return codeError(media.CodeInvalid, op, "", "WithGOP(%q, %v): 0, or 1 s to 10 s in whole milliseconds "+
+				"(04 §6.4)", rid, gop)
+		}
+		sc.layers[i].gopMS = uint32(gop / time.Millisecond)
+	}
+	return nil
+}
+
 // layerConfig is one media.LayerConfig → im_layer_config: rid, max_pixels, fps = MaxFPS, bitrate_bps = Bitrate,
-// gop_ms 0 (the engine's defaults, 01 §5.1), IM_LAYER_INACTIVE when Inactive; width and height 0.
+// gop_ms 0 (the engine's defaults, 01 §5.1; StartWith's WithGOP sets it afterwards), IM_LAYER_INACTIVE when Inactive;
+// width and height 0.
 func layerConfig(op string, i int, l media.LayerConfig) (imLayerConfig, error) {
 	var lc imLayerConfig
 	if l.RID == "" || len(l.RID) >= len(lc.rid) || strings.IndexByte(l.RID, 0) >= 0 {
@@ -1351,7 +1443,8 @@ type session struct {
 	c       caller
 	log     *slog.Logger
 	h       uint64
-	epochNS int64 // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+	epochNS int64  // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+	capture string // im_session_info.capture_path at start: the path that runs ("wgc", "dd", "test"; CapturePath)
 
 	rids          []string // layer index → rid
 	hasAudio      bool
@@ -1372,6 +1465,17 @@ type session struct {
 
 	smu   sync.Mutex
 	freed bool // im_stop ran: the handle never reaches the DLL again
+}
+
+// CapturePath is the capture path a session of this package started on, from im_session_info.capture_path: "wgc",
+// "dd" or "test". It can differ from the source's planned media.Source.Capture: on Windows 11 a WGC start that fails
+// falls back to Desktop Duplication on the same output (04 §7.1, §7.5). It is "" for any other media.Session. Only
+// isshoni-enginetest's protect-check uses it.
+func CapturePath(s media.Session) string {
+	if ns, ok := s.(*session); ok {
+		return ns.capture
+	}
+	return ""
 }
 
 // The session's limits (04 §12.3): the pull timeout, and each packet kind's largest size (the f arena; one Opus
@@ -1410,6 +1514,7 @@ func newSession(e *Engine, h uint64, info *imSessionInfo, cfg media.Config, sc *
 		log:           e.log,
 		h:             h,
 		epochNS:       info.epochNS,
+		capture:       captureToken(info.capturePath),
 		rids:          make([]string, n),
 		hasAudio:      cfg.Audio != nil,
 		noOSIndicator: info.flags&imSessNoOSIndicator != 0,

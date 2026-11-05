@@ -1,9 +1,16 @@
 // A share's mixer from 05's real AudioEngine (docs/m2/05-windows-audio.md §4.3, §9.1, §9.6, §10.5, §12.1; README WA45)
 // on whatever audio the machine has (CI's hosted runners have no render endpoint): NewMixer gives a mixer once the
 // watcher runs; Start returns with the clock running and chunks reach the PcmSink every 10 ms on one grid, the first
-// after an OnGap; the report says live, with mode, mute and pause; im_audio_set_mode and im_audio_set_muted work while
-// live and answer IM_ERR_BAD_STATE after; Stop ends the chunks; a mixer whose Start failed is destroyed without Stop;
-// im_shutdown stops a mixer still live; start/stop cycles leak no handles.
+// after an OnGap; the report says live, with mode, engine, mute and pause; im_audio_set_mode and im_audio_set_muted
+// work while live and answer IM_ERR_BAD_STATE after; Stop ends the chunks; with the fast path allowed and no kept-out
+// app outside this process's tree, the share runs exclude-self from its first plan (05 §6.4) and again after sound
+// off and on; a mixer whose Start failed is destroyed without Stop; im_shutdown stops a mixer still live; start/stop
+// cycles leak no handles.
+//
+// The engine a share runs depends on the machine only through 05 §6.1's gate, which the report shows: a failed or
+// unsupported probe (Windows 10's build gate reports unsupported) plans the endpoint engine, anything else (the probe
+// ok, or skipped without a render endpoint) process loopback. The tests read that from the report and expect the
+// engine it implies, so they hold with and without an audio device.
 //
 // Calls are ordered by counters and the chunks' own times, never by comparing clock readings shorter than Windows'
 // tick; every wait is bounded (README §4 "Testing").
@@ -77,6 +84,39 @@ bool ReportHas(const std::string &fragment) {
   return false;
 }
 
+// The live report once the startup probe has decided (05 §11.2: at most 600 ms after the start; until then the share
+// runs as if it passed), bounded; empty after a failure.
+std::string SettledReport() {
+  for (int i = 0; i < 150; ++i) {
+    const std::string doc = Report();
+    if (Has(doc, "\"live\":true") && !Has(doc, "\"probe\":{\"result\":\"pending\"")) {
+      return doc;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  ADD_FAILURE() << "the probe did not settle within 3 s: " << Report().substr(0, 300);
+  return {};
+}
+
+// Whether the report's probe leaves process loopback to the share (05 §6.1, §11.2; engine_gate.h's
+// process_loopback): not after a failed or unsupported probe, which plans the endpoint engine.
+bool ProcessLoopback(const std::string &doc) {
+  return !Has(doc, "\"probe\":{\"result\":\"failed\"") && !Has(doc, "\"probe\":{\"result\":\"unsupported\"");
+}
+
+// A kept-out app in the report other than isshoni's own tree (this process): a voice app or a mic user running on
+// this machine, which takes the fast path's condition away (05 §6.4). App and session rows both carry the verdict
+// followed by its reason.
+bool OtherKeptOutApp(const std::string &doc) {
+  static const std::string kKept = "\"verdict\":\"kept_out\",\"reason\":\"";
+  for (std::size_t at = doc.find(kKept); at != std::string::npos; at = doc.find(kKept, at + 1)) {
+    if (doc.compare(at + kKept.size(), 8, "isshoni\"") != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // What the mixer hands the session: chunks with their times, the gaps, and the order of both.
 class RecordingSink final : public PcmSink {
 public:
@@ -109,16 +149,17 @@ public:
   float peak = 0;
 };
 
-// The rules a share sheet passes: a built-in voice rule and a launcher.
+// The rules a share sheet passes: a built-in voice rule and a launcher. flags: the share sheet's (the fast path on, as
+// the release default ships it, 05 §6.4), or without IM_EXCLF_FAST_PATH where a test needs the include set.
 struct Rules {
   im_rule rules[2] = {
       {IM_RULE_APP_EXCLUDE, IM_RULE_SRC_BUILTIN, "discord.exe", "discord", "Discord"},
       {IM_RULE_STOP, IM_RULE_SRC_DATA, "explorer.exe", nullptr, nullptr},
   };
   im_exclusions ex{};
-  Rules() {
+  explicit Rules(uint32_t flags = IM_EXCLF_KEEP_OUT_MIC_USERS | IM_EXCLF_FAST_PATH) {
     ex.struct_size = sizeof ex;
-    ex.flags = IM_EXCLF_KEEP_OUT_MIC_USERS | IM_EXCLF_FAST_PATH;
+    ex.flags = flags;
     ex.rules = rules;
     ex.rule_count = 2;
   }
@@ -129,9 +170,11 @@ protected:
   void TearDown() override { im_shutdown(); }
 };
 
+// The fast path off: with no voice app running, its condition holds for this process's own tree on most machines
+// (05 §6.4), so this test asks for the include set (or the endpoint engine the probe leaves) by the rules' flags.
 TEST_F(AudioLive, AMixerFeedsTheGridReportsLiveAndStops) {
   ASSERT_EQ(Init(0), IM_OK) << LastError();
-  Rules r;
+  Rules r(IM_EXCLF_KEEP_OUT_MIC_USERS);
   ASSERT_EQ(im_set_exclusions(&r.ex), IM_OK) << LastError();
   std::unique_ptr<Mixer> m = audio_bridge::Engine().NewMixer();
   ASSERT_TRUE(m) << "the watcher runs: a share gets a mixer";
@@ -168,8 +211,12 @@ TEST_F(AudioLive, AMixerFeedsTheGridReportsLiveAndStops) {
   }
   EXPECT_TRUE(st == IM_AUDIO_STATE_OK || st == IM_AUDIO_STATE_NO_DEVICE) << st;
   EXPECT_TRUE(ReportHas("\"live\":true")) << Report().substr(0, 300);
-  const std::string doc = Report();
-  EXPECT_TRUE(Has(doc, "\"mode\":\"exclude-apps\",\"engine\":\"include-set\"")) << doc.substr(0, 300);
+  const std::string doc = SettledReport();
+  // No render endpoint (CI's runners): the probe is skipped, the state no-device, and the share still plans the
+  // include set, which captures nothing until a device comes (05 §6.1, §11.2 step 5).
+  const std::string engine = ProcessLoopback(doc) ? "\"mode\":\"exclude-apps\",\"engine\":\"include-set\""
+                                                  : "\"mode\":\"exclude-apps\",\"engine\":\"endpoint\"";
+  EXPECT_TRUE(Has(doc, engine)) << doc.substr(0, 300);
   im_audio_levels levels{};
   levels.struct_size = sizeof levels;
   EXPECT_EQ(im_audio_levels_get(&levels), IM_OK) << "live: the levels work without im_audio_watch";
@@ -187,7 +234,7 @@ TEST_F(AudioLive, AMixerFeedsTheGridReportsLiveAndStops) {
   EXPECT_TRUE(ReportHas("\"mode\":\"off\",\"engine\":\"none\"")) << "sound off: no capture engine (05 §6.5)";
   EXPECT_TRUE(ReportHas("\"code\":\"mode_changed\""));
   ASSERT_EQ(im_audio_set_mode(IM_AUDIO_MODE_EXCLUDE_APPS), IM_OK) << LastError();
-  EXPECT_TRUE(ReportHas("\"mode\":\"exclude-apps\",\"engine\":\"include-set\""));
+  EXPECT_TRUE(ReportHas(engine)) << "sound on again: the same engine (05 §6.5)";
   const std::size_t before_flags = sink.chunks();
   ASSERT_TRUE(sink.WaitChunks(before_flags + 5)) << "the grid goes on through the flags";
 
@@ -201,6 +248,45 @@ TEST_F(AudioLive, AMixerFeedsTheGridReportsLiveAndStops) {
   EXPECT_TRUE(ReportHas("\"live\":false"));
   EXPECT_TRUE(ReportHas("\"state\":\"stopped\"")) << "nobody watches after the share";
   m->Stop(); // idempotent
+}
+
+// The fast path from the first plan (05 §6.4 "At engine start"): with IM_EXCLF_FAST_PATH and no kept-out process
+// outside this process's tree, R is this process and the share runs exclude-self at once (event fastpath_enter);
+// sound off plans none, and sound on plans as at start, so exclude-self again (05 §6.5). It needs process loopback
+// and a machine without a running voice app or mic user, so it skips, with the reason, where either is missing.
+TEST_F(AudioLive, TheFastPathRunsFromTheFirstPlan) {
+  ASSERT_EQ(Init(0), IM_OK) << LastError();
+  Rules r;
+  ASSERT_EQ(im_set_exclusions(&r.ex), IM_OK) << LastError();
+  RecordingSink sink;
+  std::unique_ptr<Mixer> m = audio_bridge::Engine().NewMixer();
+  ASSERT_TRUE(m);
+  ASSERT_EQ(m->Start(MixerConfig{IM_AUDIO_MODE_EXCLUDE_APPS, 0, &sink}), IM_OK) << LastError();
+  ASSERT_TRUE(sink.WaitChunks(3));
+  const std::string doc = SettledReport();
+  ASSERT_FALSE(doc.empty());
+  if (!ProcessLoopback(doc)) {
+    EXPECT_TRUE(Has(doc, "\"mode\":\"exclude-apps\",\"engine\":\"endpoint\"")) << doc.substr(0, 300);
+    m->Stop();
+    GTEST_SKIP() << "process loopback is not available here (the probe failed, or a Windows 10 build): the endpoint "
+                    "engine runs, so the fast path can't be checked; "
+                 << doc.substr(0, 300);
+  }
+  if (!Has(doc, "\"engine\":\"exclude-self\"") && OtherKeptOutApp(doc)) {
+    m->Stop();
+    GTEST_SKIP() << "a kept-out app outside this process's tree runs here (a voice app or a mic user), so the fast "
+                    "path's condition doesn't hold (05 §6.4); "
+                 << doc.substr(0, 600);
+  }
+  EXPECT_TRUE(Has(doc, "\"mode\":\"exclude-apps\",\"engine\":\"exclude-self\"")) << doc.substr(0, 600);
+  EXPECT_TRUE(ReportHas("\"code\":\"fastpath_enter\""));
+  ASSERT_EQ(im_audio_set_mode(IM_AUDIO_MODE_OFF), IM_OK) << LastError();
+  EXPECT_TRUE(ReportHas("\"mode\":\"off\",\"engine\":\"none\""));
+  ASSERT_EQ(im_audio_set_mode(IM_AUDIO_MODE_EXCLUDE_APPS), IM_OK) << LastError();
+  EXPECT_TRUE(ReportHas("\"mode\":\"exclude-apps\",\"engine\":\"exclude-self\"")) << "sound on: planned as at start";
+  const std::size_t n = sink.chunks();
+  EXPECT_TRUE(sink.WaitChunks(n + 5)) << "the grid goes on";
+  m->Stop();
 }
 
 // 05 §10.5: a Mixer must cope with being destroyed without Stop after a failed Start (the session then runs without

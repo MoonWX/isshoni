@@ -10,8 +10,10 @@
 //
 // Slices fill it in order (README §5): the skeleton, the Shell and OSHooks interfaces, the command line, links and
 // the Pending values first (WA41); C2's session and the share controller (WA58: share.go builds them in New),
-// auth.state and server switching from the SPA (WA71, which calls the session's Refresh after 02's SetActive), audio
-// (WA77), tray, toasts and system events (WA68, WA80), the updater (WA84).
+// auth.state, the link page in the browser and server switching from the SPA (WA71: servers.go, which calls the
+// session's Refresh after 02's Add, SetActive and Remove), 05's audio service (WA77: audio.go), the tray, the window's close policy, toasts,
+// system events, keep-awake, WDA on the main window and the watchdog (WA68: tray.go, window.go, toasts.go,
+// system.go), hotkeys and the pill (WA80), the updater (WA84).
 package app
 
 import (
@@ -19,6 +21,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/client/core"
@@ -36,7 +39,7 @@ type Deps struct {
 	Servers  *deviceauth.Servers // 02: servers.json, one Manager per server, the credential store
 	Session  Session             // C2 (03 §9); nil: New builds internal/desktop/session for Engine (share.go)
 	Engine   media.Engine        // native.Open on Windows; fake.NewEngine in dev and e2e builds; nil when none opened
-	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio, wired by WA77)
+	Audio    AudioService        // 05's *audio.Service (internal/desktop/audio); nil: no audio policy
 	Updater  Updater             // 06's *update.Updater, built in the first instance only (wired by WA84)
 	Shell    Shell               // cmd/isshoni-desktop over Wails; e2ehost: a recording fake
 	OS       OSHooks             // winos on Windows; stubs elsewhere
@@ -46,6 +49,14 @@ type Deps struct {
 	// InsecureLoopback is true in dev and e2e builds: --server and the Pending values may name an http:// loopback
 	// server (03 §8.1, §13.1). A link never may.
 	InsecureLoopback bool
+	// LockResume and LockStop are 03 §11.6's bounds of a lock pause: an unlock within LockResume of the lock resumes
+	// the share, and a lock pause that lasts LockStop stops it. 0 means LockResume and LockStop (5 and 30 min); the
+	// e2e harness shortens them (-lock-resume, -lock-stop, 03 §22.4 A).
+	LockResume, LockStop time.Duration
+	// LogsDir is the logs folder App.OpenLogsFolder opens (%LOCALAPPDATA%\isshoni\logs, 03 §17); NoticesFile is the
+	// installed THIRD_PARTY_NOTICES.txt App.OpenNotices opens (06 §2.2). "" means the method isn't available
+	// (ErrNotImplemented), as in the e2e harness.
+	LogsDir, NoticesFile string
 }
 
 // Session is what the app runs of internal/desktop/session (03 §9): C2 for the active linked server. The share
@@ -83,25 +94,43 @@ type App struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	quitOnce sync.Once
+	quitting atomic.Bool // Quit or Shutdown has begun: later calls return at once
+
+	// after starts the lock pause's timer (time.AfterFunc; tests replace it).
+	after func(d time.Duration, f func()) stopper
+	// trayEvery is the tray's debounce (03 §11.1: 250 ms), guarded by tray.mu.
+	trayEvery time.Duration
+	tray      trayModel   // tray.go
+	toasts    toastBook   // toasts.go
+	sys       systemState // system.go, guarded by mu
+	beat      watchdog    // system.go, guarded by mu
+	awakeMu   sync.Mutex  // orders KeepAwake calls; guards awake
+	awake     bool
 
 	probeDone chan struct{}
 	probe     media.Probe
 	probeErr  error
 
-	pub    publisher         // C2 for the share controller; nil without a *session.Session
-	shares *share.Controller // 03 §10.1
+	pub     publisher         // C2 for the share controller; nil without a *session.Session
+	shares  *share.Controller // 03 §10.1
+	clients *shareClients     // the controller's Publisher: the share's C2 client, for the tray's Pause
 
 	// sharing reports a live share and its room (03 §13.2's "live share" rows): the share controller's Live.
 	sharing func() (roomID string, live bool)
 
 	spaLog spaLog // App.Log's rate limit
 
+	authSubs authSubscribers // SubscribeAuth: the auth.state event's source (servers.go)
+	opened   openedCodes     // the link codes whose approval page was opened (servers.go)
+
 	mu       sync.Mutex
 	running  bool
-	pending  *PendingLink // the link not yet acted on (App.PendingLink)
-	lastLink time.Time    // when the last link was handled (03 §13.2: at most one per second)
-	ownConns []string     // App.OwnConnections: C1's user.connections, for playback.state's expiry (WA77)
+	pending  *PendingLink    // the link not yet acted on (App.PendingLink)
+	lastLink time.Time       // when the last link was handled (03 §13.2: at most one per second)
+	ownConns []string        // App.OwnConnections: C1's user.connections, for playback.state's expiry (audio.go)
+	playing  map[string]bool // the senders whose last playback.state said playing (audio.go)
+
+	playbackKick chan struct{} // wakes followPlayback after a change of the link state; one slot
 }
 
 // New checks d and returns the app; it starts nothing (Run does).
@@ -122,6 +151,12 @@ func New(d Deps) (*App, error) {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
+	if d.LockResume <= 0 {
+		d.LockResume = LockResume
+	}
+	if d.LockStop <= 0 {
+		d.LockStop = LockStop
+	}
 	if d.Session == nil && d.Engine != nil {
 		s, err := newSession(d)
 		if err != nil {
@@ -131,6 +166,7 @@ func New(d Deps) (*App, error) {
 	}
 	pub, _ := d.Session.(publisher)
 	ctx, cancel := context.WithCancel(context.Background())
+	clients := watchClients(sharePublisher{pub})
 	a := &App{
 		d:         d,
 		log:       d.Log.With("component", "app"),
@@ -140,15 +176,21 @@ func New(d Deps) (*App, error) {
 		cancel:    cancel,
 		probeDone: make(chan struct{}),
 		pub:       pub,
-		shares:    newShares(d, sharePublisher{pub}),
+		shares:    newShares(d, clients),
+		clients:   clients,
+		after:     afterFunc,
+		trayEvery: TrayDebounce,
+
+		playbackKick: make(chan struct{}, 1),
 	}
 	a.sharing = a.shares.Live
 	return a, nil
 }
 
 // Run runs the app's parts until ctx ends or Quit: the active server's manager (02's Start), the engine's
-// start-time probe, the session, 05's audio service and 06's updater when present (the tray and system events join
-// with their slices). It returns after every part it started has returned. Run may be called once.
+// start-time probe, the session, 05's audio service and 06's updater when present, the tray (drawn at once and
+// after every change of the share), the OS's session and power events, the heartbeat watchdog, and WDA on the main
+// window. It returns after every part it started has returned. Run may be called once.
 func (a *App) Run(ctx context.Context) error {
 	a.mu.Lock()
 	if a.running {
@@ -163,6 +205,14 @@ func (a *App) Run(ctx context.Context) error {
 	defer a.cancel()
 
 	a.startActive()
+	a.startAudio()
+	unsubscribe := a.shares.Subscribe(a.onShareEvent)
+	a.flushTray()
+	a.applyCaptureExclusion()
+	if ch := a.d.OS.Events(); ch != nil {
+		a.wg.Go(func() { a.systemEvents(ch) })
+	}
+	a.wg.Go(a.runWatchdog)
 	if e := a.d.Engine; e != nil {
 		if b := e.Info().Build; b != "" && b != version.Version() {
 			// The installer ships both together; dev builds mix them on purpose (03 §13.4 step 7, 04 §5.5).
@@ -194,6 +244,8 @@ func (a *App) Run(ctx context.Context) error {
 	<-a.ctx.Done()
 	a.wg.Wait()
 	a.shares.Close() // C2 has closed, so its share has ended: Close finds its watcher done
+	unsubscribe()
+	a.stopTimers()
 	return nil
 }
 
@@ -259,33 +311,50 @@ func (a *App) startActive() {
 // Quit stops the app (03 §11.6): the share first (the controller's Stop: 01's Share.Stop, bounded by QuitTimeout),
 // then 05's audio service, the settings flush, and the shell's quit; Run returns. stopShare false while a share is
 // live is the bridge's busy (App.Quit), never this method's concern: the share then ends with C2's close. Quit runs
-// once; later calls do nothing.
-func (a *App) Quit(stopShare bool) {
-	a.quitOnce.Do(func() {
-		if stopShare {
-			ctx, cancel := context.WithTimeout(context.Background(), QuitTimeout)
-			a.shares.Stop(ctx, share.CauseUser)
-			cancel()
+// once; later calls, and a Shutdown during or after it, return at once.
+func (a *App) Quit(stopShare bool) { a.quit(stopShare, share.CauseUser, true) }
+
+// Shutdown is the shell's hook for a quit that Wails began itself (its OnShutdown, W14): the same steps as Quit
+// with the share stopped first, without asking the shell to quit again. After Quit it does nothing, so the shell's
+// quit that Quit asks for can call it.
+func (a *App) Shutdown() { a.quit(true, share.CauseUser, false) }
+
+// quit is Quit and Shutdown: cause is the share's end reason.
+func (a *App) quit(stopShare bool, cause share.Cause, shellQuit bool) {
+	if !a.quitting.CompareAndSwap(false, true) {
+		return
+	}
+	a.stopTimers()
+	if stopShare {
+		ctx, cancel := context.WithTimeout(context.Background(), QuitTimeout)
+		a.shares.Stop(ctx, cause)
+		cancel()
+	}
+	if a.d.Audio != nil {
+		if err := a.d.Audio.Close(); err != nil {
+			a.log.Warn("app: the audio service didn't close cleanly", errAttr(err))
 		}
-		if a.d.Audio != nil {
-			if err := a.d.Audio.Close(); err != nil {
-				a.log.Warn("app: the audio service didn't close cleanly", errAttr(err))
-			}
-		}
-		if err := a.d.Settings.Flush(); err != nil {
-			a.log.Warn("app: settings not saved at quit", "err", err)
-		}
-		a.cancel()
+	}
+	if err := a.d.Settings.Flush(); err != nil {
+		a.log.Warn("app: settings not saved at quit", "err", err)
+	}
+	a.cancel()
+	if shellQuit {
 		a.d.Shell.Quit()
-	})
+	}
 }
 
 // OnAuthState is deviceauth.ServersOptions.OnState: a server's link changed. C2's session looks again (a relink
-// builds a new core client, an unlinked or incompatible active server closes it, 03 §9). The auth.state event for
-// the active server is README WA71's; until then it is logged at debug only. It never blocks.
+// builds a new core client, an unlinked or incompatible active server closes it, 03 §9), and a state of the active
+// server goes to SubscribeAuth's callbacks: the bridge's auth.state event (03 §6.3). It never blocks.
 func (a *App) OnAuthState(s deviceauth.State) {
 	a.log.Debug("app: link state", "state", s)
 	if a.pub != nil {
 		a.pub.OnAuthState(s)
+		a.kickPlayback()
+	}
+	if s.Origin != "" && s.Origin == a.activeOrigin() {
+		a.openLinkPage(s)
+		a.authSubs.call(s)
 	}
 }

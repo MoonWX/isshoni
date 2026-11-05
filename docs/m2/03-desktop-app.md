@@ -105,7 +105,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W2 | `window.isSecureContext` is true there | CDP e2e | None needed: `DesktopPlatform` skips the NeedsHttps check (§7.2) and WebRTC works in any context |
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
-| W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and `window.open(…)` leave the page on the asset origin | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, `Shell.Reload()` |
+| W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and the native `window.open(…)` (from a fresh frame) leave the page on the asset origin, the open returns `null` and no page appears; a browser-started navigation (CDP `Page.navigate`) to a foreign URL comes back to the asset origin by itself; `chrome.webview.postMessage` is still there under the CSP sandbox | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, the start page again. **Fails at beta.34, fallback taken**: Wails registers no `NewWindowRequested` handler (the COM types exist in `internal/webview2/pkg/webview2`, nothing subscribes), and its `NavigationStarting` callback drops the event's arguments (`edge/chromium.go`, `application/webview_window_windows.go`'s `navigationStarting`), so Go can cancel neither, and no Wails option or reachable WebView2 setting blocks them. The fallback, §5.5 layer 2: (1) `bridge.js`'s Navigation API `navigate` listener cancels a script's foreign navigation (§5.2); (2) the HTML response's header CSP ends with `sandbox allow-scripts allow-same-origin allow-forms`, no `allow-popups`, so Blink refuses every new window before WebView2 sees one (§5.3); (3) after each `WebViewNavigationCompleted`, Go asks the page where it is and loads the start page (`SetURL("/")`) when the browser-reported top-level source (`OriginInfo.TopOrigin`) is not the asset origin or no answer comes (`navguard.go`). `Shell.Reload()` can't be the fallback: at beta.34 it is `location.reload()` of whatever page is showing, so the shell loads the start page instead when the window was last seen elsewhere, and W17's watchdog loads it after a reload that brought no beat back. The CDP check is written against the fallback; `desktop-security.spec` checks (1) and (2) in Chrome too. Not covered: a new window the browser starts itself (the default context menu's "Open link in new window", on only in dev and e2e builds, §5.4), and a foreign page that loads runs until Go sends it back (layer 3 keeps it off `/wails/*`). Re-check at every bump; drop (3) and the sandbox once Wails can cancel |
 | W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Local\io.isshoni.desktop.v1` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>` in `winos` (distinct from the running mutex of §13.4). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
 | W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test | Window option to hide on close, plus our own quit path from the tray |
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
@@ -117,7 +117,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W14 | Quit runs our shutdown hook before the process exits (share stopped, close 1000 sent) | Go test with a fake share | Our tray Quit stops the share first, then calls Wails' quit |
 | W15 | `.bin/wails3 generate bindings` (TypeScript) is deterministic and OS-independent for our services | CI: generate on ubuntu and macOS, diff. **The macOS half holds (WA48, group 5's integration)**: `task gen:bindings:check` (`GOOS=windows`) regenerates the committed `web/src/platform/desktop/bindings/` without a diff on the Mac, and `TestGeneratedBindingsMatchTheServices` checks, without the CLI, that every generated function calls the method id Wails gives the same Go method and every bound method has one. The ubuntu half is `ci.yml`'s `protocol` job (group 5's integration), whose first run, in the group PR, decides it | Commit the bindings generated on one OS only (Linux CI) |
 | W16 | Element fullscreen inside WebView2 plus `Window.SetFullscreen(true)` fills the screen and returns cleanly on Esc | CDP e2e + manual | CSS pseudo-fullscreen (`fullscreen: 'none'`, as M1 has for browsers without the API) |
-| W17 | A WebView2 process failure is reported (or the page is reloaded) | Manual: kill a renderer in Task Manager | Our watchdog: the SPA calls `App.Heartbeat` every 5 s; 15 s without one → `Shell.Reload()` |
+| W17 | A WebView2 process failure is reported (or the page is reloaded) | Manual: kill a renderer in Task Manager | Our watchdog: the SPA calls `App.Heartbeat` every 5 s; 15 s without one → `Shell.Reload()`; when that reload brings no beat back, the next timeout loads the start page (`ReturnHome`, a navigation the browser starts: at beta.34 `Reload` is `location.reload()`, which a hung page never runs) |
 | W18 | Tray icon, tooltip and menu can be changed at runtime; left click is reported | Manual + Go test of the view model | Rebuild the tray item on every change |
 | W19 | Unsetting every `WEBVIEW2_*` environment variable (prefix, case-insensitive, §5.4) before the webview starts takes effect | CDP e2e build vs production build: the production build started with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<p>`, `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER=<name>` and an arbitrary `WEBVIEW2_X=1` opens no debugging port or pipe and its webview sees none of them. At beta.34 Wails itself overwrites the first two in every build (§5.4), so only `WEBVIEW2_X` tells whether the scrub works (§22.4 B) | None needed for function; record |
 | W20 | License gate (`go-licenses`, GOOS=windows) and `govulncheck` pass for `./cmd/isshoni-desktop` | CI | Replace or drop the offending module before DK1 merges |
@@ -352,11 +352,18 @@ window.__ISSHONI_DESKTOP__=Object.freeze({"v":1,"transport":"wails","app":{"vers
   reads it synchronously.
 - It holds no token, no user data beyond the server's public name, and nothing a page on another origin could use.
 - It is generated per request: switching to another server (§8.1) changes the config and reloads the window.
+- A second statement, the same in every response, is W5's navigation guard (§5.5 layer 2): a Navigation API
+  `navigate` listener that cancels every cancelable navigation off the page's own `scheme://host` and opens nothing:
+
+  ```js
+  (function(n){if(!n)return;function o(u){u=new URL(u);return u.protocol+"//"+u.host}n.addEventListener("navigate",
+  function(e){if(e.cancelable&&o(e.destination.url)!==o(location.href))e.preventDefault()})})(window.navigation);
+  ```
 
 ### 5.3 CSP and headers
 
 Header (and the same policy as `<meta http-equiv="Content-Security-Policy">` in the served `index.html`, so W3's
-result doesn't matter; two identical policies intersect to the same one):
+result doesn't matter; two identical policies intersect to the same one), with one more directive in the header only:
 
 ```
 default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:;
@@ -364,6 +371,14 @@ connect-src 'self' https://<active-host> wss://<active-host>; worker-src 'none';
 font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'
 ```
 
+- The header alone ends with `; sandbox allow-scripts allow-same-origin allow-forms` (W5's fallback, §5.5 layer 2):
+  without `allow-popups` the page and its frames can't open a window in any way (`window.open` returns `null`,
+  `target=_blank` and modified clicks are refused), which the pinned Wails gives Go no way to cancel.
+  `allow-same-origin` keeps the asset origin (storage, the Guard's Origin check), `allow-scripts` the SPA, and
+  `allow-forms` the `submit` event the SPA's forms handle themselves (`form-action 'none'` still refuses every real
+  submission). No `allow-modals`, `allow-downloads` or `allow-top-navigation*`: the SPA uses none of them (a document
+  may still navigate and reload itself; layer 1 cancels a foreign navigation). Browsers ignore `sandbox` in a
+  `<meta>` policy and log an error, so the `<meta>` doesn't carry it; W3's fallback therefore doesn't cover it.
 - `<active-host>` is the active server's host with its port, from `BridgeConfig.Server.Origin`. With no active server
   `connect-src` is `'self'` only: the wizard reaches servers only through Go (§8).
 - In dev and e2e builds only, when the active origin is an `http://` loopback origin (allowed only there, §8.1),
@@ -444,7 +459,25 @@ Three layers, so no single one has to be perfect:
    - `window.open = (url) => { openExternal(String(url)); return null; }`;
    - `dragover` and `drop` listeners that cancel the default (no navigation on drop).
 2. **Go cancels foreign navigation** (W5): a top-level navigation or new window whose URL is not on the asset origin
-   is cancelled; an http(s) URL goes to the system browser through the same validation as `OpenExternal`.
+   is cancelled; an http(s) URL goes to the system browser through the same validation as `OpenExternal`. **At
+   beta.34 Go can cancel neither** (W5 fails, §3.2), and the layer is its fallback:
+   - `bridge.js`'s second statement (§5.2), which runs before any of the SPA's scripts, listens to the Navigation
+     API's `navigate` event (where the webview has it; WebView2 does) and cancels a cancelable navigation whose
+     destination is not on the page's own `scheme://host`: a script's `location.href = …`, which no click listener
+     sees (a `blob:` or `data:` URL counts as foreign; the SPA navigates to neither). It never opens the browser (a
+     click is layer 1's; a script that navigates the window is a bug or an injection). A traversal to another
+     document can't be cancelled. It is not in `links.ts` because it must run first, and `DesktopPlatform`'s share
+     of the entry chunk is at its budget (§7.2);
+   - the HTML's header CSP sandbox without `allow-popups` (§5.3) refuses every new window the page or its frames
+     ask for;
+   - after every `WebViewNavigationCompleted`, Go runs a one-line script that posts `isshoni:where:<n>` through
+     `chrome.webview`. Wails hands it to `Options.RawMessageHandler` with the top-level source WebView2 itself
+     reports (`OriginInfo.TopOrigin`, which page script can't forge). A source off the asset origin (`about:blank`,
+     an error page and anything unparsable included), or no answer within 5 s once Wails' runtime is up, loads the
+     start page with `SetURL("/")`, a navigation the browser starts and page script can't block; at most 3 times a
+     minute, then one ERROR line. The WARN line names the host only (§17). `Shell.Reload()` loads the start page
+     too while the window was last seen off the asset origin. This runs on Windows only (Wails reports no such event
+     for WKWebView; the macOS build is a dev build).
 3. **`/wails/*` is guarded by Origin and by an allowlist** (§5.6), so even a foreign page could not call a binding,
    and a script injected into the SPA can't reach the Wails runtime's own `Browser.OpenURL` (which would bypass
    `App.OpenExternal`'s rules below), `Clipboard` or `Window` objects.
@@ -634,6 +667,15 @@ unknown keys are kept, and the defaults apply under the saved values (§14.2). `
 `OwnConnections`; `OpenLogsFolder` and `OpenNotices` return `ErrNotImplemented` until their slices); `Shell` has no
 `SetTray` until WA68's tray package.
 
+As built (WA68, group 12; README §3 item 72): `SetTray` is not on `app.Shell` but on a separate interface,
+`app.TrayShell` (`shell.go`), which the app finds by a type assertion; a shell without it draws no tray. Adding a
+method to `Shell` would have broken `internal/desktop/e2ehost`'s recorder, which group 12's integration then made a
+`TrayShell` (`/__e2e/state`'s `tray`). Three more OS hooks are optional interfaces found the same way, since the
+recorder implements `OSHooks`: `IncludeInCapture` (the main window back to `WDA_NONE` when `hideFromCapture` is off,
+§11.5), `EndSessionHandled` (the `WM_QUERYENDSESSION` 2 s handshake, §11.6) and `OpenPath` (`OpenLogsFolder`,
+`OpenNotices`); `winos` implements all three. `OpenLogsFolder` and `OpenNotices` are real, and their failures wrap
+`app.ErrIO`, which the bridge maps to `io_error` (§6.4; group 12's integration).
+
 ### 6.2 Bound services (`internal/desktop/bridge`)
 
 The only app services that page script can call. The pinned Wails runtime serves its own objects (`Browser`,
@@ -806,7 +848,9 @@ As built (WA48, `bridge/errors.go`): every service maps its Go errors through on
 `internal {reason: timeout}`, because a method's own bound (`Audio.SoundCheck`'s 10 s, a local file) is no server's
 fault; only `Auth`, whose deadlines bound calls to a server, makes it `server_unreachable`. A call the page cancelled
 (W11) is `internal {reason: cancelled}`, which nobody reads. 02's `ErrOffline`, `ErrNetwork` and `ErrBadResponse`
-are `server_unreachable`; an error no rule knows is `internal`, logged once at WARN with its cause (the packages below
+are `server_unreachable`, except that `Auth.Link`'s `ErrBadResponse` (a verification URI that failed 02 §11.2's check:
+the server answered, wrongly) is `internal {reason: bad_response}`, which the link step shows as its generic error
+(§8.2; WA71, README §3 item 80); an error no rule knows is `internal`, logged once at WARN with its cause (the packages below
 never put a token, password, name or path into an error's text). Params hold codes and numbers only, never English.
 The update codes' texts are `desktop.update.error.<code>` (README §3 item 42), written with the update screens (WA82).
 As built (WA58): the share controller's errors are checked first, since they may wrap a wire or media error:
@@ -1241,14 +1285,23 @@ in settings (per install) records that the sound and voice steps were seen once.
     forbids `desktop/` importing from `setup/`; the short URL `link.verificationUri` with the code ("or open {url}
     and enter {code}"); the countdown to `link.expiresAt`. Go opens `verificationUriComplete` in the default browser
     once per new code (the click on Link is the user gesture, 02 §11.3); [Open browser again] repeats it;
-    [Copy link] copies `verificationUriComplete`.
+    [Copy link] copies `verificationUriComplete`. **The app opens it, not 02's `Manager`** (as built, WA71; README §3
+    item 80): `App.OnAuthState` (`internal/desktop/app`, 02's `ServersOptions.OnState`) calls `openLinkPage` for a
+    state of the active server, which opens `link.verificationUriComplete` through `App.OpenExternal` on its own
+    goroutine (`OnAuthState` never blocks) when the status is `linking` with a user code other than the last one it
+    opened for that origin (`openedCodes` keeps one code per origin). The same code again in a row, another server's
+    code and a state without a code open nothing (`TestLinkPageOpened`); [Open browser again] goes through the page's
+    `platform.openExternal`.
   - `status: 'linked'` → "Linked as {user.username}", then the next step.
   - `notice: 'denied'` → "Linking was declined in the browser. [Try again]" (`Auth.Link()`).
   - `notice: 'code_expired'` (600 s, 03 §7.12) → "The code expired. [Get a new code]" (`Auth.Link()`).
   - `status: 'incompatible'` → the version texts of 02 §13.3 with [Try again] (`Auth.Recheck()`).
   - a `Link()` error (`server_unreachable`, `rate_limited`) → its text with [Try again]; 02's `ErrBadResponse` (a
     verification URI that failed 02 §11.2's check) → the generic link error "Couldn't start linking with this server"
-    with [Try again].
+    with [Try again]. As built (WA71's review, README §3 item 80): `Auth.Link` maps that `ErrBadResponse` to `internal`
+    with `params.reason` `bad_response` (§6.4), not `server_unreachable`, since the server answered; the link step
+    shows its own text only for `server_unreachable`, `rate_limited` and `incompatible_server`, and
+    `desktop.setup.link.failed` ("Couldn't start linking with this server") for every other `Link()` error.
   - **"Sign in with username and password instead"** (02 §14: the plan's in-app fallback; the device flow stays the
     default): a link below the code opens a form with username and password fields and [Sign in] [Back]. [Sign in]
     calls `Auth.LinkWithPassword(username, password)` (§6.2), which cancels a running device-flow link first;
@@ -1791,6 +1844,24 @@ func Render(s State, t *i18n.Catalog) View
 | End of session (`WM_QUERYENDSESSION`) | stop within 2 s (`share.stop`, close 1000), then allow | close sockets with 1000 |
 | Keep awake | `KeepAwake(true)` from `live` to the end, except while a lock pause holds it released (above): the PC and the display don't sleep while sharing | off |
 
+As built (WA68, group 12; README §3 item 72): the lock-pause state machine (both bounds, the "Resume sharing?" prompt
+and its toast, the lock-stop toast) lives in `internal/desktop/app` on top of the share controller's `SetPaused` and
+`Stop`; the panel's "Resume sharing?" bar and the pill's state need WA80 (a `ShareView` field and the pill). The
+close-to-tray toast shows at most once per run, and never once `tips.trayNoticeShown` is set: a strict once-ever needs
+the window notice that sets the flag (WA80). End of session stops the share, acknowledges `winos` and then quits the
+app, so a shutdown the user cancels leaves isshoni closed. `-Embedding` waits up to 4 s for the toast activation by
+registering Wails' activator over an application that never runs; whether COM delivers it without a message loop is
+checked by M-DESK-5. The W8 registry test runs under a random `io.isshoni.test.<hex>` id in a child process (one
+Wails application per process, and the real id would point the installed app's `LocalServer32` at the test binary);
+`TestAppOptions` still asserts `io.isshoni.desktop`. `desktop-system.spec` covers a short lock and a suspend with the
+harness's default bounds; group 12's integration passes `-lock-resume`/`-lock-stop` into `app.Deps`, and the
+long-lock cases need `web/e2e/fixtures.ts`'s `lockResumeMs`/`lockStopMs` (WF13) and WA80's bar. Left to WF13 (group
+13): the SPA's `App.Heartbeat` (W17's watchdog never arms without it), those fixtures, e2ehost's
+`end-session-confirmed` event and removing toasts that no longer apply from Action Center (§15). WF13 built the heartbeat (with
+§20's hidden-page gap), the fixtures (`desktop-system.spec` uses 2 s and 6 s, unlocking after 3 s, and asserts the
+tray unconditionally) and `end-session-confirmed`; of Action Center it built `winos`' removal, which the app starts
+calling with WF14 in group 14 (§15; README §3 item 84).
+
 Quit always stops a share first (`core.Share.Stop`: `share.stop`, engine stop, `room.leave`; then
 `audio.OnShareStopped()`), closes C2 (`core.Client.Close`, 1000) and C1 (1000), calls `audio.Service.Close()`,
 flushes settings and logs, then exits; it waits at most 3 s for the server's replies. "Restart and update" quits the
@@ -2006,22 +2077,39 @@ exe's folder is then optional. §22.2's marker test checks it on windows-2025.
      `--self-check`, `--forget-credentials` and `--purge-data` (WA59), `--update-now` (WA84) and
      `--sound-check-helper` as step 0 (WA77) log an error and exit 2 with no window, single instance or mutex until
      their slices. The "closed unexpectedly" crash notice (§17) is only logged until its UI comes.
+   - As built (WA59, group 11; README §3 item 63): `--self-check`, `--forget-credentials` and `--purge-data` are real
+     (`cmd/isshoni-desktop/oneshot.go`, `oneshot_os.go`). `--self-check` opens the shipped engine with `native.Open`
+     in every build, `dev` and `e2e` included (never the fake), so it always checks the engine that ships, and its
+     `spa.ok` also serves `GET /` through the asset handler and needs 200 with the bridge tag, which is stricter than
+     building the handler alone. `--forget-credentials` leaves no data root behind that it created itself (the save
+     inside `ForgetAll` makes the folder, so a root that didn't exist before is deleted again), so a keep-data
+     uninstall on a PC where the app never ran leaves nothing. `--purge-data` deletes only a data root (`isshoni`, or
+     the dev build's `isshoni-dev`) and exits 0 as above even when that root can't be deleted after its 10 s of
+     retries (250 ms apart); the failure is logged at ERROR. The credential part never changes an exit code, offline
+     included.
 2. **Shell relaunch** (Windows, D16): skipped with `--relaunched` and when `Local\io.isshoni.desktop.running`
    already exists (this start will only forward). Look up the parent with a Toolhelp snapshot
    (`CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, own entry's `th32ParentProcessID`); a parent that is gone, or was
    created after this process (`GetProcessTimes`: a reused PID), needs no relaunch. If the parent's exe (lower case) is
-   neither `explorer.exe` nor in `audiorules.Launchers` (05 §5.4): `GetShellWindow` → `GetWindowThreadProcessId` →
+   neither `explorer.exe` nor in `audiorules.Launchers` (05 §5.4): `GetShellWindow` → `GetWindowThreadProcessId`;
+   the shell's process must be in this process's session (`ProcessIdToSessionId`) and its token's user must be this
+   process's user (the child inherits the parent process's token, so its user and session: a shell elsewhere would
+   start the app out of sight or as someone else while this start exits 0); then
    `OpenProcess(PROCESS_CREATE_PROCESS)`; `CreateProcessW` of the same exe with `--relaunched` first and then the
    same arguments (quoted with `syscall.EscapeArg`), the same environment and working directory,
    `EXTENDED_STARTUPINFO_PRESENT` with `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` = the shell process; then
-   `AllowSetForegroundWindow(childPid)` and exit 0. On any failure (no shell window, access denied), log WARN and
-   continue in place.
+   `AllowSetForegroundWindow(childPid)`, watch the child for 1.5 s, and exit 0. On any failure (no shell window, a
+   shell in another session or of another user, access denied, a child that exits within the 1.5 s with a nonzero
+   code; exit 0 is a normal end, e.g. a forward), log WARN and continue in place.
 2a. **Installer running** (06 §2.4, §8.7): `OpenMutexW(SYNCHRONIZE, FALSE, "Local\\io.isshoni.desktop.installing")`.
    When it succeeds (an installer runs right now: interactive, `/S`, or a start-time update), a start from
    `--open-url` writes the link's origin to `PendingServer` and its room id to `PendingRoom` (overwriting older
    values: the newest link wins), and **every** start then exits 0 without single instance, the running mutex, the
    updater or `Apply`; the installer's own app start (`/LAUNCH`, `/RELAUNCH`, Finish) handles the link (step 6).
    `ERROR_FILE_NOT_FOUND` means no installer: the start continues; any other error is logged and the start continues.
+   As built (WA59): the probe is `mutexOpens` in `cmd/isshoni-desktop/platform_windows.go`, not `winos.MutexExists`,
+   which counts `ACCESS_DENIED` as present; the name is the constant `installingMutex` in `start.go`, beside the
+   handover (`winos` was outside WA59's paths, so it isn't next to `RunningMutex`).
 3. **Single instance** (W6, §13.3): a second instance forwards and exits.
 4. **The running mutex**: the first instance calls `CreateMutexW(nil, FALSE, "Local\\io.isshoni.desktop.running")`
    and never closes the handle before the process exits; the installer and uninstaller wait on it (06 §6.7).
@@ -2179,6 +2267,19 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   (`isshoni://…`) rather than COM activation, a web page can't forge them without the nonce.
 - Without buttons (W8's fallback) a click opens the window on the mic prompt card or the panel.
 - Toast texts come from the catalog (§18.1).
+- **Removing a toast that no longer applies** (as built, WF13; README §3 item 84): `winos.Hooks.RemoveToasts(ids...)`
+  (`internal/desktop/winos/toasts.go`; a no-op off Windows) removes the app's delivered toasts whose notification id is
+  listed and reports how many went; a toast that isn't there is no error. Windows removes a single toast only by its
+  tag, and Wails beta.34 shows toasts without one, so for an untagged match it lists Action Center again just before
+  it clears, clears all of the app's toasts and delivers the others again (silently, each with its own tag), counting
+  the untagged ones only after the clear succeeded. That is a workaround, not a per-toast removal: a toast that Wails
+  shows during it would be lost, so **callers must serialize `RemoveToasts` with `Shell.Notify`** (one ordered toast
+  path) **and never call it with `App.mu` held** (several WinRT round trips). The Windows test (`windows-go`) runs
+  under a random AppUserModelID registered in HKCU and deleted afterwards, never `io.isshoni.desktop`. As WF13 merged
+  the app doesn't call it yet: WF14 (group 14) wires it where a toast's question is answered another way
+  (`toastBook.dropKind`, the lock pause's `clearLockLocked`, the pending toast keeping its notification id, through an
+  optional remover interface the tests fake), and `desktop-system.spec`'s note-only branch then expects the removed
+  toast's id. Until then the toast book's settled nonce makes a stale toast's button a no-op.
 - *Later (M5)*: "Alex started sharing in Lounge" toasts in the desktop app.
 
 ---
@@ -2381,7 +2482,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | `--self-check` probe | 20 s |
 | Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s |
 | End of session | share stopped within 2 s |
-| WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni" |
+| WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni". As built (WF13, `app.HeartbeatEvery`/`HeartbeatTimeout`; README §3 item 84): the page beats at once at boot, every 5 s, and again at once when it becomes visible; Go's watchdog arms with the first beat, checks every 5 s, watches only a visible window (one just shown gets a fresh 15 s) and waits another 15 s after a reload; when that reload brought no beat back, the next timeout loads the start page (`ReturnHome`, W5's and W17's fallbacks at beta.34). The cap of 3 reloads per 5 min and the error page are not built yet. **Known gap while hidden**: Go asks `Shell.WindowVisible()` (Wails' `IsVisible`, which reads the window's `WS_VISIBLE` style bit (beta.34's `webview_window_windows.go`)), which stays true for a minimized window and one fully covered by a full-screen game, the main case while sharing, while WebView2 marks such a page hidden and, after 5 min hidden, Chromium's intensive throttling runs chained timers about once a minute. The page then beats less often than every 15 s, and the watchdog may reload it every 15–60 s while the user plays (WF13's review, R2; not reproduced on a Mac). A dedicated Worker's timer isn't throttled that way, but §5.3's CSP has `worker-src 'none'`. The fix belongs to the app or the shell, in a later slice: watch only a page that isn't minimized or occluded (`IsIconic`, or the page's own `visibilitychange` sent with the beat), or start WebView2 with `--disable-background-timer-throttling`; M-DESK-11's variant checks it (§22.5) |
 | Settings write debounce | 500 ms |
 | `settings.json` objects | ≤ 1024 keys each (§14.2) |
 | Logs | 5 MiB × 5 files |
@@ -2423,7 +2524,7 @@ there.
 
 | Package | Asserts |
 |---|---|
-| `assets` | `index.html` gets the bridge tag exactly once before `boot-check.js`; `New` fails without the tag; CSP header and `<meta>` equal, with the active host in `connect-src` and `'self'` only without a server; `http:`/`ws:` only in dev/e2e for a loopback origin; release build has no dev origin and no `http:`/`ws:`; `bridge.js` JSON escapes `<`, `>`, `&`, U+2028/9 and never holds a token (fuzzed server names); `/sw.js` and `/manifest.webmanifest` 404; dotted miss 404; 405 for POST; `Guard`: foreign Origin 403, same-origin passes, no Origin plus `Sec-Fetch-Site: same-origin` passes, no Origin without it 403; runtime allowlist with requests built as the pinned runtime builds them (W21's ids), in both forms (JSON body and `?object=` query): `Call` and `CancelCall` pass with the body intact for the next handler, `Browser.OpenURL`, `Clipboard.Text`/`SetText`, `Window.Hide`, `Application.Quit`, `Dialog`, `System`, `Screens`, `ContextMenu` and `Events.Emit` get 403 with one rate-limited WARN; an unparsable object, a chunked request and a body over 64 KiB are refused |
+| `assets` | `index.html` gets the bridge tag exactly once before `boot-check.js`; `New` fails without the tag; CSP header and `<meta>` equal but for the header's trailing `sandbox allow-scripts allow-same-origin allow-forms` (no `allow-popups`, never in the `<meta>`), with the active host in `connect-src` and `'self'` only without a server; `http:`/`ws:` only in dev/e2e for a loopback origin; release build has no dev origin and no `http:`/`ws:`; `bridge.js` JSON escapes `<`, `>`, `&`, U+2028/9 and never holds a token (fuzzed server names), and the navigation guard follows the config statement; `/sw.js` and `/manifest.webmanifest` 404; dotted miss 404; 405 for POST; `Guard`: foreign Origin 403, same-origin passes, no Origin plus `Sec-Fetch-Site: same-origin` passes, no Origin without it 403; runtime allowlist with requests built as the pinned runtime builds them (W21's ids), in both forms (JSON body and `?object=` query): `Call` and `CancelCall` pass with the body intact for the next handler, `Browser.OpenURL`, `Clipboard.Text`/`SetText`, `Window.Hide`, `Application.Quit`, `Dialog`, `System`, `Screens`, `ContextMenu` and `Events.Emit` get 403 with one rate-limited WARN; an unparsable object, a chunked request and a body over 64 KiB are refused |
 | `servers` | `Normalize` table (hosts, IPs, ports, paths dropped, fragments never kept, invite and setup paths flagged, http refused in release, http loopback in dev/e2e through 02's `NormalizeOrigin`); `LocalID` vectors (shared with the TypeScript test); probe against `httptest` TLS servers in §8.1's order: untrusted cert → `tls_untrusted`, redirect not followed, 404 → `not_isshoni`, `setupRequired` → `server_not_set_up`, a 0.1.x `/info` without `deviceFlow` → `incompatible_server` with `reason: no_device_flow`, protocol ranges → `incompatible_server` with 02's verdicts, `publicUrl` adopted |
 | `settings` | round trip; unknown fields kept; corrupt file → `.bad-*` and `.bak` used, credentials untouched (a fake `credstore` sees no call); migration from schema 0 fixture; atomic write (temp + rename) with a fault-injected writer; no secrets serialized (reflection test on the struct); no file and `UpdateChecks=0` → `updates.check=false`, read once and never again; `serverPrefs` for an unknown origin dropped; `audio.SettingsStore` round trip of 05's `Settings` |
 | `share` | the state machine of §10.1 with a fake core (01's `Client`/`Share` shapes), fake engine, fake `audio.Service` and clock (`testing/synctest`): pick expiry at 300 s (a Start at 299 s works, one at 301 s returns `pick_expired`), one pick at a time, `ErrCancelled` → null, a fake `Pick` returning `invalid`/`self_window` → no pick held and `engine.invalid` with `params.reason: self_window`; Start calls in order (`OnShareStarted(pid, withAudio)`, then `StartShare` with `Label: ""`, 05's exclusions going through C2's `AudioConfig`, §10.1; `OnShareStopped` when `StartShare` fails); the controller sends no `room.join`, `room.leave` or `share.stop` of its own (the join-before-`share.start` order is 01's itests D1, D2); Stop calls `Share.Stop` then `OnShareStopped`, and a server-made end runs the same local steps once; pause calls `Share.SetPaused` then `audio.SetPaused`; `SetAudioEnabled` calls only `SetShareSound`; every row of the state and end-reason tables (`elsewhere` from `Server` ∈ {stopped, left} and `!ByThisApp`, `unlinked`, `failed` with `engine.<code>`); `liveSince` kept across `replaces`; `publisher_offline` at 10 s; lock pauses and releases keep-awake, an unlock at 4 min resumes and takes keep-awake again, an unlock at 6 min stays paused with the "Resume sharing?" state (pill, tray, toast) and resumes only on Resume, a lock pause stops at 30 min with `endReason: system` (also when the unlock came at 6 min and no Resume followed), an unlock at 31 min finds it stopped, a pause the user chose before the lock stays and never auto-resumes; suspend stops |
@@ -2435,6 +2536,7 @@ there.
 | `applog` | rotation at 5 MiB keeping 5; `Secret` redacted; profile path replaced; crash-file detection; at `log.level: debug`, a run of the `app`, `share` and `bridge` tests over 05's fake `normal` scenario writes no exe name (`*.exe`), no app display name, window title or share label from the fixtures into the log (§17); at `log.level: debug`, the logger `main` gives Wails as `Options.Logger` has Debug disabled, and Wails' "Binding call complete" lines for `Auth.LinkWithPassword` (the password in `args`) and `Auth.AccessToken` (the token in `result`) sent through it leave neither the password nor the token in the log (§17) |
 | `bridge` | each method validates arguments and maps errors to §6.4's JSON (02's `ErrOffline` → `server_unreachable`, `ErrIncompatible` → `incompatible_server`, `ErrTooManyServers` → `too_many_servers`; media codes → `engine.<code>`; `engine.cancelled` never returned); `Audio.Watch`/`WatchLevels`/`Share.WatchServerStats` reference counts; `OpenExternal` accepts only https (and dev http localhost); `Shell.OpenURL` refuses `file:`, `ms-settings:`, `search-ms:`, `javascript:` and a UNC path (`\\host\share`) with `invalid_argument` and opens nothing, even when called from Go code paths that skip `OpenExternal`; `OpenOSSettings` URI builder incl. `sound-communications`; `Log` rate limit; no method returns a refresh token (type check over every result type); `Auth.AccessToken(origin, force)` with an origin that isn't the active server's → `null` and no `Manager` call, with the active one → the token (and `force` reaches `AccessTokenWithExpiry`); a call racing an `AddServer` returns either `null` or the requested origin's own token, never the new server's; `SessionEnded`/`HelloRefused` with another origin → `not_found` and no `Manager` call; no `Audio` method sets a sound mode (the service type has no such method); `Audio.Decide` with `auto` → `invalid_argument`; `Audio.DismissPrompt` → 05's `DismissPrompt`, `ErrUnknownPrompt` → `not_found`; `TestHotkey` sets `typesChar` from a fake layout |
 | `cmd/isshoni-desktop` (start order) | §13.4 with fakes for the mutex probe, the registry and the updater: installer mutex present → a start from `--open-url` writes `PendingServer`/`PendingRoom` (replacing older values) and exits 0, a plain start writes nothing and exits 0, and neither calls single instance, creates the running mutex, builds the updater or calls `Apply`; mutex absent → the normal order; `--sound-check-helper` still runs after the first action only |
+| `cmd/isshoni-desktop` (navigation guard, W5's fallback) | `foreignTop`: only the asset origin (any path, its default port, any case) is home; `""`, `about:blank`, `chrome-error://`, another scheme or port, a longer host and user info are foreign; the guard asks after every completed navigation, starts the 5 s deadline only once the runtime is up, sends the window home on a foreign answer or silence and never on an asset-origin answer, at most 3 times a minute; an answer to a question never asked, or older than the last answer, is ignored; `atHome` follows the last answer |
 | `cmd/isshoni-desktop` (build) | `GOOS=darwin CGO_ENABLED=0 go vet ./...` and `GOOS=linux go build ./...` pass (the stub prints its line and exits 1) |
 
 ### 22.2 Windows-only Go tests (CI windows, owner's PC)
@@ -2452,8 +2554,11 @@ there.
 - Running mutex: the first instance holds `Local\io.isshoni.desktop.running`; one-shot modes never create it.
 - Shell relaunch: a helper (`internal/desktop/winos/internal/relaunchee`) started from the test process (not a
   launcher) calls `winos.RelaunchUnderShell` and the surviving process writes its parent's exe name to a file:
-  `explorer.exe`; started with `--relaunched` it stays; skipped with a reason when `GetShellWindow` returns 0 (no
-  shell on the runner), and run on the owner's PC runner.
+  `explorer.exe`; started with `--relaunched` it stays (every Windows run). When the shell window's process is in
+  another session or of another user than the test (a CI runner's job outside Explorer's session), the helper must
+  refuse the relaunch (exit 3, the refusal in its file) and the explorer-parent half is skipped with the reason;
+  skipped too when `GetShellWindow` returns 0 (no shell on the runner); the explorer-parent half runs on the owner's
+  PC runner.
 - `--version` prints one JSON line with the fields of §13.4 when stdout is redirected; `--self-check=<path>` on a
   GPU-less runner, against `windows-native`'s `release\` DLL and FFmpeg DLLs, writes `ok: true` with `engine.loaded`,
   `ffmpegLoaded`, `testHooks: false` and `spa.ok` (06's smoke runs the same against the install).
@@ -2597,7 +2702,7 @@ with `-tags e2e`: the fake engine with 05's audio scenarios (as in A), http serv
 `WEBVIEW2_*` scrub off, DevTools on, and `credstore.Open(credstore.Options{Prefix: "isshoni-test:<random>:"})` whose
 entries are deleted at exit (never the user's `isshoni:v1:` entries). The spec starts an `isshoni` server
 (`tls.mode=off` on `127.0.0.1`), launches the app with `--relaunched` (so Playwright keeps its process), a remote
-debugging port and a temporary data root, and attaches with `chromium.connectOverCDP`. **The data root can't come
+debugging port and a temporary data root, and attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation would keep `document.visibilityState` `visible`, so W7 couldn't see the window hide (W7 also checks the main HWND with `IsWindow`/`IsWindowVisible`). **The data root can't come
 through `LOCALAPPDATA`** either (WA48's review): the app reads `FOLDERID_LocalAppData` through the shell's known
 folder, never from the environment, so `flavor_e2e.go` (WA72) also takes the data root from the e2e-only
 `ISSHONI_E2E_DATA_DIR`, and the port from `ISSHONI_E2E_CDP_PORT`. WA48's skeleton (`web/e2e/cdp/`) sets both, seeds
@@ -2636,7 +2741,7 @@ webview processes' environment and command lines, and the unit test of `scrubEnv
 | M-DESK-8 | Win10 22H2: share a monitor (Desktop Duplication) and a window (WGC) | Monitor: no border, pill shown and checked against the stream (records whether DD honors the affinity); window: yellow border, no pill by default |
 | M-DESK-9 | Open `isshoni://<another host>/` from a web page | "Add server" confirmation with the host, before any request (no hit in that server's log); nothing starts; Cancel leaves no trace |
 | M-DESK-10 | High contrast on; text size 150 %; 200 % display scaling | Pill, tray menu and SPA readable and usable |
-| M-DESK-11 | Kill a `msedgewebview2.exe` renderer while live (W17) | The page comes back; the share never stopped |
+| M-DESK-11 | Kill a `msedgewebview2.exe` renderer while live (W17); then, while live, minimize the window for 10 minutes, and cover it with a full-screen game for 10 minutes | The page comes back; the share never stopped. Minimized or covered, the page is not reloaded (the app's log has no "the page sent no heartbeat; reloading it"): until the hidden-page gap of §20 is fixed this part is expected to fail, and its result is recorded |
 | M-DESK-12 | Measure startup and memory (§20) with Task Manager after 30 minutes of sharing 1080p60 while watching | Within §20's budgets; numbers recorded |
 
 Discord exclusion is 05's audiotest. Glass-to-glass is 01 §12.2's run: a Chrome viewer on the same PC and monitor,

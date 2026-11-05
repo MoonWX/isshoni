@@ -22,6 +22,9 @@ type SelfInfo struct {
 	// Exe is the binary that SoundCheck starts with --sound-check-helper (03: os.Executable()); "" = no helper (the
 	// fake engine, e2ehost, the audiotest). A path: never logged.
 	Exe string
+	// NoDucking: don't read Windows' ducking preference (05 §14.7); it is unknown, which hides the tip. For runs whose
+	// output must not depend on the host's registry: the share sheet's scenario fixtures and e2ehost.
+	NoDucking bool
 }
 
 // AppRule is one remembered decision (03's Settings → Audio).

@@ -54,8 +54,8 @@ private:
 // What ActivationContext::Wait saw.
 enum class WaitResult : uint8_t { kDone, kTimeout, kAborted };
 
-// A stream to open: an include stream on a target's tree (README WA45), later also the fast path's EXCLUDE stream and
-// the endpoint stream (README WA53).
+// A stream to open: an include stream on a target's tree (README WA45), the fast path's EXCLUDE stream or the endpoint
+// stream (README WA53).
 struct OpenRequest {
   uint64_t id = 0; // the caller's (include_set.h: the stream's id)
   audiopolicy::StreamKind kind = audiopolicy::StreamKind::kInclude;

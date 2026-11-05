@@ -1,0 +1,740 @@
+{
+  "seq": 2,
+  "live": false,
+  "mode": "exclude-apps",
+  "engine": "include-set",
+  "muted": false,
+  "paused": false,
+  "keepOutMicUsers": true,
+  "heard": [
+    {
+      "id": "exe:app01.exe",
+      "name": "App 01",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app02.exe",
+      "name": "App 02",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app03.exe",
+      "name": "App 03",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app04.exe",
+      "name": "App 04",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app05.exe",
+      "name": "App 05",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app06.exe",
+      "name": "App 06",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app07.exe",
+      "name": "App 07",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app08.exe",
+      "name": "App 08",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app10.exe",
+      "name": "App 10",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app11.exe",
+      "name": "App 11",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app12.exe",
+      "name": "App 12",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app14.exe",
+      "name": "App 14",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app15.exe",
+      "name": "App 15",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app16.exe",
+      "name": "App 16",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app17.exe",
+      "name": "App 17",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app19.exe",
+      "name": "App 19",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app20.exe",
+      "name": "App 20",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app21.exe",
+      "name": "App 21",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app22.exe",
+      "name": "App 22",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app23.exe",
+      "name": "App 23",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app24.exe",
+      "name": "App 24",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app25.exe",
+      "name": "App 25",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app28.exe",
+      "name": "App 28",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app29.exe",
+      "name": "App 29",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app30.exe",
+      "name": "App 30",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app31.exe",
+      "name": "App 31",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app32.exe",
+      "name": "App 32",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app33.exe",
+      "name": "App 33",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app34.exe",
+      "name": "App 34",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app35.exe",
+      "name": "App 35",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app37.exe",
+      "name": "App 37",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app38.exe",
+      "name": "App 38",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app40.exe",
+      "name": "App 40",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app41.exe",
+      "name": "App 41",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app42.exe",
+      "name": "App 42",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app43.exe",
+      "name": "App 43",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app44.exe",
+      "name": "App 44",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app46.exe",
+      "name": "App 46",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app47.exe",
+      "name": "App 47",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app48.exe",
+      "name": "App 48",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app49.exe",
+      "name": "App 49",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app50.exe",
+      "name": "App 50",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app51.exe",
+      "name": "App 51",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app53.exe",
+      "name": "App 53",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app55.exe",
+      "name": "App 55",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app56.exe",
+      "name": "App 56",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app57.exe",
+      "name": "App 57",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:spotify.exe",
+      "name": "Spotify",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app13.exe",
+      "name": "App 13",
+      "reason": "",
+      "playing": false,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app26.exe",
+      "name": "App 26",
+      "reason": "",
+      "playing": false,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app39.exe",
+      "name": "App 39",
+      "reason": "",
+      "playing": false,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app52.exe",
+      "name": "App 52",
+      "reason": "",
+      "playing": false,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    }
+  ],
+  "keptOut": [
+    {
+      "id": "exe:app09.exe",
+      "name": "App 09",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app18.exe",
+      "name": "App 18",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app27.exe",
+      "name": "App 27",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app36.exe",
+      "name": "App 36",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app45.exe",
+      "name": "App 45",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:app54.exe",
+      "name": "App 54",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "discord",
+      "name": "Discord",
+      "reason": "builtin",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "locked",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:steam.exe",
+      "name": "Steam",
+      "reason": "mic",
+      "playing": false,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    }
+  ],
+  "notCaptured": [],
+  "prompts": [
+    {
+      "id": "p1",
+      "appId": "exe:steam.exe",
+      "name": "Steam",
+      "kind": "mic",
+      "since": 946684800000
+    },
+    {
+      "id": "p2",
+      "appId": "exe:app09.exe",
+      "name": "App 09",
+      "kind": "mic",
+      "since": 946684800000
+    },
+    {
+      "id": "p3",
+      "appId": "exe:app18.exe",
+      "name": "App 18",
+      "kind": "mic",
+      "since": 946684800000
+    }
+  ],
+  "banners": [],
+  "tips": [],
+  "voiceApps": [
+    {
+      "id": "discord",
+      "name": "Discord",
+      "running": true
+    },
+    {
+      "id": "vesktop",
+      "name": "Vesktop",
+      "running": false
+    },
+    {
+      "id": "teamspeak",
+      "name": "TeamSpeak",
+      "running": false
+    },
+    {
+      "id": "mumble",
+      "name": "Mumble",
+      "running": false
+    },
+    {
+      "id": "zoom",
+      "name": "Zoom",
+      "running": false
+    },
+    {
+      "id": "teams",
+      "name": "Microsoft Teams",
+      "running": false
+    },
+    {
+      "id": "slack",
+      "name": "Slack",
+      "running": false
+    }
+  ],
+  "alert": {
+    "voiceAppsHeard": false,
+    "questions": 3
+  }
+}

@@ -8,7 +8,8 @@ import { SignalClient } from '../../protocol/signal-client';
 import { FakeSignalServer, makeError } from '../../protocol/testing';
 import type { SharingProvider } from '../types';
 import type { DesktopConfig } from './config';
-import { DesktopPlatform, type DesktopPlatformOptions } from './DesktopPlatform';
+import { VoidMethods } from './bridge';
+import { DesktopPlatform, HeartbeatEveryMs, type DesktopPlatformOptions } from './DesktopPlatform';
 import { BridgeError } from './errors';
 import { authState, createFakeBridge, shareCaps, updateStatus, type FakeBridge } from './testing/fakeBridge';
 import { LocalIdVectors } from './testing/localIdVectors';
@@ -115,6 +116,59 @@ describe('DesktopPlatform basics (docs/m2/03 §7.3)', () => {
     await expect(p.apiFetch('/api/v1/info')).rejects.toThrow('no active server');
     expect(fetchMock).not.toHaveBeenCalled();
     expect(fake.callsOf('auth.accessToken')).toEqual([]);
+  });
+});
+
+describe('the heartbeat (docs/m2/03 §3.2 W17, §20)', () => {
+  it('beats App.Heartbeat at once and then every 5 s, with or without a server, until disposed', () => {
+    vi.useFakeTimers();
+    const { p, fake } = make({ cfg: config({ server: null, serverIds: [] }), active: '' });
+    // The first beat arms Go's watchdog at once.
+    expect(fake.callsOf('app.heartbeat')).toEqual([[]]);
+    vi.advanceTimersByTime(HeartbeatEveryMs - 1);
+    expect(fake.callsOf('app.heartbeat')).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(fake.callsOf('app.heartbeat')).toHaveLength(2);
+    vi.advanceTimersByTime(4 * HeartbeatEveryMs);
+    expect(fake.callsOf('app.heartbeat')).toHaveLength(6);
+    // Go's watchdog reloads after 15 s without one (app.HeartbeatTimeout): the beat comes at least 3 times as often.
+    expect(HeartbeatEveryMs * 3).toBeLessThanOrEqual(15_000);
+    p.dispose();
+    vi.advanceTimersByTime(10 * HeartbeatEveryMs);
+    expect(fake.callsOf('app.heartbeat')).toHaveLength(6);
+  });
+
+  it('beats at once when the page becomes visible again, and not when it is hidden', () => {
+    vi.useFakeTimers();
+    const { p, fake } = make({ cfg: config({ server: null, serverIds: [] }), active: '' });
+    let state: DocumentVisibilityState = 'hidden';
+    const spy = vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => state);
+    try {
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(fake.callsOf('app.heartbeat')).toHaveLength(1);
+      state = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(fake.callsOf('app.heartbeat')).toHaveLength(2);
+      p.dispose();
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(fake.callsOf('app.heartbeat')).toHaveLength(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('is fire-and-forget: a failing beat neither throws nor stops the next one', () => {
+    vi.useFakeTimers();
+    const fake = createFakeBridge({ active: ORIGIN });
+    fake.answers['app.heartbeat'] = () => {
+      throw new BridgeError('internal');
+    };
+    // The transports log a void call's failure themselves (VoidMethods); even one that throws stays in the bridge.
+    expect(VoidMethods.has('app.heartbeat')).toBe(true);
+    const p = new DesktopPlatform(config(), { bridge: fake.bridge, interceptLinks: false });
+    made.push(p);
+    vi.advanceTimersByTime(HeartbeatEveryMs);
+    expect(fake.callsOf('app.heartbeat')).toHaveLength(2);
   });
 });
 
@@ -358,7 +412,7 @@ describe('C1 stops (docs/m2/03 §7.3)', () => {
     // No sharing provider: its own first calls (Share.Current, App.Info) aren't C1's.
     const { p, fake } = make({ sharing: () => null });
     expect(await p.desktop.signalStopped({ code })).toBe('none');
-    expect(fake.calls).toEqual([]);
+    expect(fake.calls.filter((c) => c.method !== 'app.heartbeat')).toEqual([]);
   });
 
   it('every accessToken, sessionEnded and helloRefused call of a session names server.origin', async () => {
@@ -666,14 +720,14 @@ describe('the transport (docs/m2/03 §7.2, §7.4)', () => {
     const p = new DesktopPlatform(config({ transport: 'http' }), { sharing: () => null });
     made.push(p);
     await p.apiFetch('/api/v1/me');
-    const call = sent(0);
-    expect(call.url).toBe(`${location.origin}/__bridge/call`);
-    expect(JSON.parse(call.init.body as string)).toEqual({
-      service: 'Auth',
-      method: 'AccessToken',
-      args: [ORIGIN, false],
-    });
-    expect(sent(1).auth).toBe('Bearer isa_http');
+    const calls = fetchMock.mock.calls.map((_c, i) => sent(i));
+    const bridgeCalls = calls
+      .filter((c) => c.url === `${location.origin}/__bridge/call`)
+      .map((c) => JSON.parse(c.init.body as string) as unknown);
+    expect(bridgeCalls).toContainEqual({ service: 'Auth', method: 'AccessToken', args: [ORIGIN, false] });
+    // The heartbeat (W17) goes out over the same transport.
+    expect(bridgeCalls).toContainEqual({ service: 'App', method: 'Heartbeat', args: [] });
+    expect(calls.find((c) => c.url.endsWith('/api/v1/me'))?.auth).toBe('Bearer isa_http');
   });
 
   it('a Wails build calls the bound methods through the Wails runtime, and parses their errors (W12)', async () => {

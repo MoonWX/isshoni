@@ -1,20 +1,29 @@
 // 05's AudioEngine (docs/m2/05-windows-audio.md §10.5; "05" below): Init and Shutdown with the watcher thread, the
 // rules, watch and unwatch, the report, the levels and the probe flags (README WA35), and a share's Mixer with the
-// include set's capture (README WA45): NewMixer, and SetMode and SetMuted while it runs. The sound check is README
-// WA53's; until then it answers IM_ERR_NOT_IMPLEMENTED. Without a running audio session SetMode and SetMuted answer
-// IM_ERR_BAD_STATE (05 §4.3).
+// include set's capture (README WA45): NewMixer, and SetMode and SetMuted while it runs; the sound check (README WA53;
+// the fast path, the endpoint engine and the startup probe are the watcher's). Without a running audio session SetMode
+// and SetMuted answer IM_ERR_BAD_STATE (05 §4.3).
 #include "audio/mixer.h"
 
-#include <windows.h>
+#include "audio/win_audio.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 
+#include "api/guard.h"
 #include "audio/live_mix.h"
+#include "audio/loopback_io.h"
+#include "audio/sound_check.h"
 #include "audio/watcher.h"
+#include "engine/os.h"
 #include "im/abi/status.h"
 #include "im/audiomix/mixer.h"
 #include "im/audiopolicy/exclusions.h"
@@ -26,6 +35,8 @@ namespace {
 // How long Mixer::Stop waits for the watcher to let go of the share's streams (Stop's bound is 500 ms, 05 §10.5; the
 // mixer thread's join comes first).
 constexpr std::chrono::milliseconds kDetachWait{400};
+// im_audio_sound_check waits timeout_ms plus this before IM_ERR_TIMEOUT (05 §11.3 step 5).
+constexpr int32_t kSoundCheckGraceMs = 500;
 
 class WindowsAudioEngine;
 
@@ -192,11 +203,70 @@ public:
     return w->LevelsGet(out);
   }
 
-  int32_t SoundCheck(uint32_t, int32_t, char *, int32_t) override {
-    if (!Current()) {
+  // The first-run sound check (05 §11.3): on a DLL thread in COM's MTA, with the capture path the probe flags allow.
+  // Exempt from the 3 s limit: it waits timeout_ms + 500, then answers IM_ERR_TIMEOUT and abandons the thread, which
+  // stops at its next step (05 §4.3).
+  int32_t SoundCheck(uint32_t helper_pid, int32_t timeout_ms, char *buf, int32_t cap) override {
+    const std::shared_ptr<Watcher> w = Current();
+    if (!w) {
       return NoAudio("im_audio_sound_check");
     }
-    return abi::Fail(IM_ERR_NOT_IMPLEMENTED, {}, "im_audio_sound_check: not implemented yet (README WA53)");
+    // Cached since im_probe, or computed now (05 §11.1); a Windows 10 build takes the endpoint as its shares do.
+    const uint32_t flags = SoundCheckFlags(win::OsBuild(), w->ProbeFlags());
+    struct Shared {
+      std::mutex mu;
+      std::condition_variable cv;
+      bool done = false;
+      std::string json;
+      std::atomic<bool> abort{false};
+    };
+    auto sh = std::make_shared<Shared>();
+    try {
+      std::thread t([sh, helper_pid, timeout_ms, flags] {
+        const uintptr_t token = engine::os::EnterThread("isshoni sound check", engine::os::ThreadClass::kNormal);
+        std::string json;
+        api::Guard("sound check", [&] {
+          const win::ComApartment com;
+          SoundCheckResult r;
+          if (FAILED(com.hr())) {
+            r.reason = "activation_failed";
+          } else {
+            const std::unique_ptr<LoopbackIo> io = NewWindowsLoopbackIo(kSoundCheckActivationMs, &sh->abort);
+            r = RunSoundCheck(*io, SoundCheckParams{helper_pid, timeout_ms, flags}, &sh->abort);
+          }
+          json = SoundCheckJson(r);
+        });
+        engine::os::LeaveThread(token);
+        {
+          std::lock_guard<std::mutex> l(sh->mu);
+          sh->json = std::move(json);
+          sh->done = true;
+        }
+        sh->cv.notify_all();
+      });
+      bool done = false;
+      {
+        std::unique_lock<std::mutex> l(sh->mu);
+        done = sh->cv.wait_for(l, std::chrono::milliseconds(timeout_ms + kSoundCheckGraceMs), [&] { return sh->done; });
+      }
+      if (!done) {
+        sh->abort.store(true, std::memory_order_release);
+        t.detach(); // stuck in a driver call: abandoned, never killed; it holds its own state (05 §10.5)
+        return abi::Failf(IM_ERR_TIMEOUT, {}, "im_audio_sound_check: no result within %d ms",
+                          static_cast<int>(timeout_ms + kSoundCheckGraceMs));
+      }
+      t.join();
+    } catch (const std::system_error &e) {
+      return abi::Failf(IM_ERR_INTERNAL, {}, "im_audio_sound_check: the thread did not start: %s", e.what());
+    }
+    if (sh->json.empty()) {
+      return abi::Fail(IM_ERR_INTERNAL, {}, "im_audio_sound_check: the check failed on its thread");
+    }
+    const int32_t n = abi::CopyOut(sh->json, buf, cap);
+    if (n < 0) {
+      return abi::Fail(n, {}, "im_audio_sound_check: the result does not fit the snprintf rule");
+    }
+    return n;
   }
 
   // A share's mixer; nullptr after IM_INIT_NO_AUDIO or when the watcher didn't start (the share then runs without

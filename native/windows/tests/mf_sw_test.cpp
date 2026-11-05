@@ -5,14 +5,17 @@
 // It runs when Media Foundation works on the machine (MFStartup, IM_OS_MEDIA_FOUNDATION) and the H.264 encoder MFT is
 // registered; otherwise it is skipped with the reason logged. On Windows Server, where Microsoft's H.264 encoder MFT
 // is not supported ("Minimum supported server: None supported") yet can enumerate and open, a probe failure is skipped
-// too, but only when FFmpeg's log shows the MFT itself refused during MF software's own probe (h264_mf's error with
-// the MFT's HRESULT, before MF software's failed open or failed encode call), which the skip prints; any other failure
-// (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows must pass in full. A failed
-// probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's (ISSHONI_TEST_FFMPEG_DIR; required in
-// CI).
+// too, in two cases only, each printing what it saw: FFmpeg's log shows the MFT itself refused during MF software's
+// own probe (h264_mf's error with the MFT's HRESULT, before MF software's failed open or failed encode call), or the
+// MFT gave complete AUs (SPS, PPS, IDR) only on drain, holding every frame of the probe's budget (04 §9.10). Any other
+// failure (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows must pass in full. A
+// failed probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's (ISSHONI_TEST_FFMPEG_DIR;
+// required in CI).
 //
 // It asserts, for a High and a Constrained Baseline session forced to IM_ENC_MF_SW:
-//   - the probe lists MF software as available, without zero copy or live bitrate (04 §9.1, §9.5);
+//   - the probe lists MF software as available, without zero copy or live bitrate (04 §9.1, §9.5), and so does the
+//     session's own encoder catalog (README WF10);
+//   - capture times increase from packet to packet (each AU carries its own frame's, 04 §9.2);
 //   - the session's first packet is KEYFRAME|REINIT, and every keyframe access unit is SPS, PPS, then the IDR slice
 //     (04 §9.4), with only IDR slices in a keyframe and none in the others;
 //   - the packets' profile key and the SPS's profile_idc are the session's (6400 / 100, 42e0 / 66, constraint byte
@@ -43,7 +46,6 @@
 #include <string_view>
 #include <vector>
 
-#include "encode/selector.h"
 #include "im/h264/nal.h"
 #include "im/h264/sps.h"
 #include "isshoni_media.h"
@@ -283,9 +285,18 @@ protected:
     EXPECT_NE(mf->flags & IM_ENCF_HIGH, 0u);
     EXPECT_NE(mf->flags & IM_ENCF_CB, 0u);
 
-    // The probe's encoders in the session's catalog: README WA44's wiring of session/encoder_catalog.cpp lists them
-    // there itself; this puts them first either way.
-    im::session::SetCatalogPrefixForTest(im::encode::CatalogEntries());
+    // The session's own catalog lists the probe's encoders (README WF10's wiring of session/encoder_catalog.cpp): the
+    // stored full probe's MF software, available, taking pixels on the default adapter.
+    bool listed = false;
+    for (const im::session::EncoderEntry &e : im::session::EncoderCatalog()) {
+      if (e.info.kind == IM_ENC_MF_SW && e.info.status == IM_OK) {
+        listed = true;
+        EXPECT_EQ(e.input, im::session::FrameInput::kNv12);
+        EXPECT_NE(e.open, nullptr);
+        EXPECT_EQ(e.device.adapter, im::gpu::DeviceRequest::Adapter::kDefault);
+      }
+    }
+    ASSERT_TRUE(listed) << "the session's encoder catalog lacks the probe's MF software";
     im::testhooks::Options o;
     o.pattern = im::session::Pattern::kMoving;
     o.pattern_width = kWidth;
@@ -295,7 +306,6 @@ protected:
   }
 
   void TearDown() override {
-    im::session::SetCatalogPrefixForTest({});
     if (initialized_) {
       im_shutdown();
     }
@@ -379,6 +389,10 @@ void CheckStream(const std::vector<Packet> &pkts, uint32_t profile) {
   for (std::size_t i = 0; i < pkts.size(); ++i) {
     const Packet &p = pkts[i];
     EXPECT_EQ(p.profile, profile) << "packet " << i;
+    if (i > 0) {
+      // Each AU carries its own frame's capture time (04 §9.2), also if the MFT holds frames back: increasing.
+      EXPECT_GT(p.ts_ns, pkts[i - 1].ts_ns) << "packet " << i;
+    }
     std::vector<uint8_t> types;
     im::h264::ForEachNal(std::span<const uint8_t>(p.data), [&](std::span<const uint8_t> nal) {
       const uint8_t t = im::h264::NalType(nal);

@@ -12,5 +12,12 @@
   {"name": "nv-codec-headers", "version": "12.1.14.1", "license": "MIT",
    "linking": "headers, inside avcodec", "licenseFiles": ["nv-codec-headers/LICENSE"]},
   {"name": "AMD AMF headers", "version": "1.5.3", "license": "MIT",
-   "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]}
+   "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]},
+  {"name": "C++/WinRT", "license": "MIT",
+   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["cppwinrt/LICENSE"]},
+  {"name": "OpenH264 headers", "version": "2.7.0", "license": "BSD-2-Clause",
+   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["openh264/LICENSE"]},
+  {"name": "Microsoft Edge WebView2 Runtime bootstrapper", "license": "LicenseRef-Microsoft-WebView2-Distribution",
+   "linking": "separate program inside the installer, run only when the runtime is missing",
+   "licenseFiles": ["../deploy/notices/licenses/webview2-bootstrapper.txt"]}
 ]

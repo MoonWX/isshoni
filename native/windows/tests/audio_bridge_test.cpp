@@ -1109,16 +1109,10 @@ TEST_F(AudioBridge, AfterInitNoAudioTheStartNeverReachesTheAudioEngine) {
   im_session s = 0;
   im_session_info info{};
   info.struct_size = sizeof info;
-  const im_status st = im_start(&cfg, &s, &info);
-  // Which status is still open: 05 §4.3 says IM_ERR_BAD_STATE, the session (README WA23) runs a silent share (IM_OK,
-  // no IM_SESS_AUDIO, audio state off). Both keep the AudioEngine out of it: no SetRules and no mixer.
-  if (st == IM_OK) {
-    EXPECT_EQ(info.flags & IM_SESS_AUDIO, 0u);
-    EXPECT_EQ(info.audio_state, IM_AUDIO_STATE_OFF);
-    EXPECT_EQ(im_stop(s), IM_OK);
-  } else {
-    EXPECT_EQ(st, IM_ERR_BAD_STATE) << LastError();
-  }
+  // Decided (README §3 item 35, 05 §4.3; the check is WA52's): IM_ERR_BAD_STATE before anything opens, so the
+  // AudioEngine stays out of it: no session, no SetRules and no mixer.
+  EXPECT_EQ(im_start(&cfg, &s, &info), IM_ERR_BAD_STATE) << LastError();
+  EXPECT_EQ(s, 0u);
   EXPECT_EQ(Fake().Count("SetRules"), 0u);
   EXPECT_EQ(Fake().Count("NewMixer"), 0u);
 }

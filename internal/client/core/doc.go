@@ -27,7 +27,9 @@
 //     server's view of the share (WatchServerStats, stats.watch);
 //   - relay.go: the same-user relay, of which the core consumes playback.state only (EventPlaybackState).
 //
-// Bearer auth's integration tests come with README WA73.
+// The integration tests (internal/server/itest's desktop_*_test.go) run the core on bearer auth, with a device linked
+// through the real deviceauth.Manager (README WA73): D1–D19, the forced refresh after an unauthenticated hello (a new
+// connection that publishes the share again), and a device revoke (SessionEnded, then StopUnlinked).
 //
 // The core never stores a token: 02's manager owns the credential. Nothing it logs holds a token, an SDP, an ICE
 // candidate, a window title, a source or app name, or a relay payload (§11.12). It has no Wails dependency (D18) and

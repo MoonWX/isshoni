@@ -48,7 +48,7 @@ func (s *fakeShell) WindowVisible() bool       { return true }
 func (s *fakeShell) SetFullscreen(on bool)     { s.record(fmt.Sprintf("fullscreen(%v)", on)) }
 func (s *fakeShell) Reload()                   { s.record("reload") }
 func (s *fakeShell) MainWindowHandle() uintptr { return 0 }
-func (s *fakeShell) OpenURL(string) error      { return nil }
+func (s *fakeShell) OpenURL(u string) error    { s.record("open " + u); return nil }
 func (s *fakeShell) Notify(Notification) error { return nil }
 func (s *fakeShell) Quit()                     { s.record("quit") }
 func (s *fakeShell) Emit(name string, data any) {
@@ -109,6 +109,7 @@ type env struct {
 	app   *App
 	shell *fakeShell
 	srv   *deviceauth.Servers
+	store credstore.Store
 	net   *countingTransport
 	clock *fakeClock
 	logs  *bytes.Buffer
@@ -173,6 +174,13 @@ func newEnv(t *testing.T, origins []string, linked map[string]bool) *env {
 // builds' loopback rule.
 func newEnvWith(t *testing.T, origins []string, linked map[string]bool, hc *http.Client, loopback bool) *env {
 	t.Helper()
+	return newEnvStore(t, origins, linked, hc, loopback, credstore.NewMemory())
+}
+
+// newEnvStore is newEnvWith over a given credential store (one that already holds a credential).
+func newEnvStore(t *testing.T, origins []string, linked map[string]bool, hc *http.Client, loopback bool,
+	store credstore.Store) *env {
+	t.Helper()
 	dir := t.TempDir()
 	if len(origins) > 0 {
 		writeServers(t, dir, origins, linked)
@@ -183,9 +191,10 @@ func newEnvWith(t *testing.T, origins []string, linked map[string]bool, hc *http
 		hc = &http.Client{Transport: e.net}
 	}
 	log := slog.New(slog.NewTextHandler(&lockedWriter{w: e.logs}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	e.store = store
 	srv, err := deviceauth.OpenServers(deviceauth.ServersOptions{
 		Dir:                   dir,
-		Store:                 credstore.NewMemory(),
+		Store:                 e.store,
 		App:                   deviceauth.AppInfo{Version: "0.2.0", ClientKind: protocol.ClientKindDesktop, OS: protocol.ClientOSWindows},
 		HTTP:                  hc,
 		AllowInsecureLoopback: loopback,

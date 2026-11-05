@@ -1,7 +1,8 @@
 // The real app over CDP (M2 03 §22.4 B), the skeleton of README WA48: it starts the e2e build of isshoni.exe (or
 // attaches to a running one), connects Playwright to its WebView2 and checks the Wails checklist rows that only the
 // real webview can answer (03 §3.2): W1 (the asset origin), W2 (a secure context), W3 (the CSP is enforced), W5
-// (top-level navigation and new windows are cancelled) and W7 (closing the window hides it). Each test also writes
+// (top-level navigation and new windows don't leave the asset origin; at beta.34 through the row's fallback) and W7
+// (closing the window hides it). Each test also writes
 // its row as an annotation ("Wails checklist"), for the PR. README DK13 (WA90's run) completes the spec: W9, W13,
 // W16, W21 in the webview, a device-flow link, a fake share watched in Chrome, close-to-tray while live, Quit.
 //
@@ -134,7 +135,10 @@ const test = base.extend<{ app: RealApp }>({
     try {
       await waitForEndpoint(endpoint, child);
       if (dataDir !== null) await assertUsedDataDir(dataDir);
-      const browser = await chromium.connectOverCDP(endpoint);
+      // noDefaults: by default Playwright turns on focus emulation for every page it attaches to, which keeps
+      // document.visibilityState 'visible' whatever the window does, so W7 could never see the hidden window (03 §4.4).
+      // It also leaves acceptDownloads and media emulation at the webview's own settings; no check here relies on them.
+      const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true });
       const pages = (): Page[] => browser.contexts().flatMap((c) => c.pages());
       await expect
         .poll(() => pages().some((p) => p.url().startsWith(DesktopAssetOriginWindows)), { timeout: START_TIMEOUT_MS })
@@ -196,39 +200,114 @@ test("W3: the asset handler's CSP is enforced", async ({ app }) => {
 
 test('W5: navigation and new windows stay on the asset origin', async ({ app }) => {
   const { page } = app;
-  const before = app.browser.contexts().flatMap((c) => c.pages()).length;
-  // The SPA never does this (03 §5.5 layer 1); Go's NavigationStarting cancels it (layer 2).
+  const pages = (): number => app.browser.contexts().flatMap((c) => c.pages()).length;
+  const before = pages();
+  // The CSP sandbox (03 §5.3) must leave WebView2's own channel to Go in place: Wails' runtime and the navigation
+  // guard's answer (navguard.go) post through it.
+  const channel = await page.evaluate(
+    () => typeof (window as { chrome?: { webview?: { postMessage?: unknown } } }).chrome?.webview?.postMessage,
+  );
+  // The SPA never does this (03 §5.5 layer 1). Beta.34 lets Go cancel nothing (W5 fails; 03 §3.2 records the
+  // fallback): bridge.js's navigate listener cancels it (03 §5.2).
   await page.evaluate(() => {
     location.href = 'https://example.com/';
   });
   await page.waitForTimeout(1_500);
   const origin = await page.evaluate(() => location.origin);
-  // The native window.open (DesktopPlatform replaces window.open itself): NewWindowRequested cancels it.
-  const opened = await page.evaluate(() => Window.prototype.open.call(window, 'https://example.com/w') === null);
+  // The native window.open. DesktopPlatform replaced window's own (links.ts), and Window is a [Global] interface, so
+  // open is an own property of window and Window.prototype has none. A src-less iframe's window still has the native
+  // one (its about:blank needs no navigation, so the CSP's frame-src 'none' doesn't apply). Called on this window, it
+  // opens from the main frame, as a script in the SPA would. Beta.34 has no NewWindowRequested handler: the HTML's
+  // CSP sandbox, without allow-popups, refuses it and the call returns null (03 §5.3).
+  const opened = await page.evaluate(() => {
+    const frame = document.createElement('iframe');
+    document.body.append(frame);
+    try {
+      const own = frame.contentWindow;
+      if (own === null) throw new Error('the fresh frame has no window');
+      return own.open.call(window, 'https://example.com/w') === null;
+    } finally {
+      frame.remove();
+    }
+  });
   await page.waitForTimeout(1_000);
-  const after = app.browser.contexts().flatMap((c) => c.pages()).length;
+  const after = pages();
+  // A navigation no page script can cancel, started as the browser starts one (CDP's Page.navigate): Go's half of
+  // the fallback (navguard.go) notices the foreign top level after WebViewNavigationCompleted and loads the start
+  // page again. Both are asserted: that the window got there, so the check can't pass without leaving the asset
+  // origin, and that it is back home.
+  const started = Date.now();
+  const left = await page
+    .goto('https://example.com/g', { waitUntil: 'commit', timeout: 15_000 })
+    .then(() => new URL(page.url()).origin)
+    .catch((e: unknown) => `not reached (${e instanceof Error ? (e.message.split('\n')[0] ?? '') : String(e)})`);
+  await expect
+    .poll(() => page.evaluate(() => location.origin).catch(() => ''), { timeout: 20_000 })
+    .toBe(DesktopAssetOriginWindows);
+  const back = Date.now() - started;
   row(
     'W5',
-    `after location.href: ${origin}; native window.open returned null: ${String(opened)}; pages ${String(
-      before,
-    )} → ${String(after)}`,
+    [
+      `chrome.webview.postMessage: ${channel}`,
+      `after location.href: ${origin}`,
+      `native window.open returned null: ${String(opened)}`,
+      `pages ${String(before)} → ${String(after)}`,
+      `browser-started navigation reached ${left}, back on the asset origin after ${String(back)} ms`,
+    ].join('; '),
   );
+  expect(channel).toBe('function');
   expect(origin).toBe(DesktopAssetOriginWindows);
+  expect(opened).toBe(true);
   expect(after).toBe(before);
+  expect(left).toBe('https://example.com');
 });
 
 test('W7: closing the window hides it; the app keeps running', async ({ app }) => {
   test.skip(app.process === null, 'needs the app this spec started (its pid)');
   const pid = String(app.process?.pid);
-  // WM_CLOSE to the main window, as its close button sends it.
-  await execFileAsync('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-Command',
-    `$null = (Get-Process -Id ${pid}).CloseMainWindow()`,
-  ]);
-  await expect.poll(() => app.page.evaluate(() => document.visibilityState), { timeout: 10_000 }).toBe('hidden');
+  // -EncodedCommand (base64 of UTF-16LE) so the C# below keeps its double quotes through Windows' argument quoting.
+  const ps = async (command: string): Promise<string> =>
+    (
+      await execFileAsync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-EncodedCommand',
+        Buffer.from(command, 'utf16le').toString('base64'),
+      ])
+    ).stdout.trim();
+  // The main window's HWND, read before the close: .NET leaves hidden windows out of MainWindowHandle.
+  const hwnd = await ps(`(Get-Process -Id ${pid}).MainWindowHandle.ToInt64()`);
+  expect(hwnd).toMatch(/^[1-9]\d*$/);
+  // WM_CLOSE to the main window, as its close button sends it. False would mean it wasn't posted.
+  expect(await ps(`(Get-Process -Id ${pid}).CloseMainWindow()`)).toBe('True');
+  // The window itself, independent of Chromium: it still exists (not destroyed) and is hidden (Hide(), 03 §3.2 W7).
+  // Read first, and both polls soft, so the row below always records the window's state and the webview's
+  // separately: a WebView2 visibility quirk then reads apart from a broken close path.
+  const user32 =
+    "Add-Type -Namespace W -Name U -MemberDefinition '" +
+    '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); ' +
+    '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);' +
+    "'; ";
+  const windowState = async (): Promise<string[]> =>
+    (await ps(`${user32}$h = [IntPtr]${hwnd}; '{0} {1}' -f [W.U]::IsWindow($h), [W.U]::IsWindowVisible($h)`)).split(
+      ' ',
+    );
+  await expect.soft.poll(async () => (await windowState())[1], { timeout: 10_000 }).toBe('False');
+  // What M1's layer policy reads: the webview reports hidden (03 §4.4).
+  await expect.soft.poll(() => app.page.evaluate(() => document.visibilityState), { timeout: 10_000 }).toBe('hidden');
+  const [exists, visible] = await windowState();
+  // A dead app has no page to read: the row still gets written, and the asserts below fail on it.
+  const state = await app.page
+    .evaluate(() => document.visibilityState)
+    .catch((e: unknown) => `unreadable (${String(e)})`);
   const alive = app.process?.exitCode === null;
-  row('W7', `after WM_CLOSE: visibilityState hidden, process alive = ${String(alive)}`);
+  row(
+    'W7',
+    `after WM_CLOSE: IsWindow = ${String(exists)}, IsWindowVisible = ${String(visible)}, visibilityState = ${state}, ` +
+      `process alive = ${String(alive)}`,
+  );
+  expect(exists).toBe('True');
+  expect(visible).toBe('False');
+  expect(state).toBe('hidden');
   expect(alive).toBe(true);
 });

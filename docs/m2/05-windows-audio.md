@@ -256,10 +256,18 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
   `im_start` (unless that start passes its own `exclusions`) and returns `IM_OK`. The stored set belongs to one
   `im_init`: `im_shutdown` clears it.
 - **State.** Neither watching nor live: `im_audio_levels_get` → `IM_ERR_BAD_STATE`. No running audio session:
-  `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE` (until WA45 adds capture no audio session can run,
-  so they always answer it). A watcher thread that failed to start in `im_init` leaves the audio calls answering as
-  after `IM_INIT_NO_AUDIO`. Until WA53 builds the sound check, `im_audio_sound_check` answers
-  `IM_ERR_NOT_IMPLEMENTED` (`IM_ERR_BAD_STATE` after `IM_INIT_NO_AUDIO`).
+  `im_audio_set_mode` and `im_audio_set_muted` → `IM_ERR_BAD_STATE` (before WA45 added capture no audio session could
+  run, so they always answered it; since WA45 they set the live mix's sound-off and mute flags, §9.6).
+  `im_audio_set_muted` also covers the **test tone** (04 §8.5, §10.3; group 12's integration, README §3 item 70): it
+  sets the tone's own user mute (`session::SetToneMuted`, the effective mute is that flag OR pause, as on the mix bus,
+  and only this call clears it, so `im_set_paused(s, 0)` keeps it) beside `AudioEngine::SetMuted`, and answers `IM_OK`
+  when either took it, so a test-tone session gets `IM_OK` also after `IM_INIT_NO_AUDIO`, where the `AudioEngine`
+  answers `IM_ERR_BAD_STATE`; with neither a test-tone session nor an audio session running it answers the
+  `AudioEngine`'s status and detail (`IM_ERR_BAD_STATE`). `session_pause_test`'s `ResumeKeepsTheUserMuteOfTheTone`
+  checks it through the export. A watcher thread
+  that failed to start in `im_init` leaves the audio calls answering as after `IM_INIT_NO_AUDIO`. Until WA53 built the
+  sound check (group 11, §11.3), `im_audio_sound_check` answered `IM_ERR_NOT_IMPLEMENTED`; it still answers
+  `IM_ERR_BAD_STATE` after `IM_INIT_NO_AUDIO`.
 - **Silence flags.** The mix bus is silent while any of three flags is set: **paused** (04's `im_set_paused`, which
   reaches `Mixer::SetPaused`, §10.5), **muted** (`im_audio_set_muted`: the mute 01's core sets with the pause, 01 D14),
   or **mode off** (`im_audio_set_mode(IM_AUDIO_MODE_OFF)`: the per-share "Share sound" switch). Each flag is set and
@@ -274,9 +282,10 @@ Layouts for 04 §5.4 (amd64 and arm64): `im_rule` 32 (`value` 8, `app_id` 16, `n
     process; a programming error, the v1 UI runs one share);
   - after `im_init` with `IM_INIT_NO_AUDIO`, `mode = IM_AUDIO_MODE_EXCLUDE_APPS` → `IM_ERR_BAD_STATE` (README §3 item
     35). `IM_AUDIO_MODE_TEST_TONE` (100) still starts and plays: the tone is 04's own source and touches no audio API
-    (04 §10.3), so video-only tools and CI runners without audio keep their A/V checks. Until the session makes this
-    check (README WA52's row), such an `im_start` answers `IM_OK` and runs the share without audio packets (audio
-    state off); `audio_bridge_test` pins only what both readings share: neither `SetRules` nor `NewMixer` is called.
+    (04 §10.3), so video-only tools and CI runners without audio keep their A/V checks. As built (WA52, group 12)
+    the session makes this check (`im_start: audio is off (IM_INIT_NO_AUDIO)`) before any audio call; before WA52 such
+    an `im_start` answered `IM_OK` and ran the share without audio packets. `audio_bridge_test` pins what both
+    readings share: neither `SetRules` nor `NewMixer` is called.
 
   Device loss, audio-service restarts, a missing render endpoint and stream failures are handled inside (§7.5, §8.5)
   and appear in the report (`state`, `events`); an audio-only config on a machine without a render endpoint starts in
@@ -548,7 +557,8 @@ leaks, and a failed probe switches to `endpoint`.
 **Windows 10 takes the plan's gate** (README §3 item 52; the owner's decision of 2026-11-03, with no Windows 10 run of
 A0): on a build below 22000 (`kMinIncludeSetBuild`, `im_caps.os_build`), `IM_AUDIO_MODE_EXCLUDE_APPS` plans
 `endpoint` whatever the probe says, with the banner `exclusion-unavailable` (§14.7, §15). The include set and the fast
-path run on builds 22000 and later only. WA53 builds this with the endpoint engine; a later Windows 10 run of A0 that
+path run on builds 22000 and later only. WA53 built this with the endpoint engine (group 11; §11.2's "As
+built" for the report and §11.3's for the sound check); a later Windows 10 run of A0 that
 passes can lift the gate by lowering the constant, as an owner's decision.
 
 ### 6.2 Include set (S1 `PlanIncludeSet`, extended)
@@ -634,6 +644,16 @@ passes can lift the gate by lowering the constant, as an owner's decision.
   with it `true`, cases 4, 5 and 26 are required; with it `false`, they run as INFO and don't block the gate.
 - Known difference: launcher sounds (Explorer, Steam UI) and the Windows system-sounds session are heard in
   `exclude-self` but not in the include set. The report reflects the engine actually running.
+- **As built (WA53, group 11; README §3 item 62)** (`native/windows/src/audio/watcher.cpp`, `engine_gate.h`,
+  `include_set.cpp`): while the fast path runs, a session event skips the 20 ms debounce (`SessionPlanDue`), but the
+  watcher then runs its normal refresh of every endpoint's sessions and a full reconcile instead of refreshing only
+  the new session's process and its ancestors; the session callback's time is C, and the reconcile that ends the
+  fast path cuts the EXCLUDE stream's channel at `C − 20 ms` (`kFastPathCutLeadNs`; a channel still idle or in its
+  preroll is removed without output). §7.3's budget (5 ms per reconcile, 3 ms for the process table) keeps the full
+  refresh inside the 15 ms target, which the tests with fakes check on simulated time; it is not yet measured on
+  Windows (WA62a's cases 4, 5 and 26 on the owner's PC). The fast path's EXCLUDE stream is also watched by §8.5's
+  silent-stream check (`ExclusiveSilentCheck`: a heard app's meter above −60 dBFS for 1 s over a silent EXCLUDE
+  channel reopens it, at most once per 5 s, and two reopens that bring no sound back leave it alone, logged once).
 
 ### 6.5 Mode switches
 
@@ -645,6 +665,17 @@ passes can lift the gate by lowering the constant, as an owner's decision.
 | live → off (`im_audio_set_mode(OFF)`: "Share sound" off) | Fade out 10 ms, close the capture streams; the mixer keeps its clock and grid and feeds zeros, which 04's stage encodes as digital silence (04 §10.3); the watcher keeps running, so "What friends hear" stays current | none |
 | off → exclude-apps (`im_audio_set_mode(EXCLUDE_APPS)`: "Share sound" on) | Plan and open streams as at start (§6.1), preroll, 10 ms fade in | ≈ 60–80 ms of silence |
 | exclude-apps ↔ everything | reserved (later): the same crossfade as include set ↔ exclude-self | none |
+
+**"Process loopback stops working twice in 10 s", as built (WA53, group 11; README §3 item 62)**
+(`include_set.cpp`'s `Pump`, `engine_gate.h`'s `EngineGate::LoopbackFailed`): one watcher pump counts once, and only
+when the failure is system-wide rather than one app's: the fast path's EXCLUDE stream failed, or every joined
+process-loopback stream failed in that pump, or the streams of two or more targets failed in it. A failure of a target
+that is still in its §8.5 backoff (reopened after 100 ms, 500 ms and 2 s) never counts, so one app whose stream keeps
+failing becomes `capture_failed` (§8.5) and doesn't move the whole share to the endpoint engine. Failures in the 3 s
+after a default-device change are the change's and are ignored (§7.5, `kDeviceSettleNs`). The second counted pump
+within 10 s sets the startup probe's result to `failed` (event `probe_failed`, detail `loopback_failed`), cached for
+that endpoint, so the share switches to the endpoint engine with the banner until a re-probe passes (a default-device
+change 2 s later, §7.5), which also clears the count.
 
 ## 7. Session watcher
 
@@ -1151,6 +1182,25 @@ for the process lifetime (a failed result is retried once per audio start). `IM_
 in `endpoint`, isshoni's own playback is captured too, so the desktop app mutes its viewer while live (§22, 03) and the
 banner `viewer-muted` explains it.
 
+**As built (WA53, group 11; README §3 item 62)** (`native/windows/src/audio/startup_probe.{h,cpp}`,
+`engine_gate.{h,cpp}`):
+- **Order**: the render client of step 2 opens first; without one (no render endpoint, or the device busy) the probe
+  is `skipped` before any capture opens. Then step 1's INCLUDE stream; a stream that fails after the tone is
+  `unsupported` too.
+- **Timing**: the activation waits in 10 ms slices that check the abort flag, with one 500 ms budget per open; the
+  whole probe has a 600 ms deadline (`kProbeDeadlineMs`) from its start, and a probe past it, or one aborted
+  meanwhile, is `skipped` (decides nothing). A share that stops while the probe runs aborts it without waiting
+  (`ProbeRunner::Abort`), so the streams are released on time; the next start, stop or the runner's destructor joins
+  the old thread.
+- **Measurement**: the capture and render timestamps are not lined up. The level is the highest Goertzel (Hann) level
+  at 997 Hz over sliding 160 ms windows (the tone minus 20 ms at each end, hop 10 ms) anywhere in the capture (30 ms
+  of zeros before the tone and 60 ms after it, plus a 40 ms drain), floored at −120 dBFS in the report.
+- **Windows 10**: on a build below 22000 (`kMinIncludeSetBuild`, README §3 item 52) the probe doesn't run; the
+  report shows `probe.result` `unsupported` with `osBuild` and `state` `degraded`, so Go's existing banner rules show
+  `exclusion-unavailable` without a Go change (§14.7, §15).
+- **Cache**: an `ok` result is kept per default render endpoint id for the process lifetime and reused at the next
+  start; any other result is probed again at the next start; a `skipped` one also at the next device event.
+
 ### 11.3 Sound check (first-run wizard, plan step 3)
 
 1. `audio.Service.SoundCheck` (§14.2) with `SelfInfo.Exe` set starts `<Exe> --sound-check-helper` (03's `main` only
@@ -1176,6 +1226,16 @@ banner `viewer-muted` explains it.
    `{"captured":false,"reason":"silent|activation_failed|no_device|device_busy|timeout","backend":"…"}`. `backend` is
    `process-loopback`, `endpoint` or `none`. `device_busy`: another app holds the default render device in exclusive
    mode (`AUDCLNT_E_DEVICE_IN_USE`). `timeout`: the helper's session never appeared within `timeout_ms`.
+
+**As built (WA53, group 11; README §3 item 62)** (`native/windows/src/audio/sound_check.{h,cpp}`):
+- **Windows 10**: on a build below 22000 the check takes `audio_flags` without `IM_AUDIO_PROCESS_LOOPBACK`
+  (`SoundCheckFlags`), so it captures through endpoint loopback and reports `"backend":"endpoint"`, the degraded case
+  of step 3, matching what every share on that PC runs (§6.1, README §3 item 52).
+- **Measurement**: as for the probe, no timestamp alignment: every 100 ms the capture so far is analyzed with
+  Goertzel over sliding 100 ms windows (hop 20 ms) at 880 Hz and 1320 Hz, and each partial keeps its highest level;
+  the check passes once both reach −40 dBFS, and `levelDb` is the weaker of the two.
+- **The DLL's own chime** (`helper_pid` 0) starts 100 ms after its capture stream opens; one capture open's
+  activations wait at most 3 s (§8.1).
 
 ## 12. Reports
 
@@ -1237,6 +1297,7 @@ banner `viewer-muted` explains it.
 | `apps[].reason` | kept out: `builtin`, `user`, `mic`, `viewer`, `isshoni`. Not captured: `launcher`, `tree`, `pid_reuse` (blocked only through a loose PID link, §5.2), `limit`, `capture_failed`. Heard: `""` |
 | `apps[].detail` | for `tree` and `pid_reuse`: the kept-out app's name; else `""` |
 | `apps[].warnings` | `shared_app_uses_mic`, `shared_app_kept_out`, `included_uses_mic`, `multi_process_session` |
+| `warnings[]` (top level) | `{code, app}`: `multi_process_session` (also on the row, `app` = its id) and `instance_gone` (an `IM_RULE_INSTANCE` whose pid doesn't exist, §5.3; `app` = the rule's app id), which appears only here, never in a row's `warnings` (`im_audiomix`'s `AppWarning::kInstanceGone`, added by WA45) |
 | `apps[].playing` | session active within the last 2 s, or its activity meter above −70 dBFS within the last 2 s |
 | `sessions[].created` | FILETIME as a decimal string (JSON numbers lose precision above 2^53) |
 | `sessions[].stream` | `none`, `activating`, `preroll`, `running`, `fading` |
@@ -1245,22 +1306,35 @@ banner `viewer-muted` explains it.
 
 `counters` are the mixer's; packets dropped after the mixer are 04's (`im_get_stats` `audio.drops`). The tail fade
 (§9.5, README §3 item 53) adds the counter `tailFades` and the event code `tail_fade`, additive like any later field.
-Caps: `apps` ≤ 128 rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary),
-and the first 128 top-level `warnings`, so the report stays within §17's 256 KiB (WA36's writer caps `warnings`;
-WA35's interim writer doesn't, see "The writer" below). Rows: apps with a session,
-plus running processes matched by a built-in rule (so "Discord · kept out" shows while Discord is silent), plus the
-shared app. `seq` increases whenever anything except levels, counters, `qpcNs` and `events` changes. Unknown fields are
-ignored by Go (additive changes only).
+Caps: `apps` ≤ 128 rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary), and
+the first 128 top-level `warnings`, so the report stays within §17's 256 KiB (`im_audiomix`'s writer, the one kept, caps
+`warnings`; see "The writer" below). Rows: apps with a session, plus running processes matched by a built-in rule (so
+"Discord · kept out" shows while Discord is silent), plus the shared app. `seq` increases whenever anything except
+levels, counters, `qpcNs` and `events` changes. Unknown fields are ignored by Go (additive changes only).
 
 **The one-shot snapshot** (state `stopped`, the watcher not watching) is planned on the watcher thread with the
 remembered mic roots and lineage (§5.6, §5.7) and kept for 1 s, so the snprintf retry with a larger buffer gets the
-same document; applying rules, a watch or an unwatch drops it. Until WA45 adds capture, every report is the
+same document; applying rules, a watch or an unwatch drops it. Before WA45 added capture, every report was the
 watcher's prediction: mode `exclude-apps`, engine `none`, `live` false, `probe.result` `pending` with an active render
-endpoint and `skipped` without, `probe.format` `""`, every `sessions[].stream` `none` with format `""`.
+endpoint and `skipped` without, `probe.format` `""`, every `sessions[].stream` `none` with format `""`. As built
+(WA45, group 10): while a share's mix runs, the report is `live`, `engine` is the plan's, `mode` follows the share's
+(`off` or `exclude-apps`), `muted` and `paused` are the mixer's, and each session whose process is an include target
+carries its stream's state and format; `probe.result` stayed `pending` (with a render endpoint) or `skipped` until
+WA53's startup probe (§11.2). As built (WA53, group 11): while live, `probe` carries the startup probe's result
+(`pending` while it runs, then `ok`, `failed`, `unsupported` or `skipped` with its `format`, `levelDb` and `ms`), and
+`state` is `starting` while the first probe runs, `degraded` when process loopback can't be used (a failed or
+unsupported probe, "twice in 10 s" of §6.5, or a Windows 10 build, which reports `unsupported` without probing), else
+`ok`. As built (WF11, group 11; README §3 item 60): the one writer emits the counter `tailFades` from the mixer's
+`tail_fades` and the event `tail_fade` from its tail-fade event (at most one per channel per second), with Go's
+`AudioCounters.TailFades` and `media.AudioEventTailFade`; a report without `tailFades` still parses (it reads 0).
+**Top-level `warnings[].code`**: `multi_process_session` and `instance_gone`, the two values of the table above;
+Go's `media.AudioWarning` comment names both, and callers ignore codes they don't know (additive).
 
-**The writer.** Two C++ writers produce this JSON byte for byte against the same goldens after group 4: WA35's
-`native/windows/src/audio/report.cpp` (the watcher landed first) and WA36's `im_audiomix` writer (05 A4). WA45 keeps
-one of them with its golden test and removes the other (README §3 item 36).
+**The writer.** Two C++ writers produced this JSON byte for byte against the same goldens after group 4: WA35's
+`native/windows/src/audio/report.cpp` (the watcher landed first) and WA36's `im_audiomix` writer (05 A4). WA45 kept
+`im_audiomix`'s (`native/common/audiomix/src/report.cpp`, golden test `mix_report_test`) and removed WA35's;
+`audio/report.cpp` now only maps the planner's vocabulary to the report's model (`audio_report_test`) (README §3 items
+36 and 57).
 
 ### 12.2 Levels
 
@@ -1879,6 +1953,8 @@ Example (Discord in a call, KOOK just opened the mic, sharing a game window):
 The ducking preference is read in `internal/desktop/audio/ducking_windows.go` from
 `HKCU\Software\Microsoft\Multimedia\Audio\UserDuckingPreference` (REG_DWORD; absent = Windows' default, "Reduce the
 volume of other sounds by 80%"). `ducking_other.go` (Linux, macOS: e2ehost, CI) reports "unknown", which hides the tip.
+`SelfInfo.NoDucking` skips the read (unknown) where the output must not depend on the host's registry: the share
+sheet's scenario fixtures (`internal/desktop/bridge/scenarios_test.go`) and e2ehost.
 
 **Outside the window** (plan: "Degraded modes are always shown, never silent"). A sharer in a game sees neither the
 hidden window's banners nor, under Windows' automatic Do-not-disturb rules for games and full-screen apps, most toasts.
@@ -2430,6 +2506,21 @@ Native tests use GoogleTest through 04's vcpkg `tests` feature and run with `tas
   slashes, and the `--user-data-dir=<dir>\EBWebView` form WebView2 really uses); watcher start/stop with no endpoint
   (state `no-device`, no crash, no leak: handle count back to baseline after 100 start/stop cycles); `IM_INIT_NO_AUDIO`
   returns of §4.3; `selfcheck`.
+- **`audio_live_test`** (04's `native/windows/tests/`, WA45's real `AudioEngine` on whatever audio the machine has;
+  as changed by PR #53's CI fixes, README §3 item 77): a share's mixer runs on the 10 ms grid, its report says live
+  with mode, engine, mute and pause, `im_audio_set_mode` and `im_audio_set_muted` work while live, and Stop ends the
+  chunks. **The engine it expects follows from the rules and the probe, not from the machine**: the test reads the
+  settled report (the startup probe has left `pending`, within 3 s, §11.2) and expects the engine that §6.1's gate
+  implies. A `failed` or `unsupported` probe (Windows 10's build gate reports `unsupported`) plans `endpoint`; anything
+  else, the probe `ok` or `skipped` because there is no render endpoint (CI's hosted runners, state `no-device`), plans
+  process loopback, which captures nothing until a device comes. `AMixerFeedsTheGridReportsLiveAndStops` turns the
+  fast path off (rules without `IM_EXCLF_FAST_PATH`) and expects `include-set` (or `endpoint` after such a probe),
+  again after sound off and on. `TheFastPathRunsFromTheFirstPlan` keeps the share sheet's flags (the fast path on, as
+  the release default ships it) and expects `exclude-self` from the first plan (§6.4 "At engine start", event
+  `fastpath_enter`) and again after sound off and on (§6.5), with or without a device; it skips, printing the reason
+  and the report, where process loopback is unavailable or a kept-out app other than isshoni's own tree runs (a voice
+  app or a mic user takes the fast path's condition away). Before PR #53 the test expected `include-set` with the
+  fast path allowed, which WA53's fast path from the first plan made wrong on every machine.
 - **Go, any OS**: `internal/desktop/audio` against the fake through a full share lifecycle with goleak: watch → pick
   (`SetSharedPID`) → start (`OnShareStarted`) → prompt → decide → sound off → pause → resume (stays silent) → sound on
   → stop (`OnShareStopped`). Asserts the fake's call log (`audio_mode off` at sound off, no audio call at pause or

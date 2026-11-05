@@ -25,3 +25,7 @@ func (*Hooks) Autostart() (bool, error)                        { return false, n
 func (*Hooks) OpenSettingsPage(app.OSPage) error               { return app.ErrNotSupported }
 func (*Hooks) KeepAwake(bool)                                  {}
 func (*Hooks) Events() <-chan app.SystemEvent                  { return nil }
+func (*Hooks) IncludeInCapture(uintptr) error                  { return nil }
+func (*Hooks) EndSessionHandled()                              {}
+func (*Hooks) OpenPath(string) error                           { return app.ErrNotSupported }
+func (*Hooks) Close() error                                    { return nil }

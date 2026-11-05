@@ -20,8 +20,8 @@ var (
 func goodRun(live bool) *runLog {
 	l := &runLog{
 		StartNS: 10 * ms, EndNS: 5000 * ms, Layers: runLayers(8_000_000), Profile: "6400", Test: true, Tone: true,
-		GOPMS: 4000, StepsBase: 4_000_000,
-		Stats: &media.EngineStats{Layers: []media.EngineLayerStats{{RID: "f", FPSOut: 59.5}, {RID: "q", FPSOut: 15}}},
+		StepsBase: 4_000_000,
+		Stats:     &media.EngineStats{Layers: []media.EngineLayerStats{{RID: "f", FPSOut: 59.5}, {RID: "q", FPSOut: 15}}},
 	}
 	for _, rid := range []string{"f", "q"} {
 		l.Recs = append(l.Recs, rec{Kind: media.KindEvent, Event: &media.Event{Code: media.EventLayer, Layer: rid,
@@ -197,11 +197,26 @@ func TestCheckLiveSteps(t *testing.T) {
 	l.Recs = append(l.Recs, rec{Kind: media.KindEvent, Event: &media.Event{Code: media.EventLayer, Layer: "f",
 		Profile: "6400", LiveBitrate: true}})
 	addF(l, 20*ms, 1000*ms, 4_000_000, nil, map[int64]bool{20 * ms: true})
-	addF(l, 1000*ms, 3500*ms, 8_000_000, map[int64]bool{4020 * ms: true}, nil)
-	addF(l, 3500*ms, 6000*ms, 2_000_000, map[int64]bool{4020 * ms: true}, nil) // the periodic GOP IDR at 4 s
+	addF(l, 1000*ms, 3500*ms, 8_000_000, nil, nil)
+	addF(l, 3500*ms, 6000*ms, 2_000_000, nil, nil)
 	addF(l, 6000*ms, 9000*ms, 8_000_000, nil, nil)
 	if got := checkBitrateSteps(l); len(got) != 0 {
 		t.Errorf("a good live run: %q", got)
+	}
+	// A periodic IDR between the steps fails too: capture runs f with stepsGOP (10 s, 04 §14), so none comes there;
+	// one would mean the GOP didn't reach the engine.
+	for i := range l.Recs {
+		if r := &l.Recs[i]; r.Kind == media.KindVideo && r.CaptureNS >= 4020*ms && r.CaptureNS < 4020*ms+int64(time.Second)/60 {
+			r.Key, r.Types = true, keyTypes
+		}
+	}
+	if got := checkBitrateSteps(l); len(got) != 1 || !strings.Contains(got[0], "between the steps") {
+		t.Errorf("a periodic IDR 4 s after the first keyframe: %q", got)
+	}
+	for i := range l.Recs {
+		if r := &l.Recs[i]; r.Kind == media.KindVideo && r.CaptureNS >= 4020*ms && r.CaptureNS < 4020*ms+int64(time.Second)/60 {
+			r.Key, r.Types = false, sliceTypes
+		}
 	}
 	// An IDR right after a step (QSV's reset starting a new sequence) fails it.
 	for i := range l.Recs {

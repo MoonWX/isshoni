@@ -1,8 +1,10 @@
 #include "session/encoder.h"
 
+#include <iterator>
 #include <mutex>
 #include <utility>
 
+#include "encode/selector.h"
 #include "im/abi/status.h"
 #include "im/encpolicy/encoders.h"
 #include "testhooks/fake_encoder.h"
@@ -16,6 +18,7 @@ namespace {
 struct Prefix {
   std::mutex mu;
   std::vector<EncoderEntry> entries;
+  bool only = false; // no probe entries (SetCatalogPrefixForTest)
 };
 
 Prefix &ThePrefix() noexcept {
@@ -25,9 +28,10 @@ Prefix &ThePrefix() noexcept {
 
 } // namespace
 
-void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries) {
+void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries, bool only) {
   Prefix &p = ThePrefix();
   std::lock_guard<std::mutex> lock(p.mu);
+  p.only = only && !entries.empty();
   p.entries = std::move(entries);
 }
 #endif
@@ -40,10 +44,12 @@ im_status VideoEncoder::NextTarget(gpu::Nv12Target *out) noexcept {
 std::vector<EncoderEntry> EncoderCatalog() {
   std::vector<EncoderEntry> out;
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+  bool only = false;
   {
     Prefix &p = ThePrefix();
     std::lock_guard<std::mutex> lock(p.mu);
     out = p.entries;
+    only = p.only;
   }
   // The fake encoders ignore pixels: a session of them runs no GPU path (encoder.h, FrameInput::kNone).
   const auto add_fake = [&](uint32_t kind) {
@@ -57,9 +63,15 @@ std::vector<EncoderEntry> EncoderCatalog() {
       add_fake(kind);
     }
   }
+  if (only) {
+    return out; // the test's own candidates only (SetCatalogPrefixForTest)
+  }
 #endif
-  // README WA44: the probe's encoders (libavcodec, MF; README WA51 OpenH264), in its order, with their open
-  // functions, FrameInput::kNv12 and the device request of their adapter.
+  // The probe's encoders (libavcodec: NVENC, QSV, AMF, MF hardware and software; README WA51 OpenH264), in its order
+  // (04 §9.1), with their open functions, FrameInput::kNv12 and the device request of their adapter. This may run the
+  // encoder probe (on the worker: im_start) when none is stored or the cache is stale (04 §9.8).
+  std::vector<EncoderEntry> real = encode::CatalogEntries();
+  out.insert(out.end(), std::make_move_iterator(real.begin()), std::make_move_iterator(real.end()));
   return out;
 }
 

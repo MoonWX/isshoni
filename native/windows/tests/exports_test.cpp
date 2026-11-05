@@ -5,7 +5,8 @@
 // JSON outputs follow snprintf; im_clock is monotonic and near the system time; im_abi_layout equals the golden file;
 // a stalled engine worker makes a posted call return IM_ERR_TIMEOUT (engine_timeout) after its bound + 1 s and leaves
 // its output alone; a refused audio argument never reaches the AudioEngine (README §3 item 15); a failed
-// AudioEngine::Init doesn't fail im_init, and one that finishes after im_init gave up is shut down by the worker.
+// AudioEngine::Init doesn't fail im_init, and one that finishes after im_init gave up is shut down by the worker; a
+// full probe works in every im_init/im_shutdown cycle of a process, not just the first.
 //
 // The test links the engine's objects (im_engine), so it can reach the worker and the AudioEngine override directly.
 #include <gtest/gtest.h>
@@ -809,6 +810,32 @@ TEST(Exports, BuildInfoFfmpegDirOutsideTheDllFolderIsNull) {
   EXPECT_EQ(doc.find("im-other-ffmpeg"), std::string::npos) << "a folder outside the DLL's leaked into " << doc;
   EXPECT_EQ(doc.find(".."), std::string::npos) << doc;
 }
+
+// im_init may follow im_shutdown any number of times, and each engine's probe works like the first: a probe asks
+// WinRT (GraphicsCaptureSession, ApiInformation, GraphicsCaptureAccess) through C++/WinRT's process-wide factory cache,
+// so the worker's CoUninitialize at im_shutdown must not end COM in the process (os::EnterWorkerThread holds the MTA).
+// Without that, the second round's probe crashed on the worker with an access violation.
+TEST(Exports, EveryInitCycleProbesLikeTheFirst) {
+  im_shutdown();
+  uint32_t first_os_flags = 0;
+  for (int round = 0; round < 3; ++round) {
+    SCOPED_TRACE("round " + std::to_string(round));
+    const im_init_params p = InitParams();
+    ASSERT_EQ(im_init(&p), IM_OK) << LastError();
+    im_caps caps = Sized<im_caps>(sizeof(im_caps));
+    const im_status st = im_probe(IM_PROBE_FULL, &caps);
+    const std::string detail = LastError();
+    im_shutdown();
+    ASSERT_EQ(st, IM_OK) << detail;
+    if (round == 0) {
+      first_os_flags = caps.os_flags;
+    } else {
+      // The WinRT flags are Windows' answer, the same in every round (borderless access may only become known).
+      const uint32_t mask = ~static_cast<uint32_t>(IM_OS_WGC_BORDERLESS);
+      EXPECT_EQ(caps.os_flags & mask, first_os_flags & mask) << "os_flags 0x" << std::hex << caps.os_flags;
+    }
+  }
+}
 #endif
 
 // ---------------------------------------------------------------------------------------------- im_clock
@@ -1056,7 +1083,9 @@ TEST(Exports, FailedAudioInitDoesNotFailInit) {
   ASSERT_GT(n, 0) << LastError();
   const std::string out(logs.data(), static_cast<std::size_t>(n));
   EXPECT_NE(out.find("\"msg\":\"audio init failed\""), std::string::npos) << out;
-  EXPECT_NE(out.find("the audio watcher can't start"), std::string::npos) << out;
+  // Only the detail's token: 05's text may name an app (04 §5.6, session.h's DetailToken).
+  EXPECT_NE(out.find("\"token\":\"test\""), std::string::npos) << out;
+  EXPECT_EQ(out.find("the audio watcher can't start"), std::string::npos) << out;
 
   // Video calls keep working: im_probe reaches its area (the skeleton's stub answers whatever it answers).
   im_caps caps = Sized<im_caps>(sizeof(im_caps));

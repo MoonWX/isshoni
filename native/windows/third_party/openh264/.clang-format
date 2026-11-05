@@ -1,0 +1,4 @@
+# Cisco's OpenH264 headers, copied unchanged from the pinned release (codec/api/wels/ at its tag): not ours to format.
+# task lint:native takes the nearest .clang-format above each file, so this one turns formatting off for this folder.
+DisableFormat: true
+SortIncludes: Never

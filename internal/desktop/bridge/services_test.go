@@ -447,6 +447,29 @@ func TestAudio(t *testing.T) {
 	}
 }
 
+// TestAudioBindsDismissPromptNoSoundMode is README §3 item 15 and WA77's acceptance: the bound Audio service has
+// DismissPrompt and no method that could set a sound mode (none named for a mode or for "all sound"), and none of
+// its methods takes a media.AudioMode or a media.AudioConfig.
+func TestAudioBindsDismissPromptNoSoundMode(t *testing.T) {
+	typ := reflect.TypeFor[*Audio]()
+	if _, ok := typ.MethodByName("DismissPrompt"); !ok {
+		t.Fatal("Audio.DismissPrompt isn't bound")
+	}
+	modeType, configType := reflect.TypeFor[media.AudioMode](), reflect.TypeFor[media.AudioConfig]()
+	for i := range typ.NumMethod() {
+		m := typ.Method(i)
+		name := strings.ToLower(m.Name)
+		if strings.Contains(name, "mode") || strings.Contains(name, "allsound") {
+			t.Errorf("Audio.%s looks like a sound-mode binding", m.Name)
+		}
+		for j := range m.Type.NumIn() {
+			if in := m.Type.In(j); in == modeType || in == configType {
+				t.Errorf("Audio.%s takes a %v", m.Name, in)
+			}
+		}
+	}
+}
+
 // TestEvents: every event name has the prefix and is unique; 05's events go out with the prefix until Close.
 func TestEvents(t *testing.T) {
 	seen := map[string]bool{}
@@ -503,6 +526,18 @@ func TestSettingsAndWindow(t *testing.T) {
 	if v.Schema != 1 || v.Hotkeys.Pause != "Ctrl+Alt+Shift+F9" || !v.HideFromCapture || v.Pill.Mode != "auto" ||
 		!v.Updates.PolicyOff || v.Log.Level != "info" || v.ServerPrefs == nil || v.Pill.Positions == nil {
 		t.Fatalf("settings view %+v", v)
+	}
+	// Update takes wizardDone alone (the wizard's Done, README WA77); the rest of it is WA84's.
+	done, no := true, false
+	if v, err := s.Settings.Update(SettingsPatch{WizardDone: &done}); err != nil || !v.WizardDone || !st.WizardDone() {
+		t.Fatalf("Update wizardDone: %+v %v", v, err)
+	}
+	if _, err := s.Settings.Update(SettingsPatch{WizardDone: &no}); codeOf(t, err) != codes.CodeInvalidArgument {
+		t.Fatalf("Update wizardDone false: %v", err)
+	}
+	if _, err := s.Settings.Update(SettingsPatch{WizardDone: &done, CloseToTray: &done}); codeOf(t,
+		err) != codes.CodeNotImplemented {
+		t.Fatalf("Update with another field: %v", err)
 	}
 	if err := s.Window.SetFullscreen(true); err != nil || !slices.Equal(shell.fullscreen, []bool{true}) {
 		t.Fatalf("SetFullscreen: %v %v", err, shell.fullscreen)

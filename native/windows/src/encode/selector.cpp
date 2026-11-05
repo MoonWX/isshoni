@@ -28,6 +28,18 @@ Cache &TheCache() noexcept {
   return *c;
 }
 
+// OpenH264's entry as it is now (README WA51): im_set_openh264_path takes effect at the next probe and im_start
+// (04 §5.3), also when that start or quick probe uses a full probe stored before the setting changed. The entry is
+// read again (no test encode: ProbeOpenH264's quick form keeps the last full probe's result for the same library).
+void RefreshOpenH264(im_caps &caps) noexcept {
+  const uint32_t n = std::min<uint32_t>(caps.encoder_count, IM_MAX_ENCODERS);
+  for (uint32_t i = 0; i < n; ++i) {
+    if (caps.encoders[i].kind == IM_ENC_OPENH264) {
+      ProbeOpenH264(false, kNoProbeDeadline, caps.encoders[i]);
+    }
+  }
+}
+
 } // namespace
 
 session::OpenEncoderFn OpenFunctionFor(uint32_t kind) noexcept {
@@ -67,12 +79,42 @@ void ForgetProbe() noexcept {
 
 std::optional<StoredCaps> StoredProbe() {
   const std::string dir = ffmpeg::DefaultDir();
+  std::optional<StoredCaps> out;
+  {
+    Cache &c = TheCache();
+    std::lock_guard<std::mutex> lock(c.mu);
+    if (!c.caps || session::ProbeCacheStale() || c.ffmpeg_dir != dir) {
+      return std::nullopt;
+    }
+    out = StoredCaps{*c.caps, c.complete};
+  }
+  RefreshOpenH264(out->caps);
+  return out;
+}
+
+uint32_t PrimaryAdapterIndex() noexcept {
   Cache &c = TheCache();
   std::lock_guard<std::mutex> lock(c.mu);
-  if (!c.caps || session::ProbeCacheStale() || c.ffmpeg_dir != dir) {
-    return std::nullopt;
+  if (!c.caps || c.caps->adapter_count == 0) {
+    return encpolicy::kNoAdapter;
   }
-  return StoredCaps{*c.caps, c.complete};
+  // DXGI lists the adapter of the primary output first; one without outputs (a render-only GPU, a hybrid laptop's
+  // dGPU listed first by a driver) holds no monitor, so no adapter is the capture adapter then.
+  return (c.caps->adapters[0].flags & IM_ADAPTER_HAS_OUTPUTS) != 0 ? 0u : encpolicy::kNoAdapter;
+}
+
+uint32_t AdapterIndexOfLuid(uint64_t luid) noexcept {
+  Cache &c = TheCache();
+  std::lock_guard<std::mutex> lock(c.mu);
+  if (!c.caps || luid == 0) {
+    return encpolicy::kNoAdapter;
+  }
+  for (uint32_t i = 0; i < c.caps->adapter_count && i < IM_MAX_ADAPTERS; ++i) {
+    if (c.caps->adapters[i].luid == luid) {
+      return i;
+    }
+  }
+  return encpolicy::kNoAdapter;
 }
 
 std::vector<session::EncoderEntry> CatalogEntries() {
@@ -98,6 +140,7 @@ std::vector<session::EncoderEntry> CatalogEntries() {
       return {};
     }
   }
+  RefreshOpenH264(*caps);
   std::vector<session::EncoderEntry> out;
   const uint32_t n = std::min<uint32_t>(caps->encoder_count, IM_MAX_ENCODERS);
   out.reserve(n);

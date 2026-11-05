@@ -12,6 +12,9 @@
 //   <NativeSharePanel share={share} onStop={stopShare} watchers={watchers} />   // instead of M1's SharePanel
 //   <NativeShareUnavailable reason={caps.reason} />                       // canShare false: the empty state's note
 //   <NativeShareDisabled reason={caps.reason} label="Share" />            // canShare false: the header's Share
+//
+// And once for the whole desktop app (its layout, every page): <MicPromptCorner />, the mic prompts in the window's
+// corner while no panel or sheet shows them (03 §10.3).
 import '../../i18n/lazy/desktop';
 
 export {
@@ -23,6 +26,7 @@ export {
   type ShareErrorView,
 } from './engineErrors';
 export { NativeShareButton, type NativeShareButtonProps } from './NativeShareButton';
+export { MicPromptCorner } from './MicPromptCorner';
 export { NativeSharePanel, type NativeSharePanelProps } from './NativeSharePanel';
 export {
   NativeShareDisabled,

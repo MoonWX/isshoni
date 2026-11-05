@@ -6,7 +6,9 @@
 //   ffmpeg_encoder  NVENC, QSV, AMF and Media Foundation through libavcodec behind session::VideoEncoder (§9.1-§9.5)
 //   selector        the kind → open function table and the probe's encoders as the sessions' catalog entries
 //   probe           im_probe (§9.10), with the live-bitrate check
-//   openh264_stub   OpenH264 until README WA51 (its probe entry says "disabled")
+//   openh264_*      Cisco's OpenH264, loaded at run time once the user turned it on (README WA51, 04 §9.9):
+//                   openh264_api (the DLL and the setting), openh264_encoder (the encoder and its probe entry),
+//                   openh264_support (portable settings and helpers), openh264_pin (the pinned release)
 #pragma once
 
 #include <cstdint>
@@ -27,6 +29,11 @@ im_status Probe(uint32_t flags, im_caps &caps);
 // next probe and start (04 §9.9), or nothing to turn OpenH264 off.
 im_status SetOpenH264Path(const std::optional<std::string> &path);
 
+// im_shutdown, after the sessions stopped and the worker exited: forgets im_set_openh264_path's setting and drops the
+// loaded OpenH264 library (unloaded now, no encoder holds it any more), so each im_init starts from its own
+// openh264_path and 03 can delete the file after an im_shutdown (README WA51).
+void ForgetOpenH264Setting() noexcept;
+
 // What im_build_info reports about FFmpeg (04 §5.6): loaded, and then the libraries' versions and license.
 struct FfmpegInfo {
   bool loaded = false;
@@ -39,7 +46,7 @@ FfmpegInfo GetFfmpegInfo();
 // What im_build_info reports about OpenH264.
 struct OpenH264Info {
   bool loaded = false;
-  std::string version; // "2.6.0"; "" when not loaded
+  std::string version; // "2.7.0"; "" when not loaded
 };
 OpenH264Info GetOpenH264Info();
 

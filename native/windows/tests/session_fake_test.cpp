@@ -15,7 +15,18 @@
 // (ENDED{IM_ERR_ENCODER_LOST} device_removed within 1 s, then a new session on a new device); exhausted candidates; a
 // consumer that stops for 2 s (RING_OVERFLOW, stale drops, an IDR when it resumes); im_stop with a blocked consumer;
 // the session limits; the pick-token rules; the test tone's Marker and its beeps on the video flashes; stats and
-// session info.
+// session info; the encoder catalog with the probe's real encoders after the fakes (README WF10: still no GPU path for
+// a test: session); each AU's own capture time from an encoder one frame behind (04 §9.2); a layer's gop_ms.
+//
+// README WA61 extended the fault-injection cases with scripted encoders (the fake behind catalog entries of other
+// kinds, adapters and session limits, SetCatalogPrefixForTest's only form, so no real encoder takes part): 04 §9.1's
+// candidate order with and without a capture adapter; one profile per session (a CB-only encoder makes the whole
+// session CB, and High asked of it stays CB); a preview layer past NVENC's session limit at im_start and the one retry
+// after 500 ms; bitrate re-inits 10 s apart with the latest value winning, and a bitrate riding along with an
+// im_update_layer re-init; im_update_layer re-inits 1 s apart and coalesced; mid-session fallbacks with their reasons
+// (session_limit, open_failed), each ENCODER_CHANGED before the new encoder's first REINIT|KEYFRAME; an encoder that
+// reports a removed device (ENDED device_removed within 1 s, no fallback, the encoders released before im_stop, then a
+// new session on a new device), and the next start re-probing after a device removal.
 //
 // The test links the engine's objects (im_engine), so it calls the test hooks directly.
 #include <gtest/gtest.h>
@@ -23,6 +34,7 @@
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -30,16 +42,23 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "im/abi/status.h"
 #include "im/audio/opus_packet.h"
 #include "im/h264/nal.h"
 #include "im/h264/sps.h"
 #include "isshoni_media.h"
+#include "session/encoder.h"
 #include "session/session.h"
 #include "session/sources.h"
 #include "testhooks/fake_encoder.h"
@@ -832,6 +851,7 @@ TEST_F(Session, DeviceRemovalEndsTheSessionAndTheNextStartGetsANewDevice) {
   const im_session again = Start(Config());
   ASSERT_NE(again, 0u);
   EXPECT_NE(im::testhooks::SessionDevice(again), old_device);
+  EXPECT_FALSE(im::testhooks::ProbeCacheStale()) << "the next start probed the encoders again (04 §9.8)";
   ExpectFirstKeyframes(again, started_, epoch_, 2, "after the device removal");
   EXPECT_EQ(im_stop(again), IM_OK);
 }
@@ -1158,6 +1178,732 @@ TEST_F(Session, NothingToCaptureIsInvalid) {
   im_session s = 1;
   EXPECT_EQ(im_start(&cfg, &s, nullptr), IM_ERR_INVALID_ARG);
   EXPECT_EQ(s, 0u);
+}
+
+// ------------------------------------------------------------------------ the catalog, AU times, GOP (README WF10)
+
+// The session's catalog lists the probe's encoders (encode::CatalogEntries) after the test hooks' fakes: real
+// entries that take pixels, the probe's own IM_ENC_FAKE left out. A test: session still runs IM_ENC_FAKE without a
+// GPU path, and a fallback kind a test asked for comes before the real encoder of that kind.
+TEST_F(Session, CatalogListsTheProbesEncodersAfterTheFakes) {
+  im::testhooks::Options o;
+  o.fallback_kinds = {IM_ENC_MF_SW};
+  im::testhooks::Configure(o);
+  im_session_info info{};
+  const im_session s = Start(Config("test:pattern", false), &info); // im_start runs the encoder probe on the worker
+  ASSERT_NE(s, 0u);
+  EXPECT_EQ(info.layers[0].encoder, IM_ENC_FAKE);
+  EXPECT_EQ(info.layers[1].encoder, IM_ENC_FAKE);
+  EXPECT_FALSE(im::session::GpuPathOf(s)) << "the first candidate takes nothing: no device, whatever follows it";
+  EXPECT_EQ(im_stop(s), IM_OK);
+
+  const std::vector<im::session::EncoderEntry> catalog = im::session::EncoderCatalog(); // the stored probe
+  ASSERT_GE(catalog.size(), 4u) << "fake, fake-backed mf-sw, then at least the probe's MF software and OpenH264";
+  EXPECT_EQ(catalog[0].info.kind, IM_ENC_FAKE);
+  EXPECT_EQ(catalog[0].input, im::session::FrameInput::kNone);
+  EXPECT_EQ(catalog[1].info.kind, IM_ENC_MF_SW);
+  EXPECT_EQ(catalog[1].input, im::session::FrameInput::kNone) << "the fallback kind is the fake's";
+  bool mf_sw = false;
+  bool openh264 = false;
+  for (std::size_t i = 2; i < catalog.size(); ++i) {
+    const im::session::EncoderEntry &e = catalog[i];
+    SCOPED_TRACE("entry " + std::to_string(i) + ", kind " + std::to_string(e.info.kind));
+    EXPECT_NE(e.info.kind, IM_ENC_FAKE) << "the probe's IM_ENC_FAKE is left out: the catalog adds the fake itself";
+    EXPECT_EQ(e.input, im::session::FrameInput::kNv12);
+    EXPECT_NE(e.open, nullptr);
+    mf_sw = mf_sw || e.info.kind == IM_ENC_MF_SW;
+    openh264 = openh264 || e.info.kind == IM_ENC_OPENH264;
+  }
+  EXPECT_TRUE(mf_sw) << "the probe always lists MF software";
+  EXPECT_TRUE(openh264) << "the probe always lists OpenH264";
+}
+
+// An encoder that holds one frame back (some MF and QSV configurations, 04 §9.2): each Encode hands back the access
+// unit of the frame before, which the test hooks' fake encodes from that frame's EncodeInput (so its Marker carries
+// that frame's capture time), with EncodedAu::capture_ts_ns set to it; the first Encode returns nothing.
+class FrameBehindEncoder final : public im::session::VideoEncoder {
+public:
+  explicit FrameBehindEncoder(std::unique_ptr<im::session::VideoEncoder> inner, uint32_t layer) noexcept
+      : inner_(std::move(inner)), layer_(layer) {}
+
+  static im_status Open(const im::session::EncoderParams &p, std::unique_ptr<im::session::VideoEncoder> *out) noexcept {
+    try {
+      std::unique_ptr<im::session::VideoEncoder> inner;
+      const im_status st = im::testhooks::FakeEncoderEntry(IM_ENC_FAKE).open(p, &inner);
+      if (st != IM_OK) {
+        return st;
+      }
+      *out = std::make_unique<FrameBehindEncoder>(std::move(inner), p.layer);
+      return IM_OK;
+    } catch (...) {
+      return IM_ERR_INTERNAL;
+    }
+  }
+
+  im_status Encode(const im::session::EncodeInput &in, im::session::EncodedAu *out) noexcept override {
+    *out = im::session::EncodedAu{};
+    if (layer_ == 0 && FirstF().load() == 0) {
+      FirstF().store(in.ts_ns); // the first frame f's encoder was given (f's one video thread writes it)
+    }
+    if (!held_) {
+      held_ = in;
+      return IM_OK; // held back
+    }
+    const im::session::EncodeInput prev = *held_;
+    held_ = in;
+    const im_status st = inner_->Encode(prev, out);
+    if (st == IM_OK && !out->data.empty()) {
+      out->capture_ts_ns = prev.ts_ns;
+    }
+    return st;
+  }
+
+  im_status SetBitrate(uint32_t bps) noexcept override { return inner_->SetBitrate(bps); }
+
+  // The capture time of the first frame given to a layer-0 FrameBehindEncoder (0 before one); the test resets it.
+  static std::atomic<int64_t> &FirstF() noexcept {
+    static std::atomic<int64_t> first{0};
+    return first;
+  }
+
+private:
+  std::unique_ptr<im::session::VideoEncoder> inner_;
+  uint32_t layer_ = 0;
+  std::optional<im::session::EncodeInput> held_;
+};
+
+// Clears the catalog prefix a test set, also when an assertion ends it early.
+struct PrefixGuard {
+  explicit PrefixGuard(std::vector<im::session::EncoderEntry> entries) {
+    im::session::SetCatalogPrefixForTest(std::move(entries));
+  }
+  ~PrefixGuard() { im::session::SetCatalogPrefixForTest({}); }
+  PrefixGuard(const PrefixGuard &) = delete;
+  PrefixGuard &operator=(const PrefixGuard &) = delete;
+};
+
+// 04 §9.2's pts → capture-time table, at the session: with an encoder one frame behind, every packet carries its own
+// frame's capture time (the Marker's CaptureNS, which the fake wrote from that frame), not the next frame's, and the
+// first IDR carries the first frame's time.
+TEST_F(Session, AnEncoderOneFrameBehindKeepsEachAccessUnitsOwnCaptureTime) {
+  im::session::EncoderEntry e = im::testhooks::FakeEncoderEntry(IM_ENC_FAKE);
+  e.open = &FrameBehindEncoder::Open;
+  e.input = im::session::FrameInput::kNone;
+  FrameBehindEncoder::FirstF().store(0);
+  const PrefixGuard guard({e}); // listed before the test hooks' own fake: a test: source picks it first
+  const im_session s = Start(Config("test:pattern", false));
+  ASSERT_NE(s, 0u);
+  const std::vector<Pkt> pkts = Pull(s, milliseconds(1500));
+  EXPECT_EQ(im_stop(s), IM_OK);
+
+  std::vector<uint32_t> video(2, 0);
+  std::vector<int64_t> last(2, 0);
+  std::optional<Pkt> first_f;
+  for (const Pkt &p : pkts) {
+    if (!p.video() || p.layer > 1) {
+      continue;
+    }
+    ++video[p.layer];
+    if (p.layer == 0 && !first_f) {
+      first_f = p;
+    }
+    const std::optional<im::audio::Marker> m = VideoMarker(p.data);
+    ASSERT_TRUE(m.has_value()) << "layer " << p.layer << ": no Marker";
+    EXPECT_EQ(p.ts - epoch_, m->capture_ns)
+        << "layer " << p.layer << ", AU of frame " << m->frame << ": the packet's capture time is its own frame's";
+    EXPECT_GT(p.ts, last[p.layer]) << "capture times increase per layer";
+    last[p.layer] = p.ts;
+  }
+  EXPECT_GE(video[0], 60u) << "f runs at about 60 fps";
+  EXPECT_GE(video[1], 15u) << "q runs at about 15 fps";
+  ASSERT_TRUE(first_f.has_value());
+  EXPECT_TRUE(first_f->key() && first_f->reinit()) << "flags " << first_f->flags;
+  EXPECT_NE(FrameBehindEncoder::FirstF().load(), 0);
+  EXPECT_EQ(first_f->ts, FrameBehindEncoder::FirstF().load()) << "the first IDR carries the first frame's time";
+}
+
+// im_layer_config.gop_ms reaches the layer (04 §9.4): f with 1000 ms gets a periodic IDR about every second on the
+// moving pattern, q with 10000 ms none after its first within 3.5 s (its default would be 2 s).
+TEST_F(Session, LayerGopFromTheStartConfig) {
+  im_start_config cfg = Config("test:pattern", false);
+  cfg.layers[0].gop_ms = 1000;
+  cfg.layers[1].gop_ms = 10000;
+  const im_session s = Start(cfg);
+  ASSERT_NE(s, 0u);
+  const std::vector<Pkt> pkts = Pull(s, milliseconds(3500));
+  EXPECT_EQ(im_stop(s), IM_OK);
+  std::vector<int64_t> f_keys;
+  uint32_t q_keys = 0;
+  uint32_t q_packets = 0;
+  for (const Pkt &p : pkts) {
+    if (!p.video()) {
+      continue;
+    }
+    if (p.layer == 0 && p.key()) {
+      f_keys.push_back(p.ts);
+    }
+    if (p.layer == 1) {
+      ++q_packets;
+      q_keys += p.key() ? 1 : 0;
+    }
+  }
+  ASSERT_GE(f_keys.size(), 3u) << "the first IDR and periodic ones about 1 s apart";
+  for (std::size_t i = 1; i < f_keys.size(); ++i) {
+    const int64_t gap_ms = (f_keys[i] - f_keys[i - 1]) / 1'000'000;
+    // The pacer forces the IDR on the first new frame once 1 s passed since the last one (04 §9.4): about a frame
+    // later in capture time, with room for a loaded runner.
+    EXPECT_GE(gap_ms, 900) << "keyframe " << i;
+    EXPECT_LE(gap_ms, 1250) << "keyframe " << i;
+  }
+  EXPECT_GE(q_packets, 30u);
+  EXPECT_EQ(q_keys, 1u) << "q's GOP is 10 s: only its first packet is a keyframe";
+}
+
+// ------------------------------------------- selection, fallback, device loss, profiles (04 §9.1, §9.5–§9.8; WA61)
+
+// The scripted encoders' world: which catalog entry was tried for which layer, in order (an entry is told apart by
+// the id of its open function), how many encoders of a kind are open, and what the script makes fail. A scripted
+// encoder is the test hooks' fake behind it (FrameInput::kNone: no GPU path), reported as its entry's kind.
+struct Script {
+  struct Attempt {
+    uint32_t layer = 0;
+    int id = 0;
+    Clock::time_point at;
+    bool opened = false;
+  };
+  std::mutex mu;
+  std::vector<Attempt> attempts;
+  std::map<uint32_t, int> live;  // open encoders by kind
+  std::map<uint32_t, int> limit; // a session limit by kind (NVENC's per system, 04 §9.7); absent: none
+  std::set<int> failing;         // entry ids whose opens fail (open_failed)
+  int layer1_failures = 0;       // the next opens on layer 1 that fail, whatever the entry
+  std::atomic<bool> lost{false}; // Encode reports a removed device (IM_ERR_ENCODER_LOST)
+
+  // Changes the script under its lock.
+  template <class F> void Edit(F &&change) {
+    std::lock_guard<std::mutex> lock(mu);
+    change(*this);
+  }
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mu);
+    attempts.clear();
+    live.clear();
+    limit.clear();
+    failing.clear();
+    layer1_failures = 0;
+    lost.store(false);
+  }
+  // The ids tried for layer, in order.
+  std::vector<int> Tried(uint32_t layer) {
+    std::lock_guard<std::mutex> lock(mu);
+    std::vector<int> ids;
+    for (const Attempt &a : attempts) {
+      if (a.layer == layer) {
+        ids.push_back(a.id);
+      }
+    }
+    return ids;
+  }
+  std::vector<Attempt> AttemptsOf(uint32_t layer) {
+    std::lock_guard<std::mutex> lock(mu);
+    std::vector<Attempt> out;
+    std::copy_if(attempts.begin(), attempts.end(), std::back_inserter(out),
+                 [&](const Attempt &a) { return a.layer == layer; });
+    return out;
+  }
+  int Live(uint32_t kind) {
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = live.find(kind);
+    return it == live.end() ? 0 : it->second;
+  }
+  int LiveTotal() {
+    std::lock_guard<std::mutex> lock(mu);
+    int n = 0;
+    for (const auto &by_kind : live) {
+      n += by_kind.second;
+    }
+    return n;
+  }
+};
+
+Script &TheScript() {
+  static Script *const s = new Script(); // outlives every session thread
+  return *s;
+}
+
+class ScriptedEncoder final : public im::session::VideoEncoder {
+public:
+  ScriptedEncoder(std::unique_ptr<im::session::VideoEncoder> inner, uint32_t kind) noexcept
+      : inner_(std::move(inner)), kind_(kind) {}
+  ~ScriptedEncoder() override {
+    Script &s = TheScript();
+    std::lock_guard<std::mutex> lock(s.mu);
+    --s.live[kind_];
+  }
+  ScriptedEncoder(const ScriptedEncoder &) = delete;
+  ScriptedEncoder &operator=(const ScriptedEncoder &) = delete;
+
+  im_status Encode(const im::session::EncodeInput &in, im::session::EncodedAu *out) noexcept override {
+    if (TheScript().lost.load()) {
+      *out = im::session::EncodedAu{};
+      return im::abi::Fail(IM_ERR_ENCODER_LOST, im::abi::token::kDeviceRemoved, "scripted: the device was removed");
+    }
+    return inner_->Encode(in, out);
+  }
+  im_status SetBitrate(uint32_t bps) noexcept override { return inner_->SetBitrate(bps); }
+
+private:
+  std::unique_ptr<im::session::VideoEncoder> inner_;
+  uint32_t kind_ = 0;
+};
+
+im_status OpenScriptedAs(int id, const im::session::EncoderParams &p,
+                         std::unique_ptr<im::session::VideoEncoder> *out) noexcept {
+  try {
+    Script &s = TheScript();
+    {
+      std::lock_guard<std::mutex> lock(s.mu);
+      im_status st = IM_OK;
+      const auto lim = s.limit.find(p.kind);
+      if (s.failing.count(id) != 0) {
+        st = im::abi::Fail(IM_ERR_NO_ENCODER, im::abi::token::kOpenFailed, "scripted: this entry fails to open");
+      } else if (p.layer == 1 && s.layer1_failures > 0) {
+        --s.layer1_failures;
+        st = im::abi::Fail(IM_ERR_NO_ENCODER, im::abi::token::kOpenFailed, "scripted: layer 1's open fails");
+      } else if (lim != s.limit.end() && s.live[p.kind] >= lim->second) {
+        st = im::abi::Fail(IM_ERR_LIMIT, im::abi::token::kSessionLimit, "scripted: the kind's session limit");
+      }
+      s.attempts.push_back({p.layer, id, Clock::now(), st == IM_OK});
+      if (st != IM_OK) {
+        return st;
+      }
+      ++s.live[p.kind]; // counted before the lock goes, so a concurrent open sees it
+    }
+    std::unique_ptr<im::session::VideoEncoder> inner;
+    const im_status st = im::testhooks::FakeEncoderEntry(IM_ENC_FAKE).open(p, &inner);
+    if (st != IM_OK) {
+      std::lock_guard<std::mutex> lock(s.mu);
+      --s.live[p.kind];
+      return st;
+    }
+    *out = std::make_unique<ScriptedEncoder>(std::move(inner), p.kind);
+    return IM_OK;
+  } catch (...) {
+    return IM_ERR_INTERNAL;
+  }
+}
+
+template <int Id>
+im_status OpenScripted(const im::session::EncoderParams &p, std::unique_ptr<im::session::VideoEncoder> *out) noexcept {
+  return OpenScriptedAs(Id, p, out);
+}
+
+constexpr std::array<im::session::OpenEncoderFn, 7> kScriptedOpen = {
+    &OpenScripted<0>, &OpenScripted<1>, &OpenScripted<2>, &OpenScripted<3>,
+    &OpenScripted<4>, &OpenScripted<5>, &OpenScripted<6>};
+
+// Entry id (kScriptedOpen's index) of kind on adapter (encpolicy::kNoAdapter for a software one), with the kind's
+// traits (hardware, live bitrate, profiles: OpenH264 is CB only).
+im::session::EncoderEntry Scripted(int id, uint32_t kind, uint32_t adapter) {
+  im::session::EncoderEntry e = im::testhooks::FakeEncoderEntry(kind);
+  e.info.adapter_index = adapter;
+  e.open = kScriptedOpen[static_cast<std::size_t>(id)];
+  e.input = im::session::FrameInput::kNone;
+  return e;
+}
+
+constexpr uint32_t kNoAdapter = 0xFFFFFFFFu;
+
+// The catalog of a test: its scripted entries and the test hooks' fakes only (no probe), the capture adapter, and a
+// clean script; all undone at the end, also when an assertion ends the test early.
+struct ScriptGuard {
+  ScriptGuard(std::vector<im::session::EncoderEntry> entries, uint32_t capture_adapter) {
+    TheScript().Clear();
+    im::session::SetCatalogPrefixForTest(std::move(entries), true);
+    im::session::SetCaptureAdapterForTest(capture_adapter);
+  }
+  ~ScriptGuard() {
+    im::session::SetCatalogPrefixForTest({});
+    im::session::SetCaptureAdapterForTest(std::nullopt);
+    TheScript().Clear();
+  }
+  ScriptGuard(const ScriptGuard &) = delete;
+  ScriptGuard &operator=(const ScriptGuard &) = delete;
+};
+
+im_session_info InfoOf(im_session s) {
+  im_session_info info{};
+  info.struct_size = sizeof info;
+  EXPECT_EQ(im_get_session_info(s, &info), IM_OK) << LastError();
+  return info;
+}
+
+// The ENCODER_CHANGED events and each layer's first REINIT|KEYFRAME, in delivery order, pulled for d or until every
+// layer in want has its REINIT packet.
+struct Fallbacks {
+  std::vector<Pkt> events;                    // ENCODER_CHANGED
+  std::array<std::optional<Pkt>, 2> reinit;   // per layer
+  std::array<std::size_t, 2> events_before{}; // ENCODER_CHANGED events delivered before the layer's REINIT packet
+};
+Fallbacks PullFallbacks(im_session s, milliseconds d, std::vector<uint32_t> want) {
+  Fallbacks f;
+  Pull(s, d, [&](const Pkt &p) {
+    if (p.kind == IM_PACKET_EVENT && p.event == IM_EVENT_ENCODER_CHANGED) {
+      f.events.push_back(p);
+    }
+    if (p.video() && p.reinit() && p.layer < 2 && !f.reinit[p.layer]) {
+      f.reinit[p.layer] = p;
+      std::size_t n = 0;
+      for (const Pkt &e : f.events) {
+        n += e.layer == p.layer ? 1 : 0;
+      }
+      f.events_before[p.layer] = n;
+    }
+    return std::all_of(want.begin(), want.end(), [&](uint32_t l) { return f.reinit[l].has_value(); });
+  });
+  return f;
+}
+
+// 04 §9.1's order and §9.6's one profile per session. Scrambled entries (ids 0..6 in catalog order: OpenH264, MF
+// software, MF hardware on adapter 1, NVENC on 1, AMF on 0, MF hardware on 0, QSV on 1) where only OpenH264 opens:
+// with adapter 0 as the capture adapter each layer tries AMF@0, MF-HW@0, then the vendors on the other adapters
+// (NVENC before QSV), MF-HW@1, MF software; none opens at High, so the whole session tries again at CB and gets
+// OpenH264 on both layers (never a mixed session). Without a capture adapter every adapter counts as "other": the
+// vendor encoders by adapter first, then MF hardware. High asked of the CB session leaves it at CB (IM_OK, no
+// re-init).
+TEST_F(Session, CandidatesFollowTheOrderAndTheSessionKeepsOneProfile) {
+  const std::vector<im::session::EncoderEntry> entries = {Scripted(0, IM_ENC_OPENH264, kNoAdapter),
+                                                          Scripted(1, IM_ENC_MF_SW, kNoAdapter),
+                                                          Scripted(2, IM_ENC_MF_HW, 1),
+                                                          Scripted(3, IM_ENC_NVENC, 1),
+                                                          Scripted(4, IM_ENC_AMF, 0),
+                                                          Scripted(5, IM_ENC_MF_HW, 0),
+                                                          Scripted(6, IM_ENC_QSV, 1)};
+  {
+    const ScriptGuard guard(entries, 0);
+    TheScript().Edit([](Script &sc) { sc.failing = {1, 2, 3, 4, 5, 6}; });
+    im::testhooks::FailOpens(IM_ENC_FAKE, true); // the test: source's fake comes first; it steps aside
+    im_session_info info{};
+    const im_session s = Start(Config("test:pattern", false), &info);
+    ASSERT_NE(s, 0u);
+    const std::vector<int> high_then_cb = {4, 5, 3, 6, 2, 1, 4, 5, 3, 6, 2, 1, 0};
+    EXPECT_EQ(TheScript().Tried(0), high_then_cb) << "f: the High round (OpenH264 can't do High), then the CB round";
+    EXPECT_EQ(TheScript().Tried(1), (std::vector<int>{4, 5, 3, 6, 2, 1, 0})) << "q: the CB round";
+    for (uint32_t l = 0; l < 2; ++l) {
+      EXPECT_EQ(info.layers[l].encoder, IM_ENC_OPENH264) << "layer " << l;
+      EXPECT_EQ(info.layers[l].profile, static_cast<uint32_t>(IM_PROFILE_CB)) << "layer " << l;
+    }
+    ExpectFirstKeyframes(s, started_, epoch_, 2, "a CB session");
+
+    ASSERT_EQ(im_set_profile(s, IM_PROFILE_HIGH), IM_OK) << "High asked of encoders that can't do it is IM_OK";
+    for (const Pkt &p : Pull(s, milliseconds(1500))) {
+      if (p.video()) {
+        EXPECT_FALSE(p.reinit()) << "layer " << p.layer << ": no re-init, the session stays CB";
+        EXPECT_EQ(p.profile, static_cast<uint32_t>(IM_PROFILE_CB)) << "layer " << p.layer;
+      }
+    }
+    const im_session_info after = InfoOf(s);
+    EXPECT_EQ(after.layers[0].profile, static_cast<uint32_t>(IM_PROFILE_CB));
+    EXPECT_EQ(after.layers[1].profile, static_cast<uint32_t>(IM_PROFILE_CB));
+    EXPECT_EQ(im_stop(s), IM_OK);
+  }
+  {
+    const ScriptGuard guard(entries, kNoAdapter);
+    TheScript().Edit([](Script &sc) { sc.failing = {1, 2, 3, 4, 5, 6}; });
+    im::testhooks::FailOpens(IM_ENC_FAKE, true);
+    const im_session s = Start(Config("test:pattern", false));
+    ASSERT_NE(s, 0u);
+    const std::vector<int> tried = TheScript().Tried(0);
+    ASSERT_GE(tried.size(), 6u);
+    EXPECT_EQ(std::vector<int>(tried.begin(), tried.begin() + 6), (std::vector<int>{4, 3, 6, 5, 2, 1}))
+        << "no capture adapter: AMF@0, NVENC@1, QSV@1, then MF-HW@0, MF-HW@1, then MF software";
+    EXPECT_EQ(im_stop(s), IM_OK);
+  }
+}
+
+// 04 §9.7: layer 0's NVENC opens, layer 1's hits the session limit (one NVENC session left), so q takes the next
+// encoder that does the session profile (MF software) at im_start: no event, both layers High, both first keyframes in
+// time.
+TEST_F(Session, APreviewLayerTakesTheNextEncoderWhenNvencHitsItsLimit) {
+  const ScriptGuard guard({Scripted(0, IM_ENC_NVENC, 0), Scripted(1, IM_ENC_MF_SW, kNoAdapter)}, 0);
+  TheScript().Edit([](Script &sc) { sc.limit[IM_ENC_NVENC] = 1; });
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  im_session_info info{};
+  const im_session s = Start(Config("test:pattern", false), &info);
+  ASSERT_NE(s, 0u);
+  EXPECT_EQ(info.layers[0].encoder, IM_ENC_NVENC);
+  EXPECT_EQ(info.layers[1].encoder, IM_ENC_MF_SW) << "q falls back past NVENC's limit";
+  EXPECT_EQ(info.layers[0].profile, static_cast<uint32_t>(IM_PROFILE_HIGH));
+  EXPECT_EQ(info.layers[1].profile, static_cast<uint32_t>(IM_PROFILE_HIGH));
+  const std::vector<Script::Attempt> q = TheScript().AttemptsOf(1);
+  ASSERT_EQ(q.size(), 2u);
+  EXPECT_EQ(q[0].id, 0);
+  EXPECT_FALSE(q[0].opened) << "NVENC: the session limit";
+  EXPECT_EQ(q[1].id, 1);
+  EXPECT_TRUE(q[1].opened);
+  bool changed = false;
+  std::vector<std::optional<Pkt>> first(2);
+  Pull(s, milliseconds(1500), [&](const Pkt &p) {
+    changed = changed || (p.kind == IM_PACKET_EVENT && p.event == IM_EVENT_ENCODER_CHANGED);
+    if (p.video() && p.layer < 2 && !first[p.layer]) {
+      first[p.layer] = p;
+    }
+    return first[0] && first[1];
+  });
+  EXPECT_FALSE(changed) << "a fallback at im_start is no ENCODER_CHANGED";
+  for (uint32_t l = 0; l < 2; ++l) {
+    ASSERT_TRUE(first[l].has_value()) << "layer " << l;
+    EXPECT_TRUE(first[l]->key() && first[l]->reinit()) << "layer " << l;
+    EXPECT_LE(std::chrono::duration_cast<milliseconds>(first[l]->at - started_).count(), 500) << "layer " << l;
+  }
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+// 04 §9.7: a further layer whose every option failed is retried once after 500 ms; when the retry fails too, im_start
+// is IM_ERR_NO_ENCODER (layer_failed, the detail names the layer) and nothing stays open.
+TEST_F(Session, AFurtherLayerIsRetriedOnceAfter500ms) {
+  const ScriptGuard guard({Scripted(0, IM_ENC_NVENC, 0)}, 0);
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  TheScript().Edit([](Script &sc) { sc.layer1_failures = 1; });
+  im_session_info info{};
+  const im_session s = Start(Config("test:pattern", false), &info);
+  ASSERT_NE(s, 0u);
+  EXPECT_EQ(info.layers[1].encoder, IM_ENC_NVENC);
+  std::vector<Script::Attempt> q = TheScript().AttemptsOf(1);
+  ASSERT_EQ(q.size(), 2u);
+  EXPECT_FALSE(q[0].opened);
+  EXPECT_TRUE(q[1].opened);
+  EXPECT_GE(std::chrono::duration_cast<milliseconds>(q[1].at - q[0].at).count(), 480) << "the retry waits 500 ms";
+  EXPECT_EQ(im_stop(s), IM_OK);
+
+  TheScript().Clear();
+  TheScript().Edit([](Script &sc) { sc.layer1_failures = 2; });
+  im_start_config cfg = Config("test:pattern", false);
+  im_session none = 0;
+  im_session_info out{};
+  out.struct_size = sizeof out;
+  EXPECT_EQ(im_start(&cfg, &none, &out), IM_ERR_NO_ENCODER);
+  const std::string err = LastError();
+  EXPECT_TRUE(StartsWith(err, "layer_failed: ")) << err;
+  EXPECT_NE(err.find("layer q"), std::string::npos) << err;
+  q = TheScript().AttemptsOf(1);
+  EXPECT_EQ(q.size(), 2u) << "one retry, no more";
+  EXPECT_EQ(TheScript().LiveTotal(), 0) << "f's encoder was closed again";
+}
+
+// 04 §9.5: a re-init encoder (MF software) changes its bitrate by a re-init at most every 10 s per layer: the first
+// change at once, the next ones stored and applied when the 10 s are over, the latest value winning; a bitrate that
+// comes with an im_update_layer re-init rides along with it (1 s spacing, not 10 s).
+TEST_F(Session, BitrateReinitsAreTenSecondsApartAndTheLatestValueWins) {
+  const ScriptGuard guard({Scripted(0, IM_ENC_MF_SW, kNoAdapter)}, 0);
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  im_session_info info{};
+  const im_session s = Start(Config("test:pattern", false), &info);
+  ASSERT_NE(s, 0u);
+  ASSERT_EQ(info.layers[0].encoder, IM_ENC_MF_SW);
+  EXPECT_EQ(info.layers[0].flags & IM_ENCF_LIVE_BITRATE, 0u);
+  Pull(s, milliseconds(400));
+
+  const auto t0 = Clock::now();
+  ASSERT_EQ(im_set_bitrate(s, 0, 2'000'000), IM_OK) << LastError();
+  std::vector<Clock::time_point> f_reinits;
+  uint32_t q_reinits = 0;
+  bool set_second = false;
+  bool set_third = false;
+  for (;;) {
+    const auto elapsed = Clock::now() - t0;
+    if (elapsed > milliseconds(11'500)) {
+      break;
+    }
+    if (!set_second && elapsed > milliseconds(1000)) {
+      ASSERT_EQ(im_set_bitrate(s, 0, 3'000'000), IM_OK);
+      set_second = true;
+    }
+    if (!set_third && elapsed > milliseconds(2000)) {
+      ASSERT_EQ(im_set_bitrate(s, 0, 2'500'000), IM_OK);
+      set_third = true;
+      // The stored value replaced: still 2 Mbit/s until the window ends.
+      EXPECT_EQ(InfoOf(s).layers[0].bitrate_bps, 2'000'000u);
+    }
+    Pkt p;
+    if (NextPkt(s, 50, &p) == IM_OK && p.video() && p.reinit()) {
+      if (p.layer == 0) {
+        EXPECT_TRUE(p.key());
+        f_reinits.push_back(p.at);
+      } else {
+        ++q_reinits;
+      }
+    }
+  }
+  ASSERT_EQ(f_reinits.size(), 2u) << "one re-init at once, one when the 10 s are over";
+  EXPECT_LE(std::chrono::duration_cast<milliseconds>(f_reinits[0] - t0).count(), 500);
+  const auto gap = std::chrono::duration_cast<milliseconds>(f_reinits[1] - f_reinits[0]).count();
+  EXPECT_GE(gap, 9800) << "10 s apart (packet arrival times)";
+  EXPECT_LE(gap, 11'000);
+  EXPECT_EQ(q_reinits, 0u) << "q's bitrate didn't change";
+  EXPECT_EQ(InfoOf(s).layers[0].bitrate_bps, 2'500'000u) << "the latest value won";
+
+  // A new fps with a bitrate in the same call: one re-init within the 1 s spacing carries both.
+  const auto t1 = Clock::now();
+  im_layer_config f = Layer("f", 1920 * 1080, 30, 3'000'000);
+  ASSERT_EQ(im_update_layer(s, 0, &f), IM_OK) << LastError();
+  std::vector<Clock::time_point> more;
+  for (const Pkt &p : Pull(s, milliseconds(2000))) {
+    if (p.video() && p.layer == 0 && p.reinit()) {
+      more.push_back(p.at);
+    }
+  }
+  ASSERT_EQ(more.size(), 1u);
+  EXPECT_LE(std::chrono::duration_cast<milliseconds>(more[0] - t1).count(), 1500);
+  const im_session_info after = InfoOf(s);
+  EXPECT_EQ(after.layers[0].fps, 30u);
+  EXPECT_EQ(after.layers[0].bitrate_bps, 3'000'000u) << "the bitrate rode along with the fps re-init";
+  // The current value again is a no-op.
+  ASSERT_EQ(im_set_bitrate(s, 0, 3'000'000), IM_OK);
+  for (const Pkt &p : Pull(s, milliseconds(1200))) {
+    EXPECT_FALSE(p.video() && p.reinit()) << "layer " << p.layer;
+  }
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+// 04 §9.5: im_update_layer re-inits at most once per second per layer, coalesced: a first change at once, then the
+// changes inside the next second become one re-init with the latest values (fps and size together).
+TEST_F(Session, UpdateLayerReinitsAreOneSecondApartAndCoalesced) {
+  const im_session s = Start(Config("test:pattern", false));
+  ASSERT_NE(s, 0u);
+  Pull(s, milliseconds(400));
+  const auto t0 = Clock::now();
+  im_layer_config f = Layer("f", 1920 * 1080, 30, 4'000'000);
+  ASSERT_EQ(im_update_layer(s, 0, &f), IM_OK) << LastError();
+  std::vector<Pkt> reinits;
+  bool second = false;
+  bool third = false;
+  while (Clock::now() - t0 < milliseconds(2500)) {
+    const auto elapsed = Clock::now() - t0;
+    if (!second && elapsed > milliseconds(200)) {
+      f = Layer("f", 1920 * 1080, 20, 4'000'000);
+      ASSERT_EQ(im_update_layer(s, 0, &f), IM_OK);
+      second = true;
+    }
+    if (!third && elapsed > milliseconds(300)) {
+      f = Layer("f", 1280 * 720, 20, 4'000'000);
+      ASSERT_EQ(im_update_layer(s, 0, &f), IM_OK);
+      third = true;
+    }
+    Pkt p;
+    if (NextPkt(s, 20, &p) == IM_OK && p.video() && p.reinit()) {
+      EXPECT_EQ(p.layer, 0u) << "only f changed";
+      if (p.layer == 0) {
+        reinits.push_back(p);
+      }
+    }
+  }
+  ASSERT_EQ(reinits.size(), 2u) << "the first change at once, the next two as one";
+  EXPECT_LE(std::chrono::duration_cast<milliseconds>(reinits[0].at - t0).count(), 500);
+  EXPECT_EQ(reinits[0].width, 1920u);
+  EXPECT_GE(std::chrono::duration_cast<milliseconds>(reinits[1].at - reinits[0].at).count(), 800)
+      << "1 s apart (packet arrival times)";
+  EXPECT_EQ(reinits[1].width, 1280u) << "the coalesced re-init has the latest size";
+  EXPECT_EQ(reinits[1].height, 720u);
+  const im_session_info info = InfoOf(s);
+  EXPECT_EQ(info.layers[0].fps, 20u) << "and the latest fps";
+  EXPECT_EQ(info.layers[0].width, 1280u);
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+// 04 §9.8 with a session limit mid-session: q's encode error, NVENC's re-open hits the limit (another process took the
+// session), so q falls back to MF software: ENCODER_CHANGED (reason session_limit) before its first REINIT|KEYFRAME;
+// f keeps its NVENC and doesn't re-init.
+TEST_F(Session, ASessionLimitMidSessionFallsBackWithItsReason) {
+  const ScriptGuard guard({Scripted(0, IM_ENC_NVENC, 0), Scripted(1, IM_ENC_MF_SW, kNoAdapter)}, 0);
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  im_session_info info{};
+  const im_session s = Start(Config("test:pattern", false), &info);
+  ASSERT_NE(s, 0u);
+  ASSERT_EQ(info.layers[1].encoder, IM_ENC_NVENC);
+  Pull(s, milliseconds(400));
+  TheScript().Edit([](Script &sc) { sc.limit[IM_ENC_NVENC] = 1; }); // f's stays; q's re-open finds none left
+  ASSERT_EQ(im::testhooks::Inject(s, 1, im::testhooks::Fault::kEncodeError), IM_OK);
+  const Fallbacks fb = PullFallbacks(s, milliseconds(1500), {1});
+  ASSERT_TRUE(fb.reinit[1].has_value());
+  EXPECT_TRUE(fb.reinit[1]->key());
+  ASSERT_EQ(fb.events.size(), 1u);
+  EXPECT_EQ(fb.events_before[1], 1u) << "ENCODER_CHANGED comes before the new encoder's first packet";
+  EXPECT_FALSE(fb.reinit[0].has_value()) << "f didn't re-init";
+  const std::string j = fb.events[0].json();
+  EXPECT_EQ(fb.events[0].layer, 1u);
+  EXPECT_NE(j.find("\"layer\":\"q\""), std::string::npos) << j;
+  EXPECT_NE(j.find("\"from\":\"nvenc\""), std::string::npos) << j;
+  EXPECT_NE(j.find("\"to\":\"mf-sw\""), std::string::npos) << j;
+  EXPECT_NE(j.find("\"reason\":\"session_limit\""), std::string::npos) << j;
+  const im_session_info after = InfoOf(s);
+  EXPECT_EQ(after.layers[0].encoder, IM_ENC_NVENC);
+  EXPECT_EQ(after.layers[1].encoder, IM_ENC_MF_SW);
+  EXPECT_EQ(after.layers[1].profile, static_cast<uint32_t>(IM_PROFILE_HIGH)) << "the session profile is kept";
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+// 04 §9.5 and §9.8: a re-init (the content hint, every layer) whose re-open fails goes to the next candidate:
+// ENCODER_CHANGED (open_failed) for each layer, each before that layer's first REINIT|KEYFRAME.
+TEST_F(Session, AFailedReinitFallsBackToTheNextCandidate) {
+  const ScriptGuard guard({Scripted(0, IM_ENC_NVENC, 0), Scripted(1, IM_ENC_MF_SW, kNoAdapter)}, 0);
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  const im_session s = Start(Config("test:pattern", false));
+  ASSERT_NE(s, 0u);
+  Pull(s, milliseconds(400));
+  TheScript().Edit([](Script &sc) { sc.failing = {0}; }); // NVENC doesn't re-open
+  ASSERT_EQ(im_set_content_hint(s, IM_CONTENT_DETAIL), IM_OK) << LastError();
+  const Fallbacks fb = PullFallbacks(s, milliseconds(2000), {0, 1});
+  for (uint32_t l = 0; l < 2; ++l) {
+    SCOPED_TRACE("layer " + std::to_string(l));
+    ASSERT_TRUE(fb.reinit[l].has_value());
+    EXPECT_TRUE(fb.reinit[l]->key());
+    EXPECT_EQ(fb.events_before[l], 1u) << "ENCODER_CHANGED first";
+  }
+  ASSERT_EQ(fb.events.size(), 2u);
+  for (const Pkt &e : fb.events) {
+    EXPECT_NE(e.json().find("\"reason\":\"open_failed\""), std::string::npos) << e.json();
+    EXPECT_NE(e.json().find("\"to\":\"mf-sw\""), std::string::npos) << e.json();
+  }
+  const im_session_info info = InfoOf(s);
+  EXPECT_EQ(info.layers[0].encoder, IM_ENC_MF_SW);
+  EXPECT_EQ(info.layers[1].encoder, IM_ENC_MF_SW);
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+// 04 §9.8: an encoder that reports a removed device (IM_ERR_ENCODER_LOST from Encode) ends the session within 1 s with
+// ENDED{IM_ERR_ENCODER_LOST} device_removed: no fallback is tried, no DEVICE_RESET, the probe's cache is stale, and the
+// ended session holds no encoder while the host has yet to stop it. The next start runs on a new device.
+TEST_F(Session, AnEncoderReportingADeviceRemovalEndsTheSession) {
+  const ScriptGuard guard({Scripted(0, IM_ENC_NVENC, 0), Scripted(1, IM_ENC_MF_SW, kNoAdapter)}, 0);
+  im::testhooks::FailOpens(IM_ENC_FAKE, true);
+  const im_session s = Start(Config("test:pattern", false));
+  ASSERT_NE(s, 0u);
+  Pull(s, milliseconds(400));
+  const uint64_t old_device = im::testhooks::SessionDevice(s);
+  const std::size_t tried = TheScript().AttemptsOf(0).size() + TheScript().AttemptsOf(1).size();
+  const auto lost_at = Clock::now();
+  TheScript().lost.store(true);
+  const auto ended = WaitEnded(s, milliseconds(1500));
+  ASSERT_TRUE(ended.has_value());
+  EXPECT_LE(std::chrono::duration_cast<milliseconds>(ended->at - lost_at).count(), 1000);
+  EXPECT_EQ(ended->status, IM_ERR_ENCODER_LOST);
+  EXPECT_NE(ended->json().find("\"detail\":\"device_removed: "), std::string::npos) << ended->json();
+  EXPECT_TRUE(im::testhooks::ProbeCacheStale());
+  EXPECT_EQ(TheScript().AttemptsOf(0).size() + TheScript().AttemptsOf(1).size(), tried) << "no fallback was tried";
+  const auto released_by = Clock::now() + milliseconds(500);
+  while (TheScript().LiveTotal() != 0 && Clock::now() < released_by) {
+    std::this_thread::sleep_for(milliseconds(10));
+  }
+  EXPECT_EQ(TheScript().LiveTotal(), 0) << "the ended session released its encoders before im_stop";
+  EXPECT_EQ(im_stop(s), IM_OK);
+
+  TheScript().lost.store(false);
+  const im_session again = Start(Config("test:pattern", false));
+  ASSERT_NE(again, 0u);
+  EXPECT_NE(im::testhooks::SessionDevice(again), old_device);
+  ExpectFirstKeyframes(again, started_, epoch_, 2, "after the device removal");
+  EXPECT_EQ(im_stop(again), IM_OK);
 }
 
 } // namespace

@@ -15,13 +15,22 @@
 #   third_party/                     headers compiled in (OpenH264's, 04 §9.9), on the include path
 #   tests/*_test.cpp                 one GoogleTest executable per file (IM_BUILD_TESTS), linked with im_engine and
 #                                    registered with ctest under the file's name; each file belongs to one slice
-#   tests/support/                   the marker and probe DLLs of dll_search_test, built with the tests, never shipped
+#   tests/support/                   the marker and probe DLLs of dll_search_test, and crash_report.cpp (linked into
+#                                    every test executable), built with the tests, never shipped
 #
 # System libraries: the ones 04 §13.1 names are linked below. An area that needs another one names it in its source
 # with #pragma comment(lib, "<name>.lib"), and its DLL goes onto deploy/windows/dll-imports.txt in the same change
-# (tools/desktoppkg dll-check fails on an unlisted import). C++/WinRT code (README WA50) does that for windowsapp.lib:
-# the linker searches such default libraries after the ones on its command line, so the functions kernel32.lib and the
-# others below provide keep coming from their classic DLLs, and only WinRT's resolve to windowsapp's API sets.
+# (tools/desktoppkg dll-check fails on an unlisted import). C++/WinRT code (README WA50) does that for
+# runtimeobject.lib, the classic import library of the Ro* and Windows*String functions.
+#
+# Umbrella libraries (windowsapp, onecore, onecoreuap, mincore) are never linked, not even as a default library: the
+# static CRT's kernel32 functions and C++/WinRT's /alternatename targets become undefined only after the linker has
+# passed kernel32.lib, so they would bind to the next library that has them, an umbrella's api-ms-win-core-* API
+# sets, instead of kernel32.dll. The /NODEFAULTLIB guard below turns such a pragma into a link error (LNK2019 naming
+# the symbol only an umbrella provides) rather than unlisted imports.
+#
+# shcore.dll is not import-linked: src/capture/outputs_win.cpp gets GetDpiForMonitor from System32's shcore.dll with
+# GetProcAddress (04 §13.1).
 #
 # mfplat.dll and avrt.dll are delay-loaded (absent on N editions and Windows Server without Media Foundation,
 # 04 §13.1), through src/engine/delayload.cpp's System32-only hook. /DEPENDENTLOADFLAG is not set: README WA11's
@@ -56,7 +65,6 @@ target_link_libraries(
          dxgi
          dxguid
          dwmapi
-         shcore
          synchronization
          avrt
          mfplat
@@ -69,6 +77,9 @@ foreach(_area audio audiopolicy audiomix)
 endforeach()
 # LNK4199 ("/DELAYLOAD ignored; no imports found") while no code imports a delay-loaded DLL yet.
 target_link_options(im_engine INTERFACE /DELAYLOAD:mfplat.dll /DELAYLOAD:avrt.dll /IGNORE:4199)
+# No umbrella library, whatever a header's #pragma comment(lib) asks for (see the top of this file).
+target_link_options(im_engine INTERFACE /NODEFAULTLIB:windowsapp.lib /NODEFAULTLIB:onecore.lib
+                    /NODEFAULTLIB:onecoreuap.lib /NODEFAULTLIB:mincore.lib)
 
 # FFmpeg is loaded at run time and never import-linked (04 §9.2): only the build zip's headers are used here.
 # IM_FFMPEG_ROOT is optional until README WA24 wires the locked build into the windows-native job.
@@ -147,6 +158,12 @@ if(IM_BUILD_TESTS)
   endforeach()
   target_link_options(im-test-dlprobe-flag PRIVATE /DEPENDENTLOADFLAG:0x800)
 
+  # Every test binary prints an unhandled exception's code, module+offset and stack before it dies: gtest's own guard
+  # covers the main thread's test bodies only (tests/support/crash_report.cpp). An OBJECT library, so its static
+  # initializer is always linked in.
+  add_library(im_test_crash_report OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/crash_report.cpp")
+  target_link_libraries(im_test_crash_report PRIVATE im_build_flags)
+
   file(GLOB _tests CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
   foreach(_src IN LISTS _tests)
     get_filename_component(_name "${_src}" NAME_WE)
@@ -155,12 +172,15 @@ if(IM_BUILD_TESTS)
                           "native/common and native/windows")
     endif()
     add_executable(${_name} "${_src}")
-    target_link_libraries(${_name} PRIVATE im_engine GTest::gmock_main)
+    target_link_libraries(${_name} PRIVATE im_engine GTest::gmock_main im_test_crash_report)
     target_compile_definitions(
       ${_name}
       PRIVATE "IM_NATIVE_DIR=\"${IM_NATIVE_DIR}\"" "IM_TESTDATA_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata\""
               "IM_TEST_DLL_DIR=\"${IM_TEST_DLL_DIR}\"" "IM_TEST_OUT_DIR=\"${CMAKE_CURRENT_BINARY_DIR}\"")
     add_test(NAME ${_name} COMMAND ${_name})
+    # Every run writes gtest's XML report (a binary whose cases all skip still exits 0, so ctest shows it as passed):
+    # CI lists each skipped case and its reason from these.
+    set_tests_properties(${_name} PROPERTIES ENVIRONMENT "GTEST_OUTPUT=xml:${CMAKE_CURRENT_BINARY_DIR}/gtest-xml/")
   endforeach()
 
   if(TARGET dll_search_test)

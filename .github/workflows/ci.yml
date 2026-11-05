@@ -82,6 +82,7 @@ jobs:
       run-desktop-macos: ${{ steps.plan.outputs.run-desktop-macos }}
       run-native-host: ${{ steps.plan.outputs.run-native-host }}
       run-windows-native: ${{ steps.plan.outputs.run-windows-native }}
+      run-windows-desktop: ${{ steps.plan.outputs.run-windows-desktop }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
     steps:
@@ -148,6 +149,9 @@ jobs:
               # The update signers block that lint:keys compares with deploy/keys/update_signers
               # (M2 06 §8.3).
               - 'internal/update/signers.go'
+              # The self-hosted runner labels that repocheck's workflow tests read (README WF15); the
+              # workflows themselves are in the deploy filter, which runs lint-deploy too.
+              - '.github/actionlint.yaml'
             # Doctor's checks and their codes, which docker-smoke's doctor step pins one by one
             # (deploy/docker/test/docker-smoke.sh, README F21): a change to them runs that job.
             doctor:
@@ -158,20 +162,28 @@ jobs:
               - 'tools/relserve/**'
               - 'tools/notices/**'
             # The Windows app (M2 06 §10.1): everything the app, its engine, its installer or
-            # its packaging reads, the SPA it bundles included. windows-go, desktop-macos and
-            # windows-native run on it; windows-desktop joins when it lands (README WA72).
+            # its packaging reads, the SPA it bundles included. windows-go, desktop-macos,
+            # windows-native and windows-desktop run on it (README WA67 adds the installer smoke, one
+            # of windows-desktop's own inputs; README WA72 its isshoni-audiotest selfcheck and the ps1 install, which
+            # tools/relserve serves).
             desktop:
               - 'cmd/isshoni-desktop/**'
               - 'cmd/isshoni-enginetest/**'
+              - 'cmd/isshoni-audiotest/**'
+              - 'tools/relserve/**'
               - 'internal/client/**'
               - 'internal/media/**'
               - 'internal/update/**'
               - 'internal/desktop/**'
               - 'native/**'
               - 'deploy/windows/**'
+              - 'deploy/test/windows/smoke.ps1'
               - 'deploy/install-desktop.ps1'
               - 'deploy/embed.go'
               - 'deploy/notices/native-windows.json'
+              # README WA78: the native gate's exceptions and the license files it reads from the repository.
+              - 'deploy/notices/exceptions.md'
+              - 'deploy/notices/licenses/**'
               - 'tools/desktoppkg/**'
               - 'tools/wails3/**'
               - 'tools/notices/**'
@@ -386,11 +398,27 @@ jobs:
           # native code, the MSVC environment and its pins, and tools/desktoppkg (dll-check). From
           # README WA24 it also needs the FFmpeg lock and runs `task native:dist`, so the Taskfile
           # is one of its inputs too (the native filter adds only Taskfile.yml to desktop's paths).
+          # The ps filter too: windows-desktop, which needs this job's artifact, runs the Pester tests and the
+          # grammar check under Windows PowerShell 5.1 (README WA72).
           windows_native_when=$desktop
-          if [ "$native" = true ]; then windows_native_when=true; fi
+          if [ "$native" = true ] || [ "$ps" = true ]; then windows_native_when=true; fi
           decide windows-native "$windows_native_when" go.mod native/CMakePresets.json native/vcpkg.json \
             native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
             deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions
+          # The installer (M2 06 §6, §10.1; README WA67): windows-native's inputs (it needs that job's DLLs), the
+          # web job's web/dist, the NSIS scripts, the smoke and the app. From README WA72 also on the ps filter: the job
+          # runs the Pester tests and the PowerShell 5.1 grammar check (M2 06 §10.1), whose inputs (the Pester file,
+          # deploy/test/windows/*.ps1) the desktop filter doesn't all list. And on the native filter, as windows-native:
+          # that filter adds Taskfile.yml, whose test:ps, desktop:exe:windows, desktop:package:windows and native:dist
+          # bodies this job runs, and the DLL-dependent Go tests moved here from windows-native.
+          windows_desktop_when=$desktop
+          if [ "$native" = true ] || [ "$ps" = true ]; then windows_desktop_when=true; fi
+          decide windows-desktop "$windows_desktop_when" go.mod native/CMakePresets.json native/vcpkg.json \
+            native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
+            deploy/windows/dll-imports.txt tools/desktoppkg native/ffmpeg/lock.json Taskfile.yml .tool-versions \
+            web/package.json web/package-lock.json deploy/windows/nsis/installer.nsi deploy/test/windows/smoke.ps1 \
+            cmd/isshoni-desktop cmd/isshoni-audiotest tools/relserve deploy/install-desktop.ps1 \
+            deploy/test/install-desktop.Tests.ps1 web/e2e/cdp/playwright.config.ts
 
           task_version=''
           if [ -e .tool-versions ]; then
@@ -461,6 +489,9 @@ jobs:
 
       - name: go vet (windows)
         run: GOOS=windows go vet ./...
+
+      - name: go vet (windows, the app's e2e build)
+        run: GOOS=windows go vet -tags e2e ./cmd/isshoni-desktop
 
       - name: task lint:go:cross (windows without cgo; android and ios package builds)
         run: task lint:go:cross
@@ -1028,6 +1059,13 @@ jobs:
       - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
         run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
 
+      # repocheck's tests, its workflow guards among them (M2 06 §10.4-§10.5, README WF15): no
+      # self-hosted job behind a pull request trigger, audiotest.yml's guard, labels and token
+      # rules. test-go runs them on Go changes; this step runs them for a pull request that
+      # changes only .github/workflows/** or .github/actionlint.yaml, which test-go doesn't see.
+      - name: repocheck tests (the workflow guards)
+        run: go -C tools test -count=1 ./repocheck
+
       # lint:ps and test:ps (M2 06 §10.1, §16) run PSScriptAnalyzer and Pester under the image's
       # pwsh. Both fetch their module at deploy/windows/tools.json's version from the PowerShell
       # Gallery into .deps/psmodules/ and check its SHA-256 (Taskfile.yml); the cache saves the
@@ -1504,7 +1542,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run-windows-go == 'true'
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 30 # two go test runs of up to 12 m each
     defaults:
       run:
         shell: pwsh
@@ -1580,22 +1618,39 @@ jobs:
           CGO_ENABLED: '1'
           PKGS: ${{ steps.pkgs.outputs.race }}
         run: |
-          go test -race -count=1 -timeout 12m @(-split $env:PKGS)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # -v so the skips show: each "--- SKIP" and its reason also goes to the step summary.
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-race.log'
+          go test -v -race -count=1 -timeout 12m @(-split $env:PKGS) | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $skips = @(Select-String -LiteralPath $log -Pattern '^\s*--- SKIP: ' -Context 0, 2 | ForEach-Object {
+            "- $($_.Line.Trim()) $(@($_.Context.PostContext | ForEach-Object { $_.Trim() }) -join ' ')" })
+          "### go test -race: skipped tests ($($skips.Count))`n" >> $env:GITHUB_STEP_SUMMARY
+          if ($skips.Count -gt 0) { ($skips -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY }
+          if ($code -ne 0) { exit $code }
 
       - name: go test (CGO_ENABLED=0, as the app ships)
+        # Also after a failed gcc step or -race run: the mode the app ships in reports its own failures in the
+        # same round.
+        if: ${{ !cancelled() && steps.pkgs.outcome == 'success' }}
         env:
           CGO_ENABLED: '0'
           PKGS: ${{ steps.pkgs.outputs.nocgo }}
         run: |
-          go test -count=1 -timeout 12m @(-split $env:PKGS)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-nocgo.log'
+          go test -v -count=1 -timeout 12m @(-split $env:PKGS) | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $skips = @(Select-String -LiteralPath $log -Pattern '^\s*--- SKIP: ' -Context 0, 2 | ForEach-Object {
+            "- $($_.Line.Trim()) $(@($_.Context.PostContext | ForEach-Object { $_.Trim() }) -join ' ')" })
+          "### go test with CGO_ENABLED=0: skipped tests ($($skips.Count))`n" >> $env:GITHUB_STEP_SUMMARY
+          if ($skips.Count -gt 0) { ($skips -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY }
+          if ($code -ne 0) { exit $code }
 
   desktop-macos:
     # The Windows app's Go packages on macOS (M2 06 §10.1): the client core, the media packages,
     # the updater and the app's own packages (internal/desktop/..., cmd/isshoni-desktop/...) with
     # the race detector, then the darwin app itself (cgo, the fake engine until M3) once
-    # cmd/isshoni-desktop exists (README WA22). Packages that do not exist yet are left out.
+    # cmd/isshoni-desktop exists (README WA22), and go-licenses over it (06 §9.4, README WA78). Packages that do not
+    # exist yet are left out.
     needs: changes
     if: needs.changes.outputs.run-desktop-macos == 'true'
     runs-on: macos-15
@@ -1618,7 +1673,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/Library/Caches/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
 
       - name: go test -race (client core, media, updater, the app's packages)
@@ -1636,6 +1691,16 @@ jobs:
       - name: go build ./cmd/isshoni-desktop (darwin, cgo)
         if: hashFiles('cmd/isshoni-desktop/**/*.go') != ''
         run: go build -o "$RUNNER_TEMP/isshoni-desktop" ./cmd/isshoni-desktop
+
+      - name: go-licenses check ./cmd/isshoni-desktop (darwin, cgo)
+        # M2 06 §9.4 (README WA78): the licenses job's darwin run is on Linux, where the app's main is the stub (no
+        # cgo), so the darwin app's modules (Wails' cgo files among them) are checked here, natively, with M1 06
+        # §8.3's flags and the go-licenses that tools/go.mod pins. M3 finds no surprise.
+        if: hashFiles('cmd/isshoni-desktop/**/*.go') != ''
+        run: |
+          go -C tools build -o "$RUNNER_TEMP/bin/" github.com/google/go-licenses/v2
+          "$RUNNER_TEMP/bin/go-licenses" check ./cmd/isshoni-desktop --ignore "$(go list -m)" \
+            --disallowed_types=forbidden,restricted,unknown
 
   native-host:
     # The portable C++ of native/ on Linux and macOS (M2 06 §10.1, docs/m2/04 §18.1): `task
@@ -1705,17 +1770,17 @@ jobs:
     # native/vcpkg.json's baseline with a binary cache, then the presets win-x64-ci (build and
     # ctest: 04 §18.2's Windows tests and native/common's tests under MSVC) and win-x64-release
     # (build); tools/desktoppkg dll-check on the release DLL only (exports, static: and delay:
-    # imports, VERSIONINFO); the WebView2 bootstrapper's signature; and the Go tests that need
-    # the engine DLL (ISSHONI_TEST_ENGINE_DLL), here until windows-desktop takes them over
-    # (README WA72). FFmpeg (README WA24, 06 §4.1, §5.1): the job fails first when
+    # imports, VERSIONINFO); and the WebView2 bootstrapper's signature. The Go tests that need
+    # the engine DLL (ISSHONI_TEST_ENGINE_DLL) run in windows-desktop against this job's ci\
+    # folder (README WA72). FFmpeg (README WA24, 06 §4.1, §5.1): the job fails first when
     # native/ffmpeg/lock.json is stale (a pins.json, build.sh, ffcheck.c or patches/ change
     # without a new publish), then fetches the locked zip from its deps release (SHA-256 against the lock,
     # unpacked and checked by tools/desktoppkg ffmpeg-fetch) as both presets' IM_FFMPEG_ROOT, and
     # dll-check -ffmpeg checks its DLLs against the lock's names and SHA-256s. Uploads
     # windows-native, kept 1 day: release\ (the shipped DLL and PDB, the FFmpeg DLLs and PDBs
     # next to them, the FFmpeg and vcpkg license files, the bootstrapper, native-manifest.json)
-    # and ci\ (the test-hooks DLL with the FFmpeg DLLs next to it, never staged; the Go DLL
-    # tests run against it, so it is assembled before them); and
+    # and ci\ (the test-hooks DLL with the FFmpeg DLLs next to it, never staged; windows-desktop's
+    # Go DLL tests and isshoni-audiotest selfcheck run against it); and
     # isshoni-native-tools, kept 7 days: the `task native:dist` zip for the owner's PC plus that
     # ci\ folder (for `isshoni-enginetest avsync -dll ci`, 06 §5.1).
     needs: changes
@@ -1838,6 +1903,14 @@ jobs:
             if ($tool -eq 'cmake') { "ctest=$(Join-Path (Split-Path -Parent $path) 'ctest.exe')" >> $env:GITHUB_OUTPUT }
           }
 
+      - name: Cache openh264_test's verified download
+        # openh264_test downloads Cisco's OpenH264 once per runner; it re-checks a cached copy against the pinned
+        # size and SHA-256 (and downloads again when it differs), and the cache is saved only from a green job.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: native/build/win-x64-ci/windows/openh264
+          key: ${{ runner.os }}-openh264-${{ hashFiles('native/windows/src/encode/openh264_pin.h') }}
+
       - name: win-x64-ci - configure, build and test
         working-directory: native
         env:
@@ -1856,6 +1929,51 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:CTEST --preset win-x64-ci --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The native tests that skipped, and why
+        # ctest counts a binary whose cases all call GTEST_SKIP as passed and prints nothing of it: each test writes
+        # gtest's XML (native/windows/CMakeLists.txt, GTEST_OUTPUT), and this lists every skipped case with its
+        # reason. The skips this runner is known to take (no GPU, no audio device, Windows Server, a test's own
+        # child-process case) are notices; any other is a warning to look at.
+        if: always()
+        run: |
+          Set-StrictMode -Version 3
+          $expected = @(
+            # Windows Server: the H.264 encoder MFT refuses, or gives its AUs only on drain.
+            '^MfSoftware\.',
+            # No Desktop Duplication output on the runner's session.
+            '^Protect\.DesktopDuplicationLeavesTheWindowOut$',
+            # No process loopback (no audio device), or a kept-out app runs.
+            '^AudioLive\.TheFastPathRunsFromTheFirstPlan$',
+            # No render or capture endpoint.
+            '^AudioWatcher\.(OwnSessionKeptOutBeforeAnyRules|MicRootSurvivesUnwatch)$',
+            # A test's own child-process case, skipped when run directly.
+            '^(AudioWatcherChild|AudioProcessChild|DllSearchChild|FfmpegLoadChild)\.',
+            # Opt-in (IM_GPU_TEST_HARDWARE=1).
+            '^GpuHardware\.'
+          )
+          $files = @(Get-ChildItem -Path 'native/build/win-x64-ci' -Recurse -Filter '*.xml' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq 'gtest-xml' })
+          if ($files.Count -eq 0) {
+            '::warning::no gtest XML report was written (native/build/win-x64-ci/**/gtest-xml)'
+            exit 0
+          }
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($f in $files) {
+            $doc = [xml](Get-Content -Raw -LiteralPath $f.FullName)
+            foreach ($tc in @($doc.SelectNodes('//testcase'))) {
+              $skip = $tc.SelectSingleNode('skipped')
+              if ($tc.GetAttribute('result') -ne 'skipped' -and $null -eq $skip) { continue }
+              $name = '{0}.{1}' -f $tc.GetAttribute('classname'), $tc.GetAttribute('name')
+              $why = if ($null -ne $skip) { ($skip.GetAttribute('message') -replace '\s+', ' ').Trim() } else { '' }
+              $line = '{0} / {1}: {2}' -f $f.BaseName, $name, $why
+              $known = @($expected | Where-Object { $name -match $_ }).Count -gt 0
+              if ($known) { "::notice::skipped $line" } else { "::warning::skipped (not one this runner is known to take) $line" }
+              $lines.Add("- $(if ($known) { '' } else { '**unexpected** ' })$line")
+            }
+          }
+          "### Skipped native tests ($($lines.Count))`n" >> $env:GITHUB_STEP_SUMMARY
+          if ($lines.Count -gt 0) { ($lines -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY }
 
       - name: The delay-load helper and /DEPENDENTLOADFLAG (README WA11's verdict)
         if: always()
@@ -1879,10 +1997,12 @@ jobs:
           VERSION: ${{ env.ISSHONI_VERSION }}
           FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
         run: |
-          # The four-part version of M2 06 §5.3 for CI's 0.0.0-ci.<run>: 0.0.0.<run mod 65000> (the rule
-          # tools/desktoppkg winver implements from README WA67 on).
-          if ($env:VERSION -notmatch '^(\d+)\.(\d+)\.(\d+)-ci\.(\d+)$') { throw "ISSHONI_VERSION '$env:VERSION' is not X.Y.Z-ci.N" }
-          $winver = '{0}.{1}.{2}.{3}' -f $Matches[1], $Matches[2], $Matches[3], ([int64]$Matches[4] % 65000)
+          # The four-part version of M2 06 §5.3 (CI's 0.0.0-ci.<run> is 0.0.0.<run mod 65000>), from
+          # tools/desktoppkg winver, the rule isshoni.exe's version resource uses too (README WA67, WA72).
+          $winver = [string](go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') run ./desktoppkg winver $env:VERSION | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { throw "desktoppkg winver refused ISSHONI_VERSION '$env:VERSION'" }
+          $winver = $winver.Trim()
+          if ($winver -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "desktoppkg winver printed '$winver', not a four-part version" }
           $commit = [string](git rev-parse --short=7 HEAD)
           & $env:CMAKE --preset win-x64-release "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_VERSION=$env:VERSION" `
             "-DIM_WINVER=$winver" "-DIM_COMMIT=$($commit.Trim())" "-DIM_FFMPEG_ROOT=$env:FFMPEG_ROOT"
@@ -2042,38 +2162,6 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: gcc for cgo (MinGW-w64, for the race detector)
-        run: |
-          if (Get-Command gcc -ErrorAction SilentlyContinue) {
-            gcc --version | Select-Object -First 1
-            exit 0
-          }
-          foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
-            if (Test-Path (Join-Path $dir 'gcc.exe')) {
-              $dir >> $env:GITHUB_PATH
-              & (Join-Path $dir 'gcc.exe') --version | Select-Object -First 1
-              exit 0
-            }
-          }
-          "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
-          choco install mingw --no-progress -y
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
-
-      - name: go test -race ./internal/media/... ./cmd/isshoni-enginetest/... with the engine DLL (win-x64-ci)
-        # The DLL-dependent Go tests (04 §18.2); they skip without ISSHONI_TEST_ENGINE_DLL, so they
-        # run here and nowhere else until windows-desktop exists (README WA72). They use the
-        # artifact's ci\ folder (06 §5.1): the win-x64-ci DLL with the lock-checked FFmpeg DLLs
-        # next to it, since the engine loads them from its own folder (04 §9.2). README WA44 adds
-        # isshoni-enginetest: its startup's process default (04 §13.3 layer 2, with the marker DLL
-        # built by this job's gcc) and its probe against that DLL.
-        env:
-          CGO_ENABLED: '1'
-          ISSHONI_TEST_ENGINE_DLL: ${{ runner.temp }}\windows-native\ci\isshoni-media.dll
-        run: |
-          go test -race -count=1 -timeout 10m ./internal/media/... ./cmd/isshoni-enginetest/...
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: task native:dist (isshoni-native-tools)
         env:
           FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
@@ -2095,6 +2183,651 @@ jobs:
           path: ${{ runner.temp }}/isshoni-native-tools/
           retention-days: 7
           if-no-files-found: error
+
+  windows-desktop:
+    # The Windows app's packaging and installer (M2 06 §10.1, R4; README WA67 writes this first part, WA72 completes
+    # the job): isshoni.exe (task desktop:exe:windows, with 06 §5.2 step 3's checks), NSIS from the pinned portable
+    # zip of deploy/windows/tools.json (SHA-256 checked, cached by it), the prebuilt uninstaller (06 §6.9), the stage
+    # (-release: the windows-native artifact's release\ folder only, --self-check ok with testHooks false) and the
+    # installer (task desktop:package:windows: makensis -WX, the strings rule, the stage's binaries, the size
+    # budget), two more installers for the smoke's upgrade and downgrade cases, then deploy/test/windows/smoke.ps1
+    # -Mode ci (06 §16). README WA72 completes it (06 R5, R10's Windows run): the isshoni-desktop-windows-pr artifact
+    # (the installer that passed the smoke, and the symbols; kept 7 days, for the owner's manual tests); the
+    # DLL-dependent Go tests (go test -race ./internal/media/... with ISSHONI_TEST_ENGINE_DLL = the windows-native
+    # artifact's ci\ DLL, which must run TestNativeIntoPublisher rather than skip it); isshoni-audiotest selfcheck
+    # against that DLL (05 §18.2); the Pester tests and the PowerShell 5.1 grammar check under Windows PowerShell 5.1;
+    # deploy/install-desktop.ps1 under Windows PowerShell 5.1 against tools/relserve (the CI installer signed by a key
+    # of this run, verified with the inbox ssh-keygen; a tampered installer and a checksums.txt signed by another key
+    # are refused with nothing installed); then the WebView2 runtime (installed from the checked bootstrapper when it
+    # is missing or older than 120.0) and 03's CDP spec (03 §22.4 B: the TAGS=e2e isshoni.exe, web/e2e/cdp). WA78 added
+    # the desktop notices and the native license gate (06 §9.2-§9.3: tools/notices -native, before packaging) and
+    # the check that the stage, so the installed tree, has them and 06 §9.1's LGPL files; R13 (WA81) adds the
+    # server-rendered ps1 test; WA88 the updater e2e.
+    needs: [changes, web, windows-native]
+    if: needs.changes.outputs.run-windows-desktop == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        id: go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Find Go's module and build caches
+        id: goenv
+        run: |
+          "modcache=$(go env GOMODCACHE)" >> $env:GITHUB_OUTPUT
+          "gocache=$(go env GOCACHE)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.goenv.outputs.modcache }}
+            ${{ steps.goenv.outputs.gocache }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', 'tools/wails3/go.mod', 'tools/wails3/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        id: task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: Download web/dist
+        id: webdist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Download windows-native
+        id: native
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-native
+          path: ${{ runner.temp }}/windows-native
+
+      - name: The NSIS pin
+        id: nsis-pin
+        run: |
+          $pin = (Get-Content -Raw -LiteralPath deploy/windows/tools.json | ConvertFrom-Json).nsis
+          if ($pin.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'deploy/windows/tools.json has no nsis.sha256' }
+          "version=$($pin.version)" >> $env:GITHUB_OUTPUT
+          "url=$($pin.url)" >> $env:GITHUB_OUTPUT
+          "sha256=$($pin.sha256)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache the NSIS zip
+        # M2 06 §10.2: keyed by its SHA-256, which the next step checks on a hit too.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nsis-zip
+          key: nsis-zip-${{ steps.nsis-pin.outputs.sha256 }}
+
+      - name: NSIS (makensis from the pinned portable zip)
+        id: nsis
+        env:
+          NSIS_VERSION: ${{ steps.nsis-pin.outputs.version }}
+          NSIS_URL: ${{ steps.nsis-pin.outputs.url }}
+          NSIS_SHA256: ${{ steps.nsis-pin.outputs.sha256 }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'nsis-zip'
+          $zip = Join-Path $dir "nsis-$env:NSIS_VERSION.zip"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          if (-not (Test-Path -LiteralPath $zip)) {
+            $ProgressPreference = 'SilentlyContinue'
+            for ($try = 1; ; $try++) {
+              try {
+                Invoke-WebRequest -UseBasicParsing -Uri $env:NSIS_URL -OutFile $zip -UserAgent 'Wget'
+                break
+              } catch {
+                if ($try -ge 3) { throw }
+                "download failed ($($_.Exception.Message)); trying again"
+                Start-Sleep -Seconds (5 * $try)
+              }
+            }
+          }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($sha -ne $env:NSIS_SHA256) {
+            Remove-Item -LiteralPath $zip -Force
+            throw "nsis-$env:NSIS_VERSION.zip has the SHA-256 $sha, not deploy/windows/tools.json's $env:NSIS_SHA256"
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'nsis'
+          Expand-Archive -LiteralPath $zip -DestinationPath $out -Force
+          $makensis = Join-Path $out "nsis-$env:NSIS_VERSION\makensis.exe"
+          if (-not (Test-Path -LiteralPath $makensis)) { throw "the NSIS zip has no nsis-$env:NSIS_VERSION\makensis.exe" }
+          & $makensis -VERSION
+          ''
+          "makensis=$makensis" >> $env:GITHUB_OUTPUT
+
+      - name: Desktop notices and the native license gate (tools/notices -native)
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # M2 06 §9.2-§9.3 (README WA78), on its own so a gate failure is the step's: the Go modules of
+          # cmd/isshoni-desktop for windows (Wails' among them), the web client's packages and the native section from
+          # deploy/notices/native-windows.json with the windows-native artifact's release\licenses\. The gate fails on
+          # a native license that is neither allowlisted, nor FFmpeg's LGPL-2.1-or-later linked dynamically with the
+          # LGPL files present, nor a LicenseRef-* excepted in deploy/notices/exceptions.md; on a missing license
+          # file; and when the artifact's vcpkg ports differ from the entries'. task desktop:package:windows writes
+          # the same file again for the stage.
+          $out = Join-Path $env:RUNNER_TEMP 'THIRD_PARTY_NOTICES-desktop.txt'
+          go -C tools run ./notices -root .. -pkg ./cmd/isshoni-desktop -goos windows -goarch amd64 `
+            -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt `
+            -native ../deploy/notices/native-windows.json -native-root $env:NATIVE -version $env:VERSION -o $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: isshoni.exe, the stage and the installer (task desktop:package:windows)
+        id: package
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          MAKENSIS: ${{ steps.nsis.outputs.makensis }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # M2 06 §5.2 (the exe and its step 3 checks), §6.2 (stage -release: on Windows it runs the staged
+          # isshoni.exe --self-check and requires ok and testHooks false), §6.9 (the prebuilt uninstaller), §6.10
+          # and §9.3 (desktoppkg check).
+          task desktop:package:windows "VERSION=$env:VERSION" "NATIVE_DIR=$env:NATIVE" "MAKENSIS=$env:MAKENSIS" `
+            RELEASE=true PREBUILT_UNINSTALLER=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist-desktop/isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "no $setup" }
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+
+      - name: The installed notices and the LGPL files (the stage)
+        run: |
+          # README WA78's acceptance, on the stage that the installer packs and smoke.ps1 compares byte for byte with
+          # the installed tree: licenses\THIRD_PARTY_NOTICES.txt lists Wails' modules, the web client's packages and
+          # the native section, and licenses\ffmpeg\ holds 06 §9.1's three files, all in install-files.txt.
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
+          $text = [IO.File]::ReadAllText((Join-Path $stage 'licenses/THIRD_PARTY_NOTICES.txt')) -replace "`r`n", "`n"
+          $want = @(
+            "`n1. Go modules and the Go runtime (", "`ngithub.com/wailsapp/wails/v3 v",
+            "`n2. Web client (bundled JavaScript)`n", "`n@wailsio/runtime ", "`nreact ",
+            "`n3. Native components`n", "`nFFmpeg (libavcodec, libavutil) ", "`nLicense: LGPL-2.1-or-later`nLinking: dynamic`n",
+            "`nMicrosoft Edge WebView2 Runtime bootstrapper`n", "`n4. Adapted source code and data`n")
+          $last = -1
+          foreach ($w in $want) {
+            $i = $text.IndexOf($w, [StringComparison]::Ordinal)
+            if ($i -lt 0) { throw "licenses\THIRD_PARTY_NOTICES.txt has no $($w.Trim())" }
+            if ($i -lt $last) { throw "licenses\THIRD_PARTY_NOTICES.txt has $($w.Trim()) out of order" }
+            $last = $i
+          }
+          $listed = [IO.File]::ReadAllLines((Join-Path $stage 'install-files.txt'))
+          foreach ($name in 'COPYING.LGPLv2.1.txt', 'LICENSE.md', 'README-LGPL.txt') {
+            $rel = "licenses\ffmpeg\$name"
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $rel) -PathType Leaf)) { throw "the stage has no $rel" }
+            if ($listed -notcontains $rel) { throw "install-files.txt doesn't list $rel" }
+          }
+          'the stage has the desktop notices with the native section and the LGPL files'
+
+      - name: The smoke's older and newer installers
+        id: smoke-builds
+        env:
+          MAKENSIS: ${{ steps.nsis.outputs.makensis }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # 06 §16: an older build whose install-files.txt lists an extra (fake) avcodec-00.dll, for the stale-file
+          # case, and a newer one, for the downgrade cases. Both pack the same stage otherwise, with the same
+          # prebuilt uninstaller. 0.0.0-smoke's last identifier is no number, so its winver is 0.0.0.0, never above
+          # CI's 0.0.0.<run_number mod 65000> (desktoppkg winver, 06 §5.3); 0.0.1-smoke.1 has 0.0.1.1, above it.
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
+          $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/.build/uninst/uninstall.exe'
+          $webview2 = Join-Path $env:NATIVE 'MicrosoftEdgeWebview2Setup.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-builds'
+          $old = Join-Path $out 'stage-old'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -LiteralPath $stage -Destination $old -Recurse
+          [IO.File]::WriteAllText((Join-Path $old 'avcodec-00.dll'), "fake avcodec-00.dll for the smoke`r`n")
+          [IO.File]::AppendAllText((Join-Path $old 'install-files.txt'), "avcodec-00.dll`r`n")
+          foreach ($b in @(@('0.0.0-smoke', $old, 'old.exe'), @('0.0.1-smoke.1', $stage, 'newer.exe'))) {
+            go -C tools run ./desktoppkg nsis -version $b[0] -stage $b[1] -out (Join-Path $out $b[2]) `
+              -webview2 $webview2 -prebuilt-uninstaller $uninstaller -makensis $env:MAKENSIS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          "old=$(Join-Path $out 'old.exe')" >> $env:GITHUB_OUTPUT
+          "newer=$(Join-Path $out 'newer.exe')" >> $env:GITHUB_OUTPUT
+
+      - name: smoke.ps1 -Mode ci
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          SETUP: ${{ steps.package.outputs.setup }}
+          OLD_SETUP: ${{ steps.smoke-builds.outputs.old }}
+          NEWER_SETUP: ${{ steps.smoke-builds.outputs.newer }}
+        run: |
+          ./deploy/test/windows/smoke.ps1 -Mode ci -Setup $env:SETUP -Version $env:VERSION -OldSetup $env:OLD_SETUP `
+            -NewerSetup $env:NEWER_SETUP -Stage (Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage')
+
+      - name: The isshoni-desktop-windows-pr folder (the installer and its symbols)
+        env:
+          SETUP: ${{ steps.package.outputs.setup }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # M2 06 §10.1: the installer that just passed the smoke, for manual tests on the owner's PC (M-APP-PICK, 04
+          # §18.4), and the symbols of the native DLLs it carries (isshoni.exe is built with -s -w and has none).
+          $out = Join-Path $env:RUNNER_TEMP 'isshoni-desktop-windows-pr'
+          $symbols = Join-Path $out 'symbols'
+          New-Item -ItemType Directory -Force -Path $symbols | Out-Null
+          Copy-Item -LiteralPath $env:SETUP -Destination $out
+          $pdbs = @(Get-ChildItem -LiteralPath $env:NATIVE -Filter '*.pdb' -File)
+          if (-not ($pdbs.Name -contains 'isshoni-media.pdb')) { throw "the windows-native artifact has no isshoni-media.pdb" }
+          $pdbs | Copy-Item -Destination $symbols
+          Get-ChildItem -LiteralPath $out -Recurse -File | ForEach-Object { $_.FullName.Substring($out.Length + 1) }
+
+      - name: Upload isshoni-desktop-windows-pr
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isshoni-desktop-windows-pr
+          path: ${{ runner.temp }}/isshoni-desktop-windows-pr/
+          retention-days: 7
+          if-no-files-found: error
+
+      # From here on the checks that don't need each other run each on its own prerequisites (not on every step
+      # before them), so one round reports every independent failure; the job still fails on any of them.
+      - name: gcc for cgo (MinGW-w64, for the race detector)
+        id: gcc
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            gcc --version | Select-Object -First 1
+            exit 0
+          }
+          foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
+            if (Test-Path (Join-Path $dir 'gcc.exe')) {
+              $dir >> $env:GITHUB_PATH
+              & (Join-Path $dir 'gcc.exe') --version | Select-Object -First 1
+              exit 0
+            }
+          }
+          "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
+          choco install mingw --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
+
+      - name: go test -race ./internal/media/... ./cmd/isshoni-enginetest/... with the engine DLL (win-x64-ci)
+        # The DLL-dependent Go tests (04 §18.2, 06 §16); they skip without ISSHONI_TEST_ENGINE_DLL, so they run here
+        # and nowhere else (windows-go runs the rest without the DLL). They use the windows-native artifact's ci\
+        # folder (06 §5.1): the win-x64-ci DLL with the lock-checked FFmpeg DLLs next to it, since the engine loads
+        # them from its own folder (04 §9.2). README WA44 adds isshoni-enginetest: its startup's process default (04
+        # §13.3 layer 2, with the marker DLL built by the gcc above) and its probe against that DLL. 06 R5: the run
+        # must contain TestNativeIntoPublisher's PASS (04 §18.2's milestone), not a skip.
+        if: ${{ !cancelled() && steps.gcc.outcome == 'success' && steps.native.outcome == 'success' }}
+        env:
+          CGO_ENABLED: '1'
+          ISSHONI_TEST_ENGINE_DLL: ${{ runner.temp }}\windows-native\ci\isshoni-media.dll
+        run: |
+          if (-not (Test-Path -LiteralPath $env:ISSHONI_TEST_ENGINE_DLL -PathType Leaf)) {
+            throw "no $env:ISSHONI_TEST_ENGINE_DLL in the windows-native artifact"
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-dll.log'
+          go test -race -count=1 -timeout 15m -v ./internal/media/... ./cmd/isshoni-enginetest/... 2>&1 |
+            Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $lines = Get-Content -LiteralPath $log
+          if ($lines -match '^\s*--- SKIP: TestNativeIntoPublisher\b') { throw 'TestNativeIntoPublisher was skipped' }
+          if (-not ($lines -match '^\s*--- PASS: TestNativeIntoPublisher\b')) {
+            throw 'TestNativeIntoPublisher did not run (no PASS line in the go test output)'
+          }
+          "TestNativeIntoPublisher: $(@($lines -match '^\s*--- PASS: TestNativeIntoPublisher\b')[0].Trim())"
+
+      - name: isshoni-audiotest selfcheck (the win-x64-ci DLL)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.native.outcome == 'success' }}
+        run: |
+          # 05 §18.2 (CI Windows runs it): the analyzer on synthetic signals, then native.Open of the DLL next to the
+          # exe (im_version, every export, the im_test_* hooks of the ci\ build), the probe and a watcher start and
+          # stop. No sound: the hosted runner has no audio endpoint. Built as the app is (CGO_ENABLED=0).
+          $dir = Join-Path $env:RUNNER_TEMP 'audiotest'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item -Path (Join-Path $env:RUNNER_TEMP 'windows-native\ci\*') -Destination $dir
+          $exe = Join-Path $dir 'isshoni-audiotest.exe'
+          $env:CGO_ENABLED = '0'
+          go build -trimpath -o $exe ./cmd/isshoni-audiotest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exe selfcheck
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "isshoni-audiotest selfcheck exited $code" }
+
+      - name: Pester under Windows PowerShell 5.1 (task test:ps PWSH=powershell)
+        # M2 06 §16: deploy/test/install-desktop.Tests.ps1 under Windows PowerShell 5.1 (lint-deploy runs it under
+        # pwsh). This step's shell is Windows PowerShell, and PSModulePath is the machine's: a powershell.exe started
+        # from pwsh would inherit pwsh's module path and load PowerShell 7's modules.
+        if: ${{ !cancelled() && steps.task.outcome == 'success' }}
+        shell: powershell
+        run: |
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+          "Windows PowerShell $($PSVersionTable.PSVersion)"
+          task test:ps PWSH=powershell
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The PowerShell 5.1 grammar check
+        # M2 06 §10.1, §16: every script that runs under Windows PowerShell 5.1 parses with its parser
+        # ([System.Management.Automation.Language.Parser]::ParseFile under powershell.exe); lint:ps (PSScriptAnalyzer
+        # with PSUseCompatibleSyntax) runs under pwsh in lint-deploy.
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw "this is PowerShell $($PSVersionTable.PSVersion), not 5.1" }
+          $files = @(Get-Item -LiteralPath 'deploy/install-desktop.ps1', 'deploy/test/install-desktop.Tests.ps1',
+            'deploy/windows/msvc-env.ps1') + @(Get-ChildItem -Path 'deploy/test/windows/*.ps1', 'native/windows/tools/*.ps1' -File)
+          $bad = 0
+          foreach ($f in $files) {
+            $tokens = $null
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $bad++
+              foreach ($e in $errors) {
+                $rel = Resolve-Path -LiteralPath $f.FullName -Relative
+                "::error file=$($rel.TrimStart('.\').Replace('\', '/')),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+            }
+          }
+          if ($bad -gt 0) { throw "$bad of $($files.Count) scripts don't parse under Windows PowerShell $($PSVersionTable.PSVersion)" }
+          "$($files.Count) scripts parse under Windows PowerShell $($PSVersionTable.PSVersion)"
+
+      - name: install-desktop.ps1 under Windows PowerShell 5.1 against relserve
+        # M2 06 R10's Windows run (§7.1, §7.2): tools/relserve serves the CI installer as a release, with a
+        # checksums.txt signed by a key made for this run, whose public key replaces the script's key block (as M1's
+        # distro test does for install.sh). Windows PowerShell 5.1 runs the script as `irm | iex` does
+        # (ISSHONI_DOWNLOAD_BASE, ISSHONI_NO_LAUNCH=1; ISSHONI_VERSION is this workflow's), verifying with the inbox
+        # ssh-keygen. A mirror with a changed installer and one whose checksums.txt is signed by another key are
+        # refused first, with nothing installed; then the real one installs, and is uninstalled again (/PURGE).
+        # It refuses to start over an install a failed smoke left behind.
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        env:
+          SETUP: ${{ steps.package.outputs.setup }}
+          VERSION: ${{ env.ISSHONI_VERSION }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'ps1-install'
+          $rel = Join-Path $work 'releases'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $name = "isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\isshoni'
+          $utf8 = New-Object Text.UTF8Encoding($false)
+          if (Test-Path -LiteralPath $installDir) { throw "$installDir exists before the test (left by the smoke?)" }
+
+          # The inbox OpenSSH Client, which the script prefers (06 §7.2).
+          $openssh = Join-Path $env:SystemRoot 'System32\OpenSSH'
+          $sk = Join-Path $openssh 'ssh-keygen.exe'
+          if (-not (Test-Path -LiteralPath $sk -PathType Leaf)) { throw "this runner has no inbox $sk" }
+          "inbox OpenSSH: $((& (Join-Path $openssh 'ssh.exe') -V 2>&1 | Out-String).Trim())"
+          foreach ($k in 'good', 'other') {
+            $key = Join-Path $work "key-$k"
+            & $sk -q -t ed25519 -N '' -C "isshoni-ci-ps1-$k" -f $key
+            if ($LASTEXITCODE -ne 0) { throw "ssh-keygen could not make the $k key" }
+            # Windows' OpenSSH refuses a private key that other accounts can read; RUNNER_TEMP's ACL is inherited.
+            icacls $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict $key" }
+          }
+
+          # Three release roots (tools/relserve): the release, a mirror with a changed installer, and a mirror whose
+          # checksums.txt is signed by the other key.
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:SETUP).Hash.ToLowerInvariant()
+          foreach ($root in @(@('', 'good', $false), @('tampered', 'good', $true), @('wrongkey', 'other', $false))) {
+            $d = [IO.Path]::Combine($rel, $root[0], 'download', "v$($env:VERSION)")
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            Copy-Item -LiteralPath $env:SETUP -Destination (Join-Path $d $name)
+            if ($root[2]) { [IO.File]::AppendAllText((Join-Path $d $name), 'x') }
+            $sums = Join-Path $d 'checksums.txt'
+            [IO.File]::WriteAllText($sums, "$sha  $name`n", $utf8)
+            & $sk -Y sign -f (Join-Path $work "key-$($root[1])") -n isshoni-checksums $sums 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$sums.sig")) { throw "ssh-keygen -Y sign failed for $d" }
+          }
+
+          # The script with this run's key in its key block (LF kept: .gitattributes checks it out with LF).
+          $pub = (Get-Content -Raw -LiteralPath (Join-Path $work 'key-good.pub')).Trim()
+          $signer = "isshoni-release namespaces=`"isshoni-checksums`" $pub"
+          $src = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'deploy/install-desktop.ps1'))
+          $m = [regex]::Match($src, '(?m)^(# BEGIN ALLOWED SIGNERS[^\n]*\n)(?:[^\n]*\n)*?(# END ALLOWED SIGNERS)')
+          if (-not $m.Success) { throw 'deploy/install-desktop.ps1 has no key block' }
+          $text = $src.Substring(0, $m.Index) + $m.Groups[1].Value + $signer + "`n" + $m.Groups[2].Value +
+            $src.Substring($m.Index + $m.Length)
+          $ps1 = Join-Path $work 'install-desktop.ps1'
+          [IO.File]::WriteAllText($ps1, $text, $utf8)
+
+          $relserve = Join-Path $work 'relserve.exe'
+          go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') build -o $relserve ./relserve
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ca = Join-Path $work 'ca.pem'
+          $ready = Join-Path $work 'addr'
+          $server = Start-Process -FilePath $relserve -PassThru -NoNewWindow `
+            -ArgumentList @('-dir', "`"$rel`"", '-addr', '127.0.0.1:0', '-ca-out', "`"$ca`"", '-ready-file', "`"$ready`"") `
+            -RedirectStandardOutput (Join-Path $work 'relserve.out') -RedirectStandardError (Join-Path $work 'relserve.err')
+          $store = $null
+          $cert = $null
+          try {
+            $deadline = (Get-Date).AddSeconds(30)
+            while (-not (Test-Path -LiteralPath $ready)) {
+              if ($server.HasExited) { throw "relserve exited ($($server.ExitCode)): $(Get-Content -Raw (Join-Path $work 'relserve.err'))" }
+              if ((Get-Date) -gt $deadline) { throw 'relserve did not start within 30 s' }
+              Start-Sleep -Milliseconds 200
+            }
+            $base = "https://$((Get-Content -Raw -LiteralPath $ready).Trim())"
+            # The hosted runner is an administrator: its test CA goes into the machine's root store (no dialog) for
+            # the .NET Framework's TLS, and out again below.
+            $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ca)
+            $store = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+            $store.Open('ReadWrite')
+            $store.Add($cert)
+
+            # Runs the script as `irm <server>/install-desktop.ps1 | iex` does, under Windows PowerShell 5.1 with the
+            # machine's module path (not pwsh's), and returns its exit code, stdout and stderr.
+            function Invoke-InstallScript {
+              param([string]$Base, [string]$Label)
+              $saved = $env:PSModulePath
+              $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+              $env:ISSHONI_DOWNLOAD_BASE = $Base
+              $env:ISSHONI_NO_LAUNCH = '1'
+              $env:ISSHONI_NO_UPDATE_CHECKS = '1'
+              $errFile = Join-Path $work "$Label.err"
+              try {
+                # Progress off before anything loads: 5.1 with redirected output writes progress records to stderr.
+                $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `
+                  "`$ProgressPreference = 'SilentlyContinue'; Get-Content -Raw -LiteralPath '$ps1' | Invoke-Expression" `
+                  2>$errFile | Out-String
+                $code = $LASTEXITCODE
+              } finally {
+                $env:PSModulePath = $saved
+                Remove-Item Env:ISSHONI_DOWNLOAD_BASE, Env:ISSHONI_NO_LAUNCH, Env:ISSHONI_NO_UPDATE_CHECKS -ErrorAction SilentlyContinue
+              }
+              $err = ''
+              if (Test-Path -LiteralPath $errFile) { $err = [IO.File]::ReadAllText($errFile) }
+              # A CLIXML block of progress records only (e.g. 5.1's 'Preparing modules for first use.') is not the
+              # script writing to stderr; anything else in it (an S="Error" record) still counts.
+              if ($err -match '^\s*#< CLIXML\s*(<Objs[\s\S]*</Objs>)\s*$') {
+                $records = $null
+                try {
+                  $x = [xml]('<r>' + $Matches[1] + '</r>') # one or more <Objs> blocks
+                  $records = @($x.SelectNodes('/r/*[local-name()="Objs"]/*'))
+                } catch {
+                  Write-Host "stderr's CLIXML doesn't parse: $($_.Exception.Message)"
+                }
+                if ($null -ne $records -and @($records | Where-Object { $_.GetAttribute('S') -ne 'progress' }).Count -eq 0) {
+                  Write-Host "stderr (progress records only, ignored): $err"
+                  $err = ''
+                }
+              }
+              Write-Host "---- $Label ($Base): exit $code"
+              Write-Host $out
+              if ($err.Trim()) { Write-Host "stderr: $err" }
+              return [pscustomobject]@{ Code = $code; Out = $out; Err = $err }
+            }
+            function Confirm-Refused {
+              param($R, [string]$Why, [string]$Label)
+              if ($R.Code -ne 0 -or $R.Err.Trim()) { throw "${Label}: the script exited $($R.Code) or wrote to stderr" }
+              if (-not $R.Out.Contains($Why)) { throw "${Label}: no '$Why' line" }
+              if (-not $R.Out.Contains('Nothing was installed.')) { throw "${Label}: no 'Nothing was installed.' line" }
+              if ($R.Out.Contains('is installed.') -or (Test-Path -LiteralPath $installDir)) { throw "${Label}: it installed" }
+            }
+
+            $r = Invoke-InstallScript -Base "$base/tampered" -Label 'tampered'
+            Confirm-Refused $r "does not match checksums.txt" 'a tampered installer'
+            $r = Invoke-InstallScript -Base "$base/wrongkey" -Label 'wrongkey'
+            Confirm-Refused $r 'The signature of checksums.txt is not valid' 'checksums.txt signed by another key'
+
+            $r = Invoke-InstallScript -Base $base -Label 'release'
+            if ($r.Code -ne 0 -or $r.Err.Trim()) { throw "the install exited $($r.Code) or wrote to stderr" }
+            if (-not ($r.Out -match '(?m)^Good "isshoni-checksums" signature for isshoni-release with ED25519 key SHA256:')) {
+              throw "the script printed no 'Good ... signature' line from ssh-keygen"
+            }
+            if (-not $r.Out.Contains("isshoni $($env:VERSION) is installed.")) { throw "no 'isshoni $($env:VERSION) is installed.' line" }
+            $exe = Join-Path $installDir 'isshoni.exe'
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "no $exe after the install" }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $exe
+            $psi.Arguments = '--version'
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.CreateNoWindow = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $text = $p.StandardOutput.ReadToEnd()
+            if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'isshoni.exe --version did not exit within 60 s' }
+            $installed = ($text | ConvertFrom-Json).version
+            if ($installed -cne $env:VERSION) { throw "the installed isshoni.exe --version says '$installed', not $($env:VERSION)" }
+            "installed: $exe ($installed)"
+
+            # Uninstall (/PURGE): uninstall.exe copies itself to a ~nsu*.tmp folder and exits; the copy does the work.
+            $uninstaller = Join-Path $installDir 'uninstall.exe'
+            $u = Start-Process -FilePath $uninstaller -ArgumentList '/S', '/PURGE' -PassThru
+            $null = $u.Handle
+            $u.WaitForExit()
+            if ($u.ExitCode -ne 0) { throw "uninstall.exe /S /PURGE exited $($u.ExitCode)" }
+            $deadline = (Get-Date).AddSeconds(180)
+            do {
+              Start-Sleep -Milliseconds 250
+              $running = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ExecutablePath -like '*\~nsu*.tmp\*' })
+              if ((Get-Date) -gt $deadline) { throw 'the uninstaller did not finish within 180 s' }
+            } while ($running.Count -gt 0 -or (Test-Path -LiteralPath $uninstaller))
+            if (Test-Path -LiteralPath $exe) { throw "$exe is still there after the uninstall" }
+          } finally {
+            if ($null -ne $store) {
+              if ($null -ne $cert) { $store.Remove($cert) }
+              $store.Close()
+            }
+            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
+          }
+
+      - name: The WebView2 runtime (120.0 or newer) for the CDP spec
+        id: webview2
+        if: ${{ !cancelled() && steps.native.outcome == 'success' }}
+        env:
+          WEBVIEW2: ${{ runner.temp }}\windows-native\release\MicrosoftEdgeWebview2Setup.exe
+        run: |
+          # M2 06 §10.1: the runtime's pv from 06 §6.5's keys; when it is missing or below 120.0 (03 §5.4's minimum),
+          # the windows-native artifact's bootstrapper (its signature checked there) installs it, so the CDP spec
+          # doesn't depend on the smoke's install having run first.
+          function Get-WebView2Version {
+            $guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+            foreach ($key in "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$guid",
+                             "HKCU:\Software\Microsoft\EdgeUpdate\Clients\$guid") {
+              $pv = (Get-ItemProperty -LiteralPath $key -Name pv -ErrorAction SilentlyContinue).pv
+              $v = $null
+              if ($pv -and [version]::TryParse([string]$pv, [ref]$v) -and $v -ge [version]'120.0') { return $v }
+            }
+            return $null
+          }
+          $v = Get-WebView2Version
+          if ($v) {
+            "WebView2 runtime $v"
+            exit 0
+          }
+          "::notice::no WebView2 runtime 120.0 or newer; installing it with the checked bootstrapper"
+          $p = Start-Process -FilePath $env:WEBVIEW2 -ArgumentList '/silent', '/install' -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(15 * 60 * 1000)) { $p.Kill(); throw 'the WebView2 bootstrapper did not finish within 15 minutes' }
+          $v = Get-WebView2Version
+          if (-not $v) { throw "the WebView2 bootstrapper exited $($p.ExitCode) and no runtime 120.0 or newer is registered" }
+          "WebView2 runtime $v (installed)"
+
+      - name: The e2e isshoni.exe and the server (task desktop:exe:windows TAGS=e2e, go build ./cmd/isshoni)
+        id: e2e-exe
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.task.outcome == 'success' && steps.native.outcome == 'success' && steps.webdist.outcome == 'success' }}
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+        run: |
+          # 03 §22.4 B: -tags e2e (the fake engine, DevTools on, ISSHONI_E2E_CDP_PORT and ISSHONI_E2E_DATA_DIR read
+          # by cmd/isshoni-desktop/flavor_e2e.go), into dist-desktop/windows_amd64-test/, never staged. The server is
+          # for the spec's cases with a server (README DK13).
+          task desktop:exe:windows TAGS=e2e "VERSION=$env:VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/windows_amd64-test/isshoni.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "no $exe" }
+          $env:CGO_ENABLED = '0'
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          go build -trimpath -o bin/isshoni.exe ./cmd/isshoni
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+
+      - name: The app's Go tests under -tags e2e (flavor_e2e.go's variables and credential prefix)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
+        run: |
+          # Only -tags e2e compiles flavor_e2e.go and its tests (03 §22.4 B, README WA72): the refusals of malformed
+          # ISSHONI_E2E_CDP_PORT and ISSHONI_E2E_DATA_DIR values and the isshoni-test:<random>: credential prefix
+          # (Credential Manager here) that the CDP spec's success path doesn't show. windows-go runs the package's
+          # other tests without the tag, so only flavor_e2e_test.go's run here, and each must PASS (a rename
+          # can't silently match nothing).
+          $env:CGO_ENABLED = '0'
+          $tests = 'TestE2ESettings', 'TestAppOptionsE2EPort', 'TestE2ECredentials'
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-e2e.log'
+          go test -v -count=1 -tags e2e -run "^($($tests -join '|'))`$" ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $lines = Get-Content -LiteralPath $log
+          foreach ($t in $tests) {
+            if (-not ($lines -match "^--- PASS: $t\b")) { throw "$t did not pass (no '--- PASS: $t' line)" }
+          }
+
+      - name: Set up Node (version from .tool-versions)
+        id: node
+        if: ${{ !cancelled() && steps.e2e-exe.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        id: npmci
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: |
+          npm ci --prefix web --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The CDP spec (web/e2e/cdp, 03 §22.4 B)
+        # The real app over the Chrome DevTools Protocol of its own WebView2 (connectOverCDP: no browser download):
+        # the fixture starts the e2e isshoni.exe with --relaunched, ISSHONI_E2E_CDP_PORT and a temporary
+        # ISSHONI_E2E_DATA_DIR, and fails unless the app wrote into that folder.
+        id: cdp
+        if: ${{ !cancelled() && steps.npmci.outcome == 'success' }}
+        working-directory: web
+        env:
+          ISSHONI_DESKTOP_EXE: ${{ steps.e2e-exe.outputs.exe }}
+        run: |
+          npx playwright test -c e2e/cdp/playwright.config.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the CDP spec's results (on failure)
+        # playwright.config.ts's outputDir is relative to web/e2e/cdp/; upload-artifact's path to the workspace.
+        if: ${{ failure() && steps.cdp.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cdp-test-results
+          path: web/test-results/cdp/
+          retention-days: 7
+          if-no-files-found: warn
 
   ci-ok:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
@@ -2121,6 +2854,7 @@ jobs:
         desktop-macos,
         native-host,
         windows-native,
+        windows-desktop,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

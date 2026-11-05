@@ -4,7 +4,8 @@
 // - the HTML carries the CSP (header and <meta>), which refuses an injected inline script; no service worker or
 //   manifest is served;
 // - an external link and window.open reach the system browser through App.OpenExternal (the harness records the
-//   Shell's OpenURL), and the page stays on the asset origin;
+//   Shell's OpenURL), and the page stays on the asset origin; a script's foreign navigation is cancelled and the
+//   native window.open refused (W5's fallback: bridge.js's navigate listener and the header CSP's sandbox);
 // - /wails/runtime refuses a foreign Origin, and from the page itself the runtime's own objects (W21:
 //   Browser.OpenURL('ms-settings:…') and ('search-ms:…'), Clipboard.Text(), Window.Hide()) get 403 and reach no
 //   handler, while a bound-method Call reaches the stub runtime behind the guard;
@@ -38,8 +39,14 @@ test('the page carries the CSP, refuses inline script and has no service worker'
   }
   expect(csp).not.toContain('unsafe-inline');
   expect(csp).not.toContain('unsafe-eval');
+  // The header alone sandboxes the page without allow-popups (03 §5.3, W5's fallback); a <meta> can't carry it.
+  const sandbox = '; sandbox allow-scripts allow-same-origin allow-forms';
+  expect(csp.endsWith(sandbox)).toBe(true);
+  expect(csp).not.toContain('allow-popups');
   await ready(desktop);
-  expect(await page.locator('meta[http-equiv="Content-Security-Policy"]').getAttribute('content')).toBe(csp);
+  expect(await page.locator('meta[http-equiv="Content-Security-Policy"]').getAttribute('content')).toBe(
+    csp.slice(0, -sandbox.length),
+  );
 
   expect(await page.evaluate(() => [location.origin, isSecureContext] as const)).toEqual([DESKTOP_ORIGIN, true]);
 
@@ -102,6 +109,30 @@ test('external links and window.open open the system browser; the page stays', a
   expect((await desktop.state()).openedUrls).toHaveLength(2);
   expect(page.url()).toBe(here);
   expect(page.context().pages()).toHaveLength(1);
+
+  // W5's fallback (03 §3.2, §5.5 layer 2), as the CDP spec checks it in WebView2: a script's foreign navigation is
+  // cancelled by bridge.js's navigate listener (and opens nothing), and the native window.open, taken from a fresh
+  // frame, is refused by the header CSP's sandbox.
+  await page.evaluate(() => {
+    location.href = 'https://example.com/e2e-navigation';
+  });
+  await page.waitForTimeout(500);
+  expect(await page.evaluate(() => location.href)).toBe(here);
+  const nativeOpen = await page.evaluate(() => {
+    const frame = document.createElement('iframe');
+    document.body.append(frame);
+    try {
+      const own = frame.contentWindow;
+      if (own === null) throw new Error('the fresh frame has no window');
+      return own.open.call(window, 'https://example.com/e2e-native') === null;
+    } finally {
+      frame.remove();
+    }
+  });
+  expect(nativeOpen).toBe(true);
+  await page.waitForTimeout(300);
+  expect(page.context().pages()).toHaveLength(1);
+  expect((await desktop.state()).openedUrls).toHaveLength(2);
 });
 
 test('the runtime refuses foreign origins and its own objects; a bound call passes the guard', async ({

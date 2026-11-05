@@ -4,6 +4,8 @@ package main
 
 import (
 	"log/slog"
+	"os"
+	"runtime"
 
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/native"
@@ -22,4 +24,18 @@ func openEngine(log *slog.Logger, debug bool) (media.Engine, error) {
 		return nil, err
 	}
 	return e, nil
+}
+
+// soundCheckExe is audio.SelfInfo.Exe with the shipped engine: this exe, which 05's sound check starts with
+// --sound-check-helper on Windows (05 §11.3); "" elsewhere, or when the path is unknown (the engine then plays the
+// chime itself).
+func soundCheckExe() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
 }

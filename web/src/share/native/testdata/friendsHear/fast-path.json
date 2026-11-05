@@ -1,0 +1,79 @@
+{
+  "seq": 2,
+  "live": false,
+  "mode": "exclude-apps",
+  "engine": "exclude-self",
+  "muted": false,
+  "paused": false,
+  "keepOutMicUsers": true,
+  "heard": [
+    {
+      "id": "exe:eldenring.exe",
+      "name": "ELDEN RING",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:spotify.exe",
+      "name": "Spotify",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    }
+  ],
+  "keptOut": [],
+  "notCaptured": [],
+  "prompts": [],
+  "banners": [],
+  "tips": [],
+  "voiceApps": [
+    {
+      "id": "discord",
+      "name": "Discord",
+      "running": false
+    },
+    {
+      "id": "vesktop",
+      "name": "Vesktop",
+      "running": false
+    },
+    {
+      "id": "teamspeak",
+      "name": "TeamSpeak",
+      "running": false
+    },
+    {
+      "id": "mumble",
+      "name": "Mumble",
+      "running": false
+    },
+    {
+      "id": "zoom",
+      "name": "Zoom",
+      "running": false
+    },
+    {
+      "id": "teams",
+      "name": "Microsoft Teams",
+      "running": false
+    },
+    {
+      "id": "slack",
+      "name": "Slack",
+      "running": false
+    }
+  ],
+  "alert": {
+    "voiceAppsHeard": false,
+    "questions": 0
+  }
+}

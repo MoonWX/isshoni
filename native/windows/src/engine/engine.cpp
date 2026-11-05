@@ -8,6 +8,7 @@
 #include "audio/mixer.h"
 #include "audio_bridge/audio_bridge.h"
 #include "capture/capture.h"
+#include "encode/encode.h"
 #include "engine/os.h"
 #include "im/abi/status.h"
 #include "im/log/ring.h"
@@ -66,7 +67,8 @@ im_status Init(Options options) {
     } else if (st < 0) {
       // Audio never fails a call (04 §10.1, 05 §4.3): video sharing works without it. 05's report shows the audio
       // state, and im_shutdown still calls AudioEngine::Shutdown, which copes with a failed Init.
-      log::Warn("engine", "audio init failed", {{"status", st}, {"detail", abi::LastErrorText()}});
+      // 05's detail may name an app or an executable, which no record may (04 §5.6): only its token is logged.
+      log::Warn("engine", "audio init failed", {{"status", st}, {"token", session::DetailToken(abi::LastErrorText())}});
       abi::ClearLastError(); // im_init succeeds: no detail is left behind
       st = IM_OK;
     }
@@ -103,6 +105,7 @@ void Shutdown() noexcept {
     });
   });
   s.worker.Stop(bound::kWorkerExit);
+  api::Guard("im_shutdown: encode", [] { encode::ForgetOpenH264Setting(); });
   api::Guard("im_shutdown: options", [&] {
     std::lock_guard<std::mutex> olock(s.options_mu);
     s.options = Options{};

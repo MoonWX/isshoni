@@ -50,7 +50,10 @@ im_status VideoFrames::InitGpu(const Config &config) noexcept {
     gpu::ConverterConfig cc;
     cc.output = config.layers[l].out;
     cc.source = source_;
-    cc.input = source_; // the slots' size: every capture path delivers the source upright until README WA60's DD
+    // The slots' starting size. WGC and the pattern deliver the source upright; Desktop Duplication's slots hold the
+    // panel's orientation (README WA60, FrameMeta::rotation turns them upright), so a monitor turned 90 or 270 degrees
+    // writes swapped sides and the converter makes that size's VideoProcessor on its first frame.
+    cc.input = source_;
     cc.fps = config.layers[l].fps;
     if (const im_status st = gpu::Converter::Create(*device_, cc, &converters_[l]); st != IM_OK) {
       return st;
@@ -132,18 +135,22 @@ im_status VideoFrames::Convert(uint32_t layer, bool black, const gpu::Nv12Target
   return converters_[layer]->Convert(slot != nullptr ? slot->source() : black_, target);
 }
 
-im_status VideoFrames::Configure(uint32_t layer, const video::OutputSize &out, uint32_t fps) noexcept {
+im_status VideoFrames::Configure(uint32_t layer, const video::OutputSize &out, uint32_t fps,
+                                 video::Size source) noexcept {
   if (device_ == nullptr || layer >= layer_count_ || !converters_[layer]) {
     return IM_OK;
   }
   gpu::Converter &c = *converters_[layer];
   c.ClearViews();
   const gpu::ConverterConfig &have = c.config();
-  if (have.output.size == out.size && have.output.content == out.content && have.fps == fps) {
+  if (have.output.size == out.size && have.output.content == out.content && have.fps == fps && have.source == source) {
     return IM_OK;
   }
+  // `source` is the size `out` was computed for (a settled resize's, §7.7): the geometry places content of that size
+  // at out.content and fits any other size with the aspect kept. `input` stays the slots' size.
   gpu::ConverterConfig cc = have;
   cc.output = out;
+  cc.source = source;
   cc.fps = fps;
   return c.Reconfigure(cc);
 }

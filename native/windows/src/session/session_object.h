@@ -13,22 +13,50 @@
 // builds too) and a converter per layer. A session whose encoders take nothing (the test hooks' IM_ENC_FAKE) has no
 // device: its frames are capture times only, so it stays off WARP.
 //
+// Capture (§7; README WF12): a source a capture area captures (capture/capture_source.h: a WGC pick, wgc_capture.h)
+// starts on the engine worker once the encoders opened, into the frame slots, with the start flags
+// (IM_START_HIDE_CURSOR, IM_START_KEEP_BORDER) and layer 0's fps. Such a source keeps the GPU path whatever its
+// encoders take (the capture needs slots), and IM_SESS_NO_OS_INDICATOR is set only when the capture runs borderless
+// (§7.1); the test pattern has no border and sets it too. The capture's sink counts and signals frames
+// (frames_captured_, the video waiter) and hands its other reports to the supervisor as flags. Other sources
+// (test:pattern, the test hooks' fake picks) run the supervisor's test pattern.
+//
 // Threads (§6.1):
 // - video (MMCSS "Capture"): drains the command queue, takes the newest frame for the pacer (§8.4; not while paused,
 //   so the slots keep the frozen frame, §8.5), converts the frame (or black) into each encode's NV12 target, encodes
 //   what the pacer asks for, runs the normalizer (§9.4) and pushes into the rings; re-inits through the re-init
 //   planner (§9.5); recovers a failed encoder with the next candidate (ENCODER_CHANGED first, §9.8); ends the session
 //   when a device is removed (IM_ERR_ENCODER_LOST, or any failure while the device reports itself removed, §8.1) or no
-//   candidate is left. It never waits on the consumer.
+//   candidate is left. It never waits on the consumer. Once the session ended (for any reason) it closes its encoders
+//   (README WA61), so an ended session holds no NVENC session and no dead FFmpeg context while the host has yet to call
+//   im_stop. im_set_profile moves the session only when every layer's encoder can encode the profile (§9.6: one
+//   profile per session); the candidates' order puts the capture adapter first (encode::PrimaryAdapterIndex, §9.1),
+//   and an encoder on another adapter than the session's device is skipped (open_failed).
 // - supervisor: the test pattern's frame timer (frames on a grid anchored at epoch_ns, pattern_grid.h, so the
 //   pattern's flash instants are the test tone's beeps; each frame drawn into a slot by the GPU, or only its time
 //   without a device), and the real-time flags into events: LIMIT_CHANGED (every edge of the pacer's overload rule),
-//   RING_OVERFLOW (at most one per stream and second).
+//   RING_OVERFLOW (at most one per stream and second); with a capture (§7.6, §7.7, capture::SourceWatcher): a closed
+//   source ends the session (ENDED{IM_ERR_SOURCE_GONE}), a failed capture too (device loss as device_removed),
+//   SOURCE_RESIZED when a resize is first seen and the settled size to the video thread after 1 s of stability,
+//   SOURCE_MINIMIZED / SOURCE_RESTORED from IsIconic polls every 500 ms; it stops the capture once the session ended.
+// - video thread, for a capture: a settled size re-inits the layers whose output size changes (REINIT|KEYFRAME, the
+//   converters letterbox meanwhile); a layer-0 fps re-init re-sets the capture's frame interval (SetFps).
 // - test tone (MMCSS "Pro Audio", IM_AUDIO_MODE_TEST_TONE only): 04 §10.3's tone on an exact 10 ms grid into the
 //   Opus stage. With IM_AUDIO_MODE_EXCLUDE_APPS 05's mixer feeds the stage instead (audio::AudioEngine::NewMixer).
 //
+// Pause (§8.5; README WA52): im_set_paused sets paused_ at once, so no wake-up of the video thread that checks it after
+// the call takes a frame (it is checked beside the pacer's own flag, which the queued command sets); a wake-up already
+// past the check may take one more frame, published no later than its TakeFrame. It fades the tone or 05's mix bus out
+// in 10 ms (TestTone::SetPaused, Mixer::SetPaused) and leaves the user's mute alone (im_audio_set_muted; for the tone
+// SetToneMuted): each flag is cleared only by its own call. A call whose command can't be queued changes nothing.
+//
+// Logs (§5.6 "Privacy"; README WA52): ids, sizes, tokens and codes, at every level; never a window title or the name of
+// an executable, a process or an app. A failure detail that 05's audio code wrote (SetRules, Mixer::Start) may name
+// one, so only its leading token is logged.
+//
 // Control calls validate, queue a command (64 entries, a mutex held for the push only) and wake the video thread;
-// keyframe requests are coalesced into a bit mask. Stop stops capture first, makes a blocked consumer return
+// keyframe requests are coalesced into a bit mask. Stop stops capture first (no frame is copied and no sink call made
+// once the capture's Stop returns; the slots and the device go only after the threads), makes a blocked consumer return
 // IM_ENDED at once, stops the mixer and joins the threads within 2 s (a thread that doesn't exit is abandoned with an
 // error log: it keeps the session alive through its reference, never touches freed memory and is never killed).
 #pragma once
@@ -49,6 +77,8 @@
 
 #include "api/owned.h"
 #include "audio/mixer.h"
+#include "capture/capture_source.h"
+#include "capture/source_watch.h"
 #include "engine/os.h"
 #include "gpu/device.h"
 #include "im/audio/opus_stage.h"
@@ -65,6 +95,7 @@
 #include "im/ring/signal.h"
 #include "im/video/scale.h"
 #include "isshoni_media.h"
+#include "session/au_times.h"
 #include "session/encoder.h"
 #include "session/frames.h"
 #include "session/pattern_grid.h"
@@ -85,6 +116,7 @@ inline constexpr int64_t kFlashEveryNs = 1'000'000'000;         // the test patt
 // pacer's own bump (§8.4) is 1 µs, and two AUs 1 µs apart share one RTP timestamp: the SFU and the viewer would take
 // a static IDR and the late new frame right after it for one frame, and the IDR would be lost.
 inline constexpr int64_t kMinAuSpacingNs = 11'112;
+static_assert(AuTimes::kMinSpacingNs == kMinAuSpacingNs, "an AU's own time keeps the same spacing");
 
 // The engine clock (QPC ns) as im::os::Clock, for the pump's stale rule (§6.2).
 class EngineClock final : public os::Clock {
@@ -126,6 +158,8 @@ public:
   im_status SetProfile(uint32_t profile);
   im_status SetContentHint(uint32_t hint);
   im_status SetPaused(bool paused);
+  // The user's mute of a test-tone session (session.h SetToneMuted); false (nothing changed) without the tone.
+  bool SetToneMuted(bool muted) noexcept;
   im_status SetAudioBitrate(uint32_t bps);
   im_status Stats(std::string &out) const;
 
@@ -167,7 +201,9 @@ private:
     bool ring_idr_asked = false; // RequireKeyframe was issued for a ring that waits for a keyframe
     uint32_t index = 0;          // the next access unit's index (the fake's Marker frame)
     int64_t next_flash = 0;      // the next flash instant (epoch_ns + k × 1 s)
-    int64_t last_ts = 0;         // the last encoded AU's capture_ts_ns (0: none yet)
+    int64_t last_ts = 0;         // the capture_ts_ns of the last frame the encoder took (0: none yet)
+    // Each AU's own frame (04 §9.2): an encoder that holds frames back emits an earlier frame's AU.
+    AuTimes au_times;
     uint32_t last_idr_bytes = 0;
     uint64_t keyframes = 0;
     uint64_t refreshes = 0;
@@ -199,6 +235,21 @@ private:
     Session *s_;
   };
 
+  // What the capture tells the session (capture::CaptureSink, on the capture's threads): flags and wake-ups only.
+  class Sink final : public capture::CaptureSink {
+  public:
+    explicit Sink(Session *s) noexcept : s_(s) {}
+    void OnFrame(int64_t capture_ts_ns) noexcept override;
+    void OnResized(video::Size content) noexcept override;
+    void OnInterrupted(std::string_view cause) noexcept override;
+    void OnResumed(std::string_view cause) noexcept override;
+    void OnClosed() noexcept override;
+    void OnFailed(im_status status, std::string_view detail) noexcept override;
+
+  private:
+    Session *s_;
+  };
+
   struct Thread {
     std::thread th;
     std::atomic<bool> done{false};
@@ -206,8 +257,10 @@ private:
   };
 
   im_status StartVideo(const im_start_config &cfg);
-  // The device (when an encoder takes pixels) and the frames, before the encoders open.
+  // The device (when an encoder takes pixels or the capture needs slots) and the frames, before the encoders open.
   im_status StartFrames();
+  // The capture of a source a capture area captures, after the encoders opened (README WF12).
+  im_status StartCapture(const im_start_config &cfg);
   im_status StartAudio(const im_start_config &cfg, uint32_t init_flags);
   void StartThreads();
   template <class F> void Launch(Thread &t, F &&body);
@@ -218,6 +271,8 @@ private:
   void ApplyCommands(int64_t now);
   void Apply(const Command &c, int64_t now);
   void ApplyRingRequests();
+  // A size the supervisor settled: the layers whose output size changes re-init (§7.7).
+  void ApplySourceSize();
   // Records the frames captured since the last call for fpsIn (04 §5.6), whether or not the video thread takes them.
   void CountCaptured(int64_t now) noexcept;
   // Takes the newest published frame for the pacer; count_skipped false: the frames published meanwhile were neither
@@ -241,6 +296,8 @@ private:
   // Publishes test-pattern frame k; false when the GPU failed and the session ended.
   bool PublishPattern(const PatternGrid &grid, uint64_t k);
   void SuperviseEvents(int64_t now);
+  // The capture's reports into events and ends (§7.6, §7.7); the next time it has work of its own.
+  int64_t SuperviseCapture(int64_t now);
 
   // The test-tone thread.
   void ToneLoop() noexcept;
@@ -254,6 +311,8 @@ private:
   // failure on the GPU path asks it (04 §8.1): a TDR may first show up as an encoder's or a pool's ordinary error, or
   // as re-opens that fail, and still ends the session as device_removed (§9.8). Any session thread.
   bool DeviceLost() const noexcept;
+  // The video thread, once the session ended: closes its encoders (§9.8) without waiting for im_stop.
+  void ReleaseEncoders() noexcept;
   // Releases the GPU path once no session thread can use it any more (the encoders first: they hold the device).
   void ReleaseVideo() noexcept;
   im_status Push(const Command &c);
@@ -292,6 +351,10 @@ private:
   // ---- the GPU path (declared before the layers: their encoders go first, then the frames, then the device)
   std::unique_ptr<gpu::Device> gpu_;    // null for a session whose encoders take nothing
   std::unique_ptr<VideoFrames> frames_; // the capture side writes (the supervisor's pattern), the video thread reads
+  Sink sink_{this};
+  // The running capture (declared after the frames: it goes first). Set by Start before any thread runs; stopped
+  // first by Stop, freed with the frames once no session thread can call it.
+  std::unique_ptr<capture::CaptureSource> capture_;
 
   // ---- the video thread's
   std::array<Layer, IM_MAX_LAYERS> layers_;
@@ -306,6 +369,7 @@ private:
   // none (§8.5): frames_captured_'s growth, recorded when the video thread wakes for it.
   pace::RateMeter<1024> captured_meter_;
   uint64_t captured_seen_ = 0;
+  video::Size src_size_; // the source size the layers' output sizes follow (the pick's, then each settled size)
 
   // ---- commands and flags from other threads
   std::mutex cmd_mu_;
@@ -330,10 +394,23 @@ private:
   std::atomic<bool> capture_stopped_{false};
   std::atomic<bool> stop_once_{false};
 
+  // ---- the capture's reports (its sink) and the supervisor's settled size for the video thread
+  std::atomic<uint64_t> reported_size_{0}; // capture::PackSize of the newest content size reported
+  std::atomic<bool> resize_reported_{false};
+  std::atomic<bool> source_closed_{false};
+  std::atomic<bool> capture_failed_{false};
+  std::mutex failure_mu_;
+  im_status failure_status_ = IM_OK; // guarded by failure_mu_: the capture's first failure
+  std::string failure_detail_;       // guarded by failure_mu_
+  std::atomic<uint64_t> settled_size_{0};
+  std::atomic<bool> settle_pending_{false};
+
   // ---- the supervisor's
   std::array<pace::Limit, IM_MAX_LAYERS> reported_limit_{};
   std::array<uint64_t, ring::kMaxStreams> overflow_pending_{};
   std::array<int64_t, ring::kMaxStreams> overflow_sent_at_{};
+  std::optional<capture::SourceWatcher> watcher_; // set by Start with a capture
+  bool capture_halted_ = false;                   // the supervisor stopped the capture after ENDED
 
   // ---- threads
   engine::os::Waiter video_waiter_;

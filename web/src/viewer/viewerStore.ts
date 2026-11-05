@@ -146,6 +146,12 @@ export interface ViewerData extends FocusState<ViewerShare> {
   readonly media: SubMediaState;
   /** The codec wait (05 §10.6); null while no subscription has the reason `codec`. */
   readonly codecWait: CodecWait | null;
+  /**
+   * M2 (docs/m2/03 §12.1, 05 §11.2, §15): the desktop app shares with 05's `endpoint` engine, whose loopback would
+   * capture the page's own playback, so no share is heard: every subscription's audio is `off` (layerPolicy). False in
+   * the browser. It belongs to the page: reset() keeps it.
+   */
+  readonly audioMutedForShare: boolean;
 }
 
 export interface ViewerActions {
@@ -186,6 +192,8 @@ export interface ViewerActions {
   setMedia(media: SubMediaState): void;
   /** codecWait.ts: the codec wait as it is now; null when it is over. */
   setCodecWait(wait: CodecWait | null): void;
+  /** endpointMute.ts: whether the desktop app's endpoint share mutes every subscription (docs/m2/03 §12.1). */
+  setAudioMutedForShare(muted: boolean): void;
   /**
    * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
    * no memory of ended shares, `inRoom` false. (fullscreen.ts and pip.ts follow: they leave the browser's
@@ -225,6 +233,7 @@ function initialData(volume: number): ViewerData {
     frozen: {},
     media: 'idle',
     codecWait: null,
+    audioMutedForShare: false,
   };
 }
 
@@ -444,6 +453,9 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       },
       setMedia(media) {
         if (get().media !== media) set({ media });
+      },
+      setAudioMutedForShare(audioMutedForShare) {
+        if (get().audioMutedForShare !== audioMutedForShare) set({ audioMutedForShare });
       },
       setCodecWait(codecWait) {
         const before = get().codecWait;

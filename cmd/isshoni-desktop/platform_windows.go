@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 
@@ -26,11 +27,19 @@ const clientOS = protocol.ClientOSWindows
 const defaultDeviceName = "Windows PC"
 
 // dataRoot returns %LOCALAPPDATA%\isshoni (03 §14.1) from the shell's known folder, never from the environment
-// (README §4: release builds read no environment variable for paths).
+// (README §4: release builds read no environment variable for paths). The e2e build alone takes the folder from
+// ISSHONI_E2E_DATA_DIR when it is set (flavor.localAppData, 03 §22.4 B), so a CDP run never touches the user's data.
 func dataRoot() (string, error) {
-	local, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
-	if err != nil {
-		return "", err
+	if flavor.err != nil {
+		return "", flavor.err
+	}
+	local := flavor.localAppData
+	if local == "" {
+		var err error
+		local, err = windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
+		if err != nil {
+			return "", err
+		}
 	}
 	if !filepath.IsAbs(local) {
 		return "", errors.New("the LocalAppData folder is not an absolute path")
@@ -48,7 +57,7 @@ func profileDir() string {
 }
 
 // webviewDataDir is WebView2's user data folder, %LOCALAPPDATA%\isshoni\WebView2, absolute and without a trailing
-// separator (03 §5.4; the same string becomes audio.SelfInfo.WebViewDataDir in README WA77's wiring).
+// separator (03 §5.4; the same string is audio.SelfInfo.WebViewDataDir, main.go's newAudioService).
 func webviewDataDir() (string, error) {
 	root, err := dataRoot()
 	if err != nil {
@@ -60,4 +69,24 @@ func webviewDataDir() (string, error) {
 // osBuild is the Windows build number, such as 26100 (BridgeConfig.App.OSBuild).
 func osBuild() int {
 	return int(windows.RtlGetVersion().BuildNumber)
+}
+
+// mutexOpens is 03 §13.4 step 2a's probe: OpenMutexW(SYNCHRONIZE, FALSE, name). It succeeds while the mutex exists
+// (true); ERROR_FILE_NOT_FOUND means it doesn't (false); any other error (access denied included) is returned, and
+// the start logs it and goes on. winos.MutexExists counts access denied as existing, which step 2a must not.
+func mutexOpens(name string) (bool, error) {
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return false, err
+	}
+	h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, p)
+	switch {
+	case err == nil:
+		_ = windows.CloseHandle(h)
+		return true, nil
+	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
+		return false, nil
+	default:
+		return false, fmt.Errorf("OpenMutexW: %w", err)
+	}
 }

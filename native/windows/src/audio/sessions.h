@@ -54,6 +54,7 @@ struct TrackedSession {
   bool fresh = false;         // seen by the latest enumeration
   bool announced = false;     // its session_created event went out (it needs the app id of a plan)
   std::string app_id;         // from the latest plan ("" while pending)
+  bool heard = false;         // the latest plan's verdict was heard (the EXCLUDE stream's silent-stream check)
 };
 
 // The report's apps[].playing window (05 §12.1).

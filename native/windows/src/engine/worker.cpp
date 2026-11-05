@@ -55,7 +55,8 @@ im_status Worker::Start() {
     const int32_t hr = st->start_result;
     lk.unlock();
     th.join(); // the thread exits right after a failed start
-    return abi::Failf(IM_ERR_INTERNAL, {}, "engine worker: CoInitializeEx(COINIT_MULTITHREADED) failed (0x%08X)",
+    return abi::Failf(IM_ERR_INTERNAL, {},
+                      "engine worker: COM setup (CoInitializeEx MTA / CoIncrementMTAUsage) failed (0x%08X)",
                       static_cast<unsigned>(hr));
   }
   lk.unlock();

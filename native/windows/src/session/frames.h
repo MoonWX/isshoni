@@ -12,11 +12,12 @@
 //   capture side   PublishPattern(frame k, capture time)   the supervisor's pattern timer: BeginWrite → TestPattern::
 //                                                          Render → Publish (or the time alone without a device)
 //                  slots()                                 README WA50's WGC callback and WA60's DD thread write here
+//                  PublishTime(capture time)               a capture without slots (test hooks, no device)
 //   video thread   Take()                                  the newest published frame (its capture time and the frames
 //                                                          skipped since the last Take, for the pacer); the reader's
 //                                                          slot keeps it as the last frame for refreshes and keyframes
 //                  Convert(layer, black, target)           that frame, or black, into an encoder's NV12 target
-//                  Configure(layer, output, fps)           after a layer's encoder (re)opened: its targets and
+//                  Configure(layer, output, fps, source)   after a layer's encoder (re)opened: its targets and
 //                                                          geometry (a re-init, §7.7, §9.5; a fallback, §9.8)
 //
 // The session doesn't Take while it is paused (§8.5): the reader's slot keeps the frozen frame, so refreshes and
@@ -74,6 +75,13 @@ public:
   im_status PublishPattern(const gpu::PatternFrame &f, int64_t capture_ts_ns) noexcept;
   // The slots a real capture writes (null without a device).
   gpu::FrameSlots *slots() noexcept { return slots_.get(); }
+  // A frame a capture without slots delivered at capture_ts_ns (the test hooks' fake capture in a session without a
+  // device, README WF12): its time only. No-op with a device (a capture there publishes into slots() itself).
+  void PublishTime(int64_t capture_ts_ns) noexcept {
+    if (device_ == nullptr) {
+      times_.Publish(capture_ts_ns);
+    }
+  }
 
   // ---- the video thread
   using Taken = TakenFrame;
@@ -86,8 +94,15 @@ public:
 
   // After the layer's encoder (re)opened: the layer's converter forgets the views of the previous encoder's targets
   // (its frame pool is gone, 04 §9.2; the views would keep its textures alive) and follows a new output size or frame
-  // rate (gpu::Converter::Reconfigure). No-op without a device; fails only on device loss.
-  im_status Configure(uint32_t layer, const video::OutputSize &out, uint32_t fps) noexcept;
+  // rate (gpu::Converter::Reconfigure). `source` is the upright source size `out` was computed for (the pick's, or a
+  // settled resize's, §7.7), so content of that size fills out.content and any other size is fitted into the output
+  // with the aspect kept. No-op without a device; fails only on device loss.
+  im_status Configure(uint32_t layer, const video::OutputSize &out, uint32_t fps, video::Size source) noexcept;
+
+  // The layer's converter (null without a device or past the layer count), for tests of its geometry.
+  const gpu::Converter *converter(uint32_t layer) const noexcept {
+    return layer < layer_count_ ? converters_[layer].get() : nullptr;
+  }
 
 private:
   VideoFrames() = default;

@@ -8,6 +8,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/hotkey"
+	"github.com/MoonWX/isshoni/internal/desktop/tray"
 )
 
 // recorder is the harness's recording Shell and OSHooks (03 §22.4 A): every call the app makes of the window, the
@@ -46,6 +47,12 @@ type hostState struct {
 	Tokens          []tokenRecord      `json:"tokens"`
 	RuntimeCalls    []runtimeCall      `json:"runtimeCalls"` // what reached the stub /wails/runtime behind the Guard
 	Tray            any                `json:"tray"`         // the tray's view; null until the tray (README WA68)
+	Heartbeats      int                `json:"heartbeats"`   // App.Heartbeat calls (W17's watchdog)
+	// EndSessionAcks counts the app's EndSessionHandled calls: one when it has handled WM_QUERYENDSESSION (a share
+	// stopped), one when it has quit at WM_ENDSESSION (03 §11.6), as winos's waiting window procedure would see them.
+	EndSessionAcks int `json:"endSessionAcks"`
+	// RemovedToasts are the app.Notification IDs the app took out of Action Center (winos.Hooks.RemoveToasts, 03 §15).
+	RemovedToasts []string `json:"removedToasts"`
 }
 
 // tokenRecord is one access token handed to the page. ActiveOrigin is read when Auth.AccessToken was called, the
@@ -81,6 +88,7 @@ func newRecorder(origin string, reloadDelay time.Duration) *recorder {
 			OSPages:       []string{},
 			Tokens:        []tokenRecord{},
 			RuntimeCalls:  []runtimeCall{},
+			RemovedToasts: []string{},
 		},
 	}
 	r.pill.r = r
@@ -97,6 +105,7 @@ func (r *recorder) snapshot() hostState {
 	s.OSPages = slices.Clone(s.OSPages)
 	s.Tokens = slices.Clone(s.Tokens)
 	s.RuntimeCalls = slices.Clone(s.RuntimeCalls)
+	s.RemovedToasts = slices.Clone(s.RemovedToasts)
 	hk := make(map[string]string, len(s.Hotkeys))
 	for k, v := range s.Hotkeys {
 		hk[k] = v
@@ -113,7 +122,15 @@ func (r *recorder) update(fn func(s *hostState)) {
 
 // ---- app.Shell ----
 
-var _ app.Shell = (*recorder)(nil)
+var (
+	_ app.Shell     = (*recorder)(nil)
+	_ app.TrayShell = (*recorder)(nil)
+)
+
+// SetTray records the tray's view for /__e2e/state (README WA68).
+func (r *recorder) SetTray(v tray.View) {
+	r.update(func(s *hostState) { s.Tray = v })
+}
 
 func (r *recorder) ShowWindow(bool) {
 	r.update(func(s *hostState) { s.WindowVisible = true; s.ShowWindowCalls++ })
@@ -162,7 +179,13 @@ func (r *recorder) Quit() { r.update(func(s *hostState) { s.Quit = true }) }
 
 // ---- app.OSHooks ----
 
-var _ app.OSHooks = (*recorder)(nil)
+var (
+	_ app.OSHooks                      = (*recorder)(nil)
+	_ interface{ EndSessionHandled() } = (*recorder)(nil)
+	_ interface {
+		RemoveToasts(ids ...string) (int, error)
+	} = (*recorder)(nil)
+)
 
 // osBuild is what the harness reports as the Windows build (the fake engine's probe says the same).
 const osBuild = 26100
@@ -206,6 +229,25 @@ func (r *recorder) OpenSettingsPage(p app.OSPage) error {
 func (r *recorder) KeepAwake(on bool) { r.update(func(s *hostState) { s.KeepAwake = on }) }
 
 func (r *recorder) Events() <-chan app.SystemEvent { return r.events }
+
+// EndSessionHandled is winos's end-of-session handshake (the app finds it by a type assertion): recorded.
+func (r *recorder) EndSessionHandled() { r.update(func(s *hostState) { s.EndSessionAcks++ }) }
+
+// RemoveToasts is winos's removal from Action Center (03 §15; the app finds it by a type assertion): the IDs of the
+// toasts recorded so far among ids are recorded as removed, and their number returned.
+func (r *recorder) RemoveToasts(ids ...string) (int, error) {
+	n := 0
+	r.update(func(s *hostState) {
+		for _, id := range ids {
+			if slices.ContainsFunc(s.Toasts, func(t app.Notification) bool { return t.ID == id }) &&
+				!slices.Contains(s.RemovedToasts, id) {
+				s.RemovedToasts = append(s.RemovedToasts, id)
+				n++
+			}
+		}
+	})
+	return n, nil
+}
 
 // recordedPill is the pill's recording fake.
 type recordedPill struct {

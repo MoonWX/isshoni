@@ -116,6 +116,7 @@ func TestMapError(t *testing.T) {
 		{"app invalid", fmt.Errorf("%w: x", app.ErrInvalidArgument), codes.CodeInvalidArgument, nil},
 		{"app busy", app.ErrBusy, codes.CodeBusy, nil},
 		{"app not implemented", app.ErrNotImplemented, codes.CodeNotImplemented, nil},
+		{"app io", fmt.Errorf("%w: %w", app.ErrIO, errors.New("open logs")), codes.CodeIOError, nil},
 		{"unknown prompt", fmt.Errorf("audio: %w", audio.ErrUnknownPrompt), codes.CodeNotFound, nil},
 		{"locked app", audio.ErrLockedApp, codes.CodeInvalidArgument, map[string]any{"field": "appId"}},
 		{"bad decision", audio.ErrInvalidDecision, codes.CodeInvalidArgument, map[string]any{"field": "decision"}},

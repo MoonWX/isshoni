@@ -24,3 +24,7 @@ func openEngine(*slog.Logger, bool) (media.Engine, error) {
 		AudioScenario: os.Getenv(fakeAudioEnv),
 	}), nil
 }
+
+// soundCheckExe is audio.SelfInfo.Exe with the fake engine: none, since the fake plays the sound check's chime
+// itself (03 §22.4, 05 §11.3).
+func soundCheckExe() string { return "" }

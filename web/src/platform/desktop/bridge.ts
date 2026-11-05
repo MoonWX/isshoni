@@ -330,6 +330,8 @@ export interface SettingsView {
 
 /** Every field optional; only these are accepted (docs/m2/03 §14.2). */
 export interface SettingsPatch {
+  /** Only ever set: the wizard's sound and voice steps were seen (docs/m2/03 §8.2). */
+  wizardDone?: true;
   closeToTray?: boolean;
   autostart?: boolean;
   hideFromCapture?: boolean;
@@ -399,6 +401,8 @@ export type BridgeEventName = keyof BridgeEvents;
 export interface NativeBridge {
   app: {
     info(): Promise<AppInfo>;
+    /** W17's watchdog beat (docs/m2/03 §3.2, §20): DesktopPlatform sends it every HeartbeatEveryMs. */
+    heartbeat(): void;
     openExternal(url: string): Promise<void>;
     openOSSettings(p: OSPage): Promise<void>;
     quit(stopShare: boolean): Promise<void>;
@@ -469,6 +473,7 @@ export interface NativeBridge {
 
 /** The fire-and-forget methods, as `group.method`: they return nothing, and a transport logs their failures. */
 export const VoidMethods: ReadonlySet<string> = new Set([
+  'app.heartbeat',
   'app.log',
   'app.ownConnections',
   'share.release',

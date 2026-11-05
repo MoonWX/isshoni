@@ -1,0 +1,609 @@
+<dialog class="dialog md" aria-labelledby="ID" open="">
+<div class="frame">
+<header class="header">
+<h2 id="ID" class="title">Ready to go live?</h2>
+<button type="button" class="close" aria-label="Close">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x" aria-hidden="true">
+<path d="M18 6 6 18">
+</path>
+<path d="m6 6 12 12">
+</path>
+</svg>
+</button>
+</header>
+<div class="body">
+<div class="body">
+<p class="lead">Friends will see: Minecraft</p>
+<div class="prompts">
+<section class="prompt" role="group" aria-label="Steam is using your microphone. Keep it out of your stream?" data-prompt-kind="mic">
+<p class="question">Steam is using your microphone. Keep it out of your stream?</p>
+<div class="promptActions">
+<button type="button" class="button primary sm">
+<span class="label">Keep out</span>
+</button>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+<button type="button" class="close" aria-label="Dismiss">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x" aria-hidden="true">
+<path d="M18 6 6 18">
+</path>
+<path d="m6 6 12 12">
+</path>
+</svg>
+</button>
+</section>
+<section class="prompt" role="group" aria-label="App 09 is using your microphone. Keep it out of your stream?" data-prompt-kind="mic">
+<p class="question">App 09 is using your microphone. Keep it out of your stream?</p>
+<div class="promptActions">
+<button type="button" class="button primary sm">
+<span class="label">Keep out</span>
+</button>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+<button type="button" class="close" aria-label="Dismiss">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x" aria-hidden="true">
+<path d="M18 6 6 18">
+</path>
+<path d="m6 6 12 12">
+</path>
+</svg>
+</button>
+</section>
+<section class="prompt" role="group" aria-label="App 18 is using your microphone. Keep it out of your stream?" data-prompt-kind="mic">
+<p class="question">App 18 is using your microphone. Keep it out of your stream?</p>
+<div class="promptActions">
+<button type="button" class="button primary sm">
+<span class="label">Keep out</span>
+</button>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+<button type="button" class="close" aria-label="Dismiss">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x" aria-hidden="true">
+<path d="M18 6 6 18">
+</path>
+<path d="m6 6 12 12">
+</path>
+</svg>
+</button>
+</section>
+</div>
+<div class="groups">
+<section aria-labelledby="ID" class="group">
+<h4 id="ID" class="groupTitle">Friends will hear:</h4>
+<ul class="rows">
+<li class="row" data-app-id="exe:app01.exe">
+<div class="rowMain">
+<span class="name">App 01</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app02.exe">
+<div class="rowMain">
+<span class="name">App 02</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app03.exe">
+<div class="rowMain">
+<span class="name">App 03</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app04.exe">
+<div class="rowMain">
+<span class="name">App 04</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app05.exe">
+<div class="rowMain">
+<span class="name">App 05</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app06.exe">
+<div class="rowMain">
+<span class="name">App 06</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app07.exe">
+<div class="rowMain">
+<span class="name">App 07</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app08.exe">
+<div class="rowMain">
+<span class="name">App 08</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app10.exe">
+<div class="rowMain">
+<span class="name">App 10</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app11.exe">
+<div class="rowMain">
+<span class="name">App 11</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app12.exe">
+<div class="rowMain">
+<span class="name">App 12</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app14.exe">
+<div class="rowMain">
+<span class="name">App 14</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app15.exe">
+<div class="rowMain">
+<span class="name">App 15</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app16.exe">
+<div class="rowMain">
+<span class="name">App 16</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app17.exe">
+<div class="rowMain">
+<span class="name">App 17</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app19.exe">
+<div class="rowMain">
+<span class="name">App 19</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app20.exe">
+<div class="rowMain">
+<span class="name">App 20</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app21.exe">
+<div class="rowMain">
+<span class="name">App 21</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app22.exe">
+<div class="rowMain">
+<span class="name">App 22</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app23.exe">
+<div class="rowMain">
+<span class="name">App 23</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app24.exe">
+<div class="rowMain">
+<span class="name">App 24</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app25.exe">
+<div class="rowMain">
+<span class="name">App 25</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app28.exe">
+<div class="rowMain">
+<span class="name">App 28</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app29.exe">
+<div class="rowMain">
+<span class="name">App 29</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app30.exe">
+<div class="rowMain">
+<span class="name">App 30</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app31.exe">
+<div class="rowMain">
+<span class="name">App 31</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app32.exe">
+<div class="rowMain">
+<span class="name">App 32</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app33.exe">
+<div class="rowMain">
+<span class="name">App 33</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app34.exe">
+<div class="rowMain">
+<span class="name">App 34</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app35.exe">
+<div class="rowMain">
+<span class="name">App 35</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app37.exe">
+<div class="rowMain">
+<span class="name">App 37</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app38.exe">
+<div class="rowMain">
+<span class="name">App 38</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app40.exe">
+<div class="rowMain">
+<span class="name">App 40</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app41.exe">
+<div class="rowMain">
+<span class="name">App 41</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app42.exe">
+<div class="rowMain">
+<span class="name">App 42</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app43.exe">
+<div class="rowMain">
+<span class="name">App 43</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app44.exe">
+<div class="rowMain">
+<span class="name">App 44</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app46.exe">
+<div class="rowMain">
+<span class="name">App 46</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app47.exe">
+<div class="rowMain">
+<span class="name">App 47</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app48.exe">
+<div class="rowMain">
+<span class="name">App 48</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app49.exe">
+<div class="rowMain">
+<span class="name">App 49</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app50.exe">
+<div class="rowMain">
+<span class="name">App 50</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app51.exe">
+<div class="rowMain">
+<span class="name">App 51</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app53.exe">
+<div class="rowMain">
+<span class="name">App 53</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app55.exe">
+<div class="rowMain">
+<span class="name">App 55</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app56.exe">
+<div class="rowMain">
+<span class="name">App 56</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app57.exe">
+<div class="rowMain">
+<span class="name">App 57</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:spotify.exe">
+<div class="rowMain">
+<span class="name">Spotify</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app13.exe">
+<div class="rowMain">
+<span class="name">App 13</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app26.exe">
+<div class="rowMain">
+<span class="name">App 26</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app39.exe">
+<div class="rowMain">
+<span class="name">App 39</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app52.exe">
+<div class="rowMain">
+<span class="name">App 52</span>
+<button type="button" class="button secondary sm">
+<span class="label">Keep out</span>
+</button>
+</div>
+</li>
+</ul>
+</section>
+<section aria-labelledby="ID" class="group">
+<h4 id="ID" class="groupTitle">Friends won't hear:</h4>
+<ul class="rows">
+<li class="row" data-app-id="exe:app09.exe">
+<div class="rowMain">
+<span class="name">App 09</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app18.exe">
+<div class="rowMain">
+<span class="name">App 18</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app27.exe">
+<div class="rowMain">
+<span class="name">App 27</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app36.exe">
+<div class="rowMain">
+<span class="name">App 36</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app45.exe">
+<div class="rowMain">
+<span class="name">App 45</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="exe:app54.exe">
+<div class="rowMain">
+<span class="name">App 54</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+<li class="row" data-app-id="discord">
+<div class="rowMain">
+<span class="name">Discord</span>
+<span class="reason">Voice app</span>
+</div>
+</li>
+<li class="row" data-app-id="exe:steam.exe">
+<div class="rowMain">
+<span class="name">Steam</span>
+<span class="reason">Uses your microphone</span>
+<button type="button" class="button secondary sm">
+<span class="label">Include</span>
+</button>
+</div>
+</li>
+</ul>
+</section>
+</div>
+<p class="note">Friends won't hear: Discord, Vesktop, TeamSpeak, Mumble, Zoom, Microsoft Teams, Slack. Apps that use your microphone are kept out too; you'll be asked.</p>
+<p class="note">Muting your PC doesn't mute your stream. Use Pause or turn Share sound off.</p>
+<fieldset class="presets">
+<legend class="legend">Optimize for</legend>
+<label class="preset">
+<input type="radio" value="auto" checked="" name="ID">
+<span class="presetName">Auto</span>
+<span class="presetHint">A good balance for most things</span>
+</label>
+<label class="preset">
+<input type="radio" value="game" name="ID">
+<span class="presetName">Game</span>
+<span class="presetHint">Smooth motion comes first</span>
+</label>
+<label class="preset">
+<input type="radio" value="movie" name="ID">
+<span class="presetName">Movie</span>
+<span class="presetHint">Smooth motion, and better sound</span>
+</label>
+<label class="preset">
+<input type="radio" value="text" name="ID">
+<span class="presetName">Text</span>
+<span class="presetHint">Sharp text comes first</span>
+</label>
+</fieldset>
+</div>
+</div>
+<footer class="footer">
+<button type="button" class="button ghost md">
+<span class="label">Cancel</span>
+</button>
+<button type="button" class="button primary md">
+<span class="label">Go live</span>
+</button>
+</footer>
+</div>
+</dialog>

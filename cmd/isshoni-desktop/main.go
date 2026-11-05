@@ -24,6 +24,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/applog"
 	"github.com/MoonWX/isshoni/internal/desktop/assets"
+	"github.com/MoonWX/isshoni/internal/desktop/audio"
 	"github.com/MoonWX/isshoni/internal/desktop/bridge"
 	"github.com/MoonWX/isshoni/internal/desktop/i18n"
 	"github.com/MoonWX/isshoni/internal/desktop/servers"
@@ -44,11 +45,15 @@ const appID = winos.InstanceID
 // The main window (03 §4.4).
 const (
 	windowTitle     = "isshoni"
+	mainWindowName  = "main"
 	windowWidth     = 1200
 	windowHeight    = 760
 	windowMinWidth  = 800
 	windowMinHeight = 560
 )
+
+// embeddingWait bounds -Embedding's wait for its toast activation: the mode exits within 5 s (03 §13.4 step 1, §20).
+const embeddingWait = 4 * time.Second
 
 // autoplayArg lets viewer audio play without a click (03 §5.4, W13).
 const autoplayArg = "--autoplay-policy=no-user-gesture-required"
@@ -59,6 +64,11 @@ var firstActionErr error
 func main() {
 	// The first action, before step 0 and in every mode: the DLL search order (03 §13.4, 04 §13.3 layer 2).
 	firstActionErr = restrictDLLSearch()
+	// Step 0, right after it: the sound check's helper plays the chime and exits, with no logging, single instance,
+	// Wails, WebView2 check, relaunch or env scrub (03 §13.4, 05 §11.3).
+	if len(os.Args) > 1 && os.Args[1] == audio.SoundCheckHelperFlag {
+		os.Exit(audio.RunSoundCheckHelper())
+	}
 	os.Exit(run(os.Args[1:]))
 }
 
@@ -69,8 +79,19 @@ func run(args []string) int {
 		log.Warn("desktop: "+firstActionError(firstActionErr).Error(), "err", firstActionErr)
 	}
 	s := &starter{
-		log:    log,
-		stdout: versionOutput,
+		log:              log,
+		stdout:           versionOutput,
+		soundCheckHelper: audio.RunSoundCheckHelper,
+		runningExists:    func() (bool, error) { return winos.MutexExists(winos.RunningMutex) },
+		shellRelaunch:    winos.RelaunchUnderShell,
+		installerRunning: func() (bool, error) { return mutexOpens(installingMutex) },
+		writePending:     winos.NewRegistry(winos.RegistryKey).WritePending,
+		openEngine:       selfCheckEngineOf(slog.Default()),
+		checkSPA:         checkBundledSPA,
+		openStore:        openAppCredentials,
+		openServers:      openAppServers,
+		dataRoot:         dataRoot,
+		removeAll:        os.RemoveAll,
 		singleInstance: func() (instance, error) {
 			si, err := winos.NewSingleInstance(winos.InstanceID, slog.Default())
 			if err != nil {
@@ -80,6 +101,8 @@ func run(args []string) int {
 		},
 		holdRunning: func() error { return winos.HoldRunningMutex(winos.RunningMutex) },
 		takePending: func() (app.Pending, error) { return app.TakePending(winos.NewRegistry(winos.RegistryKey)) },
+		embedding:   func() bool { return awaitToastActivation(slog.Default(), embeddingWait) },
+		relaunch:    startFresh,
 		runApp:      runApp,
 	}
 	return s.start(args)
@@ -115,6 +138,10 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		return exitFailed
 	}
 
+	if flavor.err != nil {
+		log.Error("desktop: the e2e build's variables are unusable", "err", flavor.err)
+		return exitFailed
+	}
 	root, err := dataRoot()
 	if err != nil {
 		log.Error("desktop: no data folder", "err", err)
@@ -162,11 +189,12 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 
 	// 02's servers, then settings.json (which drops the preferences of servers that aren't listed).
 	var theApp atomic.Pointer[app.App]
-	creds, err := credstore.Open(credstore.Options{Dir: root, Logger: slog.Default()})
+	creds, err := credstore.Open(appCredentialOptions(root))
 	if err != nil {
 		log.Error("desktop: no credential store", "err", err)
 		return exitFailed
 	}
+	defer dropTestCredentials(creds, log)
 	srv, err := deviceauth.OpenServers(deviceauth.ServersOptions{
 		Dir:                   root,
 		Store:                 creds,
@@ -219,11 +247,19 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		log.Error("desktop: the bundled web app is unusable", "err", err)
 		return exitFailed
 	}
+	// 05's audio policy over the engine's audio part, with settings.json's audio section (03 §6.1, 05 §14). Without
+	// an engine there is none, and the bound Audio service answers not_implemented.
+	audioSvc := newAudioService(engine, st, webviewData)
 	// Wails' own logger never logs below Info, whatever the log level is: at Debug the pinned Wails logs every
 	// bound call's raw arguments and result (03 §17).
-	wailsApp := application.New(appOptions(handler, assetGuard(), webviewData, wailsLog))
-	shell := newShell(wailsApp, mainWindowOptions())
-	a, err := app.New(app.Deps{
+	// W5's fallback (03 §3.2, §5.5 layer 2): Go sends a window that left the asset origin back to the start page.
+	nav := newNavGuard(assetOrigin, slog.Default())
+	opts := appOptions(handler, assetGuard(), webviewData, wailsLog)
+	opts.RawMessageHandler = navMessages(nav)
+	wailsApp := application.New(opts)
+	shell := newShell(wailsApp, mainWindowOptions(), slog.Default())
+	shell.guardNavigation(nav)
+	deps := app.Deps{
 		Settings:         st,
 		Servers:          srv,
 		Engine:           engine,
@@ -232,16 +268,25 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		I18n:             cat,
 		Log:              slog.Default(),
 		InsecureLoopback: insecureLoopback(),
-	})
+		LogsDir:          filepath.Join(root, "logs"),
+		NoticesFile:      noticesFile(),
+	}
+	bdeps := bridge.Deps{Servers: bridge.ServersOf(srv), ProbeApp: appInfo(),
+		AllowInsecureLoopback: insecureLoopback(), Settings: st, PolicyOff: update.PolicyDisabled,
+		Log: slog.Default()}
+	if audioSvc != nil { // never a typed nil inside the interfaces
+		deps.Audio, bdeps.Audio = audioSvc, audioSvc
+	}
+	a, err := app.New(deps)
 	if err != nil {
 		log.Error("desktop: the app can't start", "err", err)
 		return exitFailed
 	}
 	theApp.Store(a)
+	shell.bind(a)
 	// The bound services (03 §6.2), registered before Wails runs.
-	svcs, err := registerServices(shell, bridge.Deps{App: a, Servers: bridge.ServersOf(srv), ProbeApp: appInfo(),
-		AllowInsecureLoopback: insecureLoopback(), Settings: st, PolicyOff: update.PolicyDisabled,
-		Log: slog.Default()})
+	bdeps.App = a
+	svcs, err := registerServices(shell, bdeps)
 	if err != nil {
 		log.Error("desktop: the bound services can't start", "err", err)
 		return exitFailed
@@ -256,6 +301,9 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 	wailsApp.OnShutdown(fwd.stop)
 	wailsApp.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		started.Do(func() {
+			if err := shell.started(); err != nil {
+				log.Warn("desktop: no toasts", "err", err)
+			}
 			go func() {
 				defer close(runDone)
 				if err := a.Run(ctx); err != nil {
@@ -286,6 +334,31 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 		return exitFailed
 	}
 	return exitOK
+}
+
+// newAudioService is 05's audio.Service over engine's audio part (media.AudioController), with settings.json's
+// audio section (05's defaults under it) and the app's SelfInfo: this process, the WebView2 profile folder given to
+// Wails (webviewData, absolute, without a trailing separator; 05 §5.3) and the sound check's helper (this exe in a
+// build with the shipped engine, "" with the fake, which plays the chime itself). nil without an engine or with one
+// that has no audio part. App.Run runs it and Quit closes it (03 §6.1).
+func newAudioService(engine media.Engine, st *settings.Store, webviewData string) *audio.Service {
+	ctl, ok := engine.(media.AudioController)
+	if engine == nil || !ok {
+		return nil
+	}
+	self := audio.SelfInfo{PID: uint32(os.Getpid()), WebViewDataDir: webviewData, //nolint:gosec // G115: a PID fits
+		Exe: soundCheckExe()}
+	return audio.New(ctl, settings.NewAudioStore(st, audio.DefaultSettings), self, slog.Default())
+}
+
+// noticesFile is the installed THIRD_PARTY_NOTICES.txt (06 §2.2): <exe dir>\licenses\. "" when the exe's path is
+// unknown (App.OpenNotices then answers not_implemented).
+func noticesFile() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "licenses", "THIRD_PARTY_NOTICES.txt")
 }
 
 // setupLogging makes the process's default logger and returns the app's own, which adds component=app. The default
@@ -429,7 +502,7 @@ func appOptions(handler http.Handler, guard func(http.Handler) http.Handler, web
 		},
 		Windows: application.WindowsOptions{
 			WebviewUserDataPath:   webviewData,
-			AdditionalBrowserArgs: []string{autoplayArg},
+			AdditionalBrowserArgs: append([]string{autoplayArg}, flavor.browserArgs...),
 		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
@@ -453,7 +526,7 @@ var deniedPermissions = map[application.PermissionType]application.Permission{
 // bar, the browser accelerator keys and swipe navigation.
 func mainWindowOptions() application.WebviewWindowOptions {
 	return application.WebviewWindowOptions{
-		Name:                       "main",
+		Name:                       mainWindowName,
 		Title:                      windowTitle,
 		Width:                      windowWidth,
 		Height:                     windowHeight,

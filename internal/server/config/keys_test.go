@@ -385,6 +385,9 @@ var devUnknownNames = []string{
 // where they are; TestRepoEnvNamesReserved accepts them, and devUnknownNames.
 var repoNonEnvNames = map[string]string{
 	"ISSHONI_MEDIA_H":                             "native/include/isshoni_media.h's include guard",
+	"ISSHONI_COMMON_NSH":                          "deploy/windows/nsis/common.nsh's include guard (an NSIS !define)",
+	"ISSHONI_UNINSTALL_NSH":                       "deploy/windows/nsis/uninstall.nsh's include guard (an NSIS !define)",
+	"ISSHONI_UNINSTALLER_ONLY":                    "deploy/windows/nsis/uninst-gen.nsi's NSIS !define for common.nsh",
 	"ISSHONI_UPDATE_TEST":                         "internal/update's update_test: a string release builds lack",
 	"ISSHONI_TEST_PADDING":                        "tools/desktoppkg's ffmpeg_test: the filler of a long header",
 	"ISSHONI_TEST_PADDING_VALUE_OF_A_LONG_HEADER": "tools/desktoppkg's ffmpeg_test: the filler of a long header",

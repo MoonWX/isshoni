@@ -825,6 +825,34 @@ func TestAudioStore(t *testing.T) {
 	}
 }
 
+// TestAudioStoreNoSection: a settings.json without an audio section (a new install, an older build's file) gives 05's
+// defaults as they are and logs nothing (README WA77); the first save adds the section.
+func TestAudioStoreNoSection(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, FileName), `{"schema": 1}`)
+	var logs logBuffer
+	s := open(t, Options{Dir: dir, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	st := NewAudioStore(s, audioDefaults)
+	got := st.AudioSettings()
+	if !reflect.DeepEqual(got, audioDefaults()) {
+		t.Errorf("no section: %+v, want the defaults", got)
+	}
+	if strings.Contains(logs.String(), "audio") {
+		t.Errorf("no section logged: %s", logs.String())
+	}
+	fresh := NewAudioStore(open(t, Options{Dir: t.TempDir()}), audioDefaults).AudioSettings()
+	if !reflect.DeepEqual(fresh, audioDefaults()) {
+		t.Errorf("no file: %+v, want the defaults", fresh)
+	}
+	got.KeepOutMicUsers = false
+	if err := st.SaveAudioSettings(got); err != nil {
+		t.Fatal(err)
+	}
+	if v := st.AudioSettings(); v.KeepOutMicUsers || !v.FastPath {
+		t.Errorf("after the first save: %+v", v)
+	}
+}
+
 // object returns a JSON object with n members "k0": 0, "k1": 1, ….
 func object(n int) string {
 	var b strings.Builder

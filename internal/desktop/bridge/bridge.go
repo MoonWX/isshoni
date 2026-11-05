@@ -16,12 +16,13 @@
 //   - No method returns a refresh token or a credential (02 §11.7): the only secret that crosses is the access
 //     token of Auth.AccessToken, for the active server's own origin only (03 §5.8).
 //
-// Methods whose slices haven't landed return not_implemented (README §4 "Interfaces first"): Auth's server changes
-// and Unlink (WA71), Settings' writes and hotkeys and Updates (WA84). Audio works once main hands it 05's service
-// (WA77); until then it is not_implemented too. Share calls the app's share controller (internal/desktop/share).
+// Methods whose slices haven't landed return not_implemented (README §4 "Interfaces first"): Settings' writes and
+// hotkeys and Updates (WA84). Auth's server changes and Unlink call the app (Auth's ServerControl, WA71). Audio
+// works over 05's service, which main and the e2e harness pass as Deps.Audio (without one it is not_implemented too).
+// Share calls the app's share controller (internal/desktop/share).
 //
-// Events (Go → SPA, 03 §6.3) go out through Deps.Emit with the "isshoni:" prefix (events.go): 05's audio events and
-// the share controller's share.state, share.stats and share.notice.
+// Events (Go → SPA, 03 §6.3) go out through Deps.Emit with the "isshoni:" prefix (events.go): 05's audio events,
+// the share controller's share.state, share.stats and share.notice, and the active server's auth.state.
 package bridge
 
 import (
@@ -162,7 +163,7 @@ type Deps struct {
 	ProbeApp deviceauth.AppInfo
 	// AllowInsecureLoopback is true in dev and e2e builds (http:// loopback servers, 03 §8.1).
 	AllowInsecureLoopback bool
-	Audio                 AudioPolicy // 05's service; nil until README WA77 wires it
+	Audio                 AudioPolicy // 05's service; nil: Audio's methods are not_implemented
 	// Shares is the share controller; nil means App's own (*app.App's Shares). Without one, Share's controller
 	// calls answer not_implemented.
 	Shares   app.ShareController
@@ -234,6 +235,7 @@ func New(d Deps) (*Services, error) {
 		}))
 	}
 	s.closers = append(s.closers, s.Share.ctl.Subscribe(func(ev share.Event) { s.Share.forward(ev, emit) }))
+	s.closers = append(s.closers, s.Auth.forward(emit))
 	return s, nil
 }
 

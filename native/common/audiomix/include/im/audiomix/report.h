@@ -73,6 +73,7 @@ enum class ReportEventCode : uint8_t {
   kMixerResync,
   kUnderrun,
   kTrim,
+  kTailFade, // at most one per channel per second (05 §9.5)
   kSilentReopen,
   kRulesChanged,
   kMuted,
@@ -152,6 +153,7 @@ struct ReportCounters {
   uint64_t activation_failures = 0;
   uint64_t underruns = 0;
   uint64_t trims = 0;
+  uint64_t tail_fades = 0; // sounds that stopped into digital silence and were ramped out (05 §9.5)
   uint64_t overflows = 0;
   uint64_t discontinuities = 0;
   uint64_t mixer_resyncs = 0;

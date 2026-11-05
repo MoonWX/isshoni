@@ -135,6 +135,9 @@ func New(eng media.AudioController, st SettingsStore, self SelfInfo, log *slog.L
 		viewers:  map[string]viewerTab{}, families: map[string]*viewerFamily{}, overrides: map[string]bool{},
 		names: map[string]string{}, prompted: map[string]bool{}, subs: map[int]func(Event){},
 	}
+	if self.NoDucking {
+		s.ducking0 = func() duckingPref { return duckingUnknown }
+	}
 	s.fh = buildFriendsHear(s.fhInputLocked())
 	s.fh.Seq = 1
 	return s

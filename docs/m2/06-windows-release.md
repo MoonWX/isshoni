@@ -317,10 +317,9 @@ by hand against FFmpeg's release key):
 ```
 
 `msvcToolset` is the `VCToolsVersion` folder; `msvcCompiler` and `msvcLinker` are the toolset build of §3 (WF1). The
-committed lock is `deps-ffmpeg-9.0.2-r1`'s, from the owner's publishing run of 2026-11-03 (§4.6, README §3 item 50).
-With the libvpl patch the inputs are revision 2's, so that lock is stale, and every consumer (`windows-native`'s
-"The FFmpeg lock is current" step first) fails by design until the owner publishes `deps-ffmpeg-9.0.2-r2` and commits
-the lock it prints.
+committed lock is `deps-ffmpeg-9.0.2-r2`'s, the build with the libvpl patch, from the owner's publishing run of
+2026-11-04 (§4.6, README §3 item 69); r1's (2026-11-03, README §3 item 50) went stale with the patch, and while it was
+the committed one every consumer (`windows-native`'s "The FFmpeg lock is current" step first) failed by design.
 
 `avcodecMajor` and `avutilMajor` (integers; the numbers above are placeholders) are written by the publish run from
 `ffcheck`'s `avcodec_version() >> 16` and `avutil_version() >> 16` in `ffmpeg-config.json` (§4.4). 04's CMake reads
@@ -543,6 +542,13 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   shipped bytes, and every later comparison is against them); `msvcToolset` 14.44.35207, `msvcCompiler` 19.44.35229,
   `msvcLinker` 14.44.35229.0; `commit` `7e3f7bb`. `ffmpeg-fetch -source` verified the release's zip, DLLs and source
   archive against it before the commit, and group 9's integration fetched the zip with `task ffmpeg:fetch` on the Mac.
+- **Revision 2's publishing run** (README §3 items 64, 69): dispatched with `publish` from `m2/windows-app` at
+  `957cce6` (the libvpl patch and `build.sh`'s published-source fallback, §4.3), on 2026-11-04. It created the
+  prerelease `deps-ffmpeg-9.0.2-r2`, and its printed `lock.json` is committed on `m2/windows-app` (`b437d0e`, before
+  group 12's merge): `inputsSha256` `27c3b458…`, which `desktoppkg ffmpeg-inputs -check` matches; `avcodecMajor` 63
+  and `avutilMajor` 61 (unchanged); `avcodec-63.dll` `a739c6ff…` and `avutil-61.dll` `e8bfdef3…`; the same
+  `msvcToolset`, `msvcCompiler` and `msvcLinker` as r1; `commit` `957cce6`. `ffmpeg-fetch -source` verified the
+  release against it and both attestations verified before the commit.
 
 ### 4.7 Security updates
 
@@ -598,7 +604,7 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   - **Imports**: `deploy/windows/dll-imports.txt` has two sections, `static:` and `delay:`. Every imported DLL must
     be listed in the section that matches how it is imported. `mfplat.dll` and `avrt.dll` are allowed only under
     `delay:` (04 §13.1; mfplat is absent on N editions and Windows Server). The `api-ms-win-core-*` API sets that
-    `windowsapp.lib` and `synchronization.lib` pull in are listed by 04 in slice E2; 05's audio DLLs by 05; any other
+    `runtimeobject.lib` and `synchronization.lib` pull in are listed by 04 in slice E2; 05's audio DLLs by 05; any other
     system DLL by PR with a reason. An import of `avcodec-*` or `avutil-*` **always fails**, like the C runtime
     (`VCRUNTIME*`, `MSVCP*`, `MSVCR*` such as `msvcrt.dll`, `api-ms-win-crt-*`, `ucrtbase*`, `concrt*`, `vccorlib*`,
     their debug builds) and `opus*.dll`: the engine must load, probe and capture audio when FFmpeg is missing or
@@ -622,8 +628,10 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
     `IM_WINVER`). SignPath requires product metadata on every file it signs.
   - With `-ffmpeg <dir>` (from README WA24 on): the FFmpeg DLLs there are exactly the two that `lock.json` names after
     its majors, have its SHA-256s (unmodified), and import neither Media Foundation nor a C runtime DLL (§4.4).
-- **The four-part version** in CI: until README WA67's `desktoppkg winver` exists, the job computes §5.3's rule inline
-  for CI's `0.0.0-ci.<N>`: `0.0.0.<N mod 65000>`.
+- **The four-part version** in CI: the job computes §5.3's rule inline for CI's `0.0.0-ci.<N>`:
+  `0.0.0.<N mod 65000>`. README WA67's `desktoppkg winver` exists since group 12 (`desktop:exe:windows` uses it), but
+  `windows-native`'s release preset was outside WA67's part of `ci.yml`, so it still computes the number inline until
+  a later `ci.yml` slice switches it (README §3 item 71).
 - **WebView2 bootstrapper**: downloaded from the `tools.json` URL; `Get-AuthenticodeSignature` must say `Valid` with
   exactly the pinned signer subject; its SHA-256 is recorded.
 - Artifact `windows-native`, two folders:
@@ -680,8 +688,9 @@ defaults to `production`, and the release passes nothing. Test builds pass other
    application manifest are 03's files; the manifest's contents are 03 §24's list: `asInvoker`, PerMonitorV2 DPI
    awareness, the Windows 10/11 `supportedOS` GUID, Common Controls v6, `activeCodePage` UTF-8, `longPathAware`.
    `info.json` (wails3's `-info` format) carries the version fields of §5.1 with `OriginalFilename` = `isshoni.exe`,
-   `FileDescription` = `isshoni` and `InternalName` = `isshoni`; until README WA67's `desktoppkg winver`, the task's
-   shell computes §5.3's four-part number itself and refuses a `VERSION` that isn't `X.Y.Z[-pre][+build]`.
+   `FileDescription` = `isshoni` and `InternalName` = `isshoni`; the four-part number is README WA67's
+   `desktoppkg winver` (before WA67 the task's shell computed §5.3's rule itself and refused a `VERSION` that isn't
+   `X.Y.Z[-pre][+build]`).
 2. `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags "-s -w -H windowsgui
    -X github.com/MoonWX/isshoni/internal/version.version=<v> -X …version.commit=<sha> -X …version.date=<commit date>"
    -o dist-desktop/windows_amd64/isshoni.exe ./cmd/isshoni-desktop` (test builds: `-o
@@ -907,6 +916,35 @@ in `MessageBox`, `DetailPrint`, `nsDialogs::Create*`, `Banner::show` or `!define
 reference. The NSIS
 strings are not in the SPA's `en.json`: the installer is no Go or web code.
 
+**As built (WA67, group 12; README §3 item 71)**, where the installer differs from §6.1–§6.10:
+- **Strings**: the rule is stricter than above. `desktoppkg check` also covers `!define MUI_*TITLE*`,
+  `MUI_HEADER_TEXT` and `uninst-gen.nsi`, requires every `$(…)` to be a `LangString` of `English.nsh` and each
+  `LangString` there to be used exactly once, and a Go test keeps every script but `English.nsh` ASCII-only.
+- **Headers**: the shortcut AUMID uses NSIS's own `Win\COM.nsh` and `Win\Propkey.nsh` beyond §6.1's list, since
+  `System.dll` can't place the `PROPERTYKEY`'s GUID in a struct correctly.
+- **Command line** (§6.4): flags are parsed by the scripts themselves, because FileFunc's `GetOptions` cuts values at
+  `/`. `/SERVER=` is ignored when the command line reaches `NSIS_MAX_STRLEN` (1024 in the official build), so a cut-off
+  value is never stored; the 2048-byte cap can't be reached in practice.
+- **A running app** (§6.7): plain `/S` (not only `/UPDATE`) and a silent uninstall poll the running mutex for 60 s
+  before exit 3; interactive runs show the Retry/Cancel box.
+- **Uninstall** (§6.8): `/PURGE` also runs `RMDir /r` on `%LOCALAPPDATA%\isshoni` if `--purge-data` left it behind;
+  that is the data root, never `$INSTDIR`.
+- **Prebuilt uninstaller** (§6.9): with plain `WriteUninstaller` (the Mac path), `uninstall.exe` probably carries the
+  installer's `FileDescription` (`isshoni setup`, unverified); only CI's prebuilt uninstaller says `isshoni
+  uninstaller`.
+- **Staged files** (§2.2): the LGPL files (`licenses\ffmpeg\COPYING.LGPLv2.1.txt`, `LICENSE.md`, `README-LGPL.txt`)
+  are staged now, from `windows-native`'s `release\licenses\ffmpeg`, because §2.2's tree and the smoke's files check
+  need them; `THIRD_PARTY_NOTICES.txt` comes from today's `tools/notices` without a `-native` section, which WA78 adds
+  with the gate.
+- **The version ldflag** (§5.2 step 3) is checked by finding the version string in the exe's bytes: Go leaves
+  `-ldflags` out of the build info under `-trimpath`; tags, `-trimpath`, `CGO_ENABLED`, `GOOS` and `GOARCH` still come
+  from the build info.
+- **Locale**: on macOS and Linux `desktoppkg nsis` sets `LC_ALL` to `en_US.UTF-8` (darwin) or `C.UTF-8` when the
+  locale isn't UTF-8, since makensis rejects or crashes on the UTF-8 `English.nsh` under the C locale.
+- **CI** (§10.1): `windows-desktop` is in `ci-ok`'s needs with its `run-windows-desktop` output and decide line, and
+  `deploy/test/windows/smoke.ps1` is in the `desktop` filter; `smoke.ps1 -Mode ci` adds case 7 (exit 6 with the moved
+  files put back) and case 8 (`/SERVER=`) to §16's list.
+
 ## 7. `install-desktop.ps1` and the server's `/download`
 
 ### 7.1 The script (`deploy/install-desktop.ps1`)
@@ -1087,6 +1125,12 @@ name that is neither a key, reserved nor env-only. So **a slice that starts read
 `internal/server/config/keys.go` in its Touches through the integrator (README §5, shared files); a name that lives
 only inside one task's own processes takes another prefix instead, as `native:dist`'s `NATIVE_DIST_*` and
 `ffmpeg:fetch`'s `FFMPEG_FETCH_*` do (§17; README WA24).
+
+Group 10's integration added the two names WA44 started to read, so the list ends with them:
+`ISSHONI_ENGINETEST_TEST_CHILD` (the child switch of `cmd/isshoni-enginetest`'s process-default test, beside the other
+test-child names) and `ISSHONI_TEST_FFMPEG_DIR` (the FFmpeg folder of the native encoder tests `ffmpeg_load_test` and
+`mf_sw_test`, which `windows-native` sets to the locked zip's `bin`; 04 §9.10, §18.2). M1 04 §4.2's documented list
+matches `reservedEnv` again since WB9 (group 11).
 
 ### 7.4 Server: `GET /install-desktop.ps1`
 
@@ -1711,7 +1755,7 @@ archives keep M1's file unchanged. **Later (M3)**: `-goos darwin` with `native-d
    "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]},
   {"name": "Opus", "vcpkgPort": "opus", "license": "BSD-3-Clause",
    "linking": "static, inside isshoni-media.dll", "licenseFiles": ["vcpkg/opus/copyright"]},
-  {"name": "OpenH264 headers", "version": "2.6.0", "license": "BSD-2-Clause",
+  {"name": "OpenH264 headers", "version": "2.7.0", "license": "BSD-2-Clause",
    "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["openh264/LICENSE"]},
   {"name": "C++/WinRT", "license": "MIT",
    "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["cppwinrt/LICENSE"]},
@@ -2158,7 +2202,7 @@ Client requirement, running it elevated, what each error means); `#windows-verif
 | A released version that would be signed | — | `v0.2.0` with the Windows app |
 | A code-signing policy page on the project site | `/code-signing` exists (M1 06 §10.2): what is signed, roles (committers, reviewers and approvers: @MoonWX), build rules, privacy statement, contact | update (below) |
 | The line "Free code signing provided by SignPath.io, certificate by SignPath Foundation" | already in the Windows row | keep; show it on the release notes and README only after approval |
-| A privacy statement for the **signed software** | the statement on `/code-signing` lists only the server's connections | add the desktop app's: the update check (on by default, can be turned off at install and in settings), OpenH264 only when the user turns it on, the WebView2 bootstrapper when the runtime is missing, and the servers the user links (`/privacy#desktop`) |
+| A privacy statement for the **signed software** | the statement on `/code-signing` lists only the server's connections | add the desktop app's: the update check (on by default, can be turned off at install and in settings), OpenH264 only when the user turns it on (one HTTPS download of the pinned 2.7.0 from Cisco's `https://ciscobinary.openh264.org/openh264-2.7.0-win64.dll.bz2`, checked against its pinned size and SHA-256, 04 §9.9; as built, WA51), the WebView2 bootstrapper when the runtime is missing, and the servers the user links (`/privacy#desktop`) |
 | Builds only from the repository on GitHub-hosted runners, from tags; MFA on owner accounts; manual approval of each signing request | M1's release pipeline (tags, the `release` environment with owner approval) | the SignPath jobs run in the same pipeline (§12.4) |
 | Product name and version in every signed PE file | — | §5.1, §5.2, §6.2 |
 | Third-party binaries not signed with the project's certificate | stated on `/code-signing` | the list of unsigned files: `avcodec-*.dll`, `avutil-*.dll` |
@@ -2234,12 +2278,16 @@ Before the first rc with the app:
    delete local private copies. `deploy/keys/README.md` gets these steps.
 2. **FFmpeg**: Actions → FFmpeg → Run workflow with `publish` on (from the branch of the pins PR); commit the printed
    `lock.json` into that PR. Done for `deps-ffmpeg-9.0.2-r1` (README §3 item 50): dispatched on 2026-11-03 at the
-   owner's request from `main` at `7e3f7bb`, and the printed `lock.json` committed (§4.6).
+   owner's request from `main` at `7e3f7bb`, and the printed `lock.json` committed (§4.6). Done for
+   `deps-ffmpeg-9.0.2-r2` (the libvpl patch, README §3 items 64, 69): dispatched on 2026-11-04 from `m2/windows-app` at
+   `957cce6`, its `lock.json` committed as `b437d0e` (§4.6).
 3. **Rulesets**: a tag ruleset for `deps-*` (block update and deletion; creation by repository writers, which is only
    the owner).
 4. **Actions setting**: "Require approval for all external contributors".
 5. **Self-hosted runner** on the Win11 and the Win10 22H2 install (§10.5, ephemeral), and the environment `audiotest`
-   with the owner as required reviewer, created before the first dispatch (§10.4).
+   with the owner as required reviewer, created before the first dispatch (§10.4). As built (WA75; README §3 item
+   83, §8): the environment is needed for any dispatch, runner or not, with "Prevent self-review" off, since the owner
+   both dispatches and approves; the workflow's `environment` job fails the run until it exists with that reviewer.
 6. Consider GitHub's immutable releases (M1's suggestion); with them the deps releases can't change either.
 
 During the release: the checklist items marked (owner) in §11.8.

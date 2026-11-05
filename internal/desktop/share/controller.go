@@ -33,6 +33,7 @@ type Controller struct {
 	wg sync.WaitGroup // the shares' watchers and the stops Start makes
 
 	statsMu sync.Mutex // orders syncStats' calls of the clients' WatchServerStats; taken before mu, never under it
+	pidMu   sync.Mutex // orders syncSharedPID's calls of 05's SetSharedPID; taken before mu, never under it
 
 	mu         sync.Mutex // guards the fields below
 	closed     bool
@@ -134,6 +135,7 @@ func (c *Controller) Pick(ctx context.Context) (*Picked, error) {
 	if err != nil {
 		c.mu.Unlock()
 		c.stateChanged()
+		c.syncSharedPID() // the pick released above is gone
 		if errors.Is(err, media.ErrCancelled) {
 			return nil, nil
 		}
@@ -142,12 +144,14 @@ func (c *Controller) Pick(ctx context.Context) (*Picked, error) {
 	if c.closed || c.cur != nil {
 		c.mu.Unlock()
 		c.o.Engine.Release(src.ID)
+		c.syncSharedPID()
 		return nil, ErrClosed
 	}
 	h := &held{id: newPickID(), src: src, confirm: c.sheets(src), expires: time.Now().Add(c.hold)}
 	h.timer = time.AfterFunc(c.hold, func() { c.expire(h) })
 	c.pick = h
 	c.mu.Unlock()
+	c.syncSharedPID()
 	c.stateChanged()
 	c.log.Info("share: source picked", "kind", string(kindOf(src.Kind)))
 	return &Picked{PickID: h.id, Kind: kindOf(src.Kind), Label: src.Name, Border: src.OSBorder,
@@ -199,7 +203,32 @@ func (c *Controller) expire(h *held) {
 	c.pick = nil
 	c.mu.Unlock()
 	c.o.Engine.Release(h.src.ID)
+	c.syncSharedPID()
 	c.log.Debug("share: the pick expired unused")
+}
+
+// syncSharedPID tells 05 the process of the held pick (03 §10.1, 05 §22: SetSharedPID after the pick, 0 on Release
+// or expiry): the pick's PID while one is held and no share is starting or running, else 0. While a share is starting
+// or running it does nothing, since 05's OnShareStarted and OnShareStopped set it themselves. It reads the state when
+// it runs, one call at a time, so the last call always carries the current value, whatever order the callers came in.
+func (c *Controller) syncSharedPID() {
+	au := c.o.Audio
+	if au == nil {
+		return
+	}
+	c.pidMu.Lock()
+	defer c.pidMu.Unlock()
+	c.mu.Lock()
+	if c.cur != nil {
+		c.mu.Unlock()
+		return
+	}
+	var pid uint32
+	if h := c.pick; h != nil {
+		pid = pidOf(h.src.PID)
+	}
+	c.mu.Unlock()
+	au.SetSharedPID(pid)
 }
 
 // Release drops the held pick pickID: the user backed out (the first-share sheet's Cancel, the share sheet closed).
@@ -214,6 +243,7 @@ func (c *Controller) Release(pickID string) {
 	c.takePickLocked()
 	c.mu.Unlock()
 	c.o.Engine.Release(h.src.ID)
+	c.syncSharedPID()
 }
 
 // Start starts a share of the held pick r.PickID in r.RoomID (03 §10.1), in order: C2 online (at most ReadyTimeout,
@@ -248,6 +278,7 @@ func (c *Controller) Start(ctx context.Context, r StartRequest) (View, error) {
 		c.takePickLocked()
 		c.mu.Unlock()
 		c.o.Engine.Release(h.src.ID)
+		c.syncSharedPID()
 		return View{}, ErrPickExpired
 	}
 	h.inUse = true
@@ -402,6 +433,7 @@ func (c *Controller) startFailed(a *active, h *held, err error) (View, error) {
 	if release != nil {
 		c.o.Engine.Release(release.src.ID)
 	}
+	c.syncSharedPID() // a pick held for another Start is the shared app again (OnShareStopped set 0)
 	c.stateChanged()
 	c.log.Info("share: start failed", "err", redact(err), "stopped", stopped)
 	return View{}, err
@@ -943,6 +975,7 @@ func (c *Controller) Close() {
 	c.mu.Unlock()
 	if h != nil {
 		c.o.Engine.Release(h.src.ID)
+		c.syncSharedPID()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), CloseTimeout)
 	defer cancel()

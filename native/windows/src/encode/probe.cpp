@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -20,11 +21,14 @@
 #include <vector>
 
 #include "audio_bridge/audio_bridge.h"
+#include "capture/capture.h"
+#include "capture/outputs_win.h"
 #include "encode/encode.h"
 #include "encode/ffmpeg_api.h"
 #include "encode/ffmpeg_encoder.h"
 #include "encode/selector.h"
 #include "engine/delayload.h"
+#include "engine/engine.h"
 #include "engine/os.h"
 #include "gpu/device.h"
 #include "im/abi/status.h"
@@ -45,11 +49,28 @@ constexpr uint32_t kVendorIntel = 0x8086;
 constexpr uint32_t kVendorAmd = 0x1002;
 constexpr uint32_t kVendorAmdAlt = 0x1022;
 constexpr uint32_t kMinSupportedBuild = 19045; // Windows 10 22H2
-constexpr uint32_t kBuildWgc = 18362;          // GraphicsCaptureSession::IsSupported() (1903)
-constexpr uint32_t kBuild2004 = 19041;         // IsCursorCaptureEnabled, WDA_EXCLUDEFROMCAPTURE
-constexpr uint32_t kBuild24H2 = 26100;         // MinUpdateInterval, IncludeSecondaryWindows
+constexpr uint32_t kBuild2004 = 19041;         // WDA_EXCLUDEFROMCAPTURE
+// A full probe's wait for GraphicsCaptureAccess's borderless answer (capture::OsFlags): it comes at once for a desktop
+// app, and the encoders' budget runs from the probe's start, so a slow answer takes at most this much of it. A probe
+// that gets none reports IM_OS_WGC_BORDERLESS clear; the pick asks again (2 s) and keeps the answer for WGC's start and
+// later probes.
+constexpr uint32_t kProbeBorderlessWaitMs = 250;
 
 int64_t NowNs() noexcept { return engine::os::QpcNs(); }
+
+// The encoder budget against the worker's bound for a full im_probe (04 §5.3, §9.10): no open or check starts after
+// kEncoderBudgetMs, so the last one to start may still open for up to kSlowOpenUs and encode its test IDR (a few
+// frames, kMaxDelayFrames below); the rest (the close, the audio flags, which only post to 05's watcher) is quick.
+// kSlowOpenUs is not a cap: avcodec_open2 can't be interrupted, so an open that takes longer still runs to its end
+// and is only marked slow_open afterwards. The assert below therefore holds for opens of at most 1 s: then the worst
+// case, budget + one slow open + its IDR (about 2.75 s), fits in bound::kProbeFull and im_probe never times out for
+// the encoders' sake. 04 §9.10's 2 s is the typical probe on the owner's PC (E7, opens of tens of ms), not a bound
+// this budget enforces.
+constexpr std::chrono::milliseconds kAfterLastOpen{250}; // the test IDR, the close, the audio flags
+static_assert(std::chrono::milliseconds(kEncoderBudgetMs) + std::chrono::microseconds(kSlowOpenUs) + kAfterLastOpen <=
+                  engine::bound::kProbeFull,
+              "no encoder work starts after the budget; with opens of at most kSlowOpenUs, the worst case (budget + "
+              "one slow open + its IDR, about 2.75 s) must keep im_probe inside the worker's bound");
 
 // ---------------------------------------------------------------------------------------------------- 1. the OS
 
@@ -163,34 +184,34 @@ bool DuplicationWorks(std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept 
   return false;
 }
 
-// The flags the build alone decides (cheap: a quick probe re-reads them).
-uint32_t BuildFlags(uint32_t build) noexcept {
+// The flags a quick probe re-reads (cheap): the build decides IM_OS_SUPPORTED and IM_OS_EXCLUDE_FROM_CAPTURE, and
+// Windows itself the WGC flags (capture::OsFlags: IsSupported, the properties present, borderless access, 04 §7.1);
+// borderless_wait_ms 0 (a quick probe) uses the borderless answer kept from an earlier query.
+uint32_t BuildFlags(uint32_t build, uint32_t borderless_wait_ms) noexcept {
   uint32_t f = 0;
   if (build >= kMinSupportedBuild) {
     f |= IM_OS_SUPPORTED;
   }
-  if (build >= kBuildWgc) {
-    // GraphicsCaptureSession::IsSupported() and the picker: README WA50's C++/WinRT asks Windows itself; until then
-    // the build that introduced them decides.
-    f |= IM_OS_WGC | IM_OS_WGC_PICKER;
-  }
   if (build >= kBuild2004) {
-    f |= IM_OS_WGC_CURSOR_TOGGLE | IM_OS_EXCLUDE_FROM_CAPTURE;
+    f |= IM_OS_EXCLUDE_FROM_CAPTURE;
   }
-  if (build >= kBuild24H2) {
-    f |= IM_OS_WGC_MIN_INTERVAL | IM_OS_WGC_SECONDARY_WINDOWS;
-  }
-  // IM_OS_WGC_BORDERLESS needs RequestAccessAsync(Borderless) (C++/WinRT): README WA50.
-  return f;
+  return f | capture::OsFlags(borderless_wait_ms);
 }
 
 // The flags that need trials (a D3D11 device per adapter, MFStartup): a full probe's, kept by a quick one.
 constexpr uint32_t kTrialOsFlags = IM_OS_DESKTOP_DUPLICATION | IM_OS_MEDIA_FOUNDATION;
 
 uint32_t OsFlags(uint32_t build, std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept {
-  uint32_t f = BuildFlags(build);
+  uint32_t f = BuildFlags(build, kProbeBorderlessWaitMs);
   if (DuplicationWorks(adapters)) {
-    f |= IM_OS_DESKTOP_DUPLICATION;
+    // §7.4: DD needs a per-monitor DPI-aware process (the app's manifest); without it a DD start fails, so the flag
+    // is cleared (a packaging bug, not a user state).
+    if (capture::ProcessPerMonitorAware()) {
+      f |= IM_OS_DESKTOP_DUPLICATION;
+    } else {
+      log::Warn("encode", "probe: Desktop Duplication needs a per-monitor DPI-aware process",
+                {{"token", abi::token::kDpiUnaware}});
+    }
   }
   if (MediaFoundationWorks()) {
     f |= IM_OS_MEDIA_FOUNDATION;
@@ -622,7 +643,7 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
     }
 
     if (p.kind == IM_ENC_OPENH264) {
-      ProbeOpenH264(full, info);
+      ProbeOpenH264(full, deadline_ns, info); // the budget below, applied inside (README WA51)
       continue;
     }
     if (p.kind == IM_ENC_FAKE) {
@@ -682,8 +703,9 @@ void ProbeEncoders(bool full, im_caps &caps, int64_t start_ns) {
 }
 
 // IM_PROBE_QUICK after a full im_probe (04 §5.3: "cached until the next full probe; a quick probe re-reads OS flags
-// only", < 100 ms): the stored adapters, encoders and audio flags; the OS version, the build's flags and HDR read
-// again, the trial flags (duplication, Media Foundation) kept. False when no complete, current probe is stored.
+// only", < 100 ms): the stored adapters, encoders and audio flags; the OS version, BuildFlags (borderless from the
+// kept answer) and HDR read again, the trial flags (duplication, Media Foundation) kept. False when no complete,
+// current probe is stored.
 bool QuickFromStored(im_caps &caps, int64_t t0) {
   const std::optional<StoredCaps> stored = StoredProbe();
   if (!stored || !stored->complete) {
@@ -694,7 +716,7 @@ bool QuickFromStored(im_caps &caps, int64_t t0) {
   const OsVersion v = ReadOsVersion();
   caps.os_build = v.build;
   caps.os_ubr = v.ubr;
-  caps.os_flags = BuildFlags(v.build) | (stored->caps.os_flags & kTrialOsFlags) |
+  caps.os_flags = BuildFlags(v.build, 0) | (stored->caps.os_flags & kTrialOsFlags) |
                   (AdvancedColorOn() ? static_cast<uint32_t>(IM_OS_HDR_DISPLAY) : 0u);
   caps.probe_ms = static_cast<uint32_t>(std::clamp<int64_t>((NowNs() - t0) / 1'000'000, 0, UINT32_MAX));
   return true;
