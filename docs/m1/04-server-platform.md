@@ -294,14 +294,15 @@ Unknown keys:
   `ISSHONI_TEST_ENGINE_DLL`, `ISSHONI_COMPAT_SERVER_URL`, `ISSHONI_COMPAT_ADMIN_FILE`; the release notes'
   `ISSHONI_DESKTOP_MIN_VERSION`, `ISSHONI_FFMPEG_VERSION`; M2's dev, e2e, task and test names
   `ISSHONI_DESKTOP_DEV_URL`, `ISSHONI_FAKE_AUDIO`, `ISSHONI_E2E_CDP_PORT`, `ISSHONI_E2E_DATA_DIR`,
-  `ISSHONI_DESKTOP_EXE`, `ISSHONI_CDP_ENDPOINT`, `ISSHONI_NATIVE_PRESETS`, `ISSHONI_NATIVE_TEST`,
-  `ISSHONI_NATIVE_BUILD_PS1`, `ISSHONI_FFMPEG_BUILD_PS1`, `ISSHONI_CHECKLIST_OUT`, `ISSHONI_CHECKLIST_W19_PORT`,
-  `ISSHONI_CHECKLIST_W19_PIPE`, `ISSHONI_DESKTOP_TEST_CHILD`, `ISSHONI_DESKTOP_TEST_ID`,
+  `ISSHONI_DESKTOP_EXE`, `ISSHONI_DESKTOP_PROD_EXE`, `ISSHONI_CDP_ENDPOINT`, `ISSHONI_NATIVE_PRESETS`,
+  `ISSHONI_NATIVE_TEST`, `ISSHONI_NATIVE_BUILD_PS1`, `ISSHONI_FFMPEG_BUILD_PS1`, `ISSHONI_CHECKLIST_OUT`,
+  `ISSHONI_CHECKLIST_W19_PORT`, `ISSHONI_CHECKLIST_W19_PIPE`, `ISSHONI_DESKTOP_TEST_CHILD`, `ISSHONI_DESKTOP_TEST_ID`,
   `ISSHONI_DESKTOP_TEST_RUNNING`, `ISSHONI_DESKTOP_TEST_OUT`, `ISSHONI_WINOS_TEST_CHILD`, `ISSHONI_WINOS_TEST_ID`,
   `ISSHONI_WINOS_TEST_OUT`, `ISSHONI_APPLOG_CRASH_CHILD`, `ISSHONI_MEDIATEST_MUTANT`, `ISSHONI_ENGINETEST_TEST_CHILD`;
-  and the native encoder tests' FFmpeg folder `ISSHONI_TEST_FFMPEG_DIR`. Exact names, never prefixes; a repository
-  test (`TestRepoEnvNamesReserved`) fails on an `ISSHONI_*` name the repository reads that is neither a key, reserved
-  nor env-only. The env-only switches of §4.3 are read, not ignored.
+  the switch that makes the desktop autostart test fail instead of skip, `ISSHONI_REQUIRE_AUTOSTART_E2E`; and the native
+  encoder tests' FFmpeg folder `ISSHONI_TEST_FFMPEG_DIR`. Exact names, never prefixes; a repository test
+  (`TestRepoEnvNamesReserved`) fails on an `ISSHONI_*` name the repository reads that is neither a key, reserved nor
+  env-only. The env-only switches of §4.3 are read, not ignored.
 
 ### 4.3 Key reference
 

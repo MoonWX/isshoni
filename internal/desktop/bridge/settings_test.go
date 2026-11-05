@@ -152,6 +152,46 @@ func TestSettingsUpdate(t *testing.T) {
 	}
 }
 
+// TestSettingsChangedFromStore: a change made through the store itself, not Settings.Update (the app's tips, the
+// pill's position), sends settings.changed too (03 §6.3, WA84-R6); an Update sends it once; a write that changes
+// nothing and a closed bridge send none.
+func TestSettingsChangedFromStore(t *testing.T) {
+	e := newSettingsEnv(t, nil)
+	count := func() int {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return len(e.events)
+	}
+	if err := e.st.Update(func(st *settings.Settings) { st.Tips.DNDShown = true }); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	if len(e.events) != 1 || !e.events[0].Tips.DNDShown {
+		e.mu.Unlock()
+		t.Fatalf("settings.changed after a store change %+v", e.events)
+	}
+	e.mu.Unlock()
+	if _, err := e.s.Settings.Update(SettingsPatch{Pill: &PillPatch{Mode: ptr("always")}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("settings.changed after an Update: %d events, want 2", n)
+	}
+	if err := e.st.Update(func(st *settings.Settings) { st.Tips.DNDShown = true }); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("settings.changed after a write that changed nothing: %d events", n)
+	}
+	e.s.Close()
+	if err := e.st.Update(func(st *settings.Settings) { st.Tips.DNDShown = false }); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("settings.changed after Close: %d events", n)
+	}
+}
+
 // TestSettingsUpdateInvalid: each bad value is invalid_argument with its field, and nothing is saved, autostart
 // included (written to Windows and set back when the rest was refused).
 func TestSettingsUpdateInvalid(t *testing.T) {

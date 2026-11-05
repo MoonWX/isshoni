@@ -76,7 +76,8 @@ export function TestHotkey(combo: string): $CancellablePromise<$models.HotkeySta
 }
 
 /**
- * Update applies a patch and returns the new settings (03 §14.2); settings.changed carries them to the page too.
+ * Update applies a patch and returns the new settings (03 §14.2); settings.changed carries them to the page too
+ * (from the store's subscription when it has one, else from here).
  * invalid_argument with params.field for a value that isn't valid, and then nothing is saved. wizardDone can only be
  * set (false is invalid: the wizard's steps can't be unseen); serverPrefs only for a listed server; Pause and Stop
  * must differ. Autostart is written to Windows first (the Run value, 03 §16.1), so a value Windows refused (io_error)

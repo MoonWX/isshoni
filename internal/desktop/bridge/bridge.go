@@ -253,6 +253,14 @@ func New(d Deps) (*Services, error) {
 	}
 	s.closers = append(s.closers, s.Share.ctl.Subscribe(func(ev share.Event) { s.Share.forward(ev, emit) }))
 	s.closers = append(s.closers, s.Auth.forward(emit))
+	if sub, ok := d.Settings.(settingsSubscriber); ok {
+		s.Settings.watched = true
+		s.closers = append(s.closers, sub.Subscribe(func(_, _ settings.Settings) {
+			if v, err := s.Settings.Get(); err == nil {
+				emit(EventSettingsChanged, v)
+			}
+		}))
+	}
 	if updates != nil {
 		s.closers = append(s.closers, updates.SubscribeUpdates(func(st update.Status) {
 			emit(EventUpdateState, statusView(st))
