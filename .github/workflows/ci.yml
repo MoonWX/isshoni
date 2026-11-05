@@ -149,6 +149,9 @@ jobs:
               # The update signers block that lint:keys compares with deploy/keys/update_signers
               # (M2 06 §8.3).
               - 'internal/update/signers.go'
+              # The self-hosted runner labels that repocheck's workflow tests read (README WF15); the
+              # workflows themselves are in the deploy filter, which runs lint-deploy too.
+              - '.github/actionlint.yaml'
             # Doctor's checks and their codes, which docker-smoke's doctor step pins one by one
             # (deploy/docker/test/docker-smoke.sh, README F21): a change to them runs that job.
             doctor:
@@ -1055,6 +1058,13 @@ jobs:
 
       - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
         run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
+
+      # repocheck's tests, its workflow guards among them (M2 06 §10.4-§10.5, README WF15): no
+      # self-hosted job behind a pull request trigger, audiotest.yml's guard, labels and token
+      # rules. test-go runs them on Go changes; this step runs them for a pull request that
+      # changes only .github/workflows/** or .github/actionlint.yaml, which test-go doesn't see.
+      - name: repocheck tests (the workflow guards)
+        run: go -C tools test -count=1 ./repocheck
 
       # lint:ps and test:ps (M2 06 §10.1, §16) run PSScriptAnalyzer and Pester under the image's
       # pwsh. Both fetch their module at deploy/windows/tools.json's version from the PowerShell
