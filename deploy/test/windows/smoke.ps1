@@ -75,6 +75,9 @@ $script:DefaultDir = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\issh
 $script:DataRoot = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'isshoni'
 $script:SetupTimeoutSec = 300
 $script:Helpers = @()
+# -WorkDir as the functions read it (Get-WorkDir): through $script: rather than the caller's scope, which
+# PSScriptAnalyzer's PSReviewUnusedParameter doesn't follow into functions.
+$script:WorkRoot = $WorkDir
 
 function Write-Step {
     param([string]$Message)
@@ -160,7 +163,7 @@ function Test-Mutex {
 }
 
 function Get-WorkDir {
-    if ($WorkDir) { $dir = $WorkDir }
+    if ($script:WorkRoot) { $dir = $script:WorkRoot }
     elseif ($env:RUNNER_TEMP) { $dir = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'smoke' }
     else { $dir = Join-Path -Path $env:TEMP -ChildPath 'isshoni-smoke' }
     $null = New-Item -ItemType Directory -Force -Path $dir
@@ -332,7 +335,7 @@ function Get-Sha256 {
 # Test-InstalledTree: install-files.txt equals the stage's, every file it lists matches the stage's bytes, and the
 # folder holds nothing else of isshoni's but install-files.txt and uninstall.exe (and, with -AllowOld, .old files).
 function Test-InstalledTree {
-    param([string]$InstallDir, [switch]$AllowOld)
+    param([string]$InstallDir, [string]$Stage, [switch]$AllowOld)
     $list = Get-FileList -Dir $InstallDir
     $want = Get-FileList -Dir $Stage
     Confirm-That ((Compare-Object -ReferenceObject $want -DifferenceObject $list -CaseSensitive | Measure-Object).Count -eq 0) `
@@ -490,7 +493,9 @@ function Test-Uninstalled {
 
 # ---- the modes ----
 
+# The parameters come in explicitly (not through the script's scope), so each function says what it reads.
 function Invoke-CiMode {
+    param([string]$Setup, [string]$Version, [string]$OldSetup, [string]$NewerSetup, [string]$Stage)
     foreach ($p in @(@('-Setup', $Setup), @('-Version', $Version), @('-OldSetup', $OldSetup), @('-NewerSetup', $NewerSetup), @('-Stage', $Stage))) {
         if (-not $p[1]) { throw "smoke: -Mode ci needs $($p[0])" }
     }
@@ -524,7 +529,7 @@ function Invoke-CiMode {
     Confirm-That (-not ((Get-FileList -Dir $dir) -contains 'avcodec-00.dll')) 'install-files.txt still lists avcodec-00.dll'
 
     Write-Step '3. files, registry, protocol command, shortcuts, --version and --self-check'
-    Test-InstalledTree -InstallDir $dir -AllowOld
+    Test-InstalledTree -InstallDir $dir -Stage $Stage -AllowOld
     Test-InstalledRegistry -InstallDir $dir -Ver $Version
     Test-InstalledShortcut -InstallDir $dir -Desktop $true
     Test-AppMode -InstallDir $dir -Ver $Version
@@ -533,7 +538,7 @@ function Invoke-CiMode {
     $other = Join-Path -Path (Get-WorkDir) -ChildPath 'ignored dir'
     Invoke-Install -Path $script:SetupPath -Arguments @("/D=$other")
     Confirm-That (-not (Test-Path -LiteralPath $other)) '/D= was not ignored on a reinstall'
-    Test-InstalledTree -InstallDir $dir
+    Test-InstalledTree -InstallDir $dir -Stage $Stage
     Test-InstalledRegistry -InstallDir $dir -Ver $Version
 
     Write-Step '5. another setup and a link start while the installing mutex is held'
@@ -595,7 +600,7 @@ function Invoke-CiMode {
     Stop-Helper -Helper $helper
     Confirm-That ($code -eq 6) "/S /UPDATE with $($images[-1]) locked exited $code, not 6"
     Confirm-That ($elapsed -ge 9) "/S /UPDATE gave up on the locked file after $([int]$elapsed) s, not 10"
-    Test-InstalledTree -InstallDir $dir
+    Test-InstalledTree -InstallDir $dir -Stage $Stage
     Test-InstalledRegistry -InstallDir $dir -Ver $Version
     Test-AppMode -InstallDir $dir -Ver $Version
 
@@ -625,7 +630,7 @@ function Invoke-CiMode {
     Confirm-That ((Get-RegValue $script:AppKey 'Version') -ceq $newerVersion) 'a refused downgrade changed Version'
     Invoke-Install -Path $script:SetupPath -Arguments @('/ALLOWDOWNGRADE')
     Test-InstalledRegistry -InstallDir $dir -Ver $Version
-    Test-InstalledTree -InstallDir $dir
+    Test-InstalledTree -InstallDir $dir -Stage $Stage
 
     Write-Step '11. uninstall keeping the data: sign-ins and toast keys gone, the data root kept'
     Initialize-UninstallSeed -InstallDir $dir
@@ -659,7 +664,7 @@ function Invoke-CiMode {
 
 try {
     switch ($Mode) {
-        'ci' { Invoke-CiMode }
+        'ci' { Invoke-CiMode -Setup $Setup -Version $Version -OldSetup $OldSetup -NewerSetup $NewerSetup -Stage $Stage }
         'release' { throw 'smoke: -Mode release is not implemented yet (README WA81, verify-windows)' }
         'update' { throw 'smoke: -Mode update is not implemented yet (README WA88, the updater e2e)' }
     }
