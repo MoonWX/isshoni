@@ -962,10 +962,12 @@ of §14's `avsync` (05 §19.3) and of E14's pause check. It is asked for per ses
   define it (the header changes only through the integrator, README §5's shared files): the engine's constant is
   `native/windows/src/session/luma_sample.h`'s `luma::kStartFlag` and Go's is `internal/media/native/luma.go`'s
   `startTestLumaTap`, and `TestLumaConstantsMatchTheEngine` checks that the two agree and that no `IM_START_*` of the
-  header shares the bit. A **release build refuses the bit** with `IM_ERR_INVALID_ARG` ("exists in IM_TEST_HOOKS builds
-  only"), so a shipped DLL never emits `IM_PACKET_DEBUG`. A test-hooks build also refuses it, with
-  `IM_ERR_INVALID_ARG`, for an audio-only session and for a session whose streams leave no room for the tap's ring:
-  its ring is one more stream of the pump, and three layers, Opus and the PCM tap already use all five.
+  header shares the bit. It stays out of the header as built (README §3 item 98): moving it in is an integrator's
+  change that adds the mirror to `abi.go` and `abi_test.go` in the same commit. A **release build refuses the bit**
+  with `IM_ERR_INVALID_ARG` ("exists in IM_TEST_HOOKS builds only"), so a shipped DLL never emits `IM_PACKET_DEBUG`.
+  A test-hooks build also refuses it, with `IM_ERR_INVALID_ARG`, for an audio-only session and for a session whose
+  streams leave no room for the tap's ring: its ring is one more stream of the pump, and three layers, Opus and the
+  PCM tap already use all five.
 - **What it reads.** For every captured frame the session's video thread takes from its frame slots (§8.2), the mean
   BT.709 luma `Y' = 0.2126 R' + 0.7152 G' + 0.0722 B'` of the slot's 8-bit gamma-encoded BGRA values, full range, over
   a **fixed region**: the centered box of `min(256, side)` pixels on each side of the frame's content. A square box
@@ -2289,13 +2291,16 @@ on (plan "A/V sync").
   (`IsWindow`) → another process's window (`GetWindowThreadProcessId`) → **not top-level** (`GetAncestor(hwnd, GA_ROOT)
   != hwnd`), each but the build `IM_ERR_INVALID_ARG`. So a child window of this process is refused (and WebView2's,
   which another process owns, already fails the process check): the caller passes the top-level window, whose affinity
-  covers everything composed into it. Any thread of the process may call. A `SetWindowDisplayAffinity` that fails is
-  `IM_ERR_INTERNAL` with a WARN carrying the Win32 code; a `GetWindowDisplayAffinity` that fails is `IM_ERR_INTERNAL`
-  (no WARN); an affinity that doesn't read back as asked is `IM_ERR_INTERNAL` with a WARN carrying the wanted and read
-  values; the INFO line records `protected`/`unprotected` and the build, never the window's title, class or process. The
-  Go binding's `ProtectWindow(hwnd)` refuses a zero handle as `invalid` without a DLL call and has no `IM_PROTECT_OFF`
-  method (§12.2 lists `ProtectWindow` only); `protect-check` undoes the affinity with its own
-  `SetWindowDisplayAffinity(WDA_NONE)`, and the C++ tests cover the flag.
+  covers everything composed into it. Any thread of the process may call. `protect.cpp` logs nothing for the checks
+  before the affinity call (their `im_last_error` says why). Only a `SetWindowDisplayAffinity` that fails logs a WARN
+  with a Win32 code (`window`, "display affinity refused", `{off, win32}`) and is `IM_ERR_INTERNAL`; a
+  `GetWindowDisplayAffinity` that fails is `IM_ERR_INTERNAL` with the Win32 code in `im_last_error` only, and logs
+  nothing; an affinity that doesn't read back as asked logs a WARN without a Win32 code (`window`, "display affinity not
+  kept", `{off, want, got}`) and is `IM_ERR_INTERNAL`. Success logs INFO `protected` or `unprotected` with the build (0
+  when it couldn't be read), never the window's title, class or process. The Go binding's `ProtectWindow(hwnd)` refuses
+  a zero handle as `invalid` without a DLL call and has no `IM_PROTECT_OFF` method (§12.2 lists `ProtectWindow` only);
+  `protect-check` undoes the affinity with its own `SetWindowDisplayAffinity(WDA_NONE)`, and the C++ tests cover the
+  flag.
 - What the engine guarantees for any excluded window, whoever set the affinity: it vanishes from WGC monitor captures
   and from DD alike (the content behind it shows), so friends never see the isshoni window, its viewer or the pill.
 - The affinity applies to the top-level window and everything composed into it, which should include WebView2's
@@ -2995,11 +3000,11 @@ to the slice's PR. No machine names or paths go into the reports (they are attac
   is measured from the first sample at or after the 10-minute warm-up to the last sample (the peak is reported, not
   judged); a metric that is 0 at the baseline must still be 0 at the end. `RING_OVERFLOW` is counted from the
   binding's warn message, whose prefix a test ties to `internal/media/native`'s text.
-- `avsync`'s luma tap is declared (`lumaTap`, `newLumaTap`) and, as group 14 merged, answers a "not implemented"
-  dependency error (exit 2) before any helper starts: no session emits `IM_PACKET_DEBUG` and the binding drops it.
-  WF16 (group 15) builds the producer, its payload (§5) and the binding's option. Until then `avsync -no-luma` runs the
-  flash window, the click process and the session and reports `P_k`, `A_k`, `U_k` and `U − A`, never a pass, so the
-  Windows half can be checked first.
+- `avsync`'s luma tap was declared (`lumaTap`, `newLumaTap`) and, as group 14 merged, answered a "not implemented"
+  dependency error (exit 2) before any helper started: no session emitted `IM_PACKET_DEBUG` and the binding dropped
+  it. WF16 (group 15) built the producer, its payload (§5.8) and the binding's option, and `avsync` uses them (the
+  "As built (WF16)" paragraph below; README §3 item 98). `avsync -no-luma` still runs the flash window, the click
+  process and the session and reports `P_k`, `A_k`, `U_k` and `U − A`, never a pass: the Windows half's diagnostic.
 - `bench` reports the engine stats' encode p95, not p99, so `hwcheck.ps1` checks encode p95 ≤ 16 ms (necessary for
   §18.4's p99 ≤ 16 ms, not proof of it; its step notes say so) and capture-to-packet p95 ≤ 25 ms when layer `f`'s
   encoder is hardware.
@@ -3040,8 +3045,13 @@ pairs the readings' rising edges through 50 % with the PCM tap's click onsets as
 monitor: avsync opens the window centered on the captured monitor (the flash helper's `-monitor` takes the id after
 `mon:`, a device name, and centers on that monitor's rect; the primary one for `-source pick`), so the box lies inside
 it on any monitor. A rising edge whose reading follows a lost one (`missed` > 0 or `DISCONTINUITY`) may be a frame
-late: avsync discards it (its flash goes unpaired) and counts it in `avsync.json`'s `edgesDiscarded`. A DLL without test hooks fails the start with `dependency`, exit 2. `-no-luma` stays as the diagnostic of the
-Windows half. The owner's first `avsync -dll ci` run on Windows 11 (M-AVSYNC's first record, §18.4) is still manual.
+late: avsync discards it (its flash goes unpaired) and counts it in `avsync.json`'s `edgesDiscarded`. A DLL without
+test hooks fails the start with `dependency`, exit 2. `-no-luma` stays as the diagnostic of the Windows half. The
+owner's first `avsync -dll ci` run on Windows 11 (M-AVSYNC's first record, §18.4) is still manual. WF16's review
+(README §3 item 98) settled its R1 (the flash window on the captured monitor, through `-monitor`), R2
+(`edgesDiscarded`) and R3 (§12.1's `luma.go` row and §12.2's `WithLumaTap`, `LumaTapOf` and `LumaSample`) before the
+merge; the C++ (`luma_tap.cpp`, `session_object.cpp` and the two tests) had not been compiled with MSVC `/W4 /WX` as
+group 15 merged, so the group PR's first `windows-native` run is its first check there.
 
 ## 15. Glass-to-glass latency (M2 exit criterion)
 
