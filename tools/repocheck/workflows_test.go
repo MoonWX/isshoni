@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -20,11 +21,13 @@ import (
 // they run in `task test:go` (tools/), and in CI's lint-deploy job on every pull request that changes
 // .github/workflows/** or .github/actionlint.yaml (README WF15), and fail a change that breaks them.
 //
-// A job counts as self-hosted (README WF15) when its runs-on names the literal self-hosted label, names a runner
-// group, uses a label registered for a self-hosted runner, or holds an expression that could resolve to any of
-// these. The registered labels are actionlint's self-hosted-runner labels in .github/actionlint.yaml: actionlint
-// (lint:actions) rejects a runs-on label that is neither GitHub-hosted nor listed there, so every custom label a
-// workflow can use is in that one list, and repocheck reads the same list instead of keeping a copy.
+// A job counts as self-hosted (README WF15) when its runs-on names one of the default labels every self-hosted
+// runner carries (self-hosted, its OS and its architecture: no GitHub-hosted runner answers to a bare windows or
+// x64), names a runner group, uses a label registered for a self-hosted runner, or holds an expression that could
+// resolve to any of these. The registered labels are actionlint's self-hosted-runner labels in
+// .github/actionlint.yaml: actionlint (lint:actions) rejects a runs-on label that is neither GitHub-hosted, a default
+// self-hosted label nor listed there, so every custom label a workflow can use is in that one list, and repocheck
+// reads the same list instead of keeping a copy.
 
 // repoRoot is the repository root, two levels above this package (tools/repocheck).
 const repoRoot = "../.."
@@ -126,10 +129,17 @@ func (r runnerLabels) registered(label string) bool {
 	return false
 }
 
-// selfHostedLabel reports whether one plain runs-on label (not an expression) picks a self-hosted runner: the
-// literal self-hosted, or a registered label.
+// defaultSelfHostedLabels are the labels GitHub gives every self-hosted runner: self-hosted, the OS and the
+// architecture. GitHub-hosted runners answer only to image labels (ubuntu-24.04, windows-2025, macos-15, ...), so a
+// job naming one of these can only be queued for a self-hosted runner, the owner's PC among them ("Windows x64",
+// 06 §10.5). actionlint accepts them as built-ins, so lint:actions doesn't flag them.
+var defaultSelfHostedLabels = []string{"self-hosted", "linux", "windows", "macos", "x64", "arm", "arm64"}
+
+// selfHostedLabel reports whether one plain runs-on label (not an expression) picks a self-hosted runner: a default
+// self-hosted label (or any label containing self-hosted), or a registered label.
 func (r runnerLabels) selfHostedLabel(label string) bool {
-	return strings.Contains(strings.ToLower(label), "self-hosted") || r.registered(label)
+	l := strings.ToLower(strings.TrimSpace(label))
+	return strings.Contains(l, "self-hosted") || slices.Contains(defaultSelfHostedLabels, l) || r.registered(label)
 }
 
 // readRunnerLabels reads the self-hosted-runner labels of an actionlint configuration.
@@ -352,12 +362,25 @@ func tokenUse(s step) string {
 	return tokenIn(texts...)
 }
 
-// tokenIn finds a reference to a token or a secret in texts.
+// tokenPatterns find a token or a secret. Expression contexts and property names are case-insensitive, so the text
+// is matched case-insensitively; secrets is a whole word, so toJSON(secrets) and secrets['K'] count as well as
+// secrets.K, and github.token may be written github['token'].
+var tokenPatterns = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"secrets", regexp.MustCompile(`(?i)\bsecrets\b`)},
+	{"github.token", regexp.MustCompile(`(?i)\bgithub\s*(\.\s*token\b|\[\s*'token'\s*\])`)},
+	{"GITHUB_TOKEN", regexp.MustCompile(`(?i)github_token`)},
+	{"GH_TOKEN", regexp.MustCompile(`(?i)gh_token`)},
+}
+
+// tokenIn finds a reference to a token or a secret in texts and names it.
 func tokenIn(texts ...string) string {
 	for _, t := range texts {
-		for _, bad := range []string{"github.token", "secrets.", "GITHUB_TOKEN", "GH_TOKEN"} {
-			if strings.Contains(t, bad) {
-				return bad
+		for _, p := range tokenPatterns {
+			if p.re.MatchString(t) {
+				return p.name
 			}
 		}
 	}
@@ -712,13 +735,22 @@ func TestCheckAudiotest(t *testing.T) {
 		{"no environment", "    environment: audiotest\n", "", "environment must be audiotest"},
 		{"checkout in run", "      - run: .\\isshoni", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n      - run: .\\isshoni", "checks out"},
 		{"token in run", "-gate -out .", "-gate -out . ${{ github.token }}", "uses github.token"},
-		{"secret in run", "-gate -out .", "-gate -out . ${{ secrets.X }}", "uses secrets."},
+		{"secret in run", "-gate -out .", "-gate -out . ${{ secrets.X }}", "uses secrets"},
 		{"token in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      T: ${{ github.token }}\n", "run's env uses github.token"},
-		{"secret in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      K: ${{ secrets.KEY }}\n", "run's env uses secrets."},
+		{"secret in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      K: ${{ secrets.KEY }}\n", "run's env uses secrets"},
 		{"GH_TOKEN named in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      GH_TOKEN: x\n", "run's env uses GH_TOKEN"},
-		{"run's env from an expression", "    env:\n      SUITE: ${{ inputs.suite }}\n", "    env: ${{ fromJSON(secrets.ENV) }}\n", "run's env uses secrets."},
+		{"run's env from an expression", "    env:\n      SUITE: ${{ inputs.suite }}\n", "    env: ${{ fromJSON(secrets.ENV) }}\n", "run's env uses secrets"},
 		{"token in the workflow's env", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n  T: ${{ github.token }}\n", "the workflow's env uses github.token"},
-		{"secret in the workflow's env", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n  K: ${{ secrets.KEY }}\n", "the workflow's env uses secrets."},
+		{"all secrets in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      A: ${{ toJSON(secrets) }}\n", "run's env uses secrets"},
+		{"indexed secret in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      K: ${{ secrets['K'] }}\n", "run's env uses secrets"},
+		{"indexed token in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      T: ${{ github['token'] }}\n", "run's env uses github.token"},
+		{"upper-case secret in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      K: ${{ SECRETS.K }}\n", "run's env uses secrets"},
+		{"mixed-case token in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      T: ${{ github.TOKEN }}\n", "run's env uses github.token"},
+		{"lower-case github_token named in run's env", "      SUITE: ${{ inputs.suite }}\n", "      SUITE: ${{ inputs.suite }}\n      github_token: x\n", "run's env uses GITHUB_TOKEN"},
+		{"secret in the workflow's env", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n  K: ${{ secrets.KEY }}\n", "the workflow's env uses secrets"},
+		{"all secrets in the workflow's env", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n  A: ${{ toJSON(secrets) }}\n", "the workflow's env uses secrets"},
+		{"indexed secret in the workflow's env", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n  K: ${{ secrets['K'] }}\n", "the workflow's env uses secrets"},
+		{"indexed token in the workflow's env", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n", "  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}\n  T: ${{ github['token'] }}\n", "the workflow's env uses github.token"},
 		{"run permissions", "    permissions: {}\n    env:", "    permissions: {contents: read}\n    env:", "permissions must be {}"},
 		{"actions read in build", "    runs-on: windows-2025\n    permissions: {contents: read}", "    runs-on: windows-2025\n    permissions: {contents: read, actions: read}", "only job with actions: read"},
 		{"fetch without actions read", "permissions: {actions: read}", "permissions: {contents: read}", "fetch must have actions: read"},
@@ -779,6 +811,9 @@ func TestCheckNoPRToSelfHosted(t *testing.T) {
 		{"self-hosted, list", "on: [workflow_dispatch, pull_request_target]\njobs:\n  a: {runs-on: self-hosted}\n", false},
 		{"self-hosted in a group's labels", "on: {workflow_run: {}}\njobs:\n  a: {runs-on: {group: g, labels: [self-hosted]}}\n", false},
 		{"registered labels without self-hosted", "on: pull_request\njobs:\n  a: {runs-on: [windows, x64, isshoni-audio]}\n", false},
+		{"default self-hosted labels only", "on: pull_request\njobs:\n  a: {runs-on: [windows, x64]}\n", false},
+		{"default self-hosted labels in another case", "on: pull_request\njobs:\n  a: {runs-on: [Windows, X64]}\n", false},
+		{"bare OS label", "on: pull_request\njobs:\n  a: {runs-on: linux}\n", false},
 		{"one registered label", "on: pull_request\njobs:\n  a: {runs-on: win11}\n", false},
 		{"registered label in another case", "on: pull_request\njobs:\n  a: {runs-on: [Win10]}\n", false},
 		{"registered label in a mapping's labels", "on: pull_request\njobs:\n  a: {runs-on: {labels: [isshoni-audio]}}\n", false},
@@ -788,6 +823,8 @@ func TestCheckNoPRToSelfHosted(t *testing.T) {
 		{"hosted matrix", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.os }}\", strategy: {matrix: {os: [ubuntu-24.04, macos-15]}}}\n", true},
 		{"self-hosted matrix", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.os }}\", strategy: {matrix: {os: [ubuntu-24.04, self-hosted]}}}\n", false},
 		{"registered label matrix", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.os }}\", strategy: {matrix: {os: [ubuntu-24.04, win10]}}}\n", false},
+		{"default self-hosted label matrix", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.os }}\", strategy: {matrix: {os: [ubuntu-24.04, windows]}}}\n", false},
+		{"hosted image matrix", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.os }}\", strategy: {matrix: {os: [windows-2025, ubuntu-24.04-arm, macos-15]}}}\n", true},
 		{"self-hosted matrix include", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.r }}\", strategy: {matrix: {include: [{r: ubuntu-24.04}, {r: [self-hosted, x64]}]}}}\n", false},
 		{"registered label matrix include", "on: {pull_request: {}}\njobs:\n  a: {runs-on: [\"${{ matrix.r }}\"], strategy: {matrix: {include: [{r: ubuntu-24.04}, {r: isshoni-audio}]}}}\n", false},
 		{"runner group matrix", "on: {pull_request: {}}\njobs:\n  a: {runs-on: \"${{ matrix.r }}\", strategy: {matrix: {include: [{r: {group: g}}]}}}\n", false},
