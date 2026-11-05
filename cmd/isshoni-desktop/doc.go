@@ -43,7 +43,8 @@
 //	platform_darwin.go   macOS dev-build facts (WKWebView's Guard, the dev data folder)
 //	flavor_*.go          what the build tags production, dev and e2e change (03 §5.3, §5.4); flavor_e2e.go also reads
 //	                     ISSHONI_E2E_CDP_PORT (WebView2's debugging port) and ISSHONI_E2E_DATA_DIR (the folder in
-//	                     place of %LOCALAPPDATA%), which web/e2e/cdp sets (03 §22.4 B)
+//	                     place of %LOCALAPPDATA%), which web/e2e/cdp sets, and gives the credential store a random
+//	                     isshoni-test:<hex>: prefix whose entries the start deletes at exit (03 §22.4 B)
 //	main_other.go        the stub of every other OS
 //	build/tray/          the tray icons (tray-idle, -live, -paused, -warn; .ico of 16 to 32 px), written by icons.go
 //	                     (a //go:build ignore program)

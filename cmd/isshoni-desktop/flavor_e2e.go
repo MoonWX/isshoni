@@ -3,6 +3,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +13,7 @@ import (
 )
 
 // The e2e build's own variables (03 §22.4 B, README WA72), which web/e2e/cdp's fixture sets. Only this file reads
-// them, and only -tags e2e compiles it.
+// them, and only -tags e2e compiles it. The file also gives the build its own credential prefix (e2eCredPrefix).
 const (
 	// e2eCDPPortEnv is the WebView2 remote debugging port. It can't come through
 	// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: the pinned Wails overwrites that variable in every build (03 §5.4).
@@ -24,6 +26,15 @@ const (
 func init() {
 	flavor.e2e = true
 	flavor.browserArgs, flavor.localAppData, flavor.err = e2eSettings(os.Getenv)
+	flavor.credPrefix = e2eCredPrefix()
+}
+
+// e2eCredPrefix is a fresh "isshoni-test:<16 hex>:" credential prefix (03 §22.4 B): every run of the e2e build keeps
+// its credentials apart from the user's isshoni:v1: entries and from other runs, and deletes them at exit.
+func e2eCredPrefix() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:]) // crypto/rand.Read never fails (Go 1.24+)
+	return "isshoni-test:" + hex.EncodeToString(b[:]) + ":"
 }
 
 // e2eSettings reads the e2e build's variables through getenv: the extra WebView2 arguments (the debugging port) and

@@ -179,11 +179,12 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 
 	// 02's servers, then settings.json (which drops the preferences of servers that aren't listed).
 	var theApp atomic.Pointer[app.App]
-	creds, err := credstore.Open(credstore.Options{Dir: root, Logger: slog.Default()})
+	creds, err := credstore.Open(appCredentialOptions(root))
 	if err != nil {
 		log.Error("desktop: no credential store", "err", err)
 		return exitFailed
 	}
+	defer dropTestCredentials(creds, log)
 	srv, err := deviceauth.OpenServers(deviceauth.ServersOptions{
 		Dir:                   root,
 		Store:                 creds,
