@@ -1088,7 +1088,7 @@ func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, er
 	return e.start(ctx, "start", cfg, false, nil)
 }
 
-// StartWith is Start with native-only options (WithGOP), for enginetest (the app never calls it): the same mapping
+// StartWith is Start with native-only options (WithGOP, WithLumaTap), for enginetest (the app never calls it): the same mapping
 // and the same one-session rule.
 func (e *Engine) StartWith(ctx context.Context, cfg media.Config, opts ...StartOption) (media.Session, error) {
 	return e.start(ctx, "start", cfg, false, opts)
@@ -1111,7 +1111,8 @@ type StartOption func(*startOptions)
 
 // startOptions is what the StartOption values of one start set.
 type startOptions struct {
-	gop map[string]time.Duration // by rid
+	gop  map[string]time.Duration // by rid
+	luma func(LumaSample)         // WithLumaTap (luma.go): IM_START_TEST_LUMA_TAP
 }
 
 // WithGOP sets the GOP of the layer whose RID is rid (im_layer_config.gop_ms, 04 §9.4): from 1 s to 10 s in whole
@@ -1151,9 +1152,15 @@ func collectOptions(opts []StartOption) startOptions {
 
 func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra bool,
 	opts []StartOption) (media.Session, error) {
-	args, err := buildStart(op, cfg, collectOptions(opts))
+	o := collectOptions(opts)
+	args, err := buildStart(op, cfg, o)
 	if err != nil {
 		return nil, err
+	}
+	if o.luma != nil && !e.testHooks() {
+		// 04 §5.8: only an IM_TEST_HOOKS DLL knows the flag (a release build refuses it as invalid).
+		return nil, codeError(media.CodeDependency, op, "",
+			"the luma tap needs an IM_TEST_HOOKS DLL (the win-x64-ci build), and this one has no test hooks")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1184,6 +1191,7 @@ func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra b
 		return nil, e.failed(statusError(op, procStart.String(), st, lastErr))
 	}
 	s := newSession(e, h, info, cfg, args.sc)
+	s.luma = o.luma
 	e.smu.Lock()
 	if e.closed.Load() {
 		// Close began while im_start ran: it stopped the sessions it knew of, so this one stops itself, before life
@@ -1200,6 +1208,13 @@ func (e *Engine) start(ctx context.Context, op string, cfg media.Config, extra b
 	e.smu.Unlock()
 	e.log.Info("engine session started", "layers", len(s.rids), "audio", s.hasAudio, "extra", extra)
 	return s, nil
+}
+
+// testHooks is the DLL's build info testHooks (it doesn't change after Open).
+func (e *Engine) testHooks() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.build.TestHooks
 }
 
 // liveSessions is every session that hasn't been stopped yet.
@@ -1254,7 +1269,7 @@ func (a *startArgs) str(op, s string) (*byte, error) {
 const maxSourceID = 64
 
 // buildStart is media.Config → im_start_config (04 §12.2's table), with the native-only options of StartWith and
-// StartExtra (WithGOP → layers[i].gop_ms). Anything the engine would refuse that Go can tell is CodeInvalid without a
+// StartExtra (WithGOP → layers[i].gop_ms, WithLumaTap → IM_START_TEST_LUMA_TAP). Anything the engine would refuse that Go can tell is CodeInvalid without a
 // DLL call.
 func buildStart(op string, cfg media.Config, o startOptions) (*startArgs, error) {
 	a := &startArgs{sc: &imStartConfig{structSize: uint32(unsafe.Sizeof(imStartConfig{}))}}
@@ -1284,6 +1299,9 @@ func buildStart(op string, cfg media.Config, o startOptions) (*startArgs, error)
 		sc.flags |= imStartKeepBorder
 	}
 	// IM_START_HIDE_CURSOR is never set: shares show the pointer.
+	if o.luma != nil {
+		sc.flags |= startTestLumaTap
+	}
 	kind, ok := encoderKind(cfg.Encoder)
 	if !ok {
 		return nil, codeError(media.CodeInvalid, op, "", "Config.Encoder %q is not an encoder token", cfg.Encoder)
@@ -1461,7 +1479,8 @@ type session struct {
 	lastLayer    []media.Event  // Next's: each layer's last EventLayer
 	dropWarnAt   time.Time      // Next's: the last warning about a dropped packet
 
-	tapPCM bool // AudioConfig.TapPCM: IM_PACKET_PCM chunks come out of Next as media.KindPCM (05 §13.2)
+	tapPCM bool             // AudioConfig.TapPCM: IM_PACKET_PCM chunks come out of Next as media.KindPCM (05 §13.2)
+	luma   func(LumaSample) // WithLumaTap: Next's, for IM_PACKET_DEBUG readings (luma.go)
 
 	smu   sync.Mutex
 	freed bool // im_stop ran: the handle never reaches the DLL again
@@ -1670,8 +1689,9 @@ func (s *session) handle(pk *pulled) (p media.Packet, deliver bool, err error) {
 	case imPacketEvent:
 		return s.event(pk)
 	case imPacketDebug:
-		// The luma tap of IM_TEST_HOOKS builds (README WA52 adds its hook): nobody listens yet.
-		return media.Packet{}, false, nil
+		// The luma tap of IM_TEST_HOOKS builds (04 §5.8): to WithLumaTap's function, never out of Next.
+		deliver, err := s.debug(pk)
+		return media.Packet{}, deliver, err
 	}
 	s.dropped("an unknown packet kind", pk, -1)
 	return media.Packet{}, false, nil

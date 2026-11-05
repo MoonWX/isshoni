@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -10,8 +11,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/media"
@@ -34,14 +37,17 @@ func init() {
 //  2. One session captures for -seconds (25) with real capture and real audio: -source pick (pick the flash window;
 //     WGC) on Windows 11, -source mon:<id> (DD) on Windows 10; layer f at 1080p60; audio exclude-apps with TapPCM.
 //  3. Video: V_k = the capture time of the first frame after each flash whose mean luma in the luma tap exceeds
-//     50 % (a rising edge through 50 %). Audio: U_k = each click's PCM-tap onset, the first 1 ms block (48 frames
+//     50 % (a rising edge through 50 %). The tap's mean is over the centered 256-pixel box of each frame (04 §5.8),
+//     which the flash window covers both when it is the picked source and when it is centered on the captured
+//     monitor. Audio: U_k = each click's PCM-tap onset, the first 1 ms block (48 frames
 //     of the chunk) with |x| > 0.05 in either channel, at chunk time + offset / 48 kHz.
 //  4. Each flash is paired with the click nearest to it (both run on 1 s grids that need not coincide, because each
 //     pair's true offset A_k − P_k is known). Pass: over ≥ 15 pairs, |median((U_k − V_k) − (A_k − P_k))| ≤ 20 ms.
 //     avsync.json lists every pair.
 //
-// The luma tap is an IM_TEST_HOOKS feature: -dll points at the win-x64-ci DLL (06 §5.1's isshoni-native-tools carries
-// it in ci\). Capture times are on the session's clock (Packet.CaptureNS = capture_ts_ns − epoch_ns); P_k and A_k are
+// The luma tap is an IM_TEST_HOOKS feature (README WF16: native.WithLumaTap, 04 §5.8): -dll points at the win-x64-ci
+// DLL (06 §5.1's isshoni-native-tools carries it in ci\); a DLL without test hooks fails the start with
+// media.CodeDependency, exit 2. Capture times are on the session's clock (Packet.CaptureNS = capture_ts_ns − epoch_ns); P_k and A_k are
 // QPC nanoseconds (04 §12.3's formula, the engine clock). The tool converts V_k and U_k to the engine clock with the
 // session's epoch (engine clock − Session.Now, read back to back) only to associate each event with its partner; the
 // offset itself, (U_k − A_k) − (V_k − P_k), doesn't depend on the epoch.
@@ -71,17 +77,9 @@ const (
 	avsyncFlashName = "isshoni-enginetest avsync flash"
 )
 
-// An open point for whoever wires the tap: with -source mon:<id> the picture is the whole monitor, of which the
-// 1280×720 flash window covers 44 % at 1080p, so a whole-picture mean crosses 50 % only over a bright desktop; the
-// tap's mean must then be over the flash window's rectangle (centered on the primary monitor), or the window must
-// cover the monitor.
-//
-// errLumaTap is the luma tap's state in this build: the win-x64-ci DLL's luma tap (IM_PACKET_DEBUG, 04 §12.3) has no
-// producer in the session yet and internal/media/native drops IM_PACKET_DEBUG packets ("nobody listens yet"), so
-// avsync can't read V_k. The tap's Go side is lumaTap below; newLumaTap returns it once the binding passes the
-// packets on (a binding change outside README WA76's paths).
-var errLumaTap = &media.Error{Code: media.CodeDependency, Op: "avsync",
-	Detail: "not implemented: the luma tap (IM_PACKET_DEBUG of an IM_TEST_HOOKS DLL) is not delivered by internal/media/native yet"}
+// With -source mon:<id> the picture is the whole monitor, of which the 1280×720 flash window covers 44 % at 1080p;
+// the tap's region, the centered 256-pixel box (04 §5.8), lies inside the window centered on the primary monitor, so
+// the mean is the window's alone (WF16 resolved WA76's open point this way).
 
 // lumaSample is one encoded picture as the luma tap shows it: its capture time (session clock) and its mean luma,
 // 0 (black) to 1 (white).
@@ -97,10 +95,36 @@ type lumaTap interface {
 	Samples() []lumaSample
 }
 
-// newLumaTap returns a session's luma tap (errLumaTap until the binding delivers it). -no-luma runs without one: a
-// diagnostic of the Windows half (the flash window's frame statistics, the click process, the PCM tap) that the owner
-// can run before the tap exists; it never reports a pass.
-var newLumaTap = func() (lumaTap, error) { return nil, errLumaTap }
+// newLumaTap returns a session's luma tap: native.WithLumaTap's readings (04 §5.8). -no-luma runs without one: a
+// diagnostic of the Windows half (the flash window's frame statistics, the click process, the PCM tap) that runs with
+// any DLL; it never reports a pass.
+var newLumaTap = func() (lumaTap, error) { return &nativeLumaTap{}, nil }
+
+// nativeLumaTap collects the binding's luma readings (native.WithLumaTap): the session's Next hands them over on the
+// run's goroutine, Samples reads them after the session stopped.
+type nativeLumaTap struct {
+	mu      sync.Mutex
+	samples []lumaSample
+}
+
+func (t *nativeLumaTap) Options() []native.StartOption {
+	return []native.StartOption{native.WithLumaTap(t.add)}
+}
+
+func (t *nativeLumaTap) add(s native.LumaSample) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.samples = append(t.samples, lumaSample{CaptureNS: s.CaptureNS, Mean: s.Mean})
+}
+
+// Samples are the readings in capture order (as the engine delivers them; sorted again, stably, for lumaEdges).
+func (t *nativeLumaTap) Samples() []lumaSample {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := slices.Clone(t.samples)
+	slices.SortStableFunc(out, func(a, b lumaSample) int { return cmp.Compare(a.CaptureNS, b.CaptureNS) })
+	return out
+}
 
 // avsyncOptions are avsync's flags. role, result, stop, ready and clicks are the helper processes'.
 type avsyncOptions struct {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -292,12 +291,13 @@ type avsyncFakeRun struct {
 	videoDelay int64
 	audioDelay int64
 
-	mu      sync.Mutex
-	cfg     media.Config
-	picked  bool
-	stopped bool
-	clickN  int
-	flashOK bool
+	mu       sync.Mutex
+	cfg      media.Config
+	startErr error // StartWith's answer, when set
+	picked   bool
+	stopped  bool
+	clickN   int
+	flashOK  bool
 }
 
 func (f *avsyncFakeRun) now() int64 { return int64(time.Since(f.start)) } // the session clock
@@ -309,11 +309,21 @@ func (f *avsyncFakeRun) Pick(context.Context, media.PickRequest) (media.Source, 
 	return media.Source{ID: "pick:1", Kind: media.SourceWindow}, nil
 }
 
-func (f *avsyncFakeRun) StartWith(_ context.Context, cfg media.Config, _ ...native.StartOption) (media.Session, error) {
+func (f *avsyncFakeRun) StartWith(_ context.Context, cfg media.Config, opts ...native.StartOption) (media.Session,
+	error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cfg = cfg
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
 	s := &avsyncSession{run: f, stopped: make(chan struct{})}
+	// The luma tap as the binding delivers it (native.WithLumaTap): each reading to the option's function from Next,
+	// before the first packet captured after it.
+	if fn := native.LumaTapOf(opts...); fn != nil {
+		s.luma = fn
+		s.readings = fakeLumaTap{f}.Samples()
+	}
 	// The PCM tap: 10 ms chunks over the clicks' span, each click 5 ms long from A + audioDelay.
 	if len(f.clicks) > 0 {
 		first := f.clicks[0] - f.epoch - 100*ms
@@ -342,13 +352,22 @@ func (f *avsyncFakeRun) Clock() (native.ClockSample, error) {
 
 type avsyncSession struct {
 	media.Session
-	run     *avsyncFakeRun
-	packets []media.Packet
-	stopped chan struct{}
-	once    sync.Once
+	run      *avsyncFakeRun
+	packets  []media.Packet
+	luma     func(native.LumaSample) // the luma tap's function (StartWith's WithLumaTap), nil without
+	readings []lumaSample            // what the tap still has to hand over, in capture order
+	stopped  chan struct{}
+	once     sync.Once
 }
 
 func (s *avsyncSession) Next(ctx context.Context) (media.Packet, error) {
+	// The readings captured before the next packet first (the engine's pump orders by capture time), all once the
+	// packets are out.
+	for len(s.readings) > 0 && (len(s.packets) == 0 || s.readings[0].CaptureNS <= s.packets[0].CaptureNS) {
+		r := s.readings[0]
+		s.readings = s.readings[1:]
+		s.luma(native.LumaSample{CaptureNS: r.CaptureNS, Mean: r.Mean})
+	}
 	if len(s.packets) > 0 {
 		p := s.packets[0]
 		s.packets = s.packets[1:]
@@ -480,6 +499,61 @@ func TestRunAVSyncWithFakes(t *testing.T) {
 	}
 }
 
+// TestRunAVSyncWithTheNativeTap: the run with newLumaTap's tap (native.WithLumaTap, README WF16) on a fake engine that
+// delivers the readings from Next as the binding does: the tap's start option reaches StartWith, its readings pair with
+// the PCM tap's clicks, and the run passes; a DLL without test hooks fails the start as an environment problem.
+func TestRunAVSyncWithTheNativeTap(t *testing.T) {
+	tap, err := newLumaTap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native.LumaTapOf(tap.Options()...) == nil {
+		t.Fatal("the tap's options don't ask for the luma tap")
+	}
+	run := newAVSyncFakeRun(12*ms, 30*ms)
+	o := avsyncOptions{source: "mon:1", seconds: 0.2, out: t.TempDir()}
+	var stdout, stderr bytes.Buffer
+	code := runAVSync(context.Background(), avsyncEnv{engine: run, helpers: avsyncFakeHelpers{run}, tap: tap}, o, true,
+		&stdout, &stderr)
+	var rep avsyncReport
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("exit %d: no report: %v\n%s", code, err, stderr.String())
+	}
+	if code != exitPass || !rep.Pass || len(rep.Pairs) != 18 || math.Abs(rep.MedianMS-18) > 0.05 {
+		t.Fatalf("exit %d, pass %t, %d pairs, median %.3f ms, failures %q: want a pass over 18 pairs at 18 ms", code,
+			rep.Pass, len(rep.Pairs), rep.MedianMS, rep.Failures)
+	}
+	if want := len(fakeLumaTap{run}.Samples()); rep.Frames != want || rep.Edges != 18 {
+		t.Errorf("the tap saw %d pictures (%d edges), want %d (18)", rep.Frames, rep.Edges, want)
+	}
+	if run.picked || run.cfg.Source != "mon:1" || !run.cfg.Listed {
+		t.Errorf("-source mon:1: picked %t, source %q, listed %t", run.picked, run.cfg.Source, run.cfg.Listed)
+	}
+
+	// The tap's readings arrive in capture order; Samples keeps that order whatever the arrival.
+	nt := &nativeLumaTap{}
+	fn := native.LumaTapOf(nt.Options()...)
+	fn(native.LumaSample{CaptureNS: 20, Mean: 0.9})
+	fn(native.LumaSample{CaptureNS: 10, Mean: 0.1})
+	fn(native.LumaSample{CaptureNS: 20, Mean: 0.8})
+	if got := nt.Samples(); len(got) != 3 || got[0] != (lumaSample{10, 0.1}) || got[1] != (lumaSample{20, 0.9}) ||
+		got[2] != (lumaSample{20, 0.8}) {
+		t.Errorf("Samples %+v", got)
+	}
+
+	// A DLL without test hooks: the binding refuses the tap (media.CodeDependency), exit 2 before the clicks.
+	noHooks := newAVSyncFakeRun(12*ms, 30*ms)
+	noHooks.startErr = &media.Error{Code: media.CodeDependency, Op: "start",
+		Detail: "the luma tap needs an IM_TEST_HOOKS DLL"}
+	stderr.Reset()
+	tap, _ = newLumaTap()
+	code = runAVSync(context.Background(), avsyncEnv{engine: noHooks, helpers: avsyncFakeHelpers{noHooks}, tap: tap}, o,
+		true, &stdout, &stderr)
+	if code != exitEnv || !strings.Contains(stderr.String(), "IM_TEST_HOOKS") || noHooks.clickN != 0 {
+		t.Errorf("no test hooks: exit %d (want %d), clicks %d\n%s", code, exitEnv, noHooks.clickN, stderr.String())
+	}
+}
+
 func TestPairClicks(t *testing.T) {
 	// Clicks every second; onsets 25 ms later, the third missing and a spurious one between the first two.
 	a := []int64{1_000 * ms, 2_000 * ms, 3_000 * ms, 4_000 * ms}
@@ -549,19 +623,12 @@ func TestAVSyncUsage(t *testing.T) {
 			t.Errorf("%q: exit %d, want %d\n%s", args, code, exitUsage, stderr)
 		}
 	}
-	// The luma tap isn't delivered by the binding yet: an environment failure before anything starts.
-	code, _, stderr := runArgs(t, "-dll", t.TempDir(), "avsync", "-out", t.TempDir())
-	if code != exitEnv || !strings.Contains(stderr, "luma tap") {
-		t.Errorf("exit %d, want %d with the luma tap named\n%s", code, exitEnv, stderr)
-	}
-	// -no-luma gets past the tap to the engine (which this -dll doesn't have).
-	code, _, stderr = runArgs(t, "-dll", t.TempDir(), "avsync", "-no-luma", "-out", t.TempDir())
-	if code != exitEnv || strings.Contains(stderr, "luma tap") {
-		t.Errorf("-no-luma: exit %d, want %d without the luma tap\n%s", code, exitEnv, stderr)
-	}
-	var me *media.Error
-	if !errors.As(error(errLumaTap), &me) || envCode(errLumaTap) != exitEnv {
-		t.Error("errLumaTap is not an environment error")
+	// With the luma tap (README WF16) and with -no-luma, the run gets to the engine (which this -dll doesn't have).
+	for _, args := range [][]string{{"avsync"}, {"avsync", "-no-luma"}} {
+		args = append([]string{"-dll", t.TempDir()}, append(args, "-out", t.TempDir())...)
+		if code, _, stderr := runArgs(t, args...); code != exitEnv || !strings.Contains(stderr, "engine") {
+			t.Errorf("%q: exit %d, want %d for the missing engine\n%s", args, code, exitEnv, stderr)
+		}
 	}
 	// The click process without an engine writes its result with the error and exits 2.
 	res := filepath.Join(t.TempDir(), "click.json")
