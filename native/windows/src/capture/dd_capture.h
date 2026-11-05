@@ -66,6 +66,7 @@ public:
   DdCapture &operator=(const DdCapture &) = delete;
 
   bool borderless() const noexcept override { return true; } // DD never shows a border (§7.1)
+  uint32_t capture_path() const noexcept override { return IM_CAPTURE_DD; }
   WindowHandle window() const noexcept override { return 0; }
   bool minimized() const noexcept override { return false; }
   // The output's upright desktop size at Start.

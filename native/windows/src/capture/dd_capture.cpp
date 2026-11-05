@@ -130,6 +130,12 @@ bool Interrupts(HRESULT hr) noexcept {
   return hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_SESSION_DISCONNECTED;
 }
 
+// The re-creation failures worth another try every kDdRetryNs while the output is still listed: an interruption that
+// lasts (the secure desktop, a mode switch in progress), or too many duplications of the output right now. Anything
+// else (DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, ...) won't heal by waiting, so the capture fails instead of repeating the
+// last frame for ever.
+bool RetriesRecreation(HRESULT hr) noexcept { return Interrupts(hr) || hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
+
 } // namespace
 
 struct DdCapture::Impl {
@@ -234,6 +240,9 @@ bool DdCapture::Impl::Recover(int64_t now) {
       recreated = true;
     } else if (dev.Removed()) {
       Fail(dev.Fail(hr, "DuplicateOutput1"));
+      return false;
+    } else if (!RetriesRecreation(hr)) {
+      Fail(abi::Failf(IM_ERR_INTERNAL, {}, "capture: DuplicateOutput1 failed on re-creation (0x%08lX)", Hex(hr)));
       return false;
     }
     // Otherwise still the secure desktop, a mode switch in progress or too many duplications: try again.

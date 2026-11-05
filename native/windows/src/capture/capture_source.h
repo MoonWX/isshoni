@@ -64,6 +64,10 @@ public:
 
   // The session runs without Windows' capture border (IM_SESS_NO_OS_INDICATOR, §7.1).
   virtual bool borderless() const noexcept = 0;
+  // The IM_CAPTURE_* path that actually runs, which can differ from the pick's SourceSpec::capture_path when a
+  // factory falls back (a Windows 10 monitor whose output DXGI won't duplicate on the session's adapter runs WGC, a
+  // Windows 11 pick WGC can't open runs DD): im_session_info's capture_path and the stats' path should report this.
+  virtual uint32_t capture_path() const noexcept = 0;
   // The identified window (§7.6) the supervisor polls; 0 for monitors and unidentified windows.
   virtual WindowHandle window() const noexcept = 0;
   // Whether window() is minimized now (IsIconic); false without a window. The supervisor's thread.

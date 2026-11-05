@@ -182,6 +182,8 @@ public:
   ~FakeCapture() override { Stop(); }
 
   bool borderless() const noexcept override { return state_->borderless; }
+  // The fake runs the test hooks' picks, whose SourceSpec says IM_CAPTURE_TEST: the session reports that either way.
+  uint32_t capture_path() const noexcept override { return IM_CAPTURE_TEST; }
   im::capture::WindowHandle window() const noexcept override { return state_->window; }
   bool minimized() const noexcept override { return state_->minimized.load(std::memory_order_acquire); }
   im::video::Size size() const noexcept override { return state_->start_size; }

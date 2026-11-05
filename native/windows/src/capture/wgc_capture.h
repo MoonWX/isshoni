@@ -61,6 +61,7 @@ public:
 
   // The session runs without Windows' capture border (IM_SESS_NO_OS_INDICATOR).
   bool borderless() const noexcept override { return borderless_; }
+  uint32_t capture_path() const noexcept override { return IM_CAPTURE_WGC; }
   // The identified window (§7.6) for minimize polling; 0 for monitors and unidentified windows.
   WindowHandle window() const noexcept override { return window_; }
   // IsIconic(window()) (window_system_win.h's WindowMinimized).
