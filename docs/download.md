@@ -151,6 +151,9 @@ installs another version.
 isshoni is applying for free code signing; until then, Windows doesn't know the publisher of 0.x builds, and every
 new release starts without a reputation. So a browser download meets up to two warnings:
 
+<!-- 06 §12.2: screenshots of Edge's and Chrome's warnings and SmartScreen go here, taken on the owner's PC with the
+first release (WA91's checklist). -->
+
 1. **The browser** may say the file isn't commonly downloaded.
    - Edge: hover over the download, click **…** → **Keep**, then **Show more** → **Keep anyway**.
    - Chrome: click **Keep**.
@@ -189,6 +192,10 @@ cmd /c "ssh-keygen -Y verify -f allowed_signers -I isshoni-release -n isshoni-ch
 1. `ssh-keygen` must say `Good "isshoni-release" signature` and print a fingerprint that is one of
    [the release keys'](/security#keys).
 2. The hash on the next line must be the one `checksums.txt` lists for the installer.
+
+Without the OpenSSH Client, add it ([OpenSSH Client](/troubleshooting#desktop-openssh)), or check `checksums.txt`'s
+signature on a Linux or Mac computer ([Verifying the Windows app](/security#verify-desktop)) and compare only the hash
+with `Get-FileHash` on the PC.
 
 `cmd /c` runs the check because PowerShell has no `<` redirection, and a pipe would change the file's bytes. More on
 verifying, the update keys included: [Verifying the Windows app](/security#verify-desktop).

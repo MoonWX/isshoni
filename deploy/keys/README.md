@@ -120,8 +120,7 @@ own: never one of `allowed_signers`' keys (`task lint:keys` refuses that). Done 
    ```
    As with the release keys, the first `task release:update-keys` ends with lint:keys' error that README.md does not
    list them yet. Once merged and released, the project site serves the same file as `/keys/update_signers` and shows
-   the fingerprints on `/security#keys` (site.yml writes them into `release.json`, and checks every release with the
-   app against this file: its manifest's signature must verify with it).
+   the fingerprints on `/security#keys` (site.yml writes them into `release.json`).
 3. **Put the private key into the environment `release`**: environment secret `RELEASE_UPDATE_SIGNING_KEY`, the whole
    content of the **private** file `isshoni-update-1`. Then delete the local private files, after putting
    `isshoni-update-backup-1` into the password manager and printing it.
