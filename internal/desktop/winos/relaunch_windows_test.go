@@ -78,38 +78,15 @@ func processName(pid uint32) string {
 	return "?"
 }
 
-// mediumLabel gives dir a medium mandatory label when this test runs elevated (a CI runner's admin job): a folder an
-// elevated process creates is labelled high, and the relaunched helper runs with the shell's token (medium), which
-// may not write up into it. The relaunch dropping the elevation is right; only the test's folder needs the label.
-func mediumLabel(t *testing.T, dir string) {
-	t.Helper()
-	if !windows.GetCurrentProcessToken().IsElevated() {
-		return
-	}
-	sd, err := windows.SecurityDescriptorFromString("S:(ML;OICI;NW;;;ME)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sacl, _, err := sd.SACL()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.LABEL_SECURITY_INFORMATION, nil, nil,
-		nil, sacl); err != nil {
-		t.Fatalf("the medium label on %s: %v", dir, err)
-	}
-}
-
 // TestRelaunchUnderShell is 03 §22.2's shell relaunch test. Started with --relaunched the helper stays in place,
 // under this test. Started from this test process (not a launcher) it relaunches under the shell, and the process
 // that stays sees explorer.exe as its parent. When the shell window's process is in another session or runs as
-// another user than this test (a CI runner whose job doesn't run in Explorer's session or as its user), the helper
+// another user than this test, or this test is elevated and the shell is not (a CI runner's elevated job), the helper
 // must refuse the relaunch instead (exit 3, the start goes on in place), and the explorer-parent half is skipped
 // with the reason; it runs on the owner's PC. Skipped when there is no shell window.
 func TestRelaunchUnderShell(t *testing.T) {
 	exe := buildRelaunchee(t)
 	dir := t.TempDir()
-	mediumLabel(t, dir)
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)

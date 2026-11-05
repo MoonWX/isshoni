@@ -159,9 +159,10 @@ func startUnderShell(args []string) error {
 	return nil
 }
 
-// errShellElsewhere: the shell window's process is in another session or runs as another user. The child would
-// inherit its token (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the parent's token, so its user and session), so the app
-// would start out of sight or as someone else while this start exits 0. The start goes on in place instead.
+// errShellElsewhere: the shell window's process is in another session or runs as another user, or this process is
+// elevated and the shell is not. The child would inherit its token (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the
+// parent's token, so its user, session and elevation), so the app would start out of sight, as someone else or not at
+// all while this start exits 0. The start goes on in place instead.
 var errShellElsewhere = errors.New("winos: the shell runs in another session or as another user")
 
 // shellProcessID is the PID owning GetShellWindow's window; ErrNoShell without one.
@@ -210,6 +211,11 @@ func shellIsOurs(pid uint32) error {
 	}
 	if !theirUser.User.Sid.Equals(myUser.User.Sid) {
 		return fmt.Errorf("%w (another user)", errShellElsewhere)
+	}
+	// An elevated start under a shell that isn't: the child would take the shell's lower token, and on a CI runner's
+	// elevated job such a child never came up while this start exited 0. Go on in place instead.
+	if windows.GetCurrentProcessToken().IsElevated() && !tok.IsElevated() {
+		return fmt.Errorf("%w (this process is elevated, the shell is not)", errShellElsewhere)
 	}
 	return nil
 }
