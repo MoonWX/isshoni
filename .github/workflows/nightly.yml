@@ -1757,9 +1757,10 @@ jobs:
           # The e2e build started as the Run value starts it (--autostart) shows no window, and a second launch shows
           # one. It needs web/dist and a WebView2 runtime, both here; ISSHONI_REQUIRE_AUTOSTART_E2E=1 turns a missing
           # prerequisite into a failure, and the test must PASS (not skip). It runs without -race (CGO_ENABLED=0). It
-          # builds its own e2e exe, so it runs before the updater e2e: that step starts installed apps, installers and
-          # mutex helpers in this session, and the test needs the single-instance names (the per-user pipe included)
-          # that nothing else holds (PR #56's first run failed there right after it; the test now names a holder).
+          # builds its own e2e exe, and runs twice: here, before the updater e2e (a session nothing else has touched),
+          # and again right after it, where PR #56's first run failed: that step starts installed apps, installers
+          # and mutex helpers in this session, and the test needs the single-instance names (the per-user pipe
+          # included) that nothing else holds. The two runs tell a broken product path from the updater e2e's leftover.
           $env:CGO_ENABLED = '0'
           $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
           $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart.log'
@@ -1904,14 +1905,17 @@ jobs:
             if (-not $rs.HasExited) { Stop-Process -Id $rs.Id -Force }
             "---- relserve's requests"
             Get-Content -LiteralPath (Join-Path $work 'relserve.err') -ErrorAction SilentlyContinue
-            # A failed case may leave the app running or installed: the later steps (the CDP spec) need neither. Any
-            # isshoni.exe still running, in any folder or session, is named and ended, and the single-instance pipe
-            # (per user, not per session) must be gone with it: a holder would take a later start's forward.
-            $exe = Join-Path $installDir 'isshoni.exe'
+            # A failed case may leave the app running or installed: the later steps (the autostart round trip's second
+            # run, the CDP spec) need neither. smoke.ps1 ends the installed app and uninstalls it when every case
+            # passed, so any isshoni.exe still running here, in any folder or session, outlived the test: it is named
+            # and ended, and the step FAILS for it (after this cleanup, so the later steps still get a clean session).
+            # The single-instance pipe (per user, not per session) must be gone with them: a holder would take a later
+            # start's forward, so one that outlives every isshoni.exe fails the step too.
+            $outlived = New-Object System.Collections.ArrayList
             foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'")) {
-              if ($p.ExecutablePath -ne $exe) {
-                "::warning::the updater e2e left isshoni.exe $($p.ProcessId) running (session $($p.SessionId)): $($p.ExecutablePath) $($p.CommandLine)"
-              }
+              $m = "the updater e2e left isshoni.exe $($p.ProcessId) running (session $($p.SessionId)): $($p.ExecutablePath) $($p.CommandLine)"
+              "::error::$m"
+              [void]$outlived.Add($m)
               Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
             }
             $deadline = (Get-Date).AddSeconds(15)
@@ -1919,7 +1923,9 @@ jobs:
               $pipes = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like '*io.isshoni.desktop.*' })
               if ($pipes.Count -eq 0) { break }
               if ((Get-Date) -gt $deadline) {
-                "::warning::the single-instance pipe outlived every isshoni.exe of the updater e2e: $($pipes -join ', ')"
+                $m = "the single-instance pipe outlived every isshoni.exe of the updater e2e: $($pipes -join ', ')"
+                "::error::$m"
+                [void]$outlived.Add($m)
                 break
               }
               Start-Sleep -Milliseconds 250
@@ -1934,6 +1940,25 @@ jobs:
               $deadline = (Get-Date).AddSeconds(180)
               while ((Test-Path -LiteralPath $u) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
             }
+          }
+          # The cleanup above ran; a leftover it found fails the step only now, when the try block itself passed (a
+          # failed case already fails it with its own error).
+          if ($outlived.Count -gt 0) { throw "the updater e2e outlived itself: $($outlived -join '; ')" }
+
+      - name: The autostart round trip after the updater e2e (TestAutostartRoundTrip again)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        run: |
+          # The same test, as strict, in its original place: after the updater e2e (when that step ran), where PR #56's
+          # first run failed. When the run before the updater e2e passed, a failure here points at what that step
+          # left in the session (its cleanup fails on a lingering isshoni.exe or pipe), and the test's own checks name
+          # the link that broke.
+          $env:CGO_ENABLED = '0'
+          $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart-after-update.log'
+          go test -v -count=1 -run '^TestAutostartRoundTrip$' ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ((Get-Content -LiteralPath $log) -match '^--- PASS: TestAutostartRoundTrip\b')) {
+            throw "TestAutostartRoundTrip did not pass after the updater e2e (no '--- PASS: TestAutostartRoundTrip' line)"
           }
 
       - name: The e2e isshoni.exe and the server (task desktop:exe:windows TAGS=e2e, go build ./cmd/isshoni)

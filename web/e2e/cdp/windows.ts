@@ -43,6 +43,8 @@ export const PILL_WINDOW_CLASS = 'isshoni.pill';
 export interface ProcessWindow {
   readonly hwnd: string;
   readonly visible: boolean;
+  /** WS_DISABLED is in its style (GetWindowLongW(GWL_STYLE)). */
+  readonly disabled: boolean;
   /** The window class (GetClassNameW); a class name is the app's own, never a title. */
   readonly cls: string;
 }
@@ -60,6 +62,8 @@ public static class IsshoniCdpOwn {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = CharSet.Unicode)]
   static extern int GetClassNameW(IntPtr h, StringBuilder name, int max);
+  // GWL_STYLE (-16) fits in 32 bits, so GetWindowLongW serves either bitness.
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLongW(IntPtr h, int index);
   public static string[] Of(int target) {
     List<string> list = new List<string>();
     EnumWindows(delegate (IntPtr h, IntPtr p) {
@@ -68,7 +72,9 @@ public static class IsshoniCdpOwn {
       if (pid == (uint)target) {
         StringBuilder cls = new StringBuilder(256);
         GetClassNameW(h, cls, cls.Capacity);
-        list.Add(h.ToInt64().ToString() + " " + (IsWindowVisible(h) ? "1" : "0") + " " + cls.ToString());
+        bool disabled = (GetWindowLongW(h, -16) & 0x08000000) != 0; // WS_DISABLED
+        list.Add(h.ToInt64().ToString() + " " + (IsWindowVisible(h) ? "1" : "0") + " " + (disabled ? "1" : "0") +
+          " " + cls.ToString());
       }
       return true;
     }, IntPtr.Zero);
@@ -82,22 +88,28 @@ public static class IsshoniCdpOwn {
 export async function processWindows(pid: number): Promise<ProcessWindow[]> {
   const out = await ps(`${PROCESS_WINDOWS_TYPE}
 ConvertTo-Json -Compress -InputObject @([IsshoniCdpOwn]::Of(${String(pid)}))`);
-  // "<hwnd> <0|1> <class>": the class is the rest of the line.
+  // "<hwnd> <visible 0|1> <disabled 0|1> <class>": the class is the rest of the line.
   return jsonArray<string>(out).map((line) => {
-    const [hwnd = '', visible = '', ...cls] = line.split(' ');
-    return { hwnd, visible: visible === '1', cls: cls.join(' ') };
+    const [hwnd = '', visible = '', disabled = '', ...cls] = line.split(' ');
+    return { hwnd, visible: visible === '1', disabled: disabled === '1', cls: cls.join(' ') };
   });
 }
 
 /**
- * The main window's HWND of a process as a decimal string, "0" while it has none: its one top-level window of the
- * Wails class, shown or hidden. Not .NET's MainWindowHandle: that is the first visible unowned window in Z order,
+ * The main window's HWND of a process as a decimal string, "0" while it has none: its one enabled top-level window of
+ * the Wails class, shown or hidden. Not .NET's MainWindowHandle: that is the first visible unowned window in Z order,
  * which while a share is live is the topmost Sharing pill (03 §11.4), not the main window.
+ *
+ * Wails' own hidden window is left out: beta.34's initMainLoop (pkg/application/mainthread_windows.go) creates
+ * "__wails_hidden_mainthread" with the same class (options.Windows.WndClass), no parent (a top-level window, not a
+ * message-only one) and the style WS_DISABLED alone, as the target of its main-thread dispatch; EnumWindows lists it.
+ * The main window is never WS_DISABLED in these tests (no modal dialog), so two enabled windows of the class are a
+ * real ambiguity and throw.
  */
 export async function mainWindow(pid: number): Promise<string> {
-  const main = (await processWindows(pid)).filter((w) => w.cls === MAIN_WINDOW_CLASS);
+  const main = (await processWindows(pid)).filter((w) => w.cls === MAIN_WINDOW_CLASS && !w.disabled);
   if (main.length > 1)
-    throw new Error(`process ${String(pid)} has ${String(main.length)} ${MAIN_WINDOW_CLASS} windows`);
+    throw new Error(`process ${String(pid)} has ${String(main.length)} enabled ${MAIN_WINDOW_CLASS} windows`);
   return main[0]?.hwnd ?? '0';
 }
 

@@ -37,8 +37,9 @@ import (
 // Every link of the chain is checked on its own, so a failure names the one that broke (the first windows-desktop
 // run of PR #56 only said "the window didn't open"): no other process holds the single-instance mutex or pipe before
 // the start; the first instance's pipe was created; the second launch forwarded (a failed forward still exits 0,
-// 03 §13.3); the first instance is still running while the window is awaited. A failure prints both starts' stderr
-// (the e2e build mirrors its log there) and the first instance's log files.
+// 03 §13.3); the first instance logged the forward as arrived (winos' serveLoop) or not, when the window doesn't open;
+// the first instance is still running while the window is awaited. A failure prints both starts' stderr (the e2e
+// build mirrors its log there) and the first instance's log files.
 func TestAutostartRoundTrip(t *testing.T) {
 	skip := t.Skip
 	if os.Getenv("ISSHONI_REQUIRE_AUTOSTART_E2E") == "1" {
@@ -160,7 +161,13 @@ func TestAutostartRoundTrip(t *testing.T) {
 		default:
 		}
 		if time.Now().After(deadline) {
-			fail("the window didn't open after a second launch")
+			// winos' serveLoop logs each command line it delivers: which side of the pipe the chain broke on.
+			arrived := "the first instance never logged the forward as arrived"
+			if strings.Contains(firstErr.String()+logFiles(filepath.Join(data, "isshoni", "logs")),
+				"a second launch's command line arrived") {
+				arrived = "the first instance logged the forward as arrived"
+			}
+			fail("the window didn't open after a second launch (%s)", arrived)
 		}
 	}
 }
