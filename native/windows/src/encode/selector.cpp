@@ -103,6 +103,20 @@ uint32_t PrimaryAdapterIndex() noexcept {
   return (c.caps->adapters[0].flags & IM_ADAPTER_HAS_OUTPUTS) != 0 ? 0u : encpolicy::kNoAdapter;
 }
 
+uint32_t AdapterIndexOfLuid(uint64_t luid) noexcept {
+  Cache &c = TheCache();
+  std::lock_guard<std::mutex> lock(c.mu);
+  if (!c.caps || luid == 0) {
+    return encpolicy::kNoAdapter;
+  }
+  for (uint32_t i = 0; i < c.caps->adapter_count && i < IM_MAX_ADAPTERS; ++i) {
+    if (c.caps->adapters[i].luid == luid) {
+      return i;
+    }
+  }
+  return encpolicy::kNoAdapter;
+}
+
 std::vector<session::EncoderEntry> CatalogEntries() {
   std::optional<im_caps> caps;
   {

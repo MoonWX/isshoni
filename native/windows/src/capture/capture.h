@@ -34,7 +34,7 @@ im_status ListSources(uint32_t flags, std::string &json);
 // A listed monitor id ("mon:" + DeviceName, from im_list_sources) as a source for im_start (with
 // IM_START_ALLOW_LISTED_SOURCE): kind IM_SOURCE_MONITOR, capture path IM_CAPTURE_DD, the output's upright size, test
 // false, and its output in a PickedItem without a WGC item. IM_ERR_SOURCE_GONE when no attached output has that id.
-// session::SourceRegistry::Resolve is to call it for "mon:" ids (session/ is outside README WA60's paths).
+// session::SourceRegistry::Resolve calls it for "mon:" ids.
 im_status ResolveMonitor(std::string_view id, session::SourceSpec *out);
 
 // im_pick_source, on the caller's thread: shows the OS picker on the picker's STA thread and blocks until the user

@@ -5,11 +5,12 @@
 // It runs when Media Foundation works on the machine (MFStartup, IM_OS_MEDIA_FOUNDATION) and the H.264 encoder MFT is
 // registered; otherwise it is skipped with the reason logged. On Windows Server, where Microsoft's H.264 encoder MFT
 // is not supported ("Minimum supported server: None supported") yet can enumerate and open, a probe failure is skipped
-// too, but only when FFmpeg's log shows the MFT itself refused during MF software's own probe (h264_mf's error with
-// the MFT's HRESULT, before MF software's failed open or failed encode call), which the skip prints; any other failure
-// (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows must pass in full. A failed
-// probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's (ISSHONI_TEST_FFMPEG_DIR; required in
-// CI).
+// too, in two cases only, each printing what it saw: FFmpeg's log shows the MFT itself refused during MF software's
+// own probe (h264_mf's error with the MFT's HRESULT, before MF software's failed open or failed encode call), or the
+// MFT gave complete AUs (SPS, PPS, IDR) only on drain, holding every frame of the probe's budget (04 §9.10). Any other
+// failure (no AU, an AU without SPS/PPS/IDR, a failure of ours) still fails, and a client Windows must pass in full. A
+// failed probe prints the engine's encode log. The FFmpeg folder is ffmpeg_load_test's (ISSHONI_TEST_FFMPEG_DIR;
+// required in CI).
 //
 // It asserts, for a High and a Constrained Baseline session forced to IM_ENC_MF_SW:
 //   - the probe lists MF software as available, without zero copy or live bitrate (04 §9.1, §9.5), and so does the

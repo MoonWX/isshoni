@@ -22,6 +22,7 @@
 
 #include "audio_bridge/audio_bridge.h"
 #include "capture/capture.h"
+#include "capture/outputs_win.h"
 #include "encode/encode.h"
 #include "encode/ffmpeg_api.h"
 #include "encode/ffmpeg_encoder.h"
@@ -203,7 +204,14 @@ constexpr uint32_t kTrialOsFlags = IM_OS_DESKTOP_DUPLICATION | IM_OS_MEDIA_FOUND
 uint32_t OsFlags(uint32_t build, std::span<const ComPtr<IDXGIAdapter1>> adapters) noexcept {
   uint32_t f = BuildFlags(build, kProbeBorderlessWaitMs);
   if (DuplicationWorks(adapters)) {
-    f |= IM_OS_DESKTOP_DUPLICATION;
+    // §7.4: DD needs a per-monitor DPI-aware process (the app's manifest); without it a DD start fails, so the flag
+    // is cleared (a packaging bug, not a user state).
+    if (capture::ProcessPerMonitorAware()) {
+      f |= IM_OS_DESKTOP_DUPLICATION;
+    } else {
+      log::Warn("encode", "probe: Desktop Duplication needs a per-monitor DPI-aware process",
+                {{"token", abi::token::kDpiUnaware}});
+    }
   }
   if (MediaFoundationWorks()) {
     f |= IM_OS_MEDIA_FOUNDATION;

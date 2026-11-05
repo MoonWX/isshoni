@@ -50,7 +50,10 @@ im_status VideoFrames::InitGpu(const Config &config) noexcept {
     gpu::ConverterConfig cc;
     cc.output = config.layers[l].out;
     cc.source = source_;
-    cc.input = source_; // the slots' size: every capture path delivers the source upright until README WA60's DD
+    // The slots' starting size. WGC and the pattern deliver the source upright; Desktop Duplication's slots hold the
+    // panel's orientation (README WA60, FrameMeta::rotation turns them upright), so a monitor turned 90 or 270 degrees
+    // writes swapped sides and the converter makes that size's VideoProcessor on its first frame.
+    cc.input = source_;
     cc.fps = config.layers[l].fps;
     if (const im_status st = gpu::Converter::Create(*device_, cc, &converters_[l]); st != IM_OK) {
       return st;

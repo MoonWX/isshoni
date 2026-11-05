@@ -241,6 +241,8 @@ private:
     explicit Sink(Session *s) noexcept : s_(s) {}
     void OnFrame(int64_t capture_ts_ns) noexcept override;
     void OnResized(video::Size content) noexcept override;
+    void OnInterrupted(std::string_view cause) noexcept override;
+    void OnResumed(std::string_view cause) noexcept override;
     void OnClosed() noexcept override;
     void OnFailed(im_status status, std::string_view detail) noexcept override;
 

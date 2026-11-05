@@ -3,6 +3,7 @@
 #include <charconv>
 #include <utility>
 
+#include "capture/capture.h"
 #include "engine/os.h"
 #include "im/abi/status.h"
 #include "im/log/ring.h"
@@ -84,7 +85,7 @@ im_status SourceRegistry::Resolve(std::string_view id, bool allow_listed, Source
                        "im_start: a listed source needs IM_START_ALLOW_LISTED_SOURCE (the app passes picks only)");
     }
     if (StartsWith(id, kMonitorPrefix)) {
-      return abi::Fail(IM_ERR_NOT_IMPLEMENTED, {}, "im_start: monitor capture is not implemented yet (README WA60)");
+      return capture::ResolveMonitor(id, out); // README WA60: Desktop Duplication of the listed output
     }
     if (id != kTestPatternId) {
       return abi::Fail(IM_ERR_SOURCE_GONE, {}, "im_start: unknown test source (only test:pattern)");

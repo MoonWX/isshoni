@@ -58,9 +58,14 @@ std::vector<session::EncoderEntry> CatalogEntries();
 // probe's EnumAdapterByGpuPreference(UNSPECIFIED) order), as an index into the stored probe's adapters[] (the space of
 // im_encoder_info.adapter_index). encpolicy::kNoAdapter without a stored probe, or when the first adapter has no
 // outputs (every hardware encoder then counts as "another adapter"). A session asks it right after CatalogEntries,
-// which stored the probe. DD's output adapter and WGC's "monitor that holds most of the source" come from the capture
-// area (README WA60) once it reports them.
+// which stored the probe. A DD source's output adapter is AdapterIndexOfLuid's; WGC's "monitor that holds most of the
+// source" isn't reported yet.
 uint32_t PrimaryAdapterIndex() noexcept;
+
+// The index in the stored probe's adapters[] of the adapter with luid (im_adapter_info.luid), or encpolicy::kNoAdapter
+// when no probe is stored or none has it: the capture adapter of a Desktop Duplication source, its output's adapter
+// (capture::OutputAdapterLuid, 04 §7.4, §9.1 step 1).
+uint32_t AdapterIndexOfLuid(uint64_t luid) noexcept;
 
 // OpenH264 (openh264_encoder.cpp, README WA51): its probe entry and its open function. The entry is IM_ERR_DEPENDENCY
 // while it is off or its file doesn't load (disabled, missing, version, blocked_by_policy); a full probe test-encodes

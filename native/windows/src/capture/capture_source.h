@@ -44,8 +44,8 @@ public:
   // Desktop Duplication lost its duplication (§7.4: a mode change, the secure desktop, the lock screen): no frame
   // comes until OnResumed, and the session keeps repeating the last one (CAPTURE_INTERRUPTED). cause is one of
   // dd_policy.h's kCause* ("access_lost", "secure_desktop", "mode_change"). Called once per interruption.
-  // README WA60 adds these with empty bodies: the session's sink (session_object.cpp) turns them into
-  // CAPTURE_INTERRUPTED / CAPTURE_RESUMED once a session slice wires them.
+  // The defaults do nothing; the session's sink (session_object.cpp) turns them into CAPTURE_INTERRUPTED /
+  // CAPTURE_RESUMED.
   virtual void OnInterrupted(std::string_view cause) noexcept { (void)cause; }
   // The duplication is back (CAPTURE_RESUMED, with the interruption's cause); OnResized follows when the size changed.
   virtual void OnResumed(std::string_view cause) noexcept { (void)cause; }
@@ -96,7 +96,7 @@ public:
 };
 
 // The LUID of the adapter that owns a Desktop Duplication source's output (0 for every other source): DD runs only
-// on a device of that adapter (§7.4, §8.1), so the session's device should be created there.
+// on a device of that adapter (§7.4, §8.1), so the session's device is created there.
 uint64_t OutputAdapterLuid(const session::SourceSpec &source) noexcept;
 
 // Whether a capture area captures source (otherwise the session draws its own test pattern).

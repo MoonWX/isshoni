@@ -27,15 +27,20 @@ std::atomic<bool> g_device_removed_for_test{false};  // SetDeviceRemovedForTest
 std::atomic<int64_t> g_capture_adapter_for_test{-1}; // SetCaptureAdapterForTest: -1 none, else the adapter index
 #endif
 
-// The capture adapter of 04 §9.1's order for a session's candidates (README WA61): the primary monitor's adapter, as
-// the source's own monitor isn't reported yet (encode::PrimaryAdapterIndex; DD's output adapter comes with README
-// WA60). Called after EncoderCatalog, which stored the probe.
-uint32_t CaptureAdapterIndex() noexcept {
+// The capture adapter of 04 §9.1's order for a session's candidates (README WA61): a Desktop Duplication source's
+// output adapter (capture::OutputAdapterLuid, README WA60), else the primary monitor's adapter, as WGC doesn't report
+// the source's own monitor yet (encode::PrimaryAdapterIndex). Called after EncoderCatalog, which stored the probe.
+uint32_t CaptureAdapterIndex(const SourceSpec &source) noexcept {
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
   if (const int64_t v = g_capture_adapter_for_test.load(std::memory_order_acquire); v >= 0) {
     return static_cast<uint32_t>(v);
   }
 #endif
+  if (const uint64_t luid = capture::OutputAdapterLuid(source); luid != 0) {
+    if (const uint32_t i = encode::AdapterIndexOfLuid(luid); i != encpolicy::kNoAdapter) {
+      return i;
+    }
+  }
   return encode::PrimaryAdapterIndex();
 }
 
@@ -114,6 +119,25 @@ void Session::Sink::OnResized(video::Size content) noexcept {
   s_->reported_size_.store(capture::PackSize(content), std::memory_order_relaxed);
   s_->resize_reported_.store(true, std::memory_order_release);
   s_->supervisor_waiter_.Wake();
+}
+
+void Session::Sink::OnInterrupted(std::string_view cause) noexcept {
+  if (s_->capture_stopped_.load(std::memory_order_acquire) || s_->ended_.load(std::memory_order_acquire)) {
+    return;
+  }
+  // 04 §5.6, §7.4: the last frame repeats until OnResumed (no frames come meanwhile).
+  const std::string doc = EventJson([&](json::Writer &w) { w.Key("cause").String(cause); });
+  s_->events_.Push(IM_EVENT_CAPTURE_INTERRUPTED, IM_OK, IM_NO_LAYER, QpcNs(), doc);
+  log::Info("session", "capture interrupted", {{"cause", cause}});
+}
+
+void Session::Sink::OnResumed(std::string_view cause) noexcept {
+  if (s_->capture_stopped_.load(std::memory_order_acquire) || s_->ended_.load(std::memory_order_acquire)) {
+    return;
+  }
+  const std::string doc = EventJson([&](json::Writer &w) { w.Key("cause").String(cause); });
+  s_->events_.Push(IM_EVENT_CAPTURE_RESUMED, IM_OK, IM_NO_LAYER, QpcNs(), doc);
+  log::Info("session", "capture resumed", {{"cause", cause}});
 }
 
 void Session::Sink::OnClosed() noexcept {
@@ -259,7 +283,7 @@ im_status Session::StartVideo(const im_start_config &cfg) {
   }
   encpolicy::CandidateQuery q;
   q.capture_path = source_.capture_path;
-  q.capture_adapter = CaptureAdapterIndex();
+  q.capture_adapter = CaptureAdapterIndex(source_);
   q.forced = cfg.encoder;
   q.test_source = source_.test;
   candidates_.resize(std::max<std::size_t>(probe.size(), 1));
@@ -336,8 +360,14 @@ im_status Session::StartCapture(const im_start_config &cfg) {
     resize_reported_.store(true, std::memory_order_release);
   }
   watcher_.emplace(src_size_, capture_->window() != 0, epoch_);
+  // The path that runs, which can differ from the pick's (README WA60): im_session_info and the stats report it.
+  {
+    std::lock_guard<std::mutex> lock(info_mu_);
+    info_.capture_path = capture_->capture_path();
+  }
   log::Info("session", "capture started",
-            {{"borderless", capture_->borderless()},
+            {{"path", CapturePathName(info_.capture_path)},
+             {"borderless", capture_->borderless()},
              {"window", capture_->window() != 0},
              {"w", at.width},
              {"h", at.height},
@@ -355,6 +385,9 @@ im_status Session::StartFrames() {
   // a later candidate that takes pixels fails to open in it (open_failed), so the fallback moves on.
   // A source whose capture writes into slots (a WGC pick, README WF12) keeps the GPU path all the same: on the first
   // candidate that takes pixels, or on the default adapter when none does (an IM_ENC_FAKE session under test hooks).
+  // A Desktop Duplication source (README WA60) puts the device on its output's adapter whatever the candidates say
+  // (§7.4, §8.1: DD duplicates an output only on its own adapter); an encoder of another adapter is then skipped
+  // (open_failed, other_adapter) and a software one reads back from this device.
   const bool need_slots = capture::NeedsSlots(source_);
   const EncoderEntry *pixels = nullptr;
   for (const encpolicy::Candidate &c : candidates_) {
@@ -370,7 +403,11 @@ im_status Session::StartFrames() {
     }
   }
   if (pixels != nullptr || need_slots) {
-    const gpu::DeviceRequest request = pixels != nullptr ? pixels->device : gpu::DeviceRequest{};
+    gpu::DeviceRequest request = pixels != nullptr ? pixels->device : gpu::DeviceRequest{};
+    if (const uint64_t luid = capture::OutputAdapterLuid(source_); luid != 0) {
+      request.adapter = gpu::DeviceRequest::Adapter::kLuid;
+      request.luid = luid;
+    }
     if (const im_status st = gpu::Device::Create(request, &gpu_); st != IM_OK) {
       return st;
     }
@@ -526,7 +563,7 @@ im_status Session::Stats(std::string &out) const {
     s = stats_;
   }
   s.layer_count = layer_count_;
-  s.capture_path = CapturePathName(has_video_ ? source_.capture_path : 0);
+  s.capture_path = CapturePathName(has_video_ ? info_.capture_path : 0);
   s.source_width = has_video_ ? source_.width : 0;
   s.source_height = has_video_ ? source_.height : 0;
   s.frames = frames_captured_.load(std::memory_order_relaxed);

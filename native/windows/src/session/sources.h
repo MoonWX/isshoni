@@ -62,7 +62,8 @@ public:
   // Resolves id for im_start: a live pick token, or a listed id when allow_listed. On success *serial is the pick's
   // serial (0 for a listed source), for Consume. Failures set the thread's detail: IM_ERR_SOURCE_GONE (pick_expired)
   // for a pick token that was consumed, expired or evicted; IM_ERR_INVALID_ARG for a listed id without allow_listed
-  // or an id of no known form; IM_ERR_NOT_IMPLEMENTED for monitors until README WA60.
+  // or an id of no known form; a "mon:" id is capture::ResolveMonitor's (IM_ERR_SOURCE_GONE when no attached output
+  // has it, README WA60).
   im_status Resolve(std::string_view id, bool allow_listed, SourceSpec *out, uint64_t *serial);
 
   // A successful im_start used the pick: it can't be used again. No-op for 0 or a pick that is gone.

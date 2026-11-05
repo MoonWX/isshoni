@@ -722,7 +722,7 @@ times on the engine clock (05 §13.2). Everything here is v1.0 (`IM_ABI_MINOR 0`
 | `im_audio_set_mode`, `im_audio_set_muted` | < 10 ms (posted) | 05's watcher and mixer | 01's core (`SetAudioMuted`, the pause mute) and 05's `audio.Service` (`SetAudioMode` for "Share sound" off/on) | `im_audio_set_muted` is the pause mute 01's core sets (05 owns the mix bus); "Share sound" off is `im_audio_set_mode(OFF)`; `IM_AUDIO_MODE_EVERYTHING` → `IM_ERR_INVALID_ARG` in M2; pause is `im_set_paused` |
 | `im_audio_levels_get` | lock-free, < 50 µs | caller | 05's `audio.Service` (`AudioLevels`), 10 Hz | 05 §12.2 |
 | `im_audio_sound_check` | ≤ `timeout_ms` + 500 ms | 05's watcher and activator threads | 05's `Service.SoundCheck` (03's first-run wizard) | 05 §11.3 |
-| `im_start` | ≤ 3 s typical | worker | 01 (Go `Engine.Start`) | Opens capture, both encoders and audio (`Mixer::Start` ≤ 100 ms). A success consumes a picked `source_id` (single use); a failure leaves it valid (§7.2). Fills `im_session_info`: the layers really running, their encoder and profile. Each layer's first `KEYFRAME\|REINIT` is ready within 500 ms after it returns (§6.3). Sources (WA23): no `source_id` with audio off, or a listed id (`mon:`, `test:`) without `IM_START_ALLOW_LISTED_SOURCE`, is `IM_ERR_INVALID_ARG`; a `test:` id other than `test:pattern` is `IM_ERR_SOURCE_GONE`; `mon:` ids are `IM_ERR_NOT_IMPLEMENTED` until WA60's DD capture |
+| `im_start` | ≤ 3 s typical | worker | 01 (Go `Engine.Start`) | Opens capture, both encoders and audio (`Mixer::Start` ≤ 100 ms). A success consumes a picked `source_id` (single use); a failure leaves it valid (§7.2). Fills `im_session_info`: the layers really running, their encoder and profile. Each layer's first `KEYFRAME\|REINIT` is ready within 500 ms after it returns (§6.3). Sources (WA23): no `source_id` with audio off, or a listed id (`mon:`, `test:`) without `IM_START_ALLOW_LISTED_SOURCE`, is `IM_ERR_INVALID_ARG`; a `test:` id other than `test:pattern` is `IM_ERR_SOURCE_GONE`; a `mon:` id is captured with Desktop Duplication (WA60's `capture::ResolveMonitor`), `IM_ERR_SOURCE_GONE` when no attached output has it |
 | `im_get_session_info` | no | caller | Go binding (`EventLayer` synthesis, §12.3) | Changes after re-inits and fallbacks |
 | `im_next_packet` | ≤ `timeout_ms` (≤ 1000) | caller | 01's pump through Go `Session.Next` | One caller per session; §6.2 |
 | `im_request_keyframe` | no | caller | 01 on PLI/FIR (`Session.RequestKeyframe`) | Coalesced (§9.4) |
@@ -1330,11 +1330,12 @@ through to step 5.
   publishes the frame with the pointer marked drawn; a pointer that moves over a static desktop is drawn into a copy of
   the last desktop image, at most once per half frame interval. Rotation goes to the converter through
   `FrameMeta::rotation`; slots hold the panel's orientation.
-- **Left to the session (outside WA60's paths, `session/`; the integrator or a fix slice)**: `SourceRegistry::Resolve`
-  still answers `mon:` ids with `IM_ERR_NOT_IMPLEMENTED` and is to call `capture::ResolveMonitor`; the session's
-  device is to be created on `capture::OutputAdapterLuid(source)`'s adapter for a DD source; and the session's sink is
-  to turn `CaptureSink::OnInterrupted` / `OnResumed` (empty defaults today) into `CAPTURE_INTERRUPTED` /
-  `CAPTURE_RESUMED`.
+- **The session's half (group 13's integration)**: `SourceRegistry::Resolve` answers `mon:` ids with
+  `capture::ResolveMonitor`; a DD source's session device is created on `capture::OutputAdapterLuid(source)`'s adapter,
+  which is also the capture adapter of §9.1's order (`encode::AdapterIndexOfLuid`); the session's sink turns
+  `CaptureSink::OnInterrupted` / `OnResumed` into `CAPTURE_INTERRUPTED` / `CAPTURE_RESUMED` with the cause;
+  `im_session_info.capture_path` and the stats' path report the running capture (`CaptureSource::capture_path()`); and
+  `im_probe` clears `IM_OS_DESKTOP_DUPLICATION` (logged with `dpi_unaware`) when the process isn't per-monitor DPI aware.
 
 **What `DisplayName()` returns for a monitor on Windows 10 22H2** (recorded with `isshoni-enginetest sources -name`
 and `pick -name -count 2`, picking each monitor; M-DD, §18.4):
