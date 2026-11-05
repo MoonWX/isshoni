@@ -159,8 +159,13 @@ func TestRepublishNewConnection(t *testing.T) {
 	if st := e.c.Status(); st.ConnectionID != "c_2" {
 		t.Errorf("the connection is %s, want c_2", st.ConnectionID)
 	}
-	nextEvent(t, events, func(ev Event) bool { return ev.Kind == EventStatus && ev.Status.ConnectionID == "c_2" })
-	nextEvent(t, events, func(ev Event) bool { return ev.Kind == EventShare && ev.Share.ID == "s_2" })
+	// The new connection's status and the republished share come in either order; nextEvent drops what it skips.
+	var gotStatus, gotShare bool
+	nextEvent(t, events, func(ev Event) bool {
+		gotStatus = gotStatus || ev.Kind == EventStatus && ev.Status.ConnectionID == "c_2"
+		gotShare = gotShare || ev.Kind == EventShare && ev.Share.ID == "s_2"
+		return gotStatus && gotShare
+	})
 	if e.engine.Session() != sess || e.c.ActiveShare() != sh {
 		t.Error("the engine session or the share changed: a republish keeps both")
 	}
