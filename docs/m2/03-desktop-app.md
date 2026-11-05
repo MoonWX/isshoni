@@ -1695,12 +1695,11 @@ the window is in front and no panel or sheet is open waits unseen, kept out (05'
 integration (README §3 item 96) the app shell mounts it once for every desktop page (§11.6).
 
 As built (WA80; README §3 item 95): the bar has **Pause** next to Stop while live (also while reconnecting or
-unreachable) and **Resume** while paused, both through `Share.SetPaused`, the same path as the hotkey, the tray and
-the pill; the buttons' tooltips name the registered combinations ("Pause (Ctrl+Alt+Shift+F9)", "Stop
-(Ctrl+Alt+Shift+F10)", from `Settings.Hotkeys`, asked again on every change of `share.state`; until WA84 binds it,
-`Settings.Get()`'s combinations, §6.2), and a combination
-another app has adds "Pause hotkey unavailable: another app uses …" (or the Stop hotkey's line) with a link to
-Settings → Sharing. **Pause is disabled only after the server answered
+unreachable) and **Resume** while paused, both through `Share.SetPaused`, the same path as the hotkey, the tray and the
+pill; the buttons' tooltips name the registered combinations ("Pause (Ctrl+Alt+Shift+F9)", "Stop (Ctrl+Alt+Shift+F10)",
+from `Settings.Hotkeys`, asked again on every change of `share.state`; until WA84 binds it, `Settings.Get()`'s
+combinations, §6.2), and a combination another app has adds "Pause hotkey unavailable: another app uses …" (or the Stop
+hotkey's line) with a link to Settings → Sharing. **Pause is disabled only after the server answered
 `feature_disabled`**: the SPA can't see the server's features (C2's `core.Status().Features` stays in Go, and
 `ShareView` doesn't carry them), so the button is enabled until a press answers `feature_disabled`, which disables it
 with the tooltip "Pause needs a newer server" for as long as the panel is mounted (no error toast). The tray and the
