@@ -1,0 +1,4 @@
+Example bootstrapper (notices test fixture)
+Copyright (c) Example Corporation.
+
+Redistributed unmodified under Example's distribution terms.

@@ -1,0 +1,13 @@
+[
+  {"name": "libopus", "vcpkgPort": "opus", "license": "BSD-3-Clause",
+   "linking": "static, inside isshoni-media.dll", "licenseFiles": ["vcpkg/opus/copyright"]},
+  {"name": "FFmpeg (libavcodec, libavutil)", "version": "9.0.2", "license": "LGPL-2.1-or-later",
+   "linking": "dynamic", "files": ["avcodec-*.dll", "avutil-*.dll"],
+   "source": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+   "licenseFiles": ["ffmpeg/COPYING.LGPLv2.1", "ffmpeg/LICENSE.md"]},
+  {"name": "Example headers", "version": "1.0.0", "license": "MIT",
+   "linking": "headers, inside isshoni-media.dll", "licenseFiles": ["example/LICENSE"]},
+  {"name": "Example bootstrapper", "license": "LicenseRef-Example-Distribution",
+   "linking": "separate program inside the installer",
+   "licenseFiles": ["../deploy/notices/licenses/bootstrapper.txt"]}
+]

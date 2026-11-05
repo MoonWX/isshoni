@@ -178,6 +178,9 @@ jobs:
               - 'deploy/install-desktop.ps1'
               - 'deploy/embed.go'
               - 'deploy/notices/native-windows.json'
+              # README WA78: the native gate's exceptions and the license files it reads from the repository.
+              - 'deploy/notices/exceptions.md'
+              - 'deploy/notices/licenses/**'
               - 'tools/desktoppkg/**'
               - 'tools/wails3/**'
               - 'tools/notices/**'
@@ -1620,7 +1623,8 @@ jobs:
     # The Windows app's Go packages on macOS (M2 06 §10.1): the client core, the media packages,
     # the updater and the app's own packages (internal/desktop/..., cmd/isshoni-desktop/...) with
     # the race detector, then the darwin app itself (cgo, the fake engine until M3) once
-    # cmd/isshoni-desktop exists (README WA22). Packages that do not exist yet are left out.
+    # cmd/isshoni-desktop exists (README WA22), and go-licenses over it (06 §9.4, README WA78). Packages that do not
+    # exist yet are left out.
     needs: changes
     if: needs.changes.outputs.run-desktop-macos == 'true'
     runs-on: macos-15
@@ -1643,7 +1647,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/Library/Caches/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
 
       - name: go test -race (client core, media, updater, the app's packages)
@@ -1661,6 +1665,16 @@ jobs:
       - name: go build ./cmd/isshoni-desktop (darwin, cgo)
         if: hashFiles('cmd/isshoni-desktop/**/*.go') != ''
         run: go build -o "$RUNNER_TEMP/isshoni-desktop" ./cmd/isshoni-desktop
+
+      - name: go-licenses check ./cmd/isshoni-desktop (darwin, cgo)
+        # M2 06 §9.4 (README WA78): the licenses job's darwin run is on Linux, where the app's main is the stub (no
+        # cgo), so the darwin app's modules (Wails' cgo files among them) are checked here, natively, with M1 06
+        # §8.3's flags and the go-licenses that tools/go.mod pins. M3 finds no surprise.
+        if: hashFiles('cmd/isshoni-desktop/**/*.go') != ''
+        run: |
+          go -C tools build -o "$RUNNER_TEMP/bin/" github.com/google/go-licenses/v2
+          "$RUNNER_TEMP/bin/go-licenses" check ./cmd/isshoni-desktop --ignore "$(go list -m)" \
+            --disallowed_types=forbidden,restricted,unknown
 
   native-host:
     # The portable C++ of native/ on Linux and macOS (M2 06 §10.1, docs/m2/04 §18.1): `task
@@ -2106,8 +2120,10 @@ jobs:
     # deploy/install-desktop.ps1 under Windows PowerShell 5.1 against tools/relserve (the CI installer signed by a key
     # of this run, verified with the inbox ssh-keygen; a tampered installer and a checksums.txt signed by another key
     # are refused with nothing installed); then the WebView2 runtime (installed from the checked bootstrapper when it
-    # is missing or older than 120.0) and 03's CDP spec (03 §22.4 B: the TAGS=e2e isshoni.exe, web/e2e/cdp). WA78 adds
-    # the notices gate; R13 (WA81) the server-rendered ps1 test; WA88 the updater e2e.
+    # is missing or older than 120.0) and 03's CDP spec (03 §22.4 B: the TAGS=e2e isshoni.exe, web/e2e/cdp). WA78 added
+    # the desktop notices and the native license gate (06 §9.2-§9.3: tools/notices -native, before packaging) and
+    # the check that the stage, so the installed tree, has them and 06 §9.1's LGPL files; R13 (WA81) adds the
+    # server-rendered ps1 test; WA88 the updater e2e.
     needs: [changes, web, windows-native]
     if: needs.changes.outputs.run-windows-desktop == 'true'
     runs-on: windows-2025
@@ -2213,6 +2229,24 @@ jobs:
           ''
           "makensis=$makensis" >> $env:GITHUB_OUTPUT
 
+      - name: Desktop notices and the native license gate (tools/notices -native)
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # M2 06 §9.2-§9.3 (README WA78), on its own so a gate failure is the step's: the Go modules of
+          # cmd/isshoni-desktop for windows (Wails' among them), the web client's packages and the native section from
+          # deploy/notices/native-windows.json with the windows-native artifact's release\licenses\. The gate fails on
+          # a native license that is neither allowlisted, nor FFmpeg's LGPL-2.1-or-later linked dynamically with the
+          # LGPL files present, nor a LicenseRef-* excepted in deploy/notices/exceptions.md; on a missing license
+          # file; and when the artifact's vcpkg ports differ from the entries'. task desktop:package:windows writes
+          # the same file again for the stage.
+          $out = Join-Path $env:RUNNER_TEMP 'THIRD_PARTY_NOTICES-desktop.txt'
+          go -C tools run ./notices -root .. -pkg ./cmd/isshoni-desktop -goos windows -goarch amd64 `
+            -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt `
+            -native ../deploy/notices/native-windows.json -native-root $env:NATIVE -version $env:VERSION -o $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: isshoni.exe, the stage and the installer (task desktop:package:windows)
         id: package
         env:
@@ -2229,6 +2263,33 @@ jobs:
           $setup = Join-Path $env:GITHUB_WORKSPACE "dist-desktop/isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "no $setup" }
           "setup=$setup" >> $env:GITHUB_OUTPUT
+
+      - name: The installed notices and the LGPL files (the stage)
+        run: |
+          # README WA78's acceptance, on the stage that the installer packs and smoke.ps1 compares byte for byte with
+          # the installed tree: licenses\THIRD_PARTY_NOTICES.txt lists Wails' modules, the web client's packages and
+          # the native section, and licenses\ffmpeg\ holds 06 §9.1's three files, all in install-files.txt.
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
+          $text = [IO.File]::ReadAllText((Join-Path $stage 'licenses/THIRD_PARTY_NOTICES.txt')) -replace "`r`n", "`n"
+          $want = @(
+            "`n1. Go modules and the Go runtime (", "`ngithub.com/wailsapp/wails/v3 v",
+            "`n2. Web client (bundled JavaScript)`n", "`n@wailsio/runtime ", "`nreact ",
+            "`n3. Native components`n", "`nFFmpeg (libavcodec, libavutil) ", "`nLicense: LGPL-2.1-or-later`nLinking: dynamic`n",
+            "`nMicrosoft Edge WebView2 Runtime bootstrapper`n", "`n4. Adapted source code and data`n")
+          $last = -1
+          foreach ($w in $want) {
+            $i = $text.IndexOf($w, [StringComparison]::Ordinal)
+            if ($i -lt 0) { throw "licenses\THIRD_PARTY_NOTICES.txt has no $($w.Trim())" }
+            if ($i -lt $last) { throw "licenses\THIRD_PARTY_NOTICES.txt has $($w.Trim()) out of order" }
+            $last = $i
+          }
+          $listed = [IO.File]::ReadAllLines((Join-Path $stage 'install-files.txt'))
+          foreach ($name in 'COPYING.LGPLv2.1.txt', 'LICENSE.md', 'README-LGPL.txt') {
+            $rel = "licenses\ffmpeg\$name"
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $rel) -PathType Leaf)) { throw "the stage has no $rel" }
+            if ($listed -notcontains $rel) { throw "install-files.txt doesn't list $rel" }
+          }
+          'the stage has the desktop notices with the native section and the LGPL files'
 
       - name: The smoke's older and newer installers
         id: smoke-builds

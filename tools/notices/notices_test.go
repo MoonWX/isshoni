@@ -416,6 +416,23 @@ func TestParseExceptions(t *testing.T) {
 		{"no module", "| `` | MPL-2.0 | x |\n", nil, "line 7: the first cell must be a module path"},
 		{"duplicate", "| `example.com/a` | MPL-2.0 | x |\n| `example.com/a` | MPL-2.0 | y |\n", nil,
 			"line 8: example.com/a (MPL-2.0) is already listed on line 7"},
+		// The native component table (06 §9.3): names with spaces, LicenseRef-* only.
+		{"native", "| `example.com/a` | MPL-2.0 | x |\n\n| Native component | License | Reason |\n|---|---|---|\n" +
+			"| `Some bootstrapper` | LicenseRef-Vendor-Terms | Shipped unmodified. |\n",
+			[]string{"example.com/a MPL-2.0", "native Some bootstrapper LicenseRef-Vendor-Terms"}, ""},
+		{"native then module table", "| Native component | License | Reason |\n| `A b` | LicenseRef-X | y |\n" +
+			"| Module | License | Reason |\n| `example.com/a` | MPL-2.0 | x |\n",
+			[]string{"native A b LicenseRef-X", "example.com/a MPL-2.0"}, ""},
+		{"native SPDX license", "| Native component | License | Reason |\n| `A` | MPL-2.0 | y |\n", nil,
+			`line 8: A: only a LicenseRef-* license can be excepted for a native component, not "MPL-2.0"`},
+		{"native GPL", "| Native component | License | Reason |\n| `A` | GPL-3.0-only | y |\n", nil,
+			"only a LicenseRef-* license can be excepted"},
+		{"native no reason", "| Native component | License | Reason |\n| `A` | LicenseRef-X | |\n", nil,
+			"line 8: A: an exception needs a reason"},
+		{"native no backquotes", "| Native component | License | Reason |\n| A b | LicenseRef-X | y |\n", nil,
+			"line 8: the first cell must be a native component's name in backquotes"},
+		{"native duplicate", "| Native component | License | Reason |\n| `A` | LicenseRef-X | y |\n| `A` | LicenseRef-X | z |\n", nil,
+			"line 9: A (LicenseRef-X) is already listed on line 8"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			list, err := parseExceptions(header + tc.rows)
@@ -430,7 +447,11 @@ func TestParseExceptions(t *testing.T) {
 			}
 			var got []string
 			for _, e := range list {
-				got = append(got, e.module+" "+e.license)
+				if e.native {
+					got = append(got, "native "+e.module+" "+e.license)
+				} else {
+					got = append(got, e.module+" "+e.license)
+				}
 			}
 			if !slices.Equal(got, tc.want) {
 				t.Errorf("got %q, want %q", got, tc.want)
@@ -542,12 +563,57 @@ func TestRun(t *testing.T) {
 		}
 	})
 
+	t.Run("the desktop file", func(t *testing.T) {
+		desktopOut := filepath.Join(t.TempDir(), "THIRD_PARTY_NOTICES-desktop")
+		var stdout, stderr bytes.Buffer
+		code := run(t.Context(), args("./cmd/app", "-goos", "windows", "-goarch", "amd64", "-version", "9.9.9",
+			"-native", filepath.Join(td, "native", "native-windows.json"), "-native-root", filepath.Join(td, "native", "release"),
+			"-o", desktopOut), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, &stderr)
+		}
+		data, err := os.ReadFile(desktopOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(data, []byte("\n3. Native components\n")) || !strings.Contains(stdout.String(), ", 4 native components and ") {
+			t.Errorf("stdout = %q; the file has the native section: %t", &stdout, bytes.Contains(data, []byte("3. Native components")))
+		}
+	})
+
+	t.Run("native gate failure", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.CopyFS(filepath.Join(dir, "native"), os.DirFS(filepath.Join(td, "native"))); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "native", "release", "licenses", "vcpkg", "speexdsp"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "native", "release", "licenses", "vcpkg", "speexdsp", "copyright"), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		desktopOut := filepath.Join(t.TempDir(), "THIRD_PARTY_NOTICES-desktop")
+		var stdout, stderr bytes.Buffer
+		code := run(t.Context(), args("./cmd/app", "-goos", "windows", "-version", "9.9.9",
+			"-native", filepath.Join(dir, "native", "native-windows.json"), "-native-root", filepath.Join(dir, "native", "release"),
+			"-o", desktopOut), &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "docs/m2/06-windows-release.md §9.3") ||
+			!strings.Contains(stderr.String(), "the vcpkg port speexdsp is shipped") {
+			t.Errorf("exit %d, stderr:\n%s", code, &stderr)
+		}
+		if _, err := os.Stat(desktopOut); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the output exists after a failed gate: %v", err)
+		}
+	})
+
 	for _, tc := range []struct {
 		name string
 		args []string
 		code int
 	}{
 		{"help", []string{"-h"}, 0},
+		{"native without native-root", args("./cmd/app", "-version", "1", "-native", "x.json"), 2},
+		{"native-root without native", args("./cmd/app", "-version", "1", "-native-root", "dir"), 2},
 		{"no version", args("./cmd/app"), 2},
 		{"extra argument", args("./cmd/app", "-version", "1", "stray"), 2},
 		{"bad flag", []string{"-nope"}, 2},

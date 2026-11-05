@@ -1,0 +1,12 @@
+Microsoft Edge WebView2 Runtime bootstrapper (MicrosoftEdgeWebview2Setup.exe)
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+The isshoni installer for Windows carries Microsoft's WebView2 Runtime bootstrapper, unmodified and signed by
+Microsoft Corporation, as downloaded from https://go.microsoft.com/fwlink/p/?LinkId=2124703. The installer runs it
+only when the WebView2 Runtime that the isshoni app needs is missing or older than version 120.0; it is not copied
+into the isshoni install folder, and it downloads and installs the Evergreen WebView2 Runtime from Microsoft.
+
+The bootstrapper and the WebView2 Runtime are Microsoft software. They are not covered by isshoni's license (the
+Apache License, Version 2.0); Microsoft licenses them under its own terms, and isshoni redistributes the bootstrapper
+under the terms Microsoft gives for distributing the WebView2 Runtime with an application. Microsoft's WebView2
+documentation, which links those terms, is at https://developer.microsoft.com/microsoft-edge/webview2/.

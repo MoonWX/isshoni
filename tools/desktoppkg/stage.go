@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -44,6 +45,12 @@ import (
 // On Windows the staged isshoni.exe then runs --self-check (06 §2.4): the stage fails unless its report is ok, with
 // engine.testHooks false and the version staged, so a win-x64-ci DLL can never reach an installer. On the Mac (local
 // packages, never released) that step is skipped with a note.
+//
+// The LGPL compliance bundle (06 §9.1) is checked before anything is staged: COPYING.LGPLv2.1 is the LGPL 2.1 text,
+// LICENSE.md is FFmpeg's (it names the LGPL), and README-LGPL.txt was rendered by native/ffmpeg/build.sh for the
+// locked build (no @PLACEHOLDER@ left; it names lock.json's two DLLs, its tag and the release's source asset). The
+// notices must be tools/notices' desktop file with its "Native components" section (06 §9.2, README WA78): the
+// server's file, or one written without -native, is refused.
 //
 // -release (release.yml's desktop-pkg, and the windows-desktop smoke installer) also refuses an exe from
 // dist-desktop/windows_amd64-test/, re-runs 06 §5.2 step 3's checks on the exe (checkExe) and requires the native
@@ -190,6 +197,9 @@ func stageTree(ctx context.Context, o stageOptions) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("missing input file(s):\n  - %s", strings.Join(missing, "\n  - "))
 	}
+	if problems := append(lgplProblems(o.native, lock), noticesProblems(o.notices)...); len(problems) > 0 {
+		return fmt.Errorf("the licenses to stage (06 §9.1, §9.2):\n  - %s", strings.Join(problems, "\n  - "))
+	}
 
 	if err := resetStageDir(o.out); err != nil {
 		return err
@@ -228,6 +238,62 @@ func stageTree(ctx context.Context, o stageOptions) error {
 		fmt.Fprintln(o.stdout, "stage: --self-check of the staged isshoni.exe is ok")
 	}
 	fmt.Fprintf(o.stdout, "stage: %s (%d files, mtime %s)\n", o.out, len(rels)+1, o.mtime.Format(time.RFC3339))
+	return nil
+}
+
+// nativeSectionTitle is the heading of the desktop notices' native section, as tools/notices writes it.
+const nativeSectionTitle = "3. Native components"
+
+// placeholderRE matches a placeholder of native/ffmpeg/README-LGPL.txt that build.sh did not replace.
+var placeholderRE = regexp.MustCompile(`@[A-Z0-9_]+@`)
+
+// lgplProblems checks the LGPL compliance files of 06 §9.1 in -native's licenses/ffmpeg/ (their presence is checked
+// with the other inputs): each is what it should be, and README-LGPL.txt describes the locked build.
+func lgplProblems(native string, lock *Lock) []string {
+	dir := filepath.Join(native, "licenses", "ffmpeg")
+	read := func(name string) string {
+		data, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // G304: the files this command stages
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
+	var problems []string
+	copying := strings.ToUpper(read("COPYING.LGPLv2.1"))
+	if !strings.Contains(copying, "GNU LESSER GENERAL PUBLIC LICENSE") || !strings.Contains(copying, "VERSION 2.1") {
+		problems = append(problems, "licenses/ffmpeg/COPYING.LGPLv2.1 is not the GNU Lesser General Public License, version 2.1")
+	}
+	if !strings.Contains(read("LICENSE.md"), "LGPL") {
+		problems = append(problems, "licenses/ffmpeg/LICENSE.md is not FFmpeg's LICENSE.md (it doesn't name the LGPL)")
+	}
+	readme := read("README-LGPL.txt")
+	if m := placeholderRE.FindAllString(readme, -1); len(m) > 0 {
+		slices.Sort(m)
+		problems = append(problems, fmt.Sprintf("licenses/ffmpeg/README-LGPL.txt still has the placeholder(s) %s: "+
+			"native/ffmpeg/build.sh renders it", strings.Join(slices.Compact(m), ", ")))
+	}
+	for _, want := range []string{lock.AvcodecDLL(), lock.AvutilDLL(), lock.Tag, "_ffmpeg-source.tar"} {
+		if !strings.Contains(readme, want) {
+			problems = append(problems, fmt.Sprintf("licenses/ffmpeg/README-LGPL.txt doesn't name %s: it is not the "+
+				"README of the locked build (%s)", want, lock.Tag))
+		}
+	}
+	return problems
+}
+
+// noticesProblems refuses notices without the native section: the server's THIRD_PARTY_NOTICES, or a desktop file
+// written without -native.
+func noticesProblems(notices string) []string {
+	data, err := os.ReadFile(notices) //nolint:gosec // G304: the file this command stages
+	if err != nil {
+		return []string{err.Error()}
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if !strings.Contains(text, "\n"+nativeSectionTitle+"\n") {
+		return []string{fmt.Sprintf("-notices %s has no %q section: write it with tools/notices -native "+
+			"../deploy/notices/native-windows.json -native-root <the windows-native artifact's release folder> (06 §9.2)",
+			notices, nativeSectionTitle)}
+	}
 	return nil
 }
 

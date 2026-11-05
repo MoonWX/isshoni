@@ -22,6 +22,13 @@ const (
 	fakeAvcodec = "avcodec dll"
 	fakeAvutil  = "avutil dll"
 	fakeEngine  = "isshoni-media dll"
+
+	// The LGPL compliance files (06 §9.1) and the desktop notices, as short stand-ins that pass the stage's checks.
+	fakeCopying       = "GNU LESSER GENERAL PUBLIC LICENSE\nVersion 2.1, February 1999\n(fixture)\n"
+	fakeFFmpegLicense = "Most files in FFmpeg are under the LGPL v2.1+ (fixture)\n"
+	fakeReadme        = "FFmpeg as avcodec-63.dll and avutil-61.dll, build deps-ffmpeg-9.0.2-r1;\n" +
+		"source: isshoni-desktop_<version>_ffmpeg-source.tar (fixture)\n"
+	fakeNotices = "THIRD_PARTY_NOTICES for isshoni 0.2.0\n\n====\n3. Native components\n====\n(fixture)\n"
 )
 
 func newStageFixture(t *testing.T) *stageFixture {
@@ -45,15 +52,15 @@ func newStageFixture(t *testing.T) *stageFixture {
 	writeFile(t, filepath.Join(f.native, "avcodec-63.dll"), fakeAvcodec)
 	writeFile(t, filepath.Join(f.native, "avutil-61.dll"), fakeAvutil)
 	writeFile(t, filepath.Join(f.native, "MicrosoftEdgeWebview2Setup.exe"), "bootstrapper")
-	writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "COPYING.LGPLv2.1"), "LGPL")
-	writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "LICENSE.md"), "FFmpeg license")
-	writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "README-LGPL.txt"), "README-LGPL")
+	writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "COPYING.LGPLv2.1"), fakeCopying)
+	writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "LICENSE.md"), fakeFFmpegLicense)
+	writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "README-LGPL.txt"), fakeReadme)
 	writeFile(t, filepath.Join(f.native, "licenses", "vcpkg", "opus", "copyright"), "opus")
 	writeFile(t, filepath.Join(f.native, nativeManifest), `{"version": "0.2.0", "dll": {"name": "isshoni-media.dll", "sha256": "`+
 		hexSHA256([]byte(fakeEngine))+`", "abi": 65536}, "ffmpeg": {"tag": "deps-ffmpeg-9.0.2-r1", "dlls": {"avcodec-63.dll": "`+
 		hexSHA256([]byte(fakeAvcodec))+`", "avutil-61.dll": "`+hexSHA256([]byte(fakeAvutil))+`"}}}`)
 	f.notices = filepath.Join(f.root, "dist-desktop", ".build", "THIRD_PARTY_NOTICES-desktop")
-	writeFile(t, f.notices, "notices")
+	writeFile(t, f.notices, fakeNotices)
 	f.exe = filepath.Join(f.root, "dist-desktop", "windows_amd64", "isshoni.exe")
 	writeFile(t, f.exe, "MZ exe 0.2.0")
 	f.out = filepath.Join(f.root, "dist-desktop", "stage")
@@ -73,10 +80,10 @@ var wantStage = map[string]string{
 	"avutil-61.dll":                        fakeAvutil,
 	"licenses/LICENSE.txt":                 "Apache License",
 	"licenses/NOTICE.txt":                  "isshoni NOTICE",
-	"licenses/THIRD_PARTY_NOTICES.txt":     "notices",
-	"licenses/ffmpeg/COPYING.LGPLv2.1.txt": "LGPL",
-	"licenses/ffmpeg/LICENSE.md":           "FFmpeg license",
-	"licenses/ffmpeg/README-LGPL.txt":      "README-LGPL",
+	"licenses/THIRD_PARTY_NOTICES.txt":     fakeNotices,
+	"licenses/ffmpeg/COPYING.LGPLv2.1.txt": fakeCopying,
+	"licenses/ffmpeg/LICENSE.md":           fakeFFmpegLicense,
+	"licenses/ffmpeg/README-LGPL.txt":      fakeReadme,
 	"install-files.txt": "avcodec-63.dll\r\navutil-61.dll\r\nisshoni-media.dll\r\nisshoni.exe\r\n" +
 		"licenses\\LICENSE.txt\r\nlicenses\\NOTICE.txt\r\nlicenses\\THIRD_PARTY_NOTICES.txt\r\n" +
 		"licenses\\ffmpeg\\COPYING.LGPLv2.1.txt\r\nlicenses\\ffmpeg\\LICENSE.md\r\nlicenses\\ffmpeg\\README-LGPL.txt\r\n",
@@ -155,6 +162,24 @@ func TestStageRefuses(t *testing.T) {
 			mustRemove(t, filepath.Join(f.native, "licenses", "ffmpeg", "LICENSE.md"))
 		}, "missing input file(s)"},
 		{"missing notices", func(t *testing.T, f *stageFixture, _ *stageOptions) { mustRemove(t, f.notices) }, "THIRD_PARTY_NOTICES-desktop"},
+		// README WA78: the notices without -native's section (the server's file, or the desktop file before WA78).
+		{"notices without the native section", func(t *testing.T, f *stageFixture, _ *stageOptions) {
+			writeFile(t, f.notices, "THIRD_PARTY_NOTICES for isshoni 0.2.0\n\n1. Go modules and the Go runtime\n")
+		}, `has no "3. Native components" section`},
+		// 06 §9.1: the LGPL compliance files are the right ones, for the locked build.
+		{"COPYING is not the LGPL 2.1", func(t *testing.T, f *stageFixture, _ *stageOptions) {
+			writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "COPYING.LGPLv2.1"), "GNU GENERAL PUBLIC LICENSE\nVersion 2\n")
+		}, "COPYING.LGPLv2.1 is not the GNU Lesser General Public License, version 2.1"},
+		{"LICENSE.md is not FFmpeg's", func(t *testing.T, f *stageFixture, _ *stageOptions) {
+			writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "LICENSE.md"), "something else\n")
+		}, "LICENSE.md is not FFmpeg's"},
+		{"README-LGPL not rendered", func(t *testing.T, f *stageFixture, _ *stageOptions) {
+			writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "README-LGPL.txt"), fakeReadme+"@TAG@ @NAME@ @TAG@\n")
+		}, "still has the placeholder(s) @NAME@, @TAG@"},
+		{"README-LGPL of another build", func(t *testing.T, f *stageFixture, _ *stageOptions) {
+			writeFile(t, filepath.Join(f.native, "licenses", "ffmpeg", "README-LGPL.txt"),
+				strings.ReplaceAll(fakeReadme, "avcodec-63", "avcodec-62"))
+		}, "README-LGPL.txt doesn't name avcodec-63.dll"},
 		{"missing DLL", func(t *testing.T, f *stageFixture, _ *stageOptions) {
 			mustRemove(t, filepath.Join(f.native, "avutil-61.dll"))
 		}, "-native lacks avutil-61.dll"},

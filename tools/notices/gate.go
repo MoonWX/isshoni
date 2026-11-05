@@ -191,21 +191,26 @@ func allowlistString() string {
 	return strings.Join(ids, ", ")
 }
 
-// exception is one row of deploy/notices/exceptions.md: a module that may ship under a license that is not on the
-// allowlist.
+// exception is one row of deploy/notices/exceptions.md: a Go module that may ship under a license that is not on the
+// allowlist, or (native) a native component of the desktop app, named as in native-windows.json, that ships under a
+// LicenseRef-* license (docs/m2/06-windows-release.md §9.3).
 type exception struct {
-	module, license, reason string
+	module, license, reason string // module: the module path, or the native component's name
+	native                  bool
 	line                    int
 	used                    bool
 }
 
-// parseExceptions reads the Markdown table rows of exceptions.md: | `module/path` | License | Reason |. Other lines
-// (prose, headings) and the table's header and separator rows are skipped.
+// parseExceptions reads the Markdown table rows of exceptions.md. A table whose header's first cell is "Module" holds
+// Go modules (| `module/path` | License | Reason |); one whose first header cell is "Native component" holds native
+// components (| `Name as in native-windows.json` | LicenseRef-... | Reason |). Rows before any header are module
+// rows. Other lines (prose, headings) and the separator rows are skipped.
 func parseExceptions(text string) ([]*exception, error) {
 	var (
 		list     []*exception
 		problems []string
 		seen     = map[string]int{}
+		native   bool
 	)
 	for i, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
@@ -216,7 +221,13 @@ func parseExceptions(text string) ([]*exception, error) {
 		for j := range cells {
 			cells[j] = strings.TrimSpace(cells[j])
 		}
-		if isHeaderRow(cells) {
+		if kind, ok := headerRow(cells); ok {
+			switch kind {
+			case "module":
+				native = false
+			case "native":
+				native = true
+			}
 			continue
 		}
 		n := i + 1
@@ -224,28 +235,25 @@ func parseExceptions(text string) ([]*exception, error) {
 			problems = append(problems, fmt.Sprintf("line %d: want 3 cells (| `module` | License | Reason |), got %d", n, len(cells)))
 			continue
 		}
-		module := strings.Trim(cells[0], "`")
-		e := &exception{module: module, license: cells[1], reason: cells[2], line: n}
-		switch {
-		case module == "" || strings.ContainsAny(module, " \t`"):
-			problems = append(problems, fmt.Sprintf("line %d: the first cell must be a module path in backquotes, got %q", n, cells[0]))
-		case e.license == "":
-			problems = append(problems, fmt.Sprintf("line %d: %s has no license", n, module))
-		case neverExcepted(e.license):
-			problems = append(problems, fmt.Sprintf("line %d: %s: %s may not be shipped, not even with an exception", n, module, e.license))
-		case allowlist[e.license]:
-			problems = append(problems, fmt.Sprintf("line %d: %s: %s is on the allowlist and needs no exception", n, module, e.license))
-		case e.reason == "":
-			problems = append(problems, fmt.Sprintf("line %d: %s: an exception needs a reason", n, module))
-		default:
-			key := module + " " + e.license
-			if prev, dup := seen[key]; dup {
-				problems = append(problems, fmt.Sprintf("line %d: %s (%s) is already listed on line %d", n, module, e.license, prev))
-				continue
-			}
-			seen[key] = n
-			list = append(list, e)
+		name := strings.Trim(cells[0], "`")
+		e := &exception{module: name, license: cells[1], reason: cells[2], native: native, line: n}
+		var problem string
+		if native {
+			problem = nativeExceptionProblem(e, cells[0])
+		} else {
+			problem = moduleExceptionProblem(e, cells[0])
 		}
+		if problem != "" {
+			problems = append(problems, fmt.Sprintf("line %d: %s", n, problem))
+			continue
+		}
+		key := fmt.Sprintf("%t %s %s", native, name, e.license)
+		if prev, dup := seen[key]; dup {
+			problems = append(problems, fmt.Sprintf("line %d: %s (%s) is already listed on line %d", n, name, e.license, prev))
+			continue
+		}
+		seen[key] = n
+		list = append(list, e)
 	}
 	if len(problems) != 0 {
 		return nil, fmt.Errorf("%s", strings.Join(problems, "\n"))
@@ -253,17 +261,54 @@ func parseExceptions(text string) ([]*exception, error) {
 	return list, nil
 }
 
-// isHeaderRow reports whether a table row is a header (| Module | License | Reason |) or separator (|---|---|) row.
-func isHeaderRow(cells []string) bool {
-	if len(cells) > 0 && strings.EqualFold(cells[0], "module") {
-		return true
+// moduleExceptionProblem checks a Go module row; first is its first cell as written.
+func moduleExceptionProblem(e *exception, first string) string {
+	switch {
+	case e.module == "" || strings.ContainsAny(e.module, " \t`"):
+		return fmt.Sprintf("the first cell must be a module path in backquotes, got %q", first)
+	case e.license == "":
+		return fmt.Sprintf("%s has no license", e.module)
+	case neverExcepted(e.license):
+		return fmt.Sprintf("%s: %s may not be shipped, not even with an exception", e.module, e.license)
+	case allowlist[e.license]:
+		return fmt.Sprintf("%s: %s is on the allowlist and needs no exception", e.module, e.license)
+	case e.reason == "":
+		return fmt.Sprintf("%s: an exception needs a reason", e.module)
+	}
+	return ""
+}
+
+// nativeExceptionProblem checks a native component row: only a LicenseRef-* license is excepted (06 §9.3); the
+// FFmpeg rule for LGPL-2.1-or-later is the gate's own, and every other license is an SPDX id the allowlist decides.
+func nativeExceptionProblem(e *exception, first string) string {
+	switch {
+	case e.module == "" || strings.Contains(e.module, "`") || !strings.HasPrefix(first, "`") || !strings.HasSuffix(first, "`"):
+		return fmt.Sprintf("the first cell must be a native component's name in backquotes, got %q", first)
+	case !strings.HasPrefix(e.license, licenseRefPrefix) || e.license == licenseRefPrefix:
+		return fmt.Sprintf("%s: only a %s* license can be excepted for a native component, not %q", e.module, licenseRefPrefix, e.license)
+	case e.reason == "":
+		return fmt.Sprintf("%s: an exception needs a reason", e.module)
+	}
+	return ""
+}
+
+// headerRow reports whether a table row is a header row (| Module | ... | or | Native component | ... |, kind "module"
+// or "native") or a separator row (|---|---|, kind "").
+func headerRow(cells []string) (kind string, ok bool) {
+	if len(cells) > 0 {
+		switch {
+		case strings.EqualFold(cells[0], "module"):
+			return "module", true
+		case strings.EqualFold(cells[0], "native component"):
+			return "native", true
+		}
 	}
 	for _, c := range cells {
 		if strings.Trim(c, ":-") != "" || c == "" {
-			return false
+			return "", false
 		}
 	}
-	return true
+	return "", true
 }
 
 // licenseLineRE matches the "License:" lines of extra.txt.
