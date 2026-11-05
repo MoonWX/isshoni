@@ -32,7 +32,8 @@ the rc server's address (it never goes into a file), `<date>` the run's date as 
 ## 1. Pass rules
 
 The run passes when every row below holds, **both halves on both Windows versions, on one release candidate**
-(README §6). Any change to the build (a new rc) starts over as §7 says.
+(README §6): every automated result (A-1, A-2, A-7, the `g2g` runs) comes from that rc. A new rc repeats what §7
+says; manual checks that carry over from an earlier rc name it in the record.
 
 **Audio** (05 §18.10; README §3 item 52 for Windows 10):
 
@@ -44,7 +45,7 @@ The run passes when every row below holds, **both halves on both Windows version
 | A-4 | R1, R3, R4 and R5 (05 §18.9) | pass | not required (the endpoint engine can't keep anything out; R3 runs on Win11 only) |
 | A-5 | R2 | pass (Win10 can't take it, so Win11 is the "at least one") | not required |
 | A-6 | R7: once for each app of 05 §18.9 the owner can run | pass; the others stay "unverified" in the harness README's R7 table | – |
-| A-7 | `isshoni-enginetest avsync` | exit 0: \|median A/V offset\| ≤ 20 ms over ≥ 15 pairs, with WGC (`-source pick`) | the same, with Desktop Duplication (`-source mon:<id>`) |
+| A-7 | `isshoni-enginetest avsync` | exit 0: \|median A/V offset\| ≤ 20 ms over ≥ 15 pairs, with WGC (`-source pick`) | the same, with Desktop Duplication (`-source` the monitor's id as `sources` prints it, `mon:\\.\DISPLAYn`) |
 | A-8 | both reports, with their manual entries merged, committed under `cmd/isshoni-audiotest/results/`, a row in the harness README's results table; both `avsync.json` in the record | yes | yes |
 
 **Latency** (01 §12.2, D17; README §7 question 1's default reading):
@@ -212,12 +213,13 @@ Windows 11 first, then Windows 10 22H2. In `C:\isshoni-audiotest`:
    $LASTEXITCODE
    ```
 
-   Windows 10 22H2 (Desktop Duplication): take the monitor's id from `sources`, then capture that monitor (the flash
-   window opens centered on it).
+   Windows 10 22H2 (Desktop Duplication): `sources` prints one line per monitor, starting with its source id
+   (`mon:\\.\DISPLAYn`); pass that first field as it is to `-source` (the flash window opens centered on that
+   monitor).
 
    ```powershell
-   .\isshoni-enginetest.exe -dll ci sources -name
-   .\isshoni-enginetest.exe -dll ci avsync -source mon:<id> -out avsync-win10
+   .\isshoni-enginetest.exe -dll ci sources
+   .\isshoni-enginetest.exe -dll ci avsync -source <that id> -out avsync-win10
    $LASTEXITCODE
    ```
 
@@ -338,8 +340,9 @@ the content cuts; 01 §12.1's levers apply in their order (the stamps first, whi
 
 ## 5. C. Release-candidate checks (on the same build)
 
-Each on the rc installer from §2.1, on the OS the row names; the steps are the specs' own (open them next to this
-page). The tools are the rc's, from `C:\isshoni-audiotest`.
+Each on the rc installer from §2.1 (after a new rc, the rows §7 names are repeated; the others carry over), on the
+OS the row names; the steps are the specs' own (open them next to this page). The tools are the rc's, from
+`C:\isshoni-audiotest`.
 
 | Check | OS | What to do | Pass |
 |---|---|---|---|
@@ -353,7 +356,7 @@ page). The tools are the rc's, from `C:\isshoni-audiotest`.
 | M-DESK-8 (03 §22.5) | Win10 | share a monitor (DD) and a window (WGC) | monitor: no border, pill shown and checked against the stream; window: yellow border, no pill by default |
 | M-DA-1 (02 §16.4) | Win11 | install, first run, "Link this app" | the browser opens `/link?code=…` with the app's code; "Linked" within 10 s; Credential Manager lists `isshoni:v1:https://<server>` |
 | M-DA-2 (02 §16.4) | Win11 | restart Windows | the app starts linked without a prompt; the Devices page shows "last seen just now" |
-| M-DA-7 (02 §16.4) | Win11 | uninstall keeping the data, reinstall, link, uninstall with "remove my data"; repeat with the network cable unplugged | each time the Credential Manager entry is gone and the device leaves the Devices page; offline the uninstaller still finishes within 30 s |
+| M-DA-7 (02 §16.4) | Win11 | uninstall keeping the data, reinstall, link, uninstall with "remove my data"; repeat with the network cable unplugged | online: each time the Credential Manager entry is gone and the device leaves the Devices page; offline: the uninstaller finishes within 30 s and the entry is gone (the device stays on the Devices page, 02 §16.4) |
 
 06 §11.8 items 7–11 (install paths, the update path from rc to rc, uninstall, the relink check, the previous release
 against the rc server) are WA91's release checklist; run them on the same rc when convenient and record them in the
@@ -387,6 +390,10 @@ On the development machine:
 
 - A failure becomes a fix slice (`WF…`) and a **new rc**; nothing is patched on the PC. A failed required audiotest
   case is an engine bug in `native/windows/src/audio/`, never a change of the harness (05 §18.5).
-- After a change to `native/`, `internal/media/` or `internal/desktop/audio`, A runs again on both OSes. Any change
-  repeats B on both OSes and the C rows it can affect. Every result in the record comes from the one rc that passed.
+- Every new rc repeats, on both OSes, A's `run -gate` (rules A-1, A-2) and `avsync` (A-7), because the DLL changes
+  with every rc (it carries the rc's version and commit, so an older report's `dll.sha256` never equals the new
+  `native-manifest.json`), plus all of B. The real-app checks R1–R5 and R7 (A-4 to A-6) and A-3's banner are repeated
+  only after a change to `native/`, `internal/media/` or `internal/desktop/audio`; otherwise they carry over, and the
+  record names the rc they ran on. C rows are repeated where the change can affect them. Every automated result in
+  the record comes from the one rc that passed; carried-over manual checks name their rc.
 - When both halves pass on both OSes: WA91 (the release-prep PR, tag `v0.2.0`, then the SignPath application).

@@ -9,6 +9,7 @@
   DLLs equal `native-manifest.json` (yes / no); `native-manifest.json` `dll.sha256` = `<sha256>`
 - **`ci\` DLL for `avsync`:** `isshoni-native-tools` of the `ci.yml` run `<run id>` on the rc's commit
 - **rc server:** M1's exit-test server / another server (no address here), version `<from /api/v1/info>`
+- **Manual checks carried over from an earlier rc** (run book §7): none / `<rows>` from `v0.2.0-rc.<M>`
 - **Result:** PASS / FAIL (<the rows that failed>)
 
 ## The PC
@@ -18,7 +19,7 @@
 | OS build (with UBR) and edition | | |
 | GPU, driver version | | |
 | Encoder on the full layer (Details), hardware | | |
-| Monitor (resolution, refresh rate) | 1920 × 1080, 60 Hz | 1920 × 1080, 60 Hz |
+| Monitor: the gate JSON's `screen` and `refreshHz` (must be 1920 × 1080, 60) | | |
 | App `--version` (`version`, `commit`) | | |
 | Communications set to "Do nothing" | | |
 | Microphone with desktop-app access | | |
@@ -27,7 +28,7 @@
 
 | # | Check | Windows 11 | Windows 10 22H2 |
 |---|---|---|---|
-| A-1 | `isshoni-audiotest selfcheck` | | |
+| pre | `isshoni-audiotest selfcheck` ends with `selfcheck: ok` (a precondition, run book §2.3 step 5) | | |
 | A-1 | `run -gate -out .`: exit code and summary line counts (`n/n PASS · FAIL · INCONCLUSIVE · SKIP · INFO`) | exit …, … | exit … (not judged), … |
 | A-1 | Win10 reduced form: case 1 `baseline-endpoint`, case 19 `probe-fallback` | – | 1: …, 19: … |
 | A-2 | report `dll.sha256` equals the manifest's | | |
@@ -41,7 +42,7 @@
 | A-6 | R7-zoom | pass / fail / unverified | – |
 | A-6 | R7-slack | pass / fail / unverified | – |
 | A-6 | R7-vesktop | pass / fail / unverified | – |
-| A-7 | `avsync -dll ci` (Win11 `-source pick`, WGC; Win10 `-source mon:<id>`, DD): exit code, pairs, median offset (ms), p5/p95 (ms) | exit …, … pairs, … ms (…/…) | exit …, … pairs, … ms (…/…) |
+| A-7 | `avsync -dll ci` (Win11 `-source pick`, WGC; Win10 `-source` the monitor's id from `sources`, DD): exit code, pairs, median offset (ms), p5/p95 (ms) | exit …, … pairs, … ms (…/…) | exit …, … pairs, … ms (…/…) |
 | A-8 | committed report | `cmd/isshoni-audiotest/results/<yyyy-mm-dd>-win11-<build>.json` | `cmd/isshoni-audiotest/results/<yyyy-mm-dd>-win10-<build>.json` |
 | A-8 | `avsync.json` | `results/<yyyy-mm-dd>/avsync-win11.json` | `results/<yyyy-mm-dd>/avsync-win10.json` |
 | A-8 | row added to `cmd/isshoni-audiotest/README.md`'s results table (and its R7 table) | | |
@@ -96,8 +97,8 @@ Each `g2g` run: `.\g2g.exe measure -d 60s -run <run> -server https://<rc server>
 | Audio, Win10 22H2: A-1 reduced form, A-2, A-3, A-7, A-8 | |
 | Latency, Win11: `gate` exit 0 with L-2's conditions; `nocuts` and `nosound` recorded | |
 | Latency, Win10 22H2: the same | |
-| C rows pass on the same rc (WGC not covered is recorded, not passed) | |
-| Every result from this one rc | |
+| C rows pass on this rc, or carried over with their rc named (WGC not covered is recorded, not passed) | |
+| Every automated result (A-1, A-2, A-7, `g2g`) from this one rc; carried-over manual checks name their rc | |
 
 ## Notes
 
