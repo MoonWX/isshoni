@@ -8,7 +8,11 @@
 #   with main's deploy/keys/allowed_signers, then each file's SHA-256 (06 §10.3). They go into the site with the public
 #   keys (/keys/allowed_signers), and .vitepress/release.json gets the version, the installer's SHA-256 and the key
 #   fingerprints, which the install and security pages show. While no release exists the step says so and the site
-#   says "not released yet". Then vitepress build, the check that the site loads nothing from other origins
+#   says "not released yet". For the Windows app (docs/m2/06-windows-release.md §13, "M2 06" below) release.json also
+#   gets `desktop`, {windowsInstaller, sha256} from the verified checksums.txt (null for a release without the app),
+#   which /download shows, and `updateKeyFingerprints`, the keys of main's deploy/keys/update_signers, which /security
+#   shows; the site serves that file as /keys/update_signers, and a release with the app must have an update manifest
+#   whose signature verifies with it. Then vitepress build, the check that the site loads nothing from other origins
 #   (docs/scripts/check-site.mjs), and the Pages artifact.
 # - deploy publishes the artifact (environment github-pages). It runs only once the owner has turned Pages on
 #   (06 §8.6 step 5: Settings → Pages → Source "GitHub Actions"). Until the first release, a run without Pages stays
@@ -45,6 +49,7 @@ on:
       - '!docs/m1/**'
       - '!docs/m2/**'
       - 'deploy/keys/allowed_signers'
+      - 'deploy/keys/update_signers'
       - '.github/workflows/site.yml'
   workflow_dispatch:
   workflow_call:
@@ -158,22 +163,77 @@ jobs:
           sha=$(sha256sum "$rel/install.sh" | cut -d' ' -f1)
           keys_sha=$(sha256sum "$keys" | cut -d' ' -f1)
 
-          # The fingerprints of every key, as ssh-keygen -l prints them (the README and /security list them).
-          fingerprints=()
-          while IFS= read -r line || [ -n "$line" ]; do
-            case $line in '' | '#'*) continue ;; esac
-            key=$(grep -oE '(ssh-ed25519|sk-ssh-ed25519@openssh\.com|ecdsa-sha2-nistp[0-9]+|ssh-rsa) [A-Za-z0-9+/=]+' <<< "$line") ||
-              fail "$keys has a line without a public key: $line"
-            printf '%s\n' "$key" > "$RUNNER_TEMP/key.pub"
-            fingerprints+=("$(ssh-keygen -l -f "$RUNNER_TEMP/key.pub" | cut -d' ' -f2)")
-          done < "$keys"
-          [ "${#fingerprints[@]}" -gt 0 ] || fail "$keys has no key"
+          # The fingerprints of every key of an allowed-signers file, one per line, as ssh-keygen -l prints them (the
+          # README and /security list them).
+          fingerprints_of() {
+            local file=$1 line key n=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              line=${line%$'\r'}
+              case $line in '' | '#'*) continue ;; esac
+              key=$(grep -oE '(ssh-ed25519|sk-ssh-ed25519@openssh\.com|ecdsa-sha2-nistp[0-9]+|ssh-rsa) [A-Za-z0-9+/=]+' <<< "$line") ||
+                fail "$file has a line without a public key: $line"
+              printf '%s\n' "$key" > "$RUNNER_TEMP/key.pub"
+              ssh-keygen -l -f "$RUNNER_TEMP/key.pub" | cut -d' ' -f2
+              n=$((n + 1))
+            done < "$file"
+            [ "$n" -gt 0 ] || fail "$file has no key"
+          }
+          # Not in a process substitution: fail must end this step, not a subshell.
+          fingerprints_of "$keys" > "$RUNNER_TEMP/fingerprints"
+          mapfile -t fingerprints < "$RUNNER_TEMP/fingerprints"
+
+          # The Windows app (M2 06 §2.1, §13): the installer's name and SHA-256 come from the checksums.txt verified
+          # above (the installer itself is not downloaded), so /download shows exactly what the signed list holds.
+          # Every release from 0.2.0 on has the app; an older one has none, and release.json says so with null.
+          installer="isshoni-desktop_${version}_windows_amd64_setup.exe"
+          n=$(awk -v f="$installer" '$2 == f || $2 == "*" f { n++ } END { print n + 0 }' "$rel/checksums.txt")
+          if [ "$n" -eq 1 ]; then
+            installer_sha=$(awk -v f="$installer" '$2 == f || $2 == "*" f { print tolower($1) }' "$rel/checksums.txt")
+            [[ $installer_sha =~ ^[0-9a-f]{64}$ ]] || fail "checksums.txt of $tag lists $installer without a SHA-256"
+            desktop=$(jq -nc --arg name "$installer" --arg sha "$installer_sha" '{windowsInstaller: $name, sha256: $sha}')
+          elif [ "$n" -eq 0 ]; then
+            [[ $version =~ ^0\.[01]\. ]] || fail "checksums.txt of $tag does not list $installer: every release from 0.2.0 on has the Windows app"
+            desktop=null
+          else
+            fail "checksums.txt of $tag lists $installer $n times"
+          fi
+
+          # The update keys (M2 06 §8.3, §11.5): main's deploy/keys/update_signers, served as /keys/update_signers. A
+          # release with the app is checked against it like checksums.txt against allowed_signers: its update manifest
+          # must be in the signed list and carry a valid signature by one of these keys, which is what every app checks.
+          update_keys=deploy/keys/update_signers
+          update_fingerprints=()
+          update_keys_sha=
+          if [ -e "$update_keys" ]; then
+            [ -s "$update_keys" ] || fail "$update_keys is empty (deploy/keys/README.md)"
+            fingerprints_of "$update_keys" > "$RUNNER_TEMP/update_fingerprints"
+            mapfile -t update_fingerprints < "$RUNNER_TEMP/update_fingerprints"
+            update_keys_sha=$(sha256sum "$update_keys" | cut -d' ' -f1)
+          fi
+          if [ "$desktop" != null ]; then
+            [ -n "$update_keys_sha" ] ||
+              fail "$tag has the Windows app, but main has no $update_keys to check its update manifest with (deploy/keys/README.md)"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$rel" --pattern 'isshoni-desktop-update.json*'
+            manifest=isshoni-desktop-update.json
+            [ -f "$rel/$manifest" ] && [ -f "$rel/$manifest.sig" ] || fail "the release $tag has no $manifest and $manifest.sig"
+            awk -v f="$manifest" '$2 == f || $2 == "*" f { n++ } END { exit n != 1 }' "$rel/checksums.txt" ||
+              fail "checksums.txt of $tag does not list $manifest exactly once"
+            (cd "$rel" && sha256sum --ignore-missing -c checksums.txt)
+            ssh-keygen -Y verify -f "$update_keys" -I isshoni-update -n isshoni-update \
+              -s "$rel/$manifest.sig" < "$rel/$manifest" ||
+              fail "the signature of $manifest of $tag does not verify with $update_keys"
+          fi
 
           mkdir -p docs/public/keys
           cp "$rel/install.sh" "$rel/compose.yaml" "$rel/compose.host.yaml" docs/public/
           cp "$keys" docs/public/keys/allowed_signers
-          jq -n --arg version "$version" --arg sha "$sha" \
-            '{version: $version, installShSha256: $sha, keyFingerprints: $ARGS.positional}' \
+          if [ -n "$update_keys_sha" ]; then
+            cp "$update_keys" docs/public/keys/update_signers
+          fi
+          jq -n --arg version "$version" --arg sha "$sha" --argjson desktop "$desktop" \
+            --argjson updateKeyFingerprints "$(printf '%s\n' "${update_fingerprints[@]}" | jq -R . | jq -sc 'map(select(. != ""))')" \
+            '{version: $version, installShSha256: $sha, keyFingerprints: $ARGS.positional, desktop: $desktop,
+              updateKeyFingerprints: $updateKeyFingerprints}' \
             --args "${fingerprints[@]}" > docs/.vitepress/release.json
           cat docs/.vitepress/release.json
           {
@@ -181,8 +241,12 @@ jobs:
             echo "version=$version"
             echo "install-sh-sha256=$sha"
             echo "keys-sha256=$keys_sha"
+            echo "update-keys-sha256=$update_keys_sha"
           } >> "$GITHUB_OUTPUT"
           echo "The site serves the install.sh of $tag, SHA-256 $sha." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$desktop" != null ]; then
+            echo "/download shows $installer, SHA-256 $installer_sha." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: vitepress build
         run: npx --prefix docs vitepress build docs
@@ -197,9 +261,17 @@ jobs:
         env:
           SHA: ${{ steps.release.outputs.install-sh-sha256 }}
           KEYS_SHA: ${{ steps.release.outputs.keys-sha256 }}
+          UPDATE_KEYS_SHA: ${{ steps.release.outputs.update-keys-sha256 }}
         run: |
           echo "$SHA  docs/.vitepress/dist/install.sh" | sha256sum -c
           echo "$KEYS_SHA  docs/.vitepress/dist/keys/allowed_signers" | sha256sum -c
+          # /keys/update_signers: main's file, served only while it exists (M2 06 §13).
+          if [ -n "$UPDATE_KEYS_SHA" ]; then
+            echo "$UPDATE_KEYS_SHA  docs/.vitepress/dist/keys/update_signers" | sha256sum -c
+          elif [ -e docs/.vitepress/dist/keys/update_signers ]; then
+            echo "::error::the built site serves keys/update_signers, but main has no deploy/keys/update_signers"
+            exit 1
+          fi
 
       - name: Upload the Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
