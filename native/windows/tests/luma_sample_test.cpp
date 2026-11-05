@@ -27,11 +27,11 @@ TEST(LumaSample, CenterBoxIsTheCenteredSquareOfUpTo256Pixels) {
   EXPECT_GE(r.y, 180u);
   EXPECT_LE(r.y + r.height, 900u);
 
-  const luma::Region small = luma::CenterBox(200, 100);
-  EXPECT_EQ(small.x, 0u);
-  EXPECT_EQ(small.y, 0u);
-  EXPECT_EQ(small.width, 200u);
-  EXPECT_EQ(small.height, 100u);
+  const luma::Region tiny = luma::CenterBox(200, 100);
+  EXPECT_EQ(tiny.x, 0u);
+  EXPECT_EQ(tiny.y, 0u);
+  EXPECT_EQ(tiny.width, 200u);
+  EXPECT_EQ(tiny.height, 100u);
 
   const luma::Region odd = luma::CenterBox(641, 361);
   EXPECT_EQ(odd.x, 192u);

@@ -1535,6 +1535,16 @@ export class WindowBounds {
     }
 }
 
+/**
+ * WindowNotice is the window.notice event's payload and App.WindowNotice()'s answer: {code, text} (03 §11.6).
+ */
+export const WindowNotice = app$0.WindowNotice;
+
+/**
+ * WindowNotice is the window.notice event's payload and App.WindowNotice()'s answer: {code, text} (03 §11.6).
+ */
+export type WindowNotice = app$0.WindowNotice;
+
 // Private type creation functions
 const $$createType0 = LinkCode.createFrom;
 const $$createType1 = $Create.Nullable($$createType0);

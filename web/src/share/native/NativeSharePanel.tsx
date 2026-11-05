@@ -24,8 +24,8 @@
 // Share safety (README WA80, 03 §10.3, §11.2, §11.3, §11.6): Pause next to Stop while live (Share.SetPaused, the same
 // path as the hotkey, the tray and the pill), the hotkeys named in the buttons' tooltips ("Pause (Ctrl+Alt+Shift+F9)"),
 // "Pause hotkey unavailable: another app uses …" with a link to Settings → Sharing for a combination another app
-// has, Pause disabled with "Pause needs a newer server" once the server answered feature_disabled, and the close-to-
-// tray notice at its top (WindowNotice).
+// has, and Pause disabled with "Pause needs a newer server" once the server answered feature_disabled. The close-to-
+// tray notice (WindowNotice) is the desktop shell's, above every page (app/App.tsx, desktop/shell.ts).
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -62,7 +62,6 @@ import { useMicPromptHost } from './MicPromptCorner';
 import { useAudioBridge, useFriendsHear, useLevels } from './useAudio';
 import { usable, useHotkeys } from './useHotkeys';
 import { useEncoderNotice, useShareView } from './useShareView';
-import { WindowNotice } from './WindowNotice';
 
 const NO_WATCHERS: readonly ShareWatcher[] = [];
 
@@ -266,7 +265,6 @@ export function NativeSharePanel({
 
   return (
     <section className={cx(styles.panel, paused && styles.paused)} aria-label={t('share.panel.label')}>
-      <WindowNotice bridge={audioBridge} />
       {fh !== null && <MicPromptCards fh={fh} bridge={audioBridge} />}
       <div className={styles.bar}>
         <span

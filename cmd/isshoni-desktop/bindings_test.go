@@ -256,6 +256,8 @@ func (testCore) OpenNotices() error                         { return nil }
 func (testCore) PendingLink() *app.PendingLink              { return nil }
 func (testCore) LinkHandled()                               {}
 func (testCore) OwnConnections([]string) error              { return nil }
+func (testCore) WindowNotice() *app.WindowNotice            { return nil }
+func (testCore) WindowNoticeShown(string) error             { return app.ErrNoNotice }
 func (testCore) Probe(context.Context) (media.Probe, error) { return media.Probe{}, nil }
 func (s testServers) List() []deviceauth.ServerEntry        { return nil }
 func (m *testManager) Origin() string                       { return m.origin }

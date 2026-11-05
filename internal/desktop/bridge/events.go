@@ -18,6 +18,7 @@ const (
 	EventAuthState       = EventPrefix + "auth.state"       // AuthState of the active server; Auth.State()
 	EventDeepLinkOpen    = app.EventDeepLinkOpen            // app.PendingLink; App.PendingLink()
 	EventWindowState     = EventPrefix + "window.state"     // WindowState
+	EventWindowNotice    = app.EventWindowNotice            // WindowNotice; App.WindowNotice()
 	EventSettingsChanged = EventPrefix + "settings.changed" // SettingsView; Settings.Get()
 	EventUpdateState     = EventPrefix + "update.state"     // UpdateStatus; Updates.Status()
 )
@@ -26,7 +27,7 @@ const (
 var Events = []string{
 	EventShareState, EventShareStats, EventShareNotice,
 	EventAudioReport, EventAudioLevels, EventAudioPrompt, EventAudioAlert,
-	EventAuthState, EventDeepLinkOpen, EventWindowState, EventSettingsChanged, EventUpdateState,
+	EventAuthState, EventDeepLinkOpen, EventWindowState, EventWindowNotice, EventSettingsChanged, EventUpdateState,
 }
 
 // WindowState is the window.state event's payload (03 §6.3).

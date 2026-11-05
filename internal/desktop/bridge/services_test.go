@@ -56,7 +56,7 @@ func allCodes(t *testing.T) map[string]string {
 var boundMethods = map[string]map[string]bool{
 	"App": {"Info": false, "Heartbeat": false, "OpenExternal": false, "OpenOSSettings": false, "Quit": false,
 		"Log": false, "OpenLogsFolder": false, "OpenNotices": false, "PendingLink": false, "LinkHandled": false,
-		"OwnConnections": false},
+		"OwnConnections": false, "WindowNotice": false, "WindowNoticeShown": false},
 	"Auth": {"State": false, "Servers": false, "Probe": true, "AddServer": true, "SwitchServer": false,
 		"RemoveServer": true, "Link": true, "CancelLink": false, "LinkWithPassword": true, "Unlink": true,
 		"Recheck": true, "AccessToken": true, "SessionEnded": true, "HelloRefused": false},
@@ -311,6 +311,19 @@ func TestApp(t *testing.T) {
 	if core.handled != 1 {
 		t.Fatal("LinkHandled didn't reach the app")
 	}
+	if n := s.App.WindowNotice(); n != nil {
+		t.Fatalf("WindowNotice with none due: %+v", n)
+	}
+	core.notice = &app.WindowNotice{Code: app.NoticeStillSharing, Text: "still sharing"}
+	if n := s.App.WindowNotice(); n == nil || n.Code != app.NoticeStillSharing {
+		t.Fatalf("WindowNotice %+v", n)
+	}
+	if err := s.App.WindowNoticeShown("other"); codeOf(t, err) != codes.CodeNotFound {
+		t.Fatalf("WindowNoticeShown(other): %v", err)
+	}
+	if err := s.App.WindowNoticeShown(app.NoticeStillSharing); err != nil || len(core.shown) != 1 {
+		t.Fatalf("WindowNoticeShown: %v, shown %v", err, core.shown)
+	}
 	if info := s.App.Info(); info.OSBuild != 26100 {
 		t.Fatalf("Info %+v", info)
 	}
@@ -479,8 +492,8 @@ func TestEvents(t *testing.T) {
 		}
 		seen[e] = true
 	}
-	if len(Events) != 12 {
-		t.Fatalf("%d events, want 03 §6.3's 12", len(Events))
+	if len(Events) != 13 {
+		t.Fatalf("%d events, want 03 §6.3's 12 and WA80's window.notice", len(Events))
 	}
 
 	var buf bytes.Buffer

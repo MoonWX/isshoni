@@ -14,8 +14,8 @@ import (
 // The navigation guard is what Go does of 03 §5.5's layer 2 at the pinned Wails (W5's fallback, 03 §3.2): beta.34
 // registers no NewWindowRequested handler and drops NavigationStarting's arguments, so Go can cancel neither a
 // navigation nor a new window. New windows are the CSP sandbox's (internal/desktop/assets, §5.3), a script's
-// navigation is the SPA's navigate listener (links.ts); what Go can still do is notice that the main window's top
-// level left the asset origin and send it back to the start page.
+// navigation is bridge.js's navigate listener (internal/desktop/assets); what Go can still do is notice that the
+// main window's top level left the asset origin and send it back to the start page.
 //
 // After every WebViewNavigationCompleted (Windows) the guard asks the page where it is: whereScript posts
 // "isshoni:where:<n>", and the reply's top-level source is WebView2's own (CoreWebView2.Source, Wails'

@@ -63,9 +63,7 @@ constexpr Region CenterBox(uint32_t width, uint32_t height) noexcept {
 
 // One pixel's luma in units of 1 / kPixelScale (BT.709's weights × 10 000, times the 8-bit value).
 inline constexpr uint64_t kPixelScale = 10'000u * 255u;
-constexpr uint32_t PixelLuma(uint8_t r, uint8_t g, uint8_t b) noexcept {
-  return 2126u * r + 7152u * g + 722u * b;
-}
+constexpr uint32_t PixelLuma(uint8_t r, uint8_t g, uint8_t b) noexcept { return 2126u * r + 7152u * g + 722u * b; }
 
 // Sums the luma of BGRA pixels (DXGI_FORMAT_B8G8R8A8_UNORM's byte order: B, G, R, A).
 class Accumulator {

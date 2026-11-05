@@ -7,30 +7,23 @@
 // Go's side: App.WindowNotice() (the pull, null while the window is hidden or nothing is due), the window.notice
 // event when App.ShowWindow opens the window with a notice due, and App.WindowNoticeShown(code). The page pulls
 // again each time it becomes visible, so a window shown another way (a deep link, a second launch) still shows a
-// notice that is due. The bound methods are the bridge's
-// (internal/desktop/bridge); a bridge without them shows nothing, and the toast stays the only notice.
+// notice that is due. The bound methods are the bridge's (internal/desktop/bridge); a bridge without them (an older
+// fake) shows nothing, and the toast stays the only notice.
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import type { BridgeEventName, NativeBridge } from '../../platform/desktop/bridge';
+import type { NativeBridge, WindowNotice as WindowNoticeView } from '../../platform/desktop/bridge';
 import { Button } from '../../ui/Button';
 import styles from './native.module.css';
 import { useAudioBridge } from './useAudio';
 
-/** A notice for the top of the window: its code and its text (from Go's catalog). */
-export interface WindowNoticeView {
-  code: string;
-  text: string;
-}
+export type { WindowNoticeView };
 
 /** What the notice needs of the bridge's App service. */
 export interface WindowNoticeApp {
   windowNotice(): Promise<WindowNoticeView | null>;
   windowNoticeShown(code: string): Promise<void>;
 }
-
-/** The window.notice event (docs/m2/03 §6.3's names, without the isshoni: prefix). */
-export const WINDOW_NOTICE_EVENT = 'window.notice';
 
 function isNotice(v: unknown): v is WindowNoticeView {
   return (
@@ -76,7 +69,7 @@ export function WindowNotice({ bridge: given }: WindowNoticeProps) {
     const onVisible = (): void => {
       if (document.visibilityState === 'visible') pull();
     };
-    const off = bridge.on(WINDOW_NOTICE_EVENT as BridgeEventName, take);
+    const off = bridge.on('window.notice', take);
     pull();
     document.addEventListener('visibilitychange', onVisible);
     return () => {

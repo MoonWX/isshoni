@@ -55,14 +55,11 @@
 //    A src tree without lazy namespaces (test fixtures) has nothing to check.
 // 6. (M2 WA63, docs/m2/03-desktop-app.md §18.1) Every desktop bridge error code (platform/desktop/codes.gen.ts, which
 //    `task gen` makes from internal/desktop/bridge/codes) has a desktop.errors.<code> message: the SPA shows a bridge
-//    error by its code, so these keys are never t('…') literals (BRIDGE_ERRORS). The update.* codes are exempt for
-//    now (the prefix is the file's own UpdatePrefix constant): their texts are the update screens'
-//    desktop.update.error.<code>, which WA82 writes (README §3 item 42). Dropping the exemption here would demand
-//    desktop.errors.update.* keys nobody writes, so then this rule maps an update.* code to
-//    desktop.update.error.<code> instead; README's WA82 row names only codes.node.test.ts, so the write-back after
-//    group 7 adds this file to its Touches. The codes are read from the generated `Code` union like rule 2's, so a
-//    code added in Go and regenerated fails the check until desktop.en.json has its text, and rule 4 counts every
-//    required message as used. A src tree without the file (test fixtures) skips the rule with a note.
+//    error by its code, so these keys are never t('…') literals (BRIDGE_ERRORS). The update.* codes (the prefix is
+//    the file's own UpdatePrefix constant) are the update screens': an update.<code> needs desktop.update.error.<code>
+//    instead (README §3 item 42; WA82 wrote them, group 15's integration ended the exemption). The codes are read
+//    from the generated `Code` union like rule 2's, so a code added in Go and regenerated fails the check until
+//    desktop.en.json has its text, and rule 4 counts every required message as used. A src tree without the file (test fixtures) skips the rule with a note.
 //    web/src/platform/desktop/codes.node.test.ts checks the same in test:web, with 03 §10.5's reason texts.
 //
 // Usage: node scripts/check-i18n.mjs [--src <dir>] [--catalog <en.json>]
@@ -940,18 +937,19 @@ export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
 }
 
 /**
- * Rule 6: where the bridge's error codes are (relative to the src dir), the prefix of their messages, and the name
- * of the constant that starts every exempt (update) code.
+ * Rule 6: where the bridge's error codes are (relative to the src dir), the prefix of their messages, the name of
+ * the constant that starts every update code, and the prefix of the update codes' messages.
  */
 export const BRIDGE_ERRORS = Object.freeze({
   file: path.join('platform', 'desktop', 'codes.gen.ts'),
   prefix: 'desktop.errors',
-  exemptPrefixConstant: 'UpdatePrefix',
+  updatePrefixConstant: 'UpdatePrefix',
+  updatePrefix: 'desktop.update.error',
 });
 
 /**
- * Rule 6: every desktop bridge error code but the update.* ones has a desktop.errors.<code> message (a string, or
- * plural forms: the SPA shows the key as it is).
+ * Rule 6: every desktop bridge error code has a desktop.errors.<code> message, but an update.<code> one a
+ * desktop.update.error.<code> message instead (a string, or plural forms: the SPA shows the key as it is).
  * @param {{ srcDir: string, catalog: Catalog, catalogName: CatalogName }} opts
  * @returns {Promise<{ problems: Problem[], codes: number | null, required: string[] }>} codes: the codes that need a
  *   message, or null when the src tree has no codes.gen.ts (the rule is skipped); required: their keys, which rule 4
@@ -970,8 +968,8 @@ export async function checkBridgeCodes({ srcDir, catalog, catalogName }) {
       required: [],
     };
   }
-  // The exempt prefix: a string constant of the same file (`export const UpdatePrefix = "update.";`).
-  const exempt = new RegExp(`^export const ${BRIDGE_ERRORS.exemptPrefixConstant}\\s*=\\s*"([^"\\\\]+)"`, 'm').exec(
+  // The update codes' prefix: a string constant of the same file (`export const UpdatePrefix = "update.";`).
+  const update = new RegExp(`^export const ${BRIDGE_ERRORS.updatePrefixConstant}\\s*=\\s*"([^"\\\\]+)"`, 'm').exec(
     text,
   )?.[1];
   /** @type {Problem[]} */
@@ -979,8 +977,10 @@ export async function checkBridgeCodes({ srcDir, catalog, catalogName }) {
   /** @type {string[]} */
   const required = [];
   for (const c of res.constants) {
-    if (exempt !== undefined && c.value.startsWith(exempt)) continue;
-    const key = `${BRIDGE_ERRORS.prefix}.${c.value}`;
+    const key =
+      update !== undefined && c.value.startsWith(update)
+        ? `${BRIDGE_ERRORS.updatePrefix}.${c.value.slice(update.length)}`
+        : `${BRIDGE_ERRORS.prefix}.${c.value}`;
     required.push(key);
     const why = keyProblem(catalog, key);
     if (why) {
@@ -1196,7 +1196,10 @@ async function main() {
   if (bridgeCodes === null) {
     console.log(`check:i18n: note: no ${BRIDGE_ERRORS.file} under the src dir, bridge-code rule skipped`);
   } else {
-    console.log(`check:i18n: ${bridgeCodes} bridge error codes, each with its ${BRIDGE_ERRORS.prefix}.<code> text`);
+    console.log(
+      `check:i18n: ${bridgeCodes} bridge error codes, each with its ${BRIDGE_ERRORS.prefix}.<code> text ` +
+        `(${BRIDGE_ERRORS.updatePrefix}.<code> for the update ones)`,
+    );
   }
   console.log(summary);
 }

@@ -1,6 +1,7 @@
 // The desktop app's parts of the app shell (docs/m2/03 §16.2, §16.3; README WA82): VersionMismatch's desktop actions
 // (Update the app and Open in browser, which opens the current room) on the app's own DesktopPlatform over the fake
-// bridge, the browser's screen unchanged, and the banner of a required update above every page in the desktop only.
+// bridge, the browser's screen unchanged, and the banner of a required update above every page in the desktop only,
+// with share/native's close-to-tray notice (03 §11.6) and mic prompt corner (03 §10.3) mounted once for every page.
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createMemoryRouter } from 'react-router';
@@ -9,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { BrowserPlatform } from '../platform/browser/BrowserPlatform';
 import { BridgeError } from '../platform/desktop/errors';
 import { authState, updateStatus } from '../platform/desktop/testing/fakeBridge';
+import { friendsHear } from '../share/native/testing';
 import { createTestPlatform, testOrigin } from '../test/platform';
 import { createTestServices } from '../test/render';
 import { App, AppProviders } from './App';
@@ -197,5 +199,32 @@ describe('the required update banner in the shell (03 §16.2)', () => {
     render(<App services={services} router={router()} />);
     expect(await screen.findByRole('heading', { name: 'page' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Important update' })).not.toBeInTheDocument();
+  });
+});
+
+describe("share/native's parts in the desktop shell (03 §10.3, §11.6)", () => {
+  const router = () => createMemoryRouter([{ path: '*', element: <h1>page</h1> }]);
+  const KOOK = { id: 'p1', appId: 'exe:kook.exe', name: 'KOOK', kind: 'mic', since: 1 } as const;
+
+  it('shows the window notice and the mic prompt corner on any page, and reports the notice shown', async () => {
+    const d = createDesktopTestPlatform();
+    d.fake.answers['app.windowNotice'] = { code: 'still-sharing', text: 'isshoni is still sharing.' };
+    d.fake.answers['audio.friendsHear'] = friendsHear({ prompts: [KOOK] });
+    d.fake.answers['share.current'] = null;
+    const services = createTestServices({ platform: d.platform });
+    render(<App services={services} router={router()} />);
+    expect(await screen.findByText('isshoni is still sharing.')).toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Microphone questions' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'page' })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(d.fake.callsOf('app.windowNoticeShown')).toEqual([['still-sharing']]);
+    });
+  });
+
+  it('are not there in the browser', async () => {
+    const services = createTestServices();
+    render(<App services={services} router={router()} />);
+    expect(await screen.findByRole('heading', { name: 'page' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Microphone questions' })).not.toBeInTheDocument();
   });
 });
