@@ -1,7 +1,7 @@
 // @vitest-environment node
 // scripts/check-i18n.mjs, rule 6 (docs/m2/03-desktop-app.md §18.1; README WA63): every desktop bridge error code of
-// platform/desktop/codes.gen.ts but the update.* ones has a desktop.errors.<code> message, and rule 4 counts those
-// messages as used. platform/desktop/codes.node.test.ts checks the same mapping in test:web.
+// platform/desktop/codes.gen.ts has a desktop.errors.<code> message, an update.<code> one desktop.update.error.<code>
+// instead, and rule 4 counts those messages as used. platform/desktop/codes.node.test.ts checks the same mapping in test:web.
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -32,13 +32,16 @@ export const UpdatePrefix = "update.";
 type Catalog = Parameters<typeof checkBridgeCodes>[0]['catalog'];
 const asCatalog = (c: unknown): Catalog => c as Catalog;
 
-function desktopCatalog(): { desktop: { errors: Record<string, unknown> } } {
+function desktopCatalog(): {
+  desktop: { errors: Record<string, unknown>; update: { error: Record<string, unknown> } };
+} {
   return {
     desktop: {
       errors: {
         invalid_argument: 'Something in that request was wrong.',
         engine: { internal: 'The sharing engine failed.' },
       },
+      update: { error: { network: "isshoni couldn't reach GitHub." } },
     },
   };
 }
@@ -69,13 +72,25 @@ describe('check-i18n.mjs bridge-code rule on fixture trees', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('passes when every code but the update ones has its message, and counts those messages as used', async () => {
+  it('passes when every code has its message, and counts those messages as used', async () => {
     const res = await checkI18n({ srcDir, catalogPath });
     expect(res.problems).toEqual([]);
-    expect(res.bridgeCodes).toBe(2);
+    expect(res.bridgeCodes).toBe(3);
     expect(res.warnings).toEqual([]);
     const { stdout } = await run(process.execPath, [SCRIPT, '--src', srcDir, '--catalog', catalogPath]);
-    expect(stdout).toMatch(/^check:i18n: 2 bridge error codes, each with its desktop\.errors\.<code> text$/m);
+    expect(stdout).toMatch(
+      /^check:i18n: 3 bridge error codes, each with its desktop\.errors\.<code> text \(desktop\.update\.error\.<code> for the update ones\)$/m,
+    );
+  });
+
+  it('an update code needs desktop.update.error.<code>, not desktop.errors.<code>', async () => {
+    const c = desktopCatalog();
+    c.desktop.update.error = {};
+    c.desktop.errors['update'] = { network: 'Not this one.' };
+    const res = await checkBridgeCodes({ srcDir, catalog: asCatalog(c), catalogName: 'desktop.en.json' });
+    expect(res.problems.map((p) => p.message)).toEqual([
+      'bridge error code "update.network" (CodeUpdateNetwork) has no desktop.update.error.network in desktop.en.json',
+    ]);
   });
 
   it('fails when a code has no desktop.errors.<code>, pointing at the constant and the lazy file', async () => {
@@ -100,7 +115,7 @@ describe('check-i18n.mjs bridge-code rule on fixture trees', () => {
     ]);
   });
 
-  it('exempts only the update codes: without UpdatePrefix they need a message too', async () => {
+  it('maps only the update codes: without UpdatePrefix they need desktop.errors.<code>', async () => {
     await write(BRIDGE_ERRORS.file, CODES_GEN.replace(/^export const UpdatePrefix.*$/m, ''));
     const res = await checkBridgeCodes({
       srcDir,
@@ -129,7 +144,7 @@ describe('check-i18n.mjs bridge-code rule on fixture trees', () => {
 });
 
 describe('check-i18n.mjs bridge-code rule on this package', () => {
-  it('passes: desktop.en.json has a text for every bridge error code but the update ones', async () => {
+  it('passes: desktop.en.json has a text for every bridge error code, the update ones included', async () => {
     const res = await checkI18n({ srcDir: WEB_SRC, catalogPath: EN_JSON });
     expect(res.problems).toEqual([]);
     expect(res.bridgeCodes).toBeGreaterThan(30);

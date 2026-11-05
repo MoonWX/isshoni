@@ -10,7 +10,7 @@ import { AppProviders } from '../../app/App';
 import { createDesktopTestPlatform, type DesktopTestPlatform } from '../../app/testing/desktop';
 import { createTestServices } from '../../test/render';
 import { RelinkPage } from '../RelinkPage';
-import { SettingsPage } from '../SettingsPage';
+import { SettingsPage, type SettingsPageProps } from '../SettingsPage';
 import { SetupPage } from '../SetupPage';
 
 function Room() {
@@ -23,13 +23,21 @@ export interface RenderedDesktopPage extends RenderResult {
   router: DataRouter;
 }
 
-/** Renders the desktop routes at path, on d (default: a platform whose server is the test origin). */
-export function renderDesktopPage(path: string, d = createDesktopTestPlatform(), extra?: ReactNode) {
+/**
+ * Renders the desktop routes at path, on d (default: a platform whose server is the test origin); `extra` renders
+ * next to the router, and `settings` are the Settings page's props.
+ */
+export function renderDesktopPage(
+  path: string,
+  d = createDesktopTestPlatform(),
+  extra?: ReactNode,
+  settings?: SettingsPageProps,
+) {
   const router = createMemoryRouter(
     [
       { path: '/desktop/setup', element: <SetupPage /> },
       { path: '/desktop/relink', element: <RelinkPage /> },
-      { path: '/desktop/settings', element: <SettingsPage /> },
+      { path: '/desktop/settings', element: <SettingsPage {...settings} /> },
       { path: '/', element: <h1>home</h1> },
       { path: '/about', element: <h1>about</h1> },
       { path: '/r/:roomId', element: <Room /> },

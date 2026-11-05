@@ -34,6 +34,8 @@ type fakeCore struct {
 	openErr   error
 	heartbeat int
 	shares    *fakeShares
+	notice    *app.WindowNotice
+	shown     []string
 }
 
 var _ Core = (*fakeCore)(nil)
@@ -89,6 +91,21 @@ func (c *fakeCore) OwnConnections(ids []string) error {
 	c.mu.Lock()
 	c.ownConns = ids
 	c.mu.Unlock()
+	return nil
+}
+func (c *fakeCore) WindowNotice() *app.WindowNotice {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.notice
+}
+func (c *fakeCore) WindowNoticeShown(code string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.notice == nil || c.notice.Code != code {
+		return app.ErrNoNotice
+	}
+	c.shown = append(c.shown, code)
+	c.notice = nil
 	return nil
 }
 func (c *fakeCore) Probe(context.Context) (media.Probe, error) { return c.probe, c.probeErr }

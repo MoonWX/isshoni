@@ -60,7 +60,8 @@ export {
     UpdatesPatch,
     UpdatesView,
     User,
-    WindowBounds
+    WindowBounds,
+    WindowNotice
 } from "./models.js";
 
 export type {

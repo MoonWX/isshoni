@@ -272,3 +272,22 @@
   min-width: 0;
   margin: 0;
 }
+
+/* The close-to-tray notice at the top of the window (docs/m2/03 §11.6): the toast's line, dismissible. */
+.windowNotice {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--text-sm);
+}
+
+/* "Pause hotkey unavailable: another app uses …" with its link to Settings → Sharing (docs/m2/03 §11.2). */
+.hotkeyNote {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}

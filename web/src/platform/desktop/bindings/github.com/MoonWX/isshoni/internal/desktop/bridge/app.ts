@@ -102,5 +102,25 @@ export function Quit(stopShare: boolean): $CancellablePromise<void> {
     return $Call.ByID(2078123979, stopShare);
 }
 
+/**
+ * WindowNotice returns the notice due at the top of the window (03 §11.6), null while the window is hidden or none
+ * is due. The SPA subscribes to window.notice first, then pulls.
+ */
+export function WindowNotice(): $CancellablePromise<$models.WindowNotice | null> {
+    return $Call.ByID(2658579740).then(($result: any) => {
+        return $$createType2($result);
+    });
+}
+
+/**
+ * WindowNoticeShown records that the visible page showed the notice code (tips.trayNoticeShown for the close-to-tray
+ * notice); not_found when that notice isn't due or the window isn't showing.
+ */
+export function WindowNoticeShown(code: string): $CancellablePromise<void> {
+    return $Call.ByID(1165175265, code);
+}
+
 // Private type creation functions
 const $$createType0 = app$0.Info.createFrom;
+const $$createType1 = app$0.WindowNotice.createFrom;
+const $$createType2 = $Create.Nullable($$createType1);

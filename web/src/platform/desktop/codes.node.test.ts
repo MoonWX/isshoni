@@ -1,8 +1,8 @@
 // @vitest-environment node
 // The bridge error codes (docs/m2/03 §6.4, generated from internal/desktop/bridge/codes into codes.gen.ts) each have
 // their text: desktop.errors.<code> in the lazy desktop namespace (03 §18.1), the engine codes as
-// desktop.errors.engine.<media code>, plus §10.5's reason texts. The update.* codes are the update screens'
-// (desktop.update.error.<code>, README WA82), and wire codes passed through keep M1's errors.<code>.
+// desktop.errors.engine.<media code>, plus §10.5's reason texts. The update.* codes are the update screens':
+// desktop.update.error.<code> (README WA82, §3 item 42). Wire codes passed through keep M1's errors.<code>.
 import { describe, expect, it } from 'vitest';
 
 import catalog from '../../i18n/lazy/desktop.en.json';
@@ -37,6 +37,12 @@ describe('the bridge error codes', () => {
 
   it.each(all.filter((c) => !c.startsWith(codes.UpdatePrefix)))('%s has a text', (code) => {
     const text = message(`desktop.errors.${code}`);
+    expect(typeof text).toBe('string');
+    expect(text).not.toBe('');
+  });
+
+  it.each(all.filter((c) => c.startsWith(codes.UpdatePrefix)))('%s has its update screen text', (code) => {
+    const text = message(`desktop.update.error.${code.slice(codes.UpdatePrefix.length)}`);
     expect(typeof text).toBe('string');
     expect(text).not.toBe('');
   });

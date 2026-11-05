@@ -14,7 +14,15 @@
 //   <NativeShareDisabled reason={caps.reason} label="Share" />            // canShare false: the header's Share
 //
 // And once for the whole desktop app (its layout, every page): <MicPromptCorner />, the mic prompts in the window's
-// corner while no panel or sheet shows them (03 §10.3).
+// corner while no panel or sheet shows them (03 §10.3); and <WindowNotice />, the close-to-tray notice at the top of the
+// window (03 §11.6).
+//
+// Hand-over (WA80, open): no layout mounts these two yet, so for now the panel mounts <WindowNotice /> (a share
+// stopped from the tray while the window is hidden leaves no panel, and then no notice). The integrator mounts both in
+// the desktop layout and removes the panel's <WindowNotice />, and binds what the bridge lacks: App.WindowNotice and
+// App.WindowNoticeShown (internal/desktop/bridge), the 'window.notice' event in BridgeEvents and NativeBridge.app in
+// platform/desktop/bridge.ts, and ShareView's lockPrompt for the panel's "Resume sharing?" bar. WA84 maps
+// app.App.Hotkeys to Settings.Hotkeys (bridge settings.go). Until then the notice is dead code in the real app.
 import '../../i18n/lazy/desktop';
 
 export {
@@ -28,6 +36,7 @@ export {
 export { NativeShareButton, type NativeShareButtonProps } from './NativeShareButton';
 export { MicPromptCorner } from './MicPromptCorner';
 export { NativeSharePanel, type NativeSharePanelProps } from './NativeSharePanel';
+export { WindowNotice, type WindowNoticeProps } from './WindowNotice';
 export {
   NativeShareDisabled,
   NativeShareUnavailable,

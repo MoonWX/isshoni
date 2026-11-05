@@ -371,6 +371,12 @@ export interface UpdateStatus {
   policyOff: boolean;
 }
 
+/** A notice for the top of the window: its code and its text from Go's catalog (docs/m2/03 §11.6). */
+export interface WindowNotice {
+  code: string;
+  text: string;
+}
+
 // ---- Events (docs/m2/03 §6.3; the names here are without the isshoni: prefix) ----
 
 export interface BridgeEvents {
@@ -386,6 +392,8 @@ export interface BridgeEvents {
   'auth.state': AuthState;
   'deeplink.open': PendingLink;
   'window.state': { visible: boolean; focused: boolean; fullscreen: boolean };
+  /** The notice due at the top of the window (docs/m2/03 §11.6); App.windowNotice() is its pull. */
+  'window.notice': WindowNotice;
   'settings.changed': SettingsView;
   'update.state': UpdateStatus;
 }
@@ -412,6 +420,10 @@ export interface NativeBridge {
     ownConnections(ids: string[]): void;
     pendingLink(): Promise<PendingLink | null>;
     linkHandled(): Promise<void>;
+    /** null: the window is hidden, or no notice is due (docs/m2/03 §11.6). */
+    windowNotice(): Promise<WindowNotice | null>;
+    /** Rejects with not_found when that notice isn't due or the window isn't showing. */
+    windowNoticeShown(code: string): Promise<void>;
   };
   auth: {
     state(): Promise<AuthState>;

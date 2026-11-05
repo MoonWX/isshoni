@@ -25,6 +25,8 @@ const fakes = vi.hoisted(() => {
       'PendingLink',
       'LinkHandled',
       'OwnConnections',
+      'WindowNotice',
+      'WindowNoticeShown',
     ),
     Auth: group(
       'State',

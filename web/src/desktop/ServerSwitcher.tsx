@@ -1,6 +1,8 @@
-// The server switcher (docs/m2/03 §8.1, §8.3): the servers of servers.json (Auth.Servers()), with Switch, Sign out
-// of the active one and Remove, and "Add a server" (the wizard's server step, ?new=1). The relink page shows it for
-// "Switch server"; Settings → Servers (README WA82) can reuse it.
+// The server switcher (docs/m2/03 §8.1, §8.3, §14.4): the servers of servers.json (Auth.Servers()), with Switch,
+// Sign out of the active one, Link again for the active one when it isn't linked (Auth.Link(), then the link step)
+// and Remove, and "Add a server" (the wizard's server step, ?new=1). The relink page shows it for "Switch server";
+// Settings → Servers (#servers) is this list too, which the account menu's Switch server and the Offline screen's
+// link open.
 //
 // Every change of the active server reloads the window (Auth.SwitchServer, Auth.RemoveServer of the active server):
 // the page puts "/" into its address first, so the reloaded page starts at the new server's room. Sign out keeps the
@@ -43,10 +45,15 @@ export function ServerSwitcher({ bridge, appVersion }: ServerSwitcherProps) {
   const [unconfirmed, setUnconfirmed] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    bridge.auth.servers().then(setServers, (err: unknown) => {
-      setError(failureOf(err));
-      setServers([]);
-    });
+    bridge.auth.servers().then(
+      (s) => {
+        setServers(Array.isArray(s) ? s : []);
+      },
+      (err: unknown) => {
+        setError(failureOf(err));
+        setServers([]);
+      },
+    );
   }, [bridge]);
   useEffect(() => {
     load();
@@ -126,6 +133,23 @@ export function ServerSwitcher({ bridge, appVersion }: ServerSwitcherProps) {
                   }}
                 >
                   {t('desktop.servers.switch')}
+                </Button>
+              )}
+              {s.active && !s.linked && (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  disabled={busy}
+                  onClick={() => {
+                    // The link step of the active server shows the code that this call starts.
+                    run(() =>
+                      bridge.auth.link().then(() => {
+                        void navigate('/desktop/setup');
+                      }),
+                    );
+                  }}
+                >
+                  {t('desktop.servers.linkAgain')}
                 </Button>
               )}
               {s.active && s.linked && (

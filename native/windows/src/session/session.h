@@ -37,7 +37,8 @@ struct StartResult {
 // or a second one with audio; IM_ERR_SOURCE_GONE (pick_expired) for a used, expired or evicted pick token (which a
 // failed start never consumes); IM_ERR_NO_ENCODER (layer_failed, forced_failed) when a layer gets no encoder;
 // IM_ERR_BAD_STATE for IM_AUDIO_MODE_EXCLUDE_APPS after im_init(IM_INIT_NO_AUDIO) (README §3 item 35, 05 §4.3: the
-// test tone still starts).
+// test tone still starts); IM_ERR_INVALID_ARG for the luma tap's start flag (luma_sample.h's kStartFlag, 04 §5.8) in a
+// release build, without a video source, or without a free stream for its ring.
 im_status Start(const api::StartRequest &req, StartResult &out);
 
 // im_get_session_info: info is zeroed with struct_size = sizeof(im_session_info).

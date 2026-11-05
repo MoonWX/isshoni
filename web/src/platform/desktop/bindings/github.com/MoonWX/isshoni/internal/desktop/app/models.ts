@@ -68,3 +68,31 @@ export class Info {
  *     first.").
  */
 export type PendingLink = any;
+
+/**
+ * WindowNotice is the window.notice event's payload: the notice's code and its text from the catalog.
+ */
+export class WindowNotice {
+    "code": string;
+    "text": string;
+
+    /** Creates a new WindowNotice instance. */
+    constructor($$source: Partial<WindowNotice> = {}) {
+        if (!("code" in $$source)) {
+            this["code"] = "";
+        }
+        if (!("text" in $$source)) {
+            this["text"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new WindowNotice instance from a string or object.
+     */
+    static createFrom($$source: any = {}): WindowNotice {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new WindowNotice($$parsedSource as Partial<WindowNotice>);
+    }
+}

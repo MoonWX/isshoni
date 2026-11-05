@@ -1,17 +1,34 @@
-# The release pipeline (docs/m1/06-deploy-and-ci.md §9.3, "06" below).
+# The release pipeline (docs/m1/06-deploy-and-ci.md §9.3, "06" below; the desktop app's part is
+# docs/m2/06-windows-release.md §11, "M2 06" below).
 #
-#   tag v* ──► version ──► web ──► build ──► sign ──► verify ──► publish ──► site
-#                                            │ environment "release": runs only after the owner approves
-#                                  a draft release exists; nothing is public but the exact image tag :<v>
+#   tag v* ─► version ─┬─► web ────────────────────────────┬─────────────────────► build ─► sign ─► verify ─────────┬─► publish ─► site
+#                      ├─► desktop-exe (ubuntu) ─────────┐  │                         ▲       │       └► verify-windows ┘
+#                      └─► windows-native (windows) ─────┴──┴─► desktop-pkg (windows) ┘       │
+#                                    environment "release": sign runs only after the owner approves
+#                                    a draft release exists; nothing is public but the exact image tag :<v>
+#   (desktop-exe takes web's web/dist; desktop-pkg takes windows-native's DLLs, desktop-exe's exe and web's notices)
 #
 # - web is unprivileged and the only job that runs npm (every npm package is third-party code, bumped weekly).
+# - The desktop app (M2 06 §11.1) is built by three unprivileged jobs that hold no write token, since they run
+#   third-party build code (MSVC, vcpkg's ports, NSIS, the Go modules): windows-native builds isshoni-media.dll
+#   (win-x64-release only) against the locked FFmpeg build, whose attestation it checks; desktop-exe cross-builds
+#   isshoni.exe and the exit tools on Linux; desktop-pkg stages, packs and smoke-tests the installer, writes the update
+#   manifest, the symbols zip, the FFmpeg source and the stamped install-desktop.ps1 (artifact desktop-release, with
+#   the stage as desktop-stage), and uploads the exit tools (isshoni-exit-tools, kept 90 days, not a release asset)
+#   that audiotest.yml's fetch job takes by run id. build only adds their files to the release as data.
 # - build runs goreleaser (.goreleaser.yaml) with write permissions and no Node: the draft release, the image
 #   ghcr.io/moonwx/isshoni:<v>, SBOMs, the cosign bundle of checksums.txt and the provenance attestations. For a
 #   final release it first checks the protocol compat snapshot (01 §14.3): internal/protocol/testdata/compat/<v>/,
 #   committed by the release-prep PR (`task release:compat VERSION=<v>`, 06 §9.1), must be a copy of testdata/v1.
-# - sign is the only job that sees the release signing key (06 §9.4), and runs nothing but checkout, gh,
-#   ssh-keygen and upload-artifact. Its signature, checksums.txt.sig, is what install.sh checks before it installs
-#   anything; the files it signed, with the signature, go to verify as the artifact release-signed.
+# - sign is the only job that sees the release signing key (06 §9.4) and the update signing key (M2 06 §11.5), and
+#   runs nothing but checkout, gh, ssh-keygen and upload-artifact. Its signature, checksums.txt.sig, is what
+#   install.sh and install-desktop.ps1 check before they install anything, and isshoni-desktop-update.json.sig is
+#   what the desktop app checks before it updates; the files it signed, with the signatures, go to verify and
+#   verify-windows as the artifact release-signed.
+# - verify-windows installs the app the way a user does: the released install-desktop.ps1 under Windows PowerShell
+#   5.1 against a mirror of the signed files (tools/relserve), then deploy/test/windows/smoke.ps1 -Mode release and
+#   an uninstall that must leave nothing, then isshoni-audiotest selfcheck from isshoni-exit-tools (M2 06 R13). It
+#   holds no write token either (M2 06 §11.4).
 # - verify installs those files with their own install.sh in rootless systemd containers (podman), and checks the
 #   cosign signatures and the attestations. It holds no write token: the container runs third-party code as its
 #   root, from Docker Hub bases pinned by digest (06 §4.13; README §6 "Decided after group 10" (1), review R4).
@@ -24,9 +41,11 @@
 #   tag, and a job-level success() counts every job upstream (see publish).
 #
 # Dry run (Actions → Release → Run workflow, dry_run on): the same jobs as 0.0.0-dryrun.<run>, with goreleaser's
-# snapshot (built and signed with cosign, never published), a sign-dry job that signs with a key made in the job and
-# uploads release-signed as sign does, and verify against those files with an install.sh that carries that key.
-# Nothing needs approval, nothing is public.
+# snapshot (built and signed with cosign, never published), a sign-dry job that signs with keys made in the job (a
+# release key for checksums.txt, an update key and its backup for the manifest) and uploads release-signed as sign
+# does, and verify and verify-windows against those files with installers that carry that key. The desktop jobs run
+# as in a release. Nothing needs approval, nothing is public; isshoni-exit-tools of a dry run can still be run by
+# audiotest.yml (release_run_id = the dry run's id) to check the hand-over.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their own permissions;
 # third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
@@ -174,9 +193,627 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build:
-    # goreleaser and the pinned Go tools only: no Node, no npm on this runner (06 §9.3).
+  windows-native:
+    # isshoni-media.dll for the release (M2 06 §5.1, §11.1): ci.yml's job of the same name without caches, tests or
+    # the test-hooks build: the MSVC environment of deploy/windows/msvc-env.ps1, vcpkg at native/vcpkg.json's
+    # baseline built from source, the locked FFmpeg build (its SHA-256 against native/ffmpeg/lock.json and its build
+    # provenance against ffmpeg.yml), the win-x64-release preset with IM_COMMIT = the tag's short SHA, dll-check, and
+    # the WebView2 bootstrapper with its signature checked. Uploads windows-native (release\, which desktop-pkg
+    # stages and copies into isshoni-exit-tools) and ffmpeg-source (the locked source tar, which becomes the release
+    # asset isshoni-desktop_<v>_ffmpeg-source.tar). It runs third-party build code and holds no write token; GH_TOKEN
+    # is set only on the attestation step.
+    needs: version
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      attestations: read # gh attestation verify of the FFmpeg build
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      VCPKG_DISABLE_METRICS: '1'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod; for tools/desktoppkg)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: The FFmpeg lock is current
+        # M2 06 §4.1: a release is built only from the FFmpeg build that its own native/ffmpeg inputs describe.
+        run: |
+          go -C tools run ./desktoppkg ffmpeg-inputs -check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: FFmpeg from the lock (and its source)
+        id: ffmpeg
+        run: |
+          # M2 06 §4.5, §5.1: the locked zip and source tar from the deps release, each checked against lock.json's
+          # SHA-256 by tools/desktoppkg ffmpeg-fetch, which unpacks the zip and checks the build (the two DLLs with
+          # the lock's names and SHA-256s, the LGPL configuration).
+          $out = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          $root = [string](go -C tools run ./desktoppkg ffmpeg-fetch -source -out $out | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $root = $root.Trim()
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'include/libavcodec/avcodec.h'))) {
+            throw "ffmpeg-fetch printed '$root', which has no include/libavcodec/avcodec.h"
+          }
+          $lock = Get-Content -Raw -LiteralPath native/ffmpeg/lock.json | ConvertFrom-Json
+          $zip = @($lock.assets.PSObject.Properties.Name | Where-Object { $_ -like '*-win-x64.zip' })
+          $src = @($lock.assets.PSObject.Properties.Name | Where-Object { $_ -like '*-source.tar' })
+          if ($zip.Count -ne 1 -or $src.Count -ne 1) { throw 'native/ffmpeg/lock.json does not name one zip and one source tar' }
+          foreach ($name in @($zip[0], $src[0])) {
+            if (-not (Test-Path -LiteralPath (Join-Path $out $name) -PathType Leaf)) { throw "ffmpeg-fetch left no $name in $out" }
+          }
+          "IM_FFMPEG_ROOT=$root ($($lock.tag))"
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "zip=$(Join-Path $out $zip[0])" >> $env:GITHUB_OUTPUT
+          "source=$(Join-Path $out $src[0])" >> $env:GITHUB_OUTPUT
+
+      - name: The FFmpeg build's provenance (gh attestation verify, ffmpeg.yml)
+        # M2 06 §4.5, §11.1: ffmpeg.yml's publish job attested both files; a deps release asset that some other
+        # workflow made fails here even with the right SHA-256.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ steps.ffmpeg.outputs.zip }}
+          SOURCE: ${{ steps.ffmpeg.outputs.source }}
+        run: |
+          foreach ($file in @($env:ZIP, $env:SOURCE)) {
+            gh attestation verify $file --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/ffmpeg.yml"
+            if ($LASTEXITCODE -ne 0) { throw "gh attestation verify failed for $(Split-Path -Leaf $file)" }
+          }
+
+      - name: MSVC environment
+        id: msvc
+        run: ./deploy/windows/msvc-env.ps1
+
+      - name: vcpkg at native/vcpkg.json's baseline (no binary cache)
+        id: vcpkg
+        run: |
+          $baseline = [string](Get-Content -Raw -LiteralPath native/vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw 'native/vcpkg.json has no 40-hex builtin-baseline' }
+          $root = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git init -q $root
+          git -C $root remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $root fetch -q --depth 1 origin $baseline
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of vcpkg $baseline failed" }
+          git -C $root checkout -q --detach FETCH_HEAD
+          # Downloads the vcpkg tool release the checkout pins and checks its SHA-512.
+          & (Join-Path $root 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg.bat failed (exit code $LASTEXITCODE)" }
+          # A release builds every port from source: no binary cache, not even vcpkg's default one (06 §9.3).
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear" >> $env:GITHUB_ENV
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+
+      - name: CMake and Ninja
+        id: tools
+        run: |
+          # The ones on PATH (the image's, or Visual Studio's once msvc-env.ps1 ran), else the copies vcpkg pins and
+          # verifies by SHA-512.
+          foreach ($tool in 'cmake', 'ninja') {
+            $cmd = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cmd) {
+              $path = $cmd.Source
+            } else {
+              $path = [string](& (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') fetch $tool | Select-Object -Last 1)
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $path.Trim())) { throw "vcpkg fetch $tool failed" }
+              $path = $path.Trim()
+            }
+            "${tool}: $path ($(& $path --version | Select-Object -First 1))"
+            "$tool=$path" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: win-x64-release - configure and build
+        id: release
+        working-directory: native
+        env:
+          CMAKE: ${{ steps.tools.outputs.cmake }}
+          NINJA: ${{ steps.tools.outputs.ninja }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+        run: |
+          # The four-part version of M2 06 §5.3 (0.0.0-dryrun.<run> is 0.0.0.<run mod 65000>), from tools/desktoppkg
+          # winver, the rule isshoni.exe's version resource uses too. IM_COMMIT is the tag's short SHA.
+          $winver = [string](go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') run ./desktoppkg winver $env:VERSION | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { throw "desktoppkg winver refused the version '$env:VERSION'" }
+          $winver = $winver.Trim()
+          if ($winver -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "desktoppkg winver printed '$winver', not a four-part version" }
+          $commit = ([string](git rev-parse --short=7 HEAD)).Trim()
+          & $env:CMAKE --preset win-x64-release "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_VERSION=$env:VERSION" `
+            "-DIM_WINVER=$winver" "-DIM_COMMIT=$commit" "-DIM_FFMPEG_ROOT=$env:FFMPEG_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:CMAKE --build --preset win-x64-release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "winver=$winver" >> $env:GITHUB_OUTPUT
+
+      - name: dumpbin of the release DLL (for the log)
+        run: |
+          $dll = 'native/build/win-x64-release/windows/isshoni-media.dll'
+          dumpbin /nologo /dependents /exports $dll
+          dumpbin /nologo /loadconfig $dll | Select-String -Pattern 'Dependent Load' -SimpleMatch
+          exit 0
+
+      - name: dll-check (the release DLL and the FFmpeg DLLs)
+        env:
+          WINVER: ${{ steps.release.outputs.winver }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+        run: |
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'native/build/win-x64-release/windows/isshoni-media.dll'
+          go -C tools run ./desktoppkg dll-check -dll $dll -version $env:VERSION -winver $env:WINVER `
+            -ffmpeg (Join-Path $env:FFMPEG_ROOT 'bin')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The WebView2 bootstrapper (signature checked)
+        id: webview2
+        run: |
+          # M2 06 §5.1: downloaded from tools.json's URL; Authenticode Valid with exactly the pinned signer.
+          $pin = (Get-Content -Raw -LiteralPath deploy/windows/tools.json | ConvertFrom-Json).webview2Bootstrapper
+          $file = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+          $ProgressPreference = 'SilentlyContinue'
+          for ($try = 1; ; $try++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $pin.url -OutFile $file
+              break
+            } catch {
+              if ($try -ge 3) { throw }
+              "download failed ($($_.Exception.Message)); trying again"
+              Start-Sleep -Seconds (5 * $try)
+            }
+          }
+          $sig = Get-AuthenticodeSignature -LiteralPath $file
+          if ($sig.Status -ne 'Valid') { throw "the bootstrapper's signature is $($sig.Status): $($sig.StatusMessage)" }
+          $subject = $sig.SignerCertificate.Subject
+          if ($subject -cne $pin.signer) { throw "the bootstrapper is signed by '$subject', not '$($pin.signer)'" }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+          "WebView2 bootstrapper: SHA-256 $sha, signed by $subject"
+          "path=$file" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "signer=$subject" >> $env:GITHUB_OUTPUT
+
+      - name: The windows-native artifact (release\ only)
+        env:
+          WINVER: ${{ steps.release.outputs.winver }}
+          BASELINE: ${{ steps.vcpkg.outputs.baseline }}
+          TOOLSET: ${{ steps.msvc.outputs.toolset }}
+          VS_VERSION: ${{ steps.msvc.outputs.vs-version }}
+          WINDOWS_SDK: ${{ steps.msvc.outputs.windows-sdk }}
+          WEBVIEW2: ${{ steps.webview2.outputs.path }}
+          WEBVIEW2_SHA256: ${{ steps.webview2.outputs.sha256 }}
+          WEBVIEW2_SIGNER: ${{ steps.webview2.outputs.signer }}
+          FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+          FFMPEG_SOURCE: ${{ steps.ffmpeg.outputs.source }}
+        run: |
+          # M2 06 §5.1, as ci.yml's windows-native writes it, without the ci\ folder: the shipped DLL and its PDB,
+          # the FFmpeg DLLs and PDBs next to it, the FFmpeg and vcpkg license files, the bootstrapper and
+          # native-manifest.json.
+          $out = Join-Path $env:RUNNER_TEMP 'windows-native'
+          $rel = Join-Path $out 'release'
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          $build = 'native/build/win-x64-release'
+          Copy-Item -LiteralPath "$build/windows/isshoni-media.dll", "$build/windows/isshoni-media.pdb" -Destination $rel
+          $lock = Get-Content -Raw -LiteralPath native/ffmpeg/lock.json | ConvertFrom-Json
+          $ffmpegDlls = [ordered]@{}
+          foreach ($name in @("avcodec-$($lock.avcodecMajor)", "avutil-$($lock.avutilMajor)")) {
+            $file = Join-Path $env:FFMPEG_ROOT "bin/$name.dll"
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            if ($sha -ne [string]$lock.dlls."$name.dll") { throw "$name.dll is not the one lock.json names" }
+            $ffmpegDlls["$name.dll"] = $sha
+            Copy-Item -LiteralPath $file -Destination $rel
+            Copy-Item -LiteralPath (Join-Path $env:FFMPEG_ROOT "pdb/$name.pdb") -Destination $rel
+          }
+          $licenses = Join-Path $rel 'licenses'
+          New-Item -ItemType Directory -Force -Path $licenses | Out-Null
+          Copy-Item -Path (Join-Path $env:FFMPEG_ROOT 'licenses/*') -Destination $licenses -Recurse
+
+          # The vcpkg ports of the release tree (built without the tests feature, so no gtest): their copyright
+          # files and their versions from vcpkg's status database.
+          $installed = "$build/vcpkg_installed"
+          $ports = [ordered]@{}
+          $stanzas = (Get-Content -Raw -LiteralPath "$installed/vcpkg/status") -split "(?:\r?\n){2,}"
+          foreach ($stanza in $stanzas) {
+            $f = @{}
+            foreach ($line in $stanza -split "\r?\n") {
+              if ($line -match '^([A-Za-z-]+): (.*)$') { $f[$Matches[1]] = $Matches[2] }
+            }
+            if ($f['Package'] -and -not $f['Feature'] -and $f['Status'] -eq 'install ok installed' -and
+                $f['Architecture'] -eq 'x64-windows-static') {
+              $v = $f['Version']
+              if ($f['Port-Version'] -and $f['Port-Version'] -ne '0') { $v = "$v#$($f['Port-Version'])" }
+              $ports[$f['Package']] = $v
+            }
+          }
+          foreach ($port in $ports.Keys) {
+            $copyright = "$installed/x64-windows-static/share/$port/copyright"
+            if (-not (Test-Path -LiteralPath $copyright)) { throw "vcpkg port $port has no copyright file" }
+            $dest = Join-Path $rel "licenses/vcpkg/$port"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item -LiteralPath $copyright -Destination $dest
+          }
+          # License files the native slices commit (README WA51: OpenH264's headers; WA50: C++/WinRT).
+          foreach ($pair in @(@('native/windows/third_party/openh264/LICENSE', 'licenses/openh264'),
+                              @('native/windows/third_party/cppwinrt/LICENSE', 'licenses/cppwinrt'))) {
+            if (Test-Path -LiteralPath $pair[0]) {
+              $dest = Join-Path $rel $pair[1]
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              Copy-Item -LiteralPath $pair[0] -Destination $dest
+            }
+          }
+          Copy-Item -LiteralPath $env:WEBVIEW2 -Destination $rel
+
+          $header = Get-Content -Raw -LiteralPath native/include/isshoni_media.h
+          if ($header -notmatch '#define IM_ABI_MAJOR\s+(\d+)u' ) { throw 'no IM_ABI_MAJOR in the header' }
+          $major = [int]$Matches[1]
+          if ($header -notmatch '#define IM_ABI_MINOR\s+(\d+)u' ) { throw 'no IM_ABI_MINOR in the header' }
+          $minor = [int]$Matches[1]
+          $dllSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $rel 'isshoni-media.dll')).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            version              = $env:VERSION
+            winver               = $env:WINVER
+            dll                  = [ordered]@{ name = 'isshoni-media.dll'; sha256 = $dllSha; abi = ($major * 65536 + $minor) }
+            ffmpeg               = [ordered]@{ tag = [string]$lock.tag; dlls = $ffmpegDlls }
+            vcpkg                = [ordered]@{ baseline = $env:BASELINE; ports = $ports }
+            msvcToolset          = $env:TOOLSET
+            vsInstance           = $env:VS_VERSION
+            windowsSdk           = $env:WINDOWS_SDK
+            webview2Bootstrapper = [ordered]@{ sha256 = $env:WEBVIEW2_SHA256; signer = $env:WEBVIEW2_SIGNER }
+          }
+          $json = $manifest | ConvertTo-Json -Depth 6
+          [IO.File]::WriteAllText((Join-Path $rel 'native-manifest.json'), $json + "`n", (New-Object Text.UTF8Encoding($false)))
+          $json
+          Get-ChildItem -LiteralPath $out -Recurse -File | ForEach-Object { $_.FullName.Substring($out.Length + 1) }
+
+          # The locked FFmpeg source tar, on its own (M2 06 §4.5): desktop-pkg checks it against lock.json again.
+          $src = Join-Path $env:RUNNER_TEMP 'ffmpeg-source'
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          Copy-Item -LiteralPath $env:FFMPEG_SOURCE -Destination $src
+
+      - name: Upload windows-native
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-native
+          path: ${{ runner.temp }}/windows-native/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload ffmpeg-source
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ffmpeg-source
+          path: ${{ runner.temp }}/ffmpeg-source/
+          retention-days: 7
+          if-no-files-found: error
+
+  desktop-exe:
+    # isshoni.exe and the exit tools, cross-built on Linux (M2 06 §5.2, §11.1): GOOS=windows, no cgo, -trimpath, the
+    # tag's version stamp. No Node: the web app comes from web's artifact. task desktop:exe:windows runs §5.2 step
+    # 3's checks on the exe (the production tags, the version, no test or dev strings). The exit tools of 06 §11.1
+    # (isshoni-audiotest.exe, isshoni-enginetest.exe, g2g.exe) go to windows-exit-bin for desktop-pkg, which hands
+    # them on in isshoni-exit-tools with the release DLL.
     needs: [version, web]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download web/dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.version.outputs.task-version }}
+
+      - name: task release:wails3 (the pinned wails3 CLI)
+        run: task release:wails3
+
+      - name: isshoni.exe (task desktop:exe:windows)
+        run: |
+          task desktop:exe:windows VERSION="$VERSION"
+          ls -l dist-desktop/windows_amd64/
+
+      - name: The exit tools (isshoni-audiotest.exe, isshoni-enginetest.exe, g2g.exe)
+        # M2 06 §11.1; the flags of audiotest.yml's build and task native:dist, with the tag's version.
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          out=$RUNNER_TEMP/windows-exit-bin
+          mkdir -p "$out"
+          commit=$(git rev-parse HEAD)
+          pkg=github.com/MoonWX/isshoni/internal/version
+          go build -trimpath -ldflags "-s -w -X main.harnessVersion=$VERSION -X $pkg.version=$VERSION -X $pkg.commit=$commit" \
+            -o "$out/isshoni-audiotest.exe" ./cmd/isshoni-audiotest
+          go build -trimpath -ldflags "-s -w -X $pkg.version=$VERSION -X $pkg.commit=$commit" \
+            -o "$out/isshoni-enginetest.exe" ./cmd/isshoni-enginetest
+          go -C tools build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$out/g2g.exe" ./g2g
+          ls -l "$out"
+
+      - name: Upload windows-exe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-exe
+          path: dist-desktop/windows_amd64/isshoni.exe
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload windows-exit-bin
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-exit-bin
+          path: ${{ runner.temp }}/windows-exit-bin/
+          retention-days: 7
+          if-no-files-found: error
+
+  desktop-pkg:
+    # The installer and the desktop release files (M2 06 §6, §11.1), from windows-native's release\, desktop-exe's
+    # isshoni.exe and web's licenses.txt: NSIS from the pinned portable zip (SHA-256 checked, no cache), the desktop
+    # notices and the native license gate (§9.3), `stage -release` (§6.2: the staged isshoni.exe --self-check ok with
+    # testHooks false), the prebuilt uninstaller (§6.9), the installer, smoke.ps1 -Mode release (install, --version,
+    # --self-check, uninstall /S /PURGE), the update manifest (tools/desktoppkg manifest), the symbols zip, the FFmpeg
+    # source as isshoni-desktop_<v>_ffmpeg-source.tar and the stamped install-desktop.ps1. Uploads desktop-release
+    # (the §2.1 files) and desktop-stage for build, and isshoni-exit-tools (kept 90 days, not a release asset) for
+    # audiotest.yml. It runs third-party build code (NSIS, the Go modules) and holds no write token.
+    needs: [version, web, windows-native, desktop-exe]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.version.outputs.task-version }}
+
+      - name: Download web/dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Download windows-native
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-native
+          path: ${{ runner.temp }}/windows-native
+
+      - name: Download windows-exe (into dist-desktop/windows_amd64/)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-exe
+          path: dist-desktop/windows_amd64
+
+      - name: Download windows-exit-bin
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-exit-bin
+          path: ${{ runner.temp }}/windows-exit-bin
+
+      - name: Download ffmpeg-source
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ffmpeg-source
+          path: ${{ runner.temp }}/ffmpeg-source
+
+      - name: NSIS (makensis from the pinned portable zip)
+        id: nsis
+        run: |
+          # deploy/windows/tools.json's pin, downloaded each time (no caches in a release) and checked by SHA-256.
+          $pin = (Get-Content -Raw -LiteralPath deploy/windows/tools.json | ConvertFrom-Json).nsis
+          if ($pin.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'deploy/windows/tools.json has no nsis.sha256' }
+          $zip = Join-Path $env:RUNNER_TEMP "nsis-$($pin.version).zip"
+          $ProgressPreference = 'SilentlyContinue'
+          for ($try = 1; ; $try++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $pin.url -OutFile $zip -UserAgent 'Wget'
+              break
+            } catch {
+              if ($try -ge 3) { throw }
+              "download failed ($($_.Exception.Message)); trying again"
+              Start-Sleep -Seconds (5 * $try)
+            }
+          }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($sha -ne $pin.sha256) { throw "nsis-$($pin.version).zip has the SHA-256 $sha, not deploy/windows/tools.json's $($pin.sha256)" }
+          $out = Join-Path $env:RUNNER_TEMP 'nsis'
+          Expand-Archive -LiteralPath $zip -DestinationPath $out -Force
+          $makensis = Join-Path $out "nsis-$($pin.version)\makensis.exe"
+          if (-not (Test-Path -LiteralPath $makensis)) { throw "the NSIS zip has no nsis-$($pin.version)\makensis.exe" }
+          & $makensis -VERSION
+          ''
+          "makensis=$makensis" >> $env:GITHUB_OUTPUT
+
+      - name: Desktop notices and the native license gate (tools/notices -native)
+        env:
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # M2 06 §9.2-§9.3, on its own so that a gate failure is this step's; task desktop:package:windows writes the
+          # same file again for the stage.
+          $out = Join-Path $env:RUNNER_TEMP 'THIRD_PARTY_NOTICES-desktop.txt'
+          go -C tools run ./notices -root .. -pkg ./cmd/isshoni-desktop -goos windows -goarch amd64 `
+            -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt `
+            -native ../deploy/notices/native-windows.json -native-root $env:NATIVE -version $env:VERSION -o $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The stage and the installer (task desktop:package:windows RELEASE=true)
+        id: package
+        env:
+          MAKENSIS: ${{ steps.nsis.outputs.makensis }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+        run: |
+          # SKIP_EXE: desktop-exe's isshoni.exe, already checked there (06 §5.2 step 3); stage -release checks it
+          # again (a production build, testHooks false).
+          task desktop:package:windows "VERSION=$env:VERSION" "NATIVE_DIR=$env:NATIVE" "MAKENSIS=$env:MAKENSIS" `
+            RELEASE=true PREBUILT_UNINSTALLER=true SKIP_EXE=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist-desktop/isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
+          if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "no $setup" }
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+
+      - name: smoke.ps1 -Mode release (install, --version, --self-check, uninstall /S /PURGE)
+        env:
+          SETUP: ${{ steps.package.outputs.setup }}
+        run: |
+          ./deploy/test/windows/smoke.ps1 -Mode release -Setup $env:SETUP -Version $env:VERSION `
+            -Stage (Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage')
+
+      - name: The desktop release files
+        env:
+          SETUP: ${{ steps.package.outputs.setup }}
+          NATIVE: ${{ runner.temp }}\windows-native\release
+          SOURCE_DIR: ${{ runner.temp }}\ffmpeg-source
+        run: |
+          # M2 06 §2.1: everything but the SBOM (build's syft writes it from the stage) and the manifest's signature
+          # (sign's). Into desktop-release\, which build downloads into dist-desktop/.
+          $out = Join-Path $env:RUNNER_TEMP 'desktop-release'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $utf8 = New-Object Text.UTF8Encoding($false)
+          Copy-Item -LiteralPath $env:SETUP -Destination $out
+
+          # The update manifest (06 §8.2), from the installer, the tag's date, deploy/desktop/min-version and
+          # deploy/keys/update_revoked.
+          go -C tools run ./desktoppkg manifest -version $env:VERSION -installer $env:SETUP `
+            -out (Join-Path $out 'isshoni-desktop-update.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # The symbols: isshoni-media.pdb, the FFmpeg PDBs and native-manifest.json (06 §2.1, §5.1).
+          $lock = Get-Content -Raw -LiteralPath native/ffmpeg/lock.json | ConvertFrom-Json
+          $symbols = @('isshoni-media.pdb', "avcodec-$($lock.avcodecMajor).pdb", "avutil-$($lock.avutilMajor).pdb",
+            'native-manifest.json') | ForEach-Object {
+            $f = Join-Path $env:NATIVE $_
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "the windows-native artifact has no $_" }
+            $f
+          }
+          Compress-Archive -LiteralPath $symbols -DestinationPath (Join-Path $out "isshoni-desktop_$($env:VERSION)_windows_amd64_symbols.zip")
+
+          # The LGPL corresponding source, byte for byte the deps release's (06 §4.5), checked against lock.json.
+          $srcName = @($lock.assets.PSObject.Properties.Name | Where-Object { $_ -like '*-source.tar' })
+          if ($srcName.Count -ne 1) { throw 'native/ffmpeg/lock.json does not name one source tar' }
+          $src = Join-Path $env:SOURCE_DIR $srcName[0]
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $src).Hash.ToLowerInvariant()
+          if ($sha -ne [string]$lock.assets.($srcName[0])) { throw "$($srcName[0]) has the SHA-256 $sha, not lock.json's" }
+          Copy-Item -LiteralPath $src -Destination (Join-Path $out "isshoni-desktop_$($env:VERSION)_ffmpeg-source.tar")
+
+          # install-desktop.ps1 stamped with the version, as task release:prepare stamps it in build (06 §11.2;
+          # release:assets compares the two): exactly one line $IsshoniVersion = '@VERSION@'. The file is LF
+          # (.gitattributes), and stays so.
+          $text = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'deploy/install-desktop.ps1'))
+          $placeholder = "`$IsshoniVersion = '@VERSION@'"
+          $lines = $text -split "`n"
+          if (@($lines | Where-Object { $_ -ceq $placeholder }).Count -ne 1) {
+            throw "deploy/install-desktop.ps1 has no single line $placeholder to stamp"
+          }
+          $stamped = ($lines | ForEach-Object { if ($_ -ceq $placeholder) { "`$IsshoniVersion = '$($env:VERSION)'" } else { $_ } }) -join "`n"
+          [IO.File]::WriteAllText((Join-Path $out 'install-desktop.ps1'), $stamped, $utf8)
+
+          Get-ChildItem -LiteralPath $out -File | Sort-Object Name | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.Name }
+
+      - name: Upload desktop-release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-release
+          path: ${{ runner.temp }}/desktop-release/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload desktop-stage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-stage
+          path: dist-desktop/stage/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: The isshoni-exit-tools folder (the tag's tools and the release DLLs)
+        env:
+          NATIVE: ${{ runner.temp }}\windows-native\release
+          EXIT_BIN: ${{ runner.temp }}\windows-exit-bin
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # M2 06 §11.1 (05 §18.1, README WA79/WA90): flat, as audiotest.yml's fetch job reads it. The DLLs and
+          # native-manifest.json are copied byte for byte from windows-native's release\, the very files the
+          # installer packs, and this step fails unless each one's SHA-256 equals the manifest's.
+          $out = Join-Path $env:RUNNER_TEMP 'isshoni-exit-tools'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($exe in 'isshoni-audiotest.exe', 'isshoni-enginetest.exe', 'g2g.exe') {
+            $f = Join-Path $env:EXIT_BIN $exe
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "windows-exit-bin has no $exe" }
+            Copy-Item -LiteralPath $f -Destination $out
+          }
+          Copy-Item -LiteralPath 'native/windows/tools/hwcheck.ps1' -Destination $out
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $env:NATIVE 'native-manifest.json') | ConvertFrom-Json
+          $dlls = [ordered]@{ ([string]$manifest.dll.name) = [string]$manifest.dll.sha256 }
+          foreach ($p in $manifest.ffmpeg.dlls.PSObject.Properties) { $dlls[$p.Name] = [string]$p.Value }
+          if ($dlls.Count -ne 3 -or -not $dlls.Contains('isshoni-media.dll')) {
+            throw "native-manifest.json names $($dlls.Count) DLLs ($($dlls.Keys -join ', ')), not isshoni-media.dll and the two FFmpeg DLLs"
+          }
+          Copy-Item -LiteralPath (Join-Path $env:NATIVE 'native-manifest.json') -Destination $out
+          foreach ($name in $dlls.Keys) {
+            Copy-Item -LiteralPath (Join-Path $env:NATIVE $name) -Destination $out
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out $name)).Hash.ToLowerInvariant()
+            if ($sha -cne $dlls[$name]) { throw "$name in isshoni-exit-tools has the SHA-256 $sha, native-manifest.json has '$($dlls[$name])'" }
+            "${name}: $sha (= native-manifest.json)"
+          }
+          $commit = ([string](git rev-parse HEAD)).Trim()
+          $readme = "isshoni-exit-tools of release.yml run $($env:GITHUB_RUN_ID) (attempt $($env:GITHUB_RUN_ATTEMPT)): " +
+            "$($env:TAG) at $commit, version $($env:VERSION).`n" +
+            "The tools are the tag's; isshoni-media.dll and the FFmpeg DLLs are the ones the installer of this run " +
+            "packs (their SHA-256s are in native-manifest.json). Not a release asset (docs/m2/06-windows-release.md 11.1).`n"
+          [IO.File]::WriteAllText((Join-Path $out 'README.txt'), $readme, (New-Object Text.UTF8Encoding($false)))
+          Get-ChildItem -LiteralPath $out -File | Sort-Object Name | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.Name }
+
+      - name: Upload isshoni-exit-tools
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isshoni-exit-tools
+          path: ${{ runner.temp }}/isshoni-exit-tools/
+          retention-days: 90
+          if-no-files-found: error
+
+  build:
+    # goreleaser and the pinned Go tools only: no Node, no npm on this runner (06 §9.3). The desktop files come from
+    # desktop-pkg's artifacts as data: nothing from them runs here (M2 06 §11.1).
+    needs: [version, web, desktop-pkg]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -226,6 +863,26 @@ jobs:
         with:
           name: web-dist
           path: web/dist
+
+      - name: Download desktop-release (into dist-desktop/)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: desktop-release
+          path: dist-desktop
+
+      - name: Download desktop-stage (into dist-desktop/stage/)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: desktop-stage
+          path: dist-desktop/stage
+
+      - name: Keep the packaging job's install-desktop.ps1 for release:assets
+        # goreleaser's before hook (task release:prepare) stamps dist-desktop/install-desktop.ps1 again from
+        # deploy/install-desktop.ps1; release:assets then compares the two copies (M2 06 §11.2).
+        run: |
+          mkdir -p "$RUNNER_TEMP/desktop-pkg"
+          mv dist-desktop/install-desktop.ps1 "$RUNNER_TEMP/desktop-pkg/install-desktop.ps1"
+          ls -l dist-desktop
 
       - name: Set up Go (version from go.mod)
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -283,6 +940,41 @@ jobs:
           fi
           task lint:keys
 
+      - name: The app carries the update keys
+        # M2 06 §8.3, §11.1: an app built without deploy/keys/update_signers reports its updater disabled
+        # (no_keys), and the sign job could check no manifest signature. lint:keys checks that
+        # internal/update/signers.go, from which isshoni.exe took its keys, equals the file.
+        if: env.DRY_RUN == 'false'
+        run: |
+          if [ ! -s deploy/keys/update_signers ]; then
+            echo "::error file=deploy/keys/update_signers::there are no update keys yet: see deploy/keys/README.md"
+            exit 1
+          fi
+          task lint:keys
+
+      - name: The SBOM of the desktop app's install tree (syft over the stage)
+        # M2 06 §2.1: isshoni-desktop_<v>_windows_amd64.sbom.json, SPDX JSON, from desktop-stage, the tree the
+        # installer packs (release:assets compares the two).
+        run: |
+          syft scan "dir:dist-desktop/stage" --source-name isshoni-desktop --source-version "$VERSION" \
+            -o "spdx-json=dist-desktop/isshoni-desktop_${VERSION}_windows_amd64.sbom.json"
+          ls -l dist-desktop
+
+      - name: The release notes' desktop lines (ISSHONI_DESKTOP_MIN_VERSION, ISSHONI_FFMPEG_VERSION)
+        # M2 06 §11.7: .goreleaser.yaml's release.header reads both.
+        run: |
+          min=$(tr -d '\r' < deploy/desktop/min-version | sed -n '1s/^[[:space:]]*//; 1s/[[:space:]]*$//; 1p')
+          ffmpeg=$(jq -r '.ffmpeg.version' native/ffmpeg/pins.json)
+          if [ -z "$min" ] || [ -z "$ffmpeg" ] || [ "$ffmpeg" = null ]; then
+            echo "::error::deploy/desktop/min-version ('$min') or native/ffmpeg/pins.json's ffmpeg.version ('$ffmpeg') is missing"
+            exit 1
+          fi
+          {
+            echo "ISSHONI_DESKTOP_MIN_VERSION=$min"
+            echo "ISSHONI_FFMPEG_VERSION=$ffmpeg"
+          } >> "$GITHUB_ENV"
+          echo "desktop update floor $min, FFmpeg $ffmpeg"
+
       - name: The repository has the README.md that every archive carries
         # 06 §3; release:assets FULL=true checks the archives for it after goreleaser. goreleaser, which names it
         # plainly (.goreleaser.yaml), would fail without it too; this step says why, before the ghcr.io login.
@@ -310,10 +1002,15 @@ jobs:
           ISSHONI_SNAPSHOT_VERSION: ${{ needs.version.outputs.version }}
         run: .bin/goreleaser release --snapshot --clean --skip=publish
 
-      - name: task release:assets (the asset list of 06 §3)
-        run: task release:assets VERSION="$VERSION" FULL=true
+      - name: task release:assets (the asset list of 06 §3 and M2 06 §2.1)
+        # DESKTOP=true (M2 06 §11.2): the update manifest against the installer and the tag, the FFmpeg source
+        # against the lock, install-desktop.ps1 (and the packaging job's copy), the symbols, the SBOM and the
+        # installer's file list (7z) against the stage.
+        run: |
+          task release:assets VERSION="$VERSION" FULL=true DESKTOP=true \
+            PKG_PS1="$RUNNER_TEMP/desktop-pkg/install-desktop.ps1"
 
-      - name: Attest the archives, packages, checksums and installer
+      - name: Attest the archives, packages, checksums and installers
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
@@ -323,6 +1020,8 @@ jobs:
             dist/*.rpm
             dist/checksums.txt
             dist-extra/install.sh
+            dist-desktop/isshoni-desktop*
+            dist-desktop/install-desktop.ps1
 
       - name: Find the image digest
         id: image
@@ -358,7 +1057,8 @@ jobs:
           mkdir release-assets
           cp dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/*.sbom.json \
             dist/checksums.txt dist/checksums.txt.sigstore.json \
-            dist-extra/install.sh deploy/compose.yaml deploy/compose.host.yaml release-assets/
+            dist-extra/install.sh deploy/compose.yaml deploy/compose.host.yaml \
+            dist-desktop/isshoni-desktop* dist-desktop/install-desktop.ps1 release-assets/
           ls -l release-assets
 
       - name: Upload the dry run's release files
@@ -398,12 +1098,12 @@ jobs:
         # that would fail there is never signed. --strict fails on a malformed line too.
         run: |
           (cd rel && sha256sum --strict -c checksums.txt)
-          # And nothing is in the draft that the signature would not cover, hidden files included. checksums.txt.sig
-          # is there when this job runs again after it uploaded one; the next step replaces it.
+          # And nothing is in the draft that the signature would not cover, hidden files included. The two
+          # signatures are there when this job runs again after it uploaded them; the next steps replace them.
           shopt -s dotglob nullglob
           for f in rel/*; do
             name=${f#rel/}
-            case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json) continue ;; esac
+            case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json | isshoni-desktop-update.json.sig) continue ;; esac
             if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
               echo "::error::the draft has $name, which checksums.txt does not list"
               exit 1
@@ -433,8 +1133,65 @@ jobs:
           ssh-keygen -Y verify -f deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums \
             -s rel/checksums.txt.sig < rel/checksums.txt
 
-      - name: Upload checksums.txt.sig to the draft
-        run: gh release upload "$TAG" rel/checksums.txt.sig --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Sign the update manifest
+        # M2 06 §8.3, §8.12, §11.1: isshoni-desktop-update.json with the update key (namespace isshoni-update), then
+        # verified with deploy/keys/update_signers, which catches a wrong key in the secret. Its SHA-256 was already
+        # checked above (sha256sum --strict -c), before any signature. A manifest that revokes keys (revokedKeys not
+        # exactly the empty list that tools/desktoppkg writes) is signed only with the backup key: apps honour a
+        # revocation from no other key, and check-draft.sh refuses it in publish too. deploy/test/check-draft-test.sh
+        # runs this step's script.
+        env:
+          RELEASE_UPDATE_SIGNING_KEY: ${{ secrets.RELEASE_UPDATE_SIGNING_KEY }}
+        run: |
+          manifest=rel/isshoni-desktop-update.json
+          signers=deploy/keys/update_signers
+          if [ -z "$RELEASE_UPDATE_SIGNING_KEY" ]; then
+            echo "::error::the release environment has no secret RELEASE_UPDATE_SIGNING_KEY (deploy/keys/README.md)"
+            exit 1
+          fi
+          if [ ! -f "$manifest" ]; then
+            echo "::error::the draft has no isshoni-desktop-update.json"
+            exit 1
+          fi
+          if [ ! -s "$signers" ]; then
+            echo "::error file=$signers::$signers is missing or empty, so no update signature can be checked"
+            exit 1
+          fi
+          # A signature from an earlier run of this job goes first (see "Sign checksums.txt").
+          rm -f "$manifest.sig"
+          key=$RUNNER_TEMP/u
+          trap 'rm -f "$key" "$RUNNER_TEMP/u-backup.pub"' EXIT
+          umask 077
+          printf '%s\n' "$RELEASE_UPDATE_SIGNING_KEY" > "$key"
+          fingerprint=$(ssh-keygen -l -f "$key" | cut -d' ' -f2) || fingerprint=''
+          if [ -z "$fingerprint" ]; then
+            echo "::error::RELEASE_UPDATE_SIGNING_KEY is not a private key that ssh-keygen reads (without a passphrase)"
+            exit 1
+          fi
+          if ! grep -Fqx -e '  "revokedKeys": [],' -e '  "revokedKeys": []' "$manifest"; then
+            backup=$(awk '{ sub(/\r$/, "") } /^[ \t]*(#|$)/ { next } $NF ~ /^isshoni-update-backup-[0-9]+$/ { print }' "$signers")
+            if [ "$(printf '%s\n' "$backup" | grep -c 'ssh-ed25519 ')" != 1 ]; then
+              echo "::error file=$signers::$signers has no single backup line (isshoni-update-backup-<n>)"
+              exit 1
+            fi
+            printf '%s\n' "$backup" | sed 's/.*\(ssh-ed25519 [A-Za-z0-9+/=]*\).*/\1/' > "$RUNNER_TEMP/u-backup.pub"
+            backup_fingerprint=$(ssh-keygen -l -f "$RUNNER_TEMP/u-backup.pub" | cut -d' ' -f2) || backup_fingerprint=''
+            if [ "$fingerprint" != "$backup_fingerprint" ]; then
+              echo "::error::isshoni-desktop-update.json revokes keys (revokedKeys is not empty), but the key in" \
+                "RELEASE_UPDATE_SIGNING_KEY ($fingerprint) is not the backup key of $signers ($backup_fingerprint):" \
+                "apps honour a revocation only from the backup key (docs/m2/06-windows-release.md §8.12)"
+              exit 1
+            fi
+            echo "isshoni-desktop-update.json revokes keys, and the key is the backup key"
+          fi
+          ssh-keygen -Y sign -f "$key" -n isshoni-update "$manifest"
+          echo "signed isshoni-desktop-update.json with the update key $fingerprint"
+          ssh-keygen -Y verify -f "$signers" -I isshoni-update -n isshoni-update -s "$manifest.sig" < "$manifest"
+
+      - name: Upload checksums.txt.sig and isshoni-desktop-update.json.sig to the draft
+        run: |
+          gh release upload "$TAG" rel/checksums.txt.sig rel/isshoni-desktop-update.json.sig \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Upload the signed files for verify
         # verify installs exactly these, the draft as checked above with its signature, and so needs no token that
@@ -449,8 +1206,8 @@ jobs:
           retention-days: 7
 
   sign-dry:
-    # The dry run's sign: the same commands with a key made here, and no environment. It uploads the signed files as
-    # sign does, and the key's allowed_signers for the dry run's installer.
+    # The dry run's sign: the same commands with keys made here, and no environment. It uploads the signed files as
+    # sign does, and the keys' allowed_signers and update_signers for the dry run's installers and verify-windows.
     if: needs.version.outputs.dry-run == 'true'
     needs: [version, build]
     runs-on: ubuntu-24.04
@@ -469,7 +1226,7 @@ jobs:
           shopt -s dotglob nullglob
           for f in rel/*; do
             name=${f#rel/}
-            case $name in checksums.txt | checksums.txt.sigstore.json) continue ;; esac
+            case $name in checksums.txt | checksums.txt.sigstore.json | isshoni-desktop-update.json.sig) continue ;; esac
             if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
               echo "::error::the release has $name, which checksums.txt does not list"
               exit 1
@@ -487,6 +1244,32 @@ jobs:
           ssh-keygen -Y verify -f keys/allowed_signers -I isshoni-release -n isshoni-checksums \
             -s rel/checksums.txt.sig < rel/checksums.txt
 
+      - name: Sign the update manifest with throwaway update keys and verify it
+        # M2 06 §11.1: an update key and its backup made here, in update_signers' format (M2 06 §8.3), for
+        # verify-windows. A manifest that revokes keys is signed with the backup, as sign requires of a release.
+        # deploy/test/check-draft-test.sh runs this step's script.
+        run: |
+          manifest=rel/isshoni-desktop-update.json
+          if [ ! -f "$manifest" ]; then
+            echo "::error::the dry run has no isshoni-desktop-update.json"
+            exit 1
+          fi
+          ssh-keygen -q -t ed25519 -N '' -C isshoni-update-1 -f "$RUNNER_TEMP/u"
+          ssh-keygen -q -t ed25519 -N '' -C isshoni-update-backup-1 -f "$RUNNER_TEMP/u-backup"
+          for k in u u-backup; do
+            printf 'isshoni-update namespaces="isshoni-update" %s\n' "$(cat "$RUNNER_TEMP/$k.pub")"
+          done > keys/update_signers
+          key=$RUNNER_TEMP/u
+          if ! grep -Fqx -e '  "revokedKeys": [],' -e '  "revokedKeys": []' "$manifest"; then
+            echo "isshoni-desktop-update.json revokes keys: signing it with the backup key"
+            key=$RUNNER_TEMP/u-backup
+          fi
+          rm -f "$manifest.sig"
+          ssh-keygen -Y sign -f "$key" -n isshoni-update "$manifest"
+          rm -f "$RUNNER_TEMP/u" "$RUNNER_TEMP/u-backup"
+          ssh-keygen -Y verify -f keys/update_signers -I isshoni-update -n isshoni-update \
+            -s "$manifest.sig" < "$manifest"
+
       - name: Upload the signed files for verify
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -496,7 +1279,7 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Upload the throwaway key's allowed_signers
+      - name: Upload the throwaway keys' allowed_signers and update_signers
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-keys-dryrun
@@ -731,6 +1514,215 @@ jobs:
           podman exec "$CONTAINER" journalctl -u isshoni --no-pager -n 100 || :
           cat "$RUNNER_TEMP/relserve.log" || :
 
+  verify-windows:
+    # The desktop app as a user gets it (M2 06 §11.4): the signed files checked with Windows' inbox ssh-keygen, the
+    # installer's attestation, then the released, stamped install-desktop.ps1 under Windows PowerShell 5.1 against a
+    # mirror of those files (tools/relserve over HTTPS), then smoke.ps1 -Mode release on what it installed and an
+    # uninstall (/S /PURGE) that must leave nothing behind; last, isshoni-audiotest selfcheck from desktop-pkg's
+    # isshoni-exit-tools (M2 06 R13: the hand-over to audiotest.yml loads the release DLL). In a dry run the script and
+    # the checks use sign-dry's keys.
+    # Like verify, it takes the files from sign's artifact and holds no write token; GH_TOKEN, read-only, is set only
+    # on the attestation step.
+    needs: [version, build, sign, sign-dry, desktop-pkg]
+    if: >-
+      !cancelled() && needs.build.result == 'success' &&
+      (needs.sign.result == 'success' || needs.sign-dry.result == 'success')
+    runs-on: windows-2025
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      attestations: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      DRY_RUN: ${{ needs.version.outputs.dry-run }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod; for tools/relserve)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Download the signed release files (sign's, or sign-dry's in a dry run)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-signed
+          path: ${{ runner.temp }}/mirror/download/${{ needs.version.outputs.tag }}
+
+      - name: Download the dry run's keys
+        if: env.DRY_RUN == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-keys-dryrun
+          path: ${{ runner.temp }}/keys
+
+      - name: Download desktop-stage (the tree the installer packs)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: desktop-stage
+          path: ${{ runner.temp }}/stage
+
+      - name: The signatures, with the inbox ssh-keygen
+        # 2. Windows' own OpenSSH (M2 06 §7.2), as install-desktop.ps1 uses it: checksums.txt.sig with the release
+        # keys, isshoni-desktop-update.json.sig with the update keys (the repository's, or the dry run's).
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "mirror/download/$env:TAG"
+          if ($env:DRY_RUN -eq 'true') {
+            $allowed = Join-Path $env:RUNNER_TEMP 'keys/allowed_signers'
+            $update = Join-Path $env:RUNNER_TEMP 'keys/update_signers'
+          } else {
+            $allowed = Join-Path $env:GITHUB_WORKSPACE 'deploy/keys/allowed_signers'
+            $update = Join-Path $env:GITHUB_WORKSPACE 'deploy/keys/update_signers'
+          }
+          $openssh = Join-Path $env:SystemRoot 'System32\OpenSSH'
+          $sk = Join-Path $openssh 'ssh-keygen.exe'
+          if (-not (Test-Path -LiteralPath $sk -PathType Leaf)) { throw "this runner has no inbox $sk" }
+          "inbox OpenSSH: $((& (Join-Path $openssh 'ssh.exe') -V 2>&1 | Out-String).Trim())"
+          # ssh-keygen reads the signed file on stdin, byte for byte: a file handle, not a PowerShell pipe.
+          function Test-Signature {
+            param([string]$Signers, [string]$Identity, [string]$Namespace, [string]$File)
+            $out = Join-Path $env:RUNNER_TEMP 'ssh-keygen.out'
+            $err = Join-Path $env:RUNNER_TEMP 'ssh-keygen.err'
+            $p = Start-Process -FilePath $sk -NoNewWindow -Wait -PassThru -RedirectStandardInput $File `
+              -RedirectStandardOutput $out -RedirectStandardError $err `
+              -ArgumentList @('-Y', 'verify', '-f', "`"$Signers`"", '-I', $Identity, '-n', $Namespace, '-s', "`"$File.sig`"")
+            Get-Content -LiteralPath $out, $err
+            if ($p.ExitCode -ne 0) { throw "the inbox ssh-keygen does not verify $(Split-Path -Leaf $File).sig ($Identity, $Namespace)" }
+          }
+          Test-Signature -Signers $allowed -Identity 'isshoni-release' -Namespace 'isshoni-checksums' -File (Join-Path $dir 'checksums.txt')
+          Test-Signature -Signers $update -Identity 'isshoni-update' -Namespace 'isshoni-update' -File (Join-Path $dir 'isshoni-desktop-update.json')
+
+      - name: gh attestation verify on the installer
+        # 3. The installer that build attested (M2 06 §2.1).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP "mirror/download/$env:TAG/isshoni-desktop_$($env:VERSION)_windows_amd64_setup.exe"
+          gh attestation verify $setup --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install with the released install-desktop.ps1 (Windows PowerShell 5.1, against relserve)
+        # 4. and 5.: tools/relserve serves the signed files as https://127.0.0.1:<port>/download/v<v>/... with a test
+        # CA that goes into the machine's root store (the hosted runner is an administrator: no dialog) and out
+        # again. The released script is stamped with <v> and carries the release keys; a dry run's gets sign-dry's
+        # key in its key block instead, as verify does for install.sh. It runs as `irm | iex` would, under Windows
+        # PowerShell 5.1 with ISSHONI_DOWNLOAD_BASE and ISSHONI_NO_LAUNCH=1, and must install <v> with no error.
+        run: |
+          $mirror = Join-Path $env:RUNNER_TEMP 'mirror'
+          $dir = Join-Path $mirror "download/$env:TAG"
+          $work = Join-Path $env:RUNNER_TEMP 'verify-windows'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $utf8 = New-Object Text.UTF8Encoding($false)
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\isshoni'
+          if (Test-Path -LiteralPath $installDir) { throw "$installDir exists before the install" }
+
+          $text = [IO.File]::ReadAllText((Join-Path $dir 'install-desktop.ps1'))
+          if (-not $text.Contains("`n`$IsshoniVersion = '$($env:VERSION)'`n")) { throw "the released install-desktop.ps1 is not stamped with $($env:VERSION)" }
+          if ($env:DRY_RUN -eq 'true') {
+            $signer = (Get-Content -Raw -LiteralPath (Join-Path $env:RUNNER_TEMP 'keys/allowed_signers')).Trim()
+            $m = [regex]::Match($text, '(?m)^(# BEGIN ALLOWED SIGNERS[^\n]*\n)(?:[^\n]*\n)*?(# END ALLOWED SIGNERS)')
+            if (-not $m.Success) { throw 'the released install-desktop.ps1 has no key block' }
+            $text = $text.Substring(0, $m.Index) + $m.Groups[1].Value + $signer + "`n" + $m.Groups[2].Value +
+              $text.Substring($m.Index + $m.Length)
+          }
+          $ps1 = Join-Path $work 'install-desktop.ps1'
+          [IO.File]::WriteAllText($ps1, $text, $utf8)
+
+          $relserve = Join-Path $work 'relserve.exe'
+          go -C (Join-Path $env:GITHUB_WORKSPACE 'tools') build -o $relserve ./relserve
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ca = Join-Path $work 'ca.pem'
+          $ready = Join-Path $work 'addr'
+          $server = Start-Process -FilePath $relserve -PassThru -NoNewWindow `
+            -ArgumentList @('-dir', "`"$mirror`"", '-latest', $env:VERSION, '-addr', '127.0.0.1:0', '-ca-out', "`"$ca`"",
+              '-ready-file', "`"$ready`"") `
+            -RedirectStandardOutput (Join-Path $work 'relserve.out') -RedirectStandardError (Join-Path $work 'relserve.err')
+          $store = $null
+          $cert = $null
+          try {
+            $deadline = (Get-Date).AddSeconds(30)
+            while (-not (Test-Path -LiteralPath $ready)) {
+              if ($server.HasExited) { throw "relserve exited ($($server.ExitCode)): $(Get-Content -Raw (Join-Path $work 'relserve.err'))" }
+              if ((Get-Date) -gt $deadline) { throw 'relserve did not start within 30 s' }
+              Start-Sleep -Milliseconds 200
+            }
+            $base = "https://$((Get-Content -Raw -LiteralPath $ready).Trim())"
+            $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ca)
+            $store = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+            $store.Open('ReadWrite')
+            $store.Add($cert)
+
+            # Windows PowerShell 5.1 with the machine's module path (not pwsh's).
+            $saved = $env:PSModulePath
+            $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+            $env:ISSHONI_DOWNLOAD_BASE = $base
+            $env:ISSHONI_NO_LAUNCH = '1'
+            $errFile = Join-Path $work 'install.err'
+            try {
+              $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `
+                "`$ProgressPreference = 'SilentlyContinue'; Get-Content -Raw -LiteralPath '$ps1' | Invoke-Expression" `
+                2>$errFile | Out-String
+              $code = $LASTEXITCODE
+            } finally {
+              $env:PSModulePath = $saved
+              Remove-Item Env:ISSHONI_DOWNLOAD_BASE, Env:ISSHONI_NO_LAUNCH -ErrorAction SilentlyContinue
+            }
+            $err = [IO.File]::ReadAllText($errFile)
+            # A CLIXML block of progress records only (5.1's 'Preparing modules for first use.') is not an error.
+            if ($err -match '^\s*#< CLIXML\s*(<Objs[\s\S]*</Objs>)\s*$') {
+              $x = [xml]('<r>' + $Matches[1] + '</r>')
+              $records = @($x.SelectNodes('/r/*[local-name()="Objs"]/*'))
+              if (@($records | Where-Object { $_.GetAttribute('S') -ne 'progress' }).Count -eq 0) { $err = '' }
+            }
+            "---- install-desktop.ps1 ($base): exit $code"
+            $out
+            if ($err.Trim()) { "stderr: $err" }
+            if ($code -ne 0 -or $err.Trim()) { throw "the install exited $code or wrote to stderr" }
+            if (-not ($out -match '(?m)^Good "isshoni-checksums" signature for isshoni-release with ED25519 key SHA256:')) {
+              throw "the script printed no 'Good ... signature' line from ssh-keygen"
+            }
+            if (-not $out.Contains("isshoni $($env:VERSION) is installed.")) { throw "no 'isshoni $($env:VERSION) is installed.' line" }
+          } finally {
+            if ($null -ne $store) {
+              if ($null -ne $cert) { $store.Remove($cert) }
+              $store.Close()
+            }
+            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
+          }
+
+      - name: smoke.ps1 -Mode release (the installed tree, then uninstall /S /PURGE)
+        # 6. Files and their SHA-256 against the stage, the registry, the protocol command, the shortcut's
+        # AppUserModelID, --version and --self-check, licenses\; then the seeded sign-in and toast keys, and
+        # uninstall.exe /S /PURGE, which must leave nothing of M2 06 §2.2 and §2.3.
+        run: |
+          ./deploy/test/windows/smoke.ps1 -Mode release -Version $env:VERSION -Stage (Join-Path $env:RUNNER_TEMP 'stage')
+
+      - name: Download isshoni-exit-tools (desktop-pkg's hand-over to audiotest.yml)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: isshoni-exit-tools
+          path: ${{ runner.temp }}/exit-tools
+
+      - name: isshoni-audiotest selfcheck (isshoni-exit-tools, the release DLL)
+        # 7. M2 06 R13: the hand-over runs, not only its SHA-256s. selfcheck loads isshoni-media.dll and the FFmpeg
+        # DLLs from beside the exe (the artifact's flat layout), checks im_version and every export, runs the probe,
+        # starts and stops the watcher and runs the analyzer on synthetic signals. No sound: the hosted runner has no
+        # audio endpoint, as in ci.yml's windows-desktop.
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'exit-tools\isshoni-audiotest.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "isshoni-exit-tools has no isshoni-audiotest.exe" }
+          & $exe selfcheck
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "isshoni-audiotest selfcheck exited $code" }
+
   publish:
     # 06 §9.3: refuses notes with a TODO, and a draft that is no longer what sign signed: it downloads the draft
     # once more right before it goes public, since anything with a write token could have changed it after sign
@@ -738,8 +1730,10 @@ jobs:
     # The result check is explicit: a job-level `if` without a status function means success(), and success() looks
     # at every job upstream, not only at `needs`. On a tag sign-dry is skipped, so a plain condition would skip
     # publish after a green verify, and the run would end green with the release still a draft (actions/runner#491).
-    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.version.outputs.dry-run == 'false' }}
-    needs: [version, verify]
+    # A Windows-runner outage blocks a release too (M2 06 D14, §11.1): the fix is a re-run, never a release without
+    # the desktop app.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.verify-windows.result == 'success' && needs.version.outputs.dry-run == 'false' }}
+    needs: [version, verify, verify-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -773,15 +1767,16 @@ jobs:
           rm -rf rel
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
 
-      - name: The draft is what sign signed (signature, checksums, no other asset)
-        # deploy/release/check-draft.sh (06 §9.3), in this order: checksums.txt is signed by a key of
+      - name: The draft is what sign signed (signatures, checksums, no other asset)
+        # deploy/release/check-draft.sh (06 §9.3, M2 06 §11.3), in this order: checksums.txt is signed by a key of
         # deploy/keys/allowed_signers, as install.sh will check it (06 §4.3); every asset it lists is there, with
-        # that SHA-256 (--strict); and the draft has no asset that it does not list, hidden ones included, which no
-        # signature would cover (its own signature and cosign bundle excepted). The script reads only rel/ and
-        # deploy/keys/allowed_signers, and annotates each error; deploy/test/check-draft-test.sh tests it on
-        # fixture drafts (`task test:sh`, README F15).
+        # that SHA-256 (--strict); the draft has no asset that it does not list, hidden ones included, which no
+        # signature would cover (the two signatures and the cosign bundle excepted); isshoni-desktop-update.json is
+        # signed by a key of deploy/keys/update_signers, as the app checks it, and by its backup key when it revokes
+        # keys. The script reads only rel/ and the two key files, and annotates each error;
+        # deploy/test/check-draft-test.sh tests it on fixture drafts (`task test:sh`, README F15).
         run: |
-          if ! sh deploy/release/check-draft.sh rel deploy/keys/allowed_signers; then
+          if ! sh deploy/release/check-draft.sh rel deploy/keys/allowed_signers deploy/keys/update_signers; then
             echo "::error::the draft $TAG is not the release that sign signed, so it stays a draft (the errors above say why)"
             exit 1
           fi

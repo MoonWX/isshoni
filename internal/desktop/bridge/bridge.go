@@ -66,6 +66,8 @@ type Core interface {
 	PendingLink() *app.PendingLink
 	LinkHandled()
 	OwnConnections(ids []string) error
+	WindowNotice() *app.WindowNotice
+	WindowNoticeShown(code string) error
 	Probe(ctx context.Context) (media.Probe, error)
 }
 

@@ -80,6 +80,8 @@ export function createWailsBridge(opts: WailsBridgeOptions = {}): NativeBridge {
       },
       pendingLink: () => call(App.PendingLink()),
       linkHandled: () => call(App.LinkHandled()),
+      windowNotice: () => call(App.WindowNotice()),
+      windowNoticeShown: (code) => call(App.WindowNoticeShown(code)),
     },
     auth: {
       state: () => call(Auth.State()),

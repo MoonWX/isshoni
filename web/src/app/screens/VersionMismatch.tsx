@@ -1,4 +1,5 @@
 import { RefreshCw } from 'lucide-react';
+import { lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { VersionActions } from '../../platform/types';
@@ -16,10 +17,17 @@ export interface VersionMismatchProps {
   actions: VersionActions;
 }
 
+/** The desktop app's variant (docs/m2/03 §16.3), loaded on demand: the browser never fetches it. */
+const DesktopVersionMismatch = lazy(() =>
+  import('../../desktop/shell').then((m) => ({ default: m.DesktopVersionMismatch })),
+);
+
 /**
  * This page and the server don't speak a common protocol version (05 §16.4). The connection wiring
  * (rooms/connection.ts) shows it for `stopped` with protocol_unsupported or client_outdated, at once and without a
  * reload of its own; a second time for the same server version means that the Reload didn't help (`stillStale`).
+ * In the desktop app (M2: actions with updateApp or openInBrowser, docs/m2/03 §16.3) it is desktop/VersionScreen.tsx
+ * instead: Update the app and Open in browser (the current room), and Try again; the browser's screen is unchanged.
  * A welcome from a server of another version is not this screen: the page reloads once, or the update pill waits
  * while it shares. e2e/version.spec.ts checks both through a routed signaling socket.
  */
@@ -30,6 +38,17 @@ export function VersionMismatch({
   actions,
 }: VersionMismatchProps) {
   const { t } = useTranslation();
+  if (actions.updateApp !== undefined || actions.openInBrowser !== undefined) {
+    return (
+      <Suspense fallback={null}>
+        <DesktopVersionMismatch
+          {...(serverVersion !== undefined ? { serverVersion } : {})}
+          serverOlder={serverOlder}
+          actions={actions}
+        />
+      </Suspense>
+    );
+  }
   const body = serverOlder
     ? t('common.screens.versionMismatch.serverOlder')
     : stillStale

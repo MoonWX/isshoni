@@ -66,6 +66,23 @@ func (s *App) OpenLogsFolder() error { return mapError(s.core.OpenLogsFolder(), 
 // OpenNotices opens the installed THIRD_PARTY_NOTICES.txt (io_error when it can't).
 func (s *App) OpenNotices() error { return mapError(s.core.OpenNotices(), s.log) }
 
+// WindowNotice is the window.notice event's payload and App.WindowNotice()'s answer: {code, text} (03 §11.6).
+type WindowNotice = app.WindowNotice
+
+// WindowNotice returns the notice due at the top of the window (03 §11.6), null while the window is hidden or none
+// is due. The SPA subscribes to window.notice first, then pulls.
+func (s *App) WindowNotice() *WindowNotice { return s.core.WindowNotice() }
+
+// WindowNoticeShown records that the visible page showed the notice code (tips.trayNoticeShown for the close-to-tray
+// notice); not_found when that notice isn't due or the window isn't showing.
+func (s *App) WindowNoticeShown(code string) error {
+	err := s.core.WindowNoticeShown(code)
+	if errors.Is(err, app.ErrNoNotice) {
+		return newError(codes.CodeNotFound, nil)
+	}
+	return mapError(err, s.log)
+}
+
 // PendingLink returns the deep link not yet acted on (03 §13.2), null when there is none.
 func (s *App) PendingLink() *PendingLink { return s.core.PendingLink() }
 

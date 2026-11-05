@@ -135,6 +135,28 @@ describe('shareView (05 §10.4, §12.6)', () => {
     expect(shareView(live, undefined, true, false).overlay).toBeNull();
   });
 
+  it('M2: says "Paused" over the last frame of a paused share, or over no frame for a late joiner (03 §11.3)', () => {
+    const paused = viewerShare({}, shareInfo('s_a', 'u_bea', 1, { status: 'paused' }));
+    expect(shareView(paused, undefined, true)).toEqual({ overlay: 'paused', badge: null });
+    // A viewer who joined while paused has no frame: "Paused", never "Connecting…".
+    expect(shareView(paused, undefined, false)).toEqual({ overlay: 'paused', badge: null });
+    expect(shareView(paused, status('s_a', { reason: 'waiting' }), false).overlay).toBe('paused');
+    // Neither the freeze notice, the decoder wait nor a quality badge while paused.
+    expect(shareView(paused, undefined, true, true).overlay).toBe('paused');
+    expect(shareView(paused, status('s_a', { video: 'off', reason: 'codec' }), true).overlay).toBe('paused');
+    expect(shareView(paused, status('s_a', { video: 'low', reason: 'bandwidth' }), true)).toEqual({
+      overlay: 'paused',
+      badge: null,
+    });
+    expect(overlayText(t, 'paused')).toBe('Paused');
+    // The desktop app's own share pauses the same way in its own tile.
+    const nativePaused = viewerShare(
+      { own: true, local: true, localPreview: false },
+      shareInfo('s_a', 'u_alex', 1, { status: 'paused' }),
+    );
+    expect(shareView(nativePaused, undefined, true).overlay).toBe('paused');
+  });
+
   it('shows a preview of this page’s share as it is; only `stalled` applies', () => {
     const mine = viewerShare({ own: true, local: true, localPreview: true });
     expect(shareView(mine, undefined, true, true)).toEqual({ overlay: null, badge: null });

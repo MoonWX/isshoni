@@ -19,15 +19,22 @@
 //   toggle, the ducking tip with "Open sound settings", and the volume note under Share sound.
 //
 // M1's "No sound captured" line doesn't apply to native shares (05's silent-stream check does): while sound is on
-// and no heard app plays, the panel says "Nothing is playing right now". A later slice adds Pause with the hotkeys'
-// tooltips (WA80).
+// and no heard app plays, the panel says "Nothing is playing right now".
+//
+// Share safety (README WA80, 03 §10.3, §11.2, §11.3, §11.6): Pause next to Stop while live (Share.SetPaused, the same
+// path as the hotkey, the tray and the pill), the hotkeys named in the buttons' tooltips ("Pause (Ctrl+Alt+Shift+F9)"),
+// "Pause hotkey unavailable: another app uses …" with a link to Settings → Sharing for a combination another app
+// has, and Pause disabled with "Pause needs a newer server" once the server answered feature_disabled. The close-to-
+// tray notice (WindowNotice) is the desktop shell's, above every page (app/App.tsx, desktop/shell.ts).
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router';
 import { useStore } from 'zustand';
 
 import { useApp } from '../../app/context';
 import { errorMessage } from '../../lib/errorText';
+import { BridgeError } from '../../platform/desktop/errors';
 import { isDesktopShare } from '../../platform/desktop/DesktopShare';
 import type { ActiveShare } from '../../platform/types';
 import type { Preset } from '../../protocol/types.gen';
@@ -53,6 +60,7 @@ import { ShareDetails } from './ShareDetails';
 import { ShareErrorNote } from './ShareErrorNote';
 import { useMicPromptHost } from './MicPromptCorner';
 import { useAudioBridge, useFriendsHear, useLevels } from './useAudio';
+import { usable, useHotkeys } from './useHotkeys';
 import { useEncoderNotice, useShareView } from './useShareView';
 
 const NO_WATCHERS: readonly ShareWatcher[] = [];
@@ -115,6 +123,11 @@ export function NativeSharePanel({
 
   const published = phase === 'live' || phase === 'reconnecting';
   const levels = useLevels(audioBridge, published && open);
+  // The hotkeys are registered at live: ask again when the share's state changes.
+  const hotkeys = useHotkeys(showsShare ? audioBridge : null, view?.state ?? null);
+  // The server answered feature_disabled: no share.pause there (03 §11.3).
+  const [pauseUnavailable, setPauseUnavailable] = useState(false);
+  const navigate = useNavigate();
 
   // Ctrl+Shift+D toggles the Details disclosure while the window has focus; showing it opens the expander too.
   const detailsShown = useRef(false);
@@ -226,6 +239,29 @@ export function NativeSharePanel({
       ? `${platform.serverOrigin}/r/${encodeURIComponent(view.roomId)}?conntest=1`
       : null;
   const expanded = published && open;
+  // Pause while the share runs (live, reconnecting or unreachable); Resume replaces it while paused.
+  const canPause = !paused && (viewState === 'live' || viewState === 'reconnecting' || viewState === 'unreachable');
+  // "Pause (Ctrl+Alt+Shift+F9)": the hotkeys are named in the buttons' tooltips while they work (03 §10.3).
+  const withHotkey = (action: string, combo: string | null): string =>
+    combo === null ? action : t('desktop.share.panel.withHotkey', { action, hotkey: combo });
+  const pauseTitle = (action: string): string => withHotkey(action, usable(hotkeys.pause) ? hotkeys.pause.combo : null);
+  const stopTitle = withHotkey(t('desktop.share.panel.stop'), usable(hotkeys.stop) ? hotkeys.stop.combo : null);
+  // A combination another app has (03 §11.2): said under the bar, with the way to change it.
+  const taken = [
+    hotkeys.pause?.state === 'taken'
+      ? t('desktop.share.panel.hotkeyTakenPause', { hotkey: hotkeys.pause.combo })
+      : null,
+    hotkeys.stop?.state === 'taken' ? t('desktop.share.panel.hotkeyTakenStop', { hotkey: hotkeys.stop.combo }) : null,
+  ].filter((s): s is string => s !== null);
+  const takenNotes =
+    published && taken.length > 0 ? (
+      <p className={styles.hotkeyNote} data-hotkey-note="">
+        <span>{taken.join(' · ')}</span>
+        <Button size="sm" variant="ghost" onClick={() => void navigate('/desktop/settings#sharing')}>
+          {t('desktop.share.panel.hotkeySettings')}
+        </Button>
+      </p>
+    ) : null;
 
   return (
     <section className={cx(styles.panel, paused && styles.paused)} aria-label={t('share.panel.label')}>
@@ -253,6 +289,7 @@ export function NativeSharePanel({
             <Button
               size="sm"
               variant="primary"
+              title={pauseTitle(t('desktop.share.panel.resume'))}
               onClick={() => {
                 active.setPaused(false).catch((err: unknown) => {
                   ui.getState().toast({ kind: 'error', message: errorMessage(err, t) });
@@ -260,6 +297,28 @@ export function NativeSharePanel({
               }}
             >
               {t('desktop.share.panel.resume')}
+            </Button>
+          )}
+          {canPause && active !== null && (
+            <Button
+              size="sm"
+              disabled={pauseUnavailable}
+              title={
+                pauseUnavailable
+                  ? t('desktop.share.panel.pauseNeedsNewerServer')
+                  : pauseTitle(t('desktop.share.panel.pause'))
+              }
+              onClick={() => {
+                active.setPaused(true).catch((err: unknown) => {
+                  if (err instanceof BridgeError && err.code === 'feature_disabled') {
+                    setPauseUnavailable(true);
+                    return;
+                  }
+                  ui.getState().toast({ kind: 'error', message: errorMessage(err, t) });
+                });
+              }}
+            >
+              {t('desktop.share.panel.pause')}
             </Button>
           )}
           {published && (
@@ -282,6 +341,7 @@ export function NativeSharePanel({
             loading={phase === 'stopping'}
             disabled={active === null && phase === 'starting'}
             aria-label={t('share.panel.stopSharing')}
+            title={stopTitle}
             onClick={() => {
               if (share !== null || active === null) void onStop();
               else void active.stop();
@@ -291,6 +351,7 @@ export function NativeSharePanel({
           </Button>
         </div>
       </div>
+      {takenNotes}
       {view?.minimized === true && <p className={styles.hint}>{t('desktop.share.panel.minimized')}</p>}
       {hint !== null && (
         <p className={styles.hint}>

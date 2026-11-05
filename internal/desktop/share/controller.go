@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -572,7 +573,7 @@ func (c *Controller) viewLocked(a *active, snap *core.ShareSnapshot, connID stri
 	v := View{
 		State: StateStarting, ConnectionID: connID, RoomID: a.req.RoomID, Kind: kindOf(a.src.Kind),
 		Label: a.src.Name, Preset: a.req.Preset, WithAudio: a.req.WithAudio, AudioOn: a.req.WithAudio && a.audioOn,
-		Border: a.src.OSBorder,
+		Border: a.src.OSBorder, Monitor: monitorOf(a.src),
 	}
 	if snap != nil {
 		v.ShareID = snap.ID
@@ -608,6 +609,16 @@ func (c *Controller) viewLocked(a *active, snap *core.ShareSnapshot, connID stri
 	}
 	v.Pill = v.State.active() && !v.Border
 	return v
+}
+
+// monitorOf is src's monitor device name for the pill (03 §11.4): 04's MonitorID without its "mon:" prefix for a
+// monitor share, else "" (a window share's pill goes on the primary monitor). a.src is the pick, so it is kept
+// across a republish (replaces).
+func monitorOf(src media.Source) string {
+	if src.Kind != media.SourceScreen {
+		return ""
+	}
+	return strings.TrimPrefix(src.MonitorID, "mon:")
 }
 
 // debounceLocked is the state to show for state (stateOf's) when shown was shown before: reconnecting only once it

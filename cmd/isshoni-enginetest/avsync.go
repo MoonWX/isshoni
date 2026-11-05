@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -10,8 +11,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/media"
@@ -34,17 +37,21 @@ func init() {
 //  2. One session captures for -seconds (25) with real capture and real audio: -source pick (pick the flash window;
 //     WGC) on Windows 11, -source mon:<id> (DD) on Windows 10; layer f at 1080p60; audio exclude-apps with TapPCM.
 //  3. Video: V_k = the capture time of the first frame after each flash whose mean luma in the luma tap exceeds
-//     50 % (a rising edge through 50 %). Audio: U_k = each click's PCM-tap onset, the first 1 ms block (48 frames
-//     of the chunk) with |x| > 0.05 in either channel, at chunk time + offset / 48 kHz.
+//     50 % (a rising edge through 50 %). The tap's mean is over the centered 256-pixel box of each frame (04 §5.8),
+//     which the flash window covers both when it is the picked source and with -source mon:<id>, where it opens
+//     centered on that monitor. Audio: U_k = each click's PCM-tap onset, the first 1 ms block (48 frames of the
+//     chunk) with |x| > 0.05 in either channel, at chunk time + offset / 48 kHz. A luma edge whose reading follows a
+//     lost one (Missed > 0 or Discontinuity) may be late by a frame or more: it is discarded (edgesDiscarded).
 //  4. Each flash is paired with the click nearest to it (both run on 1 s grids that need not coincide, because each
 //     pair's true offset A_k − P_k is known). Pass: over ≥ 15 pairs, |median((U_k − V_k) − (A_k − P_k))| ≤ 20 ms.
 //     avsync.json lists every pair.
 //
-// The luma tap is an IM_TEST_HOOKS feature: -dll points at the win-x64-ci DLL (06 §5.1's isshoni-native-tools carries
-// it in ci\). Capture times are on the session's clock (Packet.CaptureNS = capture_ts_ns − epoch_ns); P_k and A_k are
-// QPC nanoseconds (04 §12.3's formula, the engine clock). The tool converts V_k and U_k to the engine clock with the
-// session's epoch (engine clock − Session.Now, read back to back) only to associate each event with its partner; the
-// offset itself, (U_k − A_k) − (V_k − P_k), doesn't depend on the epoch.
+// The luma tap is an IM_TEST_HOOKS feature (README WF16: native.WithLumaTap, 04 §5.8): -dll points at the win-x64-ci
+// DLL (06 §5.1's isshoni-native-tools carries it in ci\); a DLL without test hooks fails the start with
+// media.CodeDependency, exit 2. Capture times are on the session's clock (Packet.CaptureNS = capture_ts_ns −
+// epoch_ns); P_k and A_k are QPC nanoseconds (04 §12.3's formula, the engine clock). The tool converts V_k and U_k
+// to the engine clock with the session's epoch (engine clock − Session.Now, read back to back) only to associate each
+// event with its partner; the offset itself, (U_k − A_k) − (V_k − P_k), doesn't depend on the epoch.
 const (
 	avsyncMinPairs        = 15
 	avsyncMaxOffset       = 20 * time.Millisecond
@@ -71,23 +78,18 @@ const (
 	avsyncFlashName = "isshoni-enginetest avsync flash"
 )
 
-// An open point for whoever wires the tap: with -source mon:<id> the picture is the whole monitor, of which the
-// 1280×720 flash window covers 44 % at 1080p, so a whole-picture mean crosses 50 % only over a bright desktop; the
-// tap's mean must then be over the flash window's rectangle (centered on the primary monitor), or the window must
-// cover the monitor.
-//
-// errLumaTap is the luma tap's state in this build: the win-x64-ci DLL's luma tap (IM_PACKET_DEBUG, 04 §12.3) has no
-// producer in the session yet and internal/media/native drops IM_PACKET_DEBUG packets ("nobody listens yet"), so
-// avsync can't read V_k. The tap's Go side is lumaTap below; newLumaTap returns it once the binding passes the
-// packets on (a binding change outside README WA76's paths).
-var errLumaTap = &media.Error{Code: media.CodeDependency, Op: "avsync",
-	Detail: "not implemented: the luma tap (IM_PACKET_DEBUG of an IM_TEST_HOOKS DLL) is not delivered by internal/media/native yet"}
+// With -source mon:<id> the picture is the whole monitor, of which the 1280×720 flash window covers 44 % at 1080p;
+// the tap's region, the centered 256-pixel box (04 §5.8), lies inside the window, which the flash role centers on the
+// captured monitor (-monitor), so the mean is the window's alone (WF16 resolved WA76's open point this way).
 
 // lumaSample is one encoded picture as the luma tap shows it: its capture time (session clock) and its mean luma,
-// 0 (black) to 1 (white).
+// 0 (black) to 1 (white). Missed and Discontinuity are native.LumaSample's: frames before it that have no reading,
+// and readings the debug ring dropped before it (04 §5.8).
 type lumaSample struct {
-	CaptureNS int64
-	Mean      float64
+	CaptureNS     int64
+	Mean          float64
+	Missed        int
+	Discontinuity bool
 }
 
 // lumaTap is the luma tap of one session: the start options that turn it on, and the pictures it saw (in capture
@@ -97,10 +99,37 @@ type lumaTap interface {
 	Samples() []lumaSample
 }
 
-// newLumaTap returns a session's luma tap (errLumaTap until the binding delivers it). -no-luma runs without one: a
-// diagnostic of the Windows half (the flash window's frame statistics, the click process, the PCM tap) that the owner
-// can run before the tap exists; it never reports a pass.
-var newLumaTap = func() (lumaTap, error) { return nil, errLumaTap }
+// newLumaTap returns a session's luma tap: native.WithLumaTap's readings (04 §5.8). -no-luma runs without one: a
+// diagnostic of the Windows half (the flash window's frame statistics, the click process, the PCM tap) that runs with
+// any DLL; it never reports a pass.
+var newLumaTap = func() (lumaTap, error) { return &nativeLumaTap{}, nil }
+
+// nativeLumaTap collects the binding's luma readings (native.WithLumaTap): the session's Next hands them over on the
+// run's goroutine, Samples reads them after the session stopped.
+type nativeLumaTap struct {
+	mu      sync.Mutex
+	samples []lumaSample
+}
+
+func (t *nativeLumaTap) Options() []native.StartOption {
+	return []native.StartOption{native.WithLumaTap(t.add)}
+}
+
+func (t *nativeLumaTap) add(s native.LumaSample) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.samples = append(t.samples, lumaSample{CaptureNS: s.CaptureNS, Mean: s.Mean, Missed: s.Missed,
+		Discontinuity: s.Discontinuity})
+}
+
+// Samples are the readings in capture order (as the engine delivers them; sorted again, stably, for lumaEdges).
+func (t *nativeLumaTap) Samples() []lumaSample {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := slices.Clone(t.samples)
+	slices.SortStableFunc(out, func(a, b lumaSample) int { return cmp.Compare(a.CaptureNS, b.CaptureNS) })
+	return out
+}
 
 // avsyncOptions are avsync's flags. role, result, stop, ready and clicks are the helper processes'.
 type avsyncOptions struct {
@@ -113,13 +142,15 @@ type avsyncOptions struct {
 	ready   string // the flash window creates this file once its first frame is on screen
 	clicks  int    // the click process's bursts
 	life    time.Duration
-	noLuma  bool // the diagnostic without the luma tap
+	monitor string // the flash window's monitor: a mon:<id> source's id ("" = the primary monitor)
+	noLuma  bool   // the diagnostic without the luma tap
 }
 
 func cmdAVSync(ctx context.Context, g *globals, args []string) int {
 	fs := newFlags(g, "avsync", "[-source pick|mon:<id>] [-seconds 25] [-out DIR] [-no-luma]")
 	o := avsyncOptions{}
-	fs.StringVar(&o.source, "source", "pick", "`pick` (the flash window, WGC; Windows 11) or mon:<id> (DD; Windows 10: the primary monitor, where the flash window opens)")
+	fs.StringVar(&o.source, "source", "pick", "`pick` (the flash window, WGC; Windows 11) or "+
+		"mon:<id> (DD; Windows 10: the flash window opens centered on it)")
 	fs.Float64Var(&o.seconds, "seconds", avsyncDefaultSeconds, "how long to capture")
 	fs.StringVar(&o.out, "out", ".", "write avsync.json into `DIR`")
 	fs.StringVar(&o.role, "role", "", "helper processes only: flash or click")
@@ -128,6 +159,7 @@ func cmdAVSync(ctx context.Context, g *globals, args []string) int {
 	fs.StringVar(&o.ready, "ready", "", "the flash window only: created once the first frame is on screen")
 	fs.IntVar(&o.clicks, "clicks", 0, "the click process only: how many clicks")
 	fs.DurationVar(&o.life, "life", avsyncFlashLifetime, "the flash window only: the longest it stays")
+	fs.StringVar(&o.monitor, "monitor", "", "the flash window only: center it on this monitor (a mon:<id>'s id)")
 	fs.BoolVar(&o.noLuma, "no-luma", false, "diagnostic: the flash window, the click process and the session without the "+
 		"luma tap; reports P_k, A_k, U_k and U − A, never a pass")
 	if code, ok := parseFlags(fs, args); !ok {
@@ -170,7 +202,7 @@ func checkAVSyncOptions(stderr io.Writer, o avsyncOptions) (int, bool) {
 	switch o.role {
 	case "":
 		switch {
-		case o.source != "pick" && !strings.HasPrefix(o.source, "mon:"):
+		case o.source != "pick" && (!strings.HasPrefix(o.source, "mon:") || o.source == "mon:"):
 			fmt.Fprintln(stderr, "avsync: -source is pick or mon:<id>")
 			return exitUsage, false
 		case o.seconds < avsyncMinSeconds || o.seconds > 600:
@@ -227,7 +259,8 @@ type clickProc interface {
 
 // avsyncHelpers starts the helper processes (on Windows as children of explorer.exe).
 type avsyncHelpers interface {
-	StartFlash(ctx context.Context) (flashProc, error)
+	// StartFlash opens the flash window centered on monitor (a mon:<id> source's id; "" = the primary monitor).
+	StartFlash(ctx context.Context, monitor string) (flashProc, error)
 	StartClicks(ctx context.Context, n int) (clickProc, error)
 	Close()
 }
@@ -327,14 +360,15 @@ type avsyncReport struct {
 	FlashMissing int        `json:"flashesUnresolved"`
 	RefreshMS    float64    `json:"refreshMs"`
 	Clicks       int        `json:"clicks"`
-	Frames       int        `json:"frames"`    // pictures the luma tap saw
-	Edges        int        `json:"lumaEdges"` // rising edges through 50 %
-	Onsets       int        `json:"pcmOnsets"` // click onsets found in the PCM tap
-	PCMChunks    int        `json:"pcmChunks"` // PCM-tap chunks read
-	Pairs        []avPair   `json:"pairs"`     // every pair
-	Unpaired     []string   `json:"unpaired"`  // flashes without a pair, and why
-	MedianMS     float64    `json:"medianMs"`  // median of the pairs' offsets
-	SpreadMS     [2]float64 `json:"p5p95Ms"`   // the offsets' 5th and 95th percentiles, for the reader
+	Frames       int        `json:"frames"`         // pictures the luma tap saw
+	Edges        int        `json:"lumaEdges"`      // rising edges through 50 %
+	EdgesDropped int        `json:"edgesDiscarded"` // rising edges after a lost reading (possibly late): not paired
+	Onsets       int        `json:"pcmOnsets"`      // click onsets found in the PCM tap
+	PCMChunks    int        `json:"pcmChunks"`      // PCM-tap chunks read
+	Pairs        []avPair   `json:"pairs"`          // every pair
+	Unpaired     []string   `json:"unpaired"`       // flashes without a pair, and why
+	MedianMS     float64    `json:"medianMs"`       // median of the pairs' offsets
+	SpreadMS     [2]float64 `json:"p5p95Ms"`        // the offsets' 5th and 95th percentiles, for the reader
 	Failures     []string   `json:"failures"`
 	Pass         bool       `json:"pass"`
 
@@ -353,7 +387,13 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 	rep := avsyncReport{Command: "avsync", Source: sourceKind, Seconds: o.seconds, Pairs: []avPair{},
 		Unpaired: []string{}, Failures: []string{}}
 
-	flash, err := env.helpers.StartFlash(ctx)
+	// The tap reads the centered box of each frame (04 §5.8): with -source mon:<id> the flash window opens centered
+	// on that monitor, so the box lies inside it whichever monitor is captured.
+	monitor := ""
+	if sourceKind == "mon" {
+		monitor = strings.TrimPrefix(o.source, "mon:")
+	}
+	flash, err := env.helpers.StartFlash(ctx, monitor)
 	if err != nil {
 		fmt.Fprintln(stderr, "avsync: the flash window:", err)
 		return exitEnv
@@ -445,10 +485,11 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 	if env.tap != nil {
 		frames = env.tap.Samples()
 	}
-	edges := lumaEdges(frames, avsyncLumaLevel)
+	edges, discarded := lumaEdges(frames, avsyncLumaLevel)
 	rep.Flashes, rep.FlashEst, rep.FlashMissing = len(fr.FlashesNS), fr.Estimated, fr.Unresolved
 	rep.RefreshMS = float64(fr.RefreshNS) / 1e6
 	rep.Clicks, rep.Frames, rep.Edges, rep.Onsets = len(cr.OnsetsNS), len(frames), len(edges), len(det.onsets)
+	rep.EdgesDropped = discarded
 
 	v := shift(edges, epoch)
 	u := shift(det.onsets, epoch)
@@ -632,15 +673,21 @@ func (d *onsetDetector) chunk(captureNS int64, data []byte) error {
 
 // lumaEdges returns the capture times of the pictures whose mean luma exceeds level while the picture before it
 // didn't (the first frame after each flash). The first picture is never an edge: a capture that starts inside a
-// flash doesn't see its start. The samples are in capture order.
-func lumaEdges(frames []lumaSample, level float64) []int64 {
-	var out []int64
+// flash doesn't see its start. An edge whose reading follows a lost one (Missed > 0: a frame without a reading;
+// Discontinuity: the debug ring dropped readings) is not returned but counted in discarded: the lost frame may have
+// been the flash's first, so the edge may be late by a frame or more, which would bias the median unseen. Its flash
+// is then unpaired. The samples are in capture order.
+func lumaEdges(frames []lumaSample, level float64) (edges []int64, discarded int) {
 	for i := 1; i < len(frames); i++ {
 		if frames[i].Mean > level && frames[i-1].Mean <= level {
-			out = append(out, frames[i].CaptureNS)
+			if frames[i].Missed > 0 || frames[i].Discontinuity {
+				discarded++
+				continue
+			}
+			edges = append(edges, frames[i].CaptureNS)
 		}
 	}
-	return out
+	return edges, discarded
 }
 
 // nearest is the index of the value of ts nearest to t within ±window that used doesn't mark, or -1.
@@ -774,8 +821,8 @@ func flashTimes(firstWhite []uint32, stats []frameStat, freq int64) flashResult 
 func printAVSync(w io.Writer, r avsyncReport) {
 	fmt.Fprintf(w, "avsync: %s, %.0f s; %d flashes (%d extrapolated, %d unresolved, refresh %.2f ms), %d clicks\n",
 		r.Source, r.Seconds, r.Flashes, r.FlashEst, r.FlashMissing, r.RefreshMS, r.Clicks)
-	fmt.Fprintf(w, "luma tap: %d pictures, %d flashes seen; PCM tap: %d chunks, %d clicks heard\n", r.Frames, r.Edges,
-		r.PCMChunks, r.Onsets)
+	fmt.Fprintf(w, "luma tap: %d pictures, %d flashes seen (%d discarded after a lost reading); PCM tap: %d chunks, "+
+		"%d clicks heard\n", r.Frames, r.Edges, r.EdgesDropped, r.PCMChunks, r.Onsets)
 	for _, p := range r.ClickPairs {
 		fmt.Fprintf(w, "click %2d: audio (U − A) %+7.1f ms\n", p.Click, p.AudioMS)
 	}
