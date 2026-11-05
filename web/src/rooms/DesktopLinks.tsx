@@ -14,7 +14,8 @@
 //
 // A link that arrives while one of these questions is open is ignored (Go ignores its own; the room question is the
 // page's). Nothing is done while the user isn't signed in or the wizard or the relink page is showing: those pages
-// read the pending link themselves (SetupPage), and Go keeps it until then. Only in the desktop app: InRoomBar mounts
+// read the pending link themselves (SetupPage), and Go keeps it until then; once the page is ready again it pulls
+// App.PendingLink() again, so a room link that came meanwhile still opens. Only in the desktop app: InRoomBar mounts
 // this once, lazily (a chunk of its own), for every page of the app. Its texts are room.* keys of the main catalog:
 // two of them are M1's room switch question.
 import { useEffect, useEffectEvent, useRef, useState } from 'react';
@@ -162,14 +163,25 @@ function Links({ bridge }: { bridge: NativeBridge }) {
     }
   });
 
-  // A link that came before the page (the one that started the app, a reload after a server switch), once the page
-  // can act on it; then every link Go forwards.
+  // A link that came before the page (the one that started the app, a reload after a server switch), and one that
+  // came while the page wasn't ready (signed out, the relink page: Go keeps it pending until App.LinkHandled), pulled
+  // each time the page becomes ready; then every link Go forwards. A pull after the first leaves the wizard's
+  // answers ({add}, {error}) to the wizard: the page typically just came from it, and its pending link stays there
+  // until the wizard is done with it.
   const pulled = useRef(false);
+  const pulledBefore = useRef(false);
   useEffect(() => {
-    if (!ready || pulled.current) return;
+    if (!ready) {
+      pulled.current = false;
+      return;
+    }
+    if (pulled.current) return;
     pulled.current = true;
+    const first = !pulledBefore.current;
+    pulledBefore.current = true;
     bridge.app.pendingLink().then(
       (p: AnyPendingLink | null) => {
+        if (!first && isObject(p) && ('add' in p || 'error' in p)) return;
         act(p);
       },
       (err: unknown) => {

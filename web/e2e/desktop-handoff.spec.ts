@@ -133,8 +133,13 @@ test('a same-user tab hands off to the app and back; a phone keeps playing; a cl
   await expect(tab.page.getByText('Now watching in the isshoni app')).toBeVisible({ timeout: RELAY_TIMEOUT_MS });
   await waitForState(
     tab.page,
-    (s) => s.viewer.shares.find((sh) => sh.id === share.id && sh.subscription?.audio === 'off'),
-    { timeout: MEDIA_TIMEOUT_MS, message: 'the handed-off tab no longer subscribes to the sound' },
+    // 03 §22.4: every subscription off; the video goes after the off delay (SUBSCRIBE_OFF_DELAY_MS, well inside the
+    // timeout).
+    (s) =>
+      s.viewer.shares.find(
+        (sh) => sh.id === share.id && sh.subscription?.audio === 'off' && sh.subscription.video === 'off',
+      ),
+    { timeout: MEDIA_TIMEOUT_MS, message: 'the handed-off tab subscribes to nothing' },
   );
   await expectTabPlaying(desktop, false, "the handed-off tab's playback.state {playing: false} reaches the app");
   await expectHearing(phone.page, share.id, 'the phone keeps playing');

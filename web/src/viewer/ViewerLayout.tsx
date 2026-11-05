@@ -39,7 +39,8 @@
 // - "Now listening to bo" for screen readers when the sound moves to a share that was already there (05 §16.6).
 //
 // A tab handed off to the user's desktop app (viewerStore.handedOff, docs/m2/03 §12.2) shows no share: the stage says
-// "Now watching in the isshoni app" with Watch here instead, and the tiles are gone until then.
+// "Now watching in the isshoni app" with Watch here instead, and the tiles are gone until then, but for the page's
+// own share's (its preview, which subscribes nothing).
 import { Layers } from 'lucide-react';
 import {
   useCallback,
@@ -206,7 +207,8 @@ export function ViewerLayout({
 
   // Handed off to the desktop app: no share on the stage and no tiles (nothing is subscribed, layerPolicy rule 9).
   const focused = handedOff ? null : (shares.find((s) => s.id === focusedId) ?? null);
-  const others = handedOff ? [] : shares.filter((s) => s.id !== focusedId);
+  // Handed off, the page's own share keeps its tile and preview (03 §12.2: it is untouched); nothing else shows.
+  const others = handedOff ? shares.filter((s) => s.localPreview) : shares.filter((s) => s.id !== focusedId);
   const showOthers = !isFullscreen && others.length > 0;
   const inSheet = showOthers && phoneLandscape;
   // One tab stop for the list: the tile that had the focus, else the first.

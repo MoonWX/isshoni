@@ -93,6 +93,7 @@ const routes = [
   { path: '/r/:roomId', element: <Where /> },
   { path: '/desktop/setup', element: <Where /> },
   { path: '/desktop/settings', element: <Where /> },
+  { path: '/desktop/relink', element: <Where /> },
 ];
 
 describe('DesktopLinks', () => {
@@ -172,6 +173,34 @@ describe('DesktopLinks', () => {
     });
     expect(where()).toBe('/desktop/setup');
     expect(d.fake.callsOf('app.linkHandled')).toEqual([]);
+  });
+
+  it('a room link that came while the relink page showed opens once the page is ready again', async () => {
+    await show('/r/lounge');
+    expect(d.fake.callsOf('app.pendingLink')).toHaveLength(1);
+    await act(() => router.navigate('/desktop/relink'));
+    // Go keeps the link pending; the page forwards none of it while not ready.
+    d.fake.answers['app.pendingLink'] = { roomId: 'games' };
+    act(() => {
+      d.fake.emit('deeplink.open', { roomId: 'games' });
+    });
+    expect(where()).toBe('/desktop/relink');
+
+    await act(() => router.navigate('/r/lounge'));
+    await act(() => tick());
+    expect(where()).toBe('/r/games');
+    expect(d.fake.callsOf('app.linkHandled')).toHaveLength(1);
+  });
+
+  it('a pull after the first leaves the wizard’s answers to the wizard', async () => {
+    await show('/r/lounge');
+    expect(d.fake.callsOf('app.pendingLink')).toHaveLength(1);
+    await act(() => router.navigate('/desktop/setup'));
+    d.fake.answers['app.pendingLink'] = { error: 'too_many_servers' };
+    await act(() => router.navigate('/r/lounge'));
+    await act(() => tick());
+    expect(d.fake.callsOf('app.pendingLink')).toHaveLength(2);
+    expect(where()).toBe('/r/lounge');
   });
 
   it('does nothing before the user is signed in', async () => {

@@ -217,6 +217,23 @@ describe('M2: handed off to the desktop app (docs/m2/03 §12.2)', () => {
     const again = new Map(signal.updates.flat().map((w) => [w.shareId, w]));
     expect(sorted([...again.values()])).toEqual(before);
   });
+
+  it('keeps the tile of the page’s own share (its preview) while handed off: the page’s share is untouched', async () => {
+    render(<ViewerLayout viewer={viewer} />);
+    sync_(BEA, MINE);
+    await flush(SUBSCRIBE_DEBOUNCE_MS);
+    act(() => {
+      state().setHandedOff(true);
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('Now watching in the isshoni app');
+    const list = screen.getByRole('list', { name: 'Shares' });
+    expect(list.querySelectorAll('li')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: /^Show your preview on the stage/ })).toBeInTheDocument();
+    // Still nothing subscribed: the own share is never on the wire.
+    await flush(SUBSCRIBE_OFF_DELAY_MS + SUBSCRIBE_DEBOUNCE_MS);
+    const held = new Map(signal.updates.flat().map((w) => [w.shareId, w]));
+    expect(sorted([...held.values()])).toEqual([want('s_bea', 'off')]);
+  });
 });
 
 describe('attachSubscriptions: one subscribe.update per change (05 §12.3)', () => {

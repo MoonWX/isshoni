@@ -68,7 +68,9 @@ import type { RoomStore } from './roomStore';
  * A desktop connection that appears in user.connections hears the tab's playback.state again after this long. The
  * app's Go side follows C2's events only once C2 is online, so the report that the tab sends as soon as C2 appears
  * can reach C2 before anyone listens (a race in App.followPlayback, seen in desktop-handoff.spec); the repeat makes
- * sure it lands. Repeating the same value changes nothing in Go.
+ * sure it lands. Repeating the same value changes nothing in Go. A stopgap that covers only this case (a report
+ * during a later C2 reconnect is lost the same way): it goes once Go subscribes to C2's events before its Ready, and
+ * 03 §12.2's sender says "once" until then.
  */
 export const PLAYBACK_STATE_REPEAT_MS = 3_000;
 

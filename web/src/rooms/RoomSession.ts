@@ -139,8 +139,9 @@ interface SessionEvents extends Record<string, unknown> {
   /** The local share changed: started, or gone (null). */
   share: ActiveShare | null;
   /**
-   * join() was asked for a room the session isn't in yet (the user, a room page, a deep link): never a resync's
-   * re-join, nor a join() of the room the session is already in. The desktop's playback.stop (handoff.ts) follows it.
+   * join() was asked for a room the session isn't in yet (the user, a room page, a deep link), or for the same room
+   * again after a refusal or a leave(): never a resync's re-join, nor a join() of the room the session is already in
+   * or is re-joining after a welcome. The desktop's playback.stop (handoff.ts) follows it.
    */
   join: string;
 }
@@ -303,6 +304,9 @@ export class RoomSession {
     this.#desired = roomId;
     this.#mayPickRoom = false;
     const room = this.#stores.room;
+    // Asked for: another room, or the same one again after a refusal or a leave. A join() of the room a welcome is
+    // still re-joining (joinState 'joining') is no new ask (a RoomPage that mounts again during a drop).
+    const asked = previous !== roomId || ['idle', 'failed'].includes(room.getState().joinState);
     if (previous !== roomId) {
       this.#settleOthers(roomId);
       if (previous !== null) {
@@ -319,7 +323,7 @@ export class RoomSession {
     const done = new Promise<void>((resolve, reject) => {
       this.#waiters.push({ roomId, resolve, reject });
     });
-    this.#emitter.emit('join', roomId);
+    if (asked) this.#emitter.emit('join', roomId);
     if (this.#signal.state === 'ready') void this.#joinNow(roomId);
     return done;
   }
