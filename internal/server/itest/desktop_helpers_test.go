@@ -156,16 +156,16 @@ type appAuth struct {
 	mgr *deviceauth.Manager
 
 	mu     sync.Mutex
-	tokens int         // AccessToken calls that returned a token, forced or not
-	forced int         // AccessToken(ctx, true) calls
-	ended  []endedCall // SessionEnded calls, in order
+	tokens int                           // AccessToken calls that returned a token, forced or not
+	forced int                           // AccessToken(ctx, true) calls
+	ended  []endedCall                   // SessionEnded calls, in order
+	before func(code protocol.ErrorCode) // if set, SessionEnded runs it (outside mu) before the manager's
 }
 
-// endedCall is one SessionEnded call of the core: its code, the manager's state when it returned, and when.
+// endedCall is one SessionEnded call of the core: its code and the manager's state when it returned.
 type endedCall struct {
 	code  protocol.ErrorCode
 	state deviceauth.State
-	at    time.Time
 }
 
 // linkApp links an app of m's to the test's server, as the user does from the app's sign-in screen and their
@@ -189,12 +189,26 @@ func (a *appAuth) AccessToken(ctx context.Context, force bool) (protocol.Secret,
 	return tok, err
 }
 
-// SessionEnded is the manager's, recorded with the state it returned.
+// SessionEnded is the manager's, recorded with the state it returned. The before hook, if set, runs first: a test
+// checks there what must already hold when the core calls SessionEnded.
 func (a *appAuth) SessionEnded(ctx context.Context, code protocol.ErrorCode) {
+	a.mu.Lock()
+	before := a.before
+	a.mu.Unlock()
+	if before != nil {
+		before(code)
+	}
 	st := a.mgr.SessionEnded(ctx, code)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.ended = append(a.ended, endedCall{code: code, state: st, at: time.Now()})
+	a.ended = append(a.ended, endedCall{code: code, state: st})
+}
+
+// setBefore sets the hook SessionEnded runs before the manager's.
+func (a *appAuth) setBefore(f func(code protocol.ErrorCode)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.before = f
 }
 
 // counts returns how many tokens the core got and how many forced refreshes it asked for.

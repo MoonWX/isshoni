@@ -128,11 +128,13 @@ func TestDesktopDeviceRevoked(t *testing.T) {
 	sh := app.start(defaultRoom(bob))
 	snap := app.waitState(sh, core.StateLive)
 	bob.waitLive(snap.ID)
-	ended := make(chan time.Time, 1)
-	go func() {
-		<-sh.Done()
-		ended <- time.Now()
-	}()
+	app.auth.setBefore(func(protocol.ErrorCode) { // 01 §11.3: the share has ended when SessionEnded is called
+		select {
+		case <-sh.Done():
+		default:
+			t.Error("SessionEnded was called before the share ended")
+		}
+	})
 
 	// ---- the removal ----
 	device := app.auth.mgr.State().Device
@@ -156,14 +158,6 @@ func TestDesktopDeviceRevoked(t *testing.T) {
 	if s := calls[0].state; s.Status != deviceauth.StatusUnlinked || s.Notice != deviceauth.NoticeSignedOut || s.Device != nil {
 		t.Errorf("SessionEnded left the manager %s/%q with device %v, want unlinked/signed_out", s.Status, s.Notice,
 			s.Device != nil)
-	}
-	select {
-	case at := <-ended:
-		if at.After(calls[0].at) {
-			t.Errorf("the share ended %v after SessionEnded returned, want it ended first", at.Sub(calls[0].at))
-		}
-	default:
-		t.Error("the share had not ended when Run returned")
 	}
 	if end := sh.Snapshot().End; end == nil || *end != (core.EndInfo{Reason: core.EndUnlinked,
 		Protocol: protocol.ErrorCodeSessionRevoked}) {
