@@ -22,7 +22,12 @@ import { Button } from '../ui/Button';
 import { Spinner } from '../ui/Spinner';
 import styles from './wizard.module.css';
 
-/** The site's section on voice apps that can't be kept out on this PC (03 §8.4's [Learn more]). */
+/**
+ * The site's section on voice apps that can't be kept out on this PC (03 §8.4's [Learn more]). The anchor
+ * `{#desktop-sound}` is pending: docs/troubleshooting.md belongs to the docs slice (WA85), which adds the section
+ * "Voice apps can't be kept out on this PC" with it and the anchor to TestDocsAnchors' list. Until then the link
+ * opens the top of the troubleshooting page.
+ */
 export const SOUND_HELP = `${DOCS_URL}troubleshooting#desktop-sound`;
 
 type CheckState =

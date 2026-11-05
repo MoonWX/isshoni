@@ -10,7 +10,7 @@
 //   Audio.SetAppDecision, "Decide for me" forgetting it), the built-in voice apps listed as locked; the ducking tip's
 //   text with [Open sound settings] (App.OpenOSSettings('sound-communications')); and Run the sound check again.
 //   There is no sound-mode choice: M2 has no "All sound" mode (03 §6.2, README §3 item 15).
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useApp } from '../app/context';
@@ -120,6 +120,16 @@ function RuleRow({ rule, bridge, onChanged }: { rule: AppRule; bridge: NativeBri
   );
 }
 
+/** What of a report can change the remembered decisions: each row's decision and the mic toggle. */
+function decisionsKey(fh: FriendsHear): string {
+  return (
+    [...fh.heard, ...fh.keptOut, ...fh.notCaptured]
+      .map((r) => `${r.id}:${r.decision}`)
+      .sort()
+      .join(',') + `|${String(fh.keepOutMicUsers)}`
+  );
+}
+
 /** Settings → Audio (03 §14.4). */
 export function AudioSettings({ bridge }: { bridge: NativeBridge }) {
   const { t } = useTranslation();
@@ -134,11 +144,16 @@ export function AudioSettings({ bridge }: { bridge: NativeBridge }) {
     }, fail);
   }, [bridge, fail]);
   useEffect(loadRules, [loadRules]);
-  // A decision made elsewhere (a row of the share panel, a prompt) changes the report: read the rules again.
-  const seq = fh?.seq ?? 0;
+  // A decision made elsewhere (a row of the share panel, a prompt) changes the report's decisions: read the rules
+  // again then. Not on every report: during a share 05 sends up to 4 a second for levels and playing changes alone.
+  const key = fh === null ? null : decisionsKey(fh);
+  const lastKey = useRef<string | null>(null);
   useEffect(() => {
-    if (seq > 0) loadRules();
-  }, [seq, loadRules]);
+    if (key === null) return;
+    const prev = lastKey.current;
+    lastKey.current = key;
+    if (prev !== null && prev !== key) loadRules();
+  }, [key, loadRules]);
 
   const voiceApps = fh?.voiceApps ?? [];
   return (

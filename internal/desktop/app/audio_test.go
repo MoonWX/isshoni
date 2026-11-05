@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,6 +116,12 @@ func (p *eventPub) Ready(context.Context) (session.Client, string, error) {
 // newAudioApp is an app over recAudio, sysShell, the desktop catalog and pub (nil: no C2), running.
 func newAudioApp(t *testing.T, pub publisher) (*App, *recAudio, *sysShell) {
 	t.Helper()
+	return newAudioAppWith(t, pub, func(s *sysShell) Shell { return s })
+}
+
+// newAudioAppWith is newAudioApp with the shell the app gets wrapped by wrap.
+func newAudioAppWith(t *testing.T, pub publisher, wrap func(*sysShell) Shell) (*App, *recAudio, *sysShell) {
+	t.Helper()
 	e := newEnv(t, nil, nil)
 	cat, err := i18n.Load(web.DesktopCatalog(), nil)
 	if err != nil {
@@ -122,7 +129,7 @@ func newAudioApp(t *testing.T, pub publisher) (*App, *recAudio, *sysShell) {
 	}
 	rec := &recAudio{}
 	shell := &sysShell{fakeShell: e.shell}
-	d := Deps{Settings: e.app.d.Settings, Servers: e.srv, Audio: rec, Shell: shell, OS: fakeOS{}, I18n: cat,
+	d := Deps{Settings: e.app.d.Settings, Servers: e.srv, Audio: rec, Shell: wrap(shell), OS: fakeOS{}, I18n: cat,
 		Log: e.app.d.Log}
 	if pub != nil {
 		d.Session = pub.(Session)
@@ -318,6 +325,63 @@ func TestMicPromptToast(t *testing.T) {
 	rec.mu.Unlock()
 	if a.ToastAction(toasts()[3].Nonce, ToastInclude) {
 		t.Error("an answer to a prompt that is gone ran")
+	}
+}
+
+// focusShell is a shell that reports whether its window has the focus (the app's focusReporter), as the Wails shell
+// does.
+type focusShell struct {
+	*sysShell
+	focused atomic.Bool
+}
+
+func (s *focusShell) WindowFocused() bool { return s.WindowVisible() && s.focused.Load() }
+
+// TestMicPromptToastUnfocused is 03 §15's "whenever the window isn't in the foreground": a window that is visible
+// but not focused (minimised, or behind a full-screen game) gets the prompt as a toast with Keep out and Include; a
+// focused one gets none.
+func TestMicPromptToastUnfocused(t *testing.T) {
+	var fs *focusShell
+	a, rec, shell := newAudioAppWith(t, nil, func(s *sysShell) Shell {
+		fs = &focusShell{sysShell: s}
+		fs.focused.Store(true)
+		return fs
+	})
+	waitFor(t, "the subscription to 05's events", func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return rec.fn != nil
+	})
+	toasts := func() []Notification {
+		shell.mu.Lock()
+		defer shell.mu.Unlock()
+		return slices.Clone(shell.toasts)
+	}
+	if !shell.WindowVisible() {
+		t.Fatal("the window isn't visible")
+	}
+
+	rec.emit(audio.Event{Name: audio.EventPrompt, Payload: audio.Prompt{ID: "p1", AppID: "exe:kook.exe",
+		Name: "KOOK", Kind: audio.PromptMic}})
+	if n := len(toasts()); n != 0 {
+		t.Fatalf("%d toasts while the window is in front", n)
+	}
+
+	fs.focused.Store(false)
+	rec.emit(audio.Event{Name: audio.EventPrompt, Payload: audio.Prompt{ID: "p2", AppID: "exe:kook.exe",
+		Name: "KOOK", Kind: audio.PromptMic}})
+	got := toasts()
+	if len(got) != 1 {
+		t.Fatalf("toasts %+v", got)
+	}
+	mic := got[0]
+	if mic.Kind != ToastMicPrompt || mic.Body != "KOOK is using your microphone. Keep it out of your stream?" ||
+		len(mic.Actions) != 2 || mic.Actions[0].ID != ToastKeepOut || mic.Actions[0].Title != "Keep out" ||
+		mic.Actions[1].ID != ToastInclude || mic.Actions[1].Title != "Include" {
+		t.Errorf("mic toast %+v", mic)
+	}
+	if !a.ToastAction(mic.Nonce, ToastInclude) || !slices.Contains(rec.get(), "decide(p2,include)") {
+		t.Errorf("calls %q", rec.get())
 	}
 }
 

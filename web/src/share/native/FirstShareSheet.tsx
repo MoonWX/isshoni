@@ -16,6 +16,7 @@ import { PRESETS } from '../presets';
 import { presetText } from '../presetText';
 import { AppGroups, AudioBanners, MicPromptCards, VoiceAppsLine, VolumeNote } from './FriendsHear';
 import styles from './native.module.css';
+import { useMicPromptHost } from './MicPromptCorner';
 import { useAudioBridge, useFriendsHear } from './useAudio';
 
 export interface FirstShareSheetProps {
@@ -45,6 +46,7 @@ export function FirstShareSheet({
   const group = useId();
   const bridge = useAudioBridge();
   const fh = useFriendsHear(open ? bridge : null, { watch: true });
+  useMicPromptHost(open && bridge !== null);
   return (
     <Dialog
       open={open}

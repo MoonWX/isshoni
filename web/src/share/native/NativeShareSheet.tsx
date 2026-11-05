@@ -10,7 +10,8 @@
 //
 // What friends hear (README WA77): while the sheet is open it watches the app list (Audio.Watch(true), 05's watcher
 // runs before a share, listing what plays without capturing it) and shows the one-line summary "Friends will hear 2
-// apps · Discord kept out · [Details]", the banners of degraded modes, and under Share sound the volume note.
+// apps · Discord kept out · [Details]", the banners of degraded modes, the mic prompt cards, and under Share sound
+// the volume note.
 import { MonitorUp } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -22,7 +23,8 @@ import { Sheet } from '../../ui/Sheet';
 import { PRESETS } from '../presets';
 import { presetText } from '../presetText';
 import type { ShareElsewhere } from '../ShareSheet';
-import { AudioBanners, FriendsHearSummary, VolumeNote } from './FriendsHear';
+import { AudioBanners, FriendsHearSummary, MicPromptCards, VolumeNote } from './FriendsHear';
+import { useMicPromptHost } from './MicPromptCorner';
 import { ShareErrorNote } from './ShareErrorNote';
 import styles from './native.module.css';
 import { useAudioBridge, useFriendsHear } from './useAudio';
@@ -85,6 +87,8 @@ export function NativeShareSheet({
   const group = useId();
   const bridge = useAudioBridge();
   const fh = useFriendsHear(open ? bridge : null, { watch: true });
+  // A modal sheet makes the rest of the window inert, so it shows the mic prompts itself (03 §10.3).
+  useMicPromptHost(open && bridge !== null);
 
   return (
     <Sheet
@@ -111,6 +115,7 @@ export function NativeShareSheet({
       }
     >
       <div className={styles.body}>
+        {fh !== null && <MicPromptCards fh={fh} bridge={bridge} />}
         {picking && (
           <p className={styles.picking} role="status">
             {t('desktop.share.sheet.picking')}

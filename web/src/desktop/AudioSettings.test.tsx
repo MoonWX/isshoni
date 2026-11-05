@@ -2,13 +2,13 @@
 // text ("Always kept out: Discord, TeamSpeak, …"), the mic toggle, the per-app decisions from Audio.AppRules with
 // Change (Audio.SetAppDecision, auto forgets), the built-in voice apps listed as locked, the ducking tip's button, and
 // Run the sound check again; no sound-mode control.
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 
 import { createDesktopTestPlatform } from '../app/testing/desktop';
 import type { AppRule } from '../platform/desktop/bridge';
-import { friendsHear } from '../share/native/testing';
+import { appRow, friendsHear } from '../share/native/testing';
 import { renderDesktopPage } from './testing/render';
 
 const RULES: AppRule[] = [
@@ -73,6 +73,40 @@ describe('Settings → Audio', () => {
     });
     await user.click(screen.getByRole('switch', { name: 'Keep out apps that use my microphone' }));
     expect(d.fake.callsOf('audio.setKeepOutMicUsers')).toEqual([[false]]);
+  });
+
+  it('reads the rules again when a report changes a decision, not on every report', async () => {
+    const { d } = renderSettings();
+    await screen.findByRole('combobox', { name: 'Choice for KOOK' });
+    await waitFor(() => {
+      expect(d.fake.callsOf('audio.friendsHear')).toHaveLength(1);
+    });
+    const kook = appRow({ id: 'exe:kook.exe', name: 'KOOK', decision: 'auto' });
+    act(() => {
+      d.fake.emit('audio.report', friendsHear({ seq: 10, live: true, heard: [kook] }));
+    });
+    const base = d.fake.callsOf('audio.appRules').length;
+    // Levels and playing changes alone (05 sends up to 4 reports a second during a share): no new read.
+    for (let seq = 11; seq < 15; seq += 1) {
+      act(() => {
+        d.fake.emit('audio.report', friendsHear({ seq, live: true, heard: [{ ...kook, playing: seq % 2 === 0 }] }));
+      });
+    }
+    expect(d.fake.callsOf('audio.appRules')).toHaveLength(base);
+    // A decision made elsewhere (a prompt kept KOOK out): read again, once; so does the mic toggle's change.
+    const keptOut = [appRow({ ...kook, decision: 'keep-out', reason: 'user' })];
+    act(() => {
+      d.fake.emit('audio.report', friendsHear({ seq: 15, live: true, heard: [], keptOut }));
+    });
+    await waitFor(() => {
+      expect(d.fake.callsOf('audio.appRules')).toHaveLength(base + 1);
+    });
+    act(() => {
+      d.fake.emit('audio.report', friendsHear({ seq: 16, live: true, heard: [], keptOut, keepOutMicUsers: false }));
+    });
+    await waitFor(() => {
+      expect(d.fake.callsOf('audio.appRules')).toHaveLength(base + 2);
+    });
   });
 
   it('without decisions says so; the ducking tip opens the Communications tab; the sound check runs again', async () => {

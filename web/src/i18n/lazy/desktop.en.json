@@ -73,7 +73,8 @@
         "keepOut": "Keep out",
         "keepBrowserOut": "Keep browser out",
         "include": "Include",
-        "dismiss": "Dismiss"
+        "dismiss": "Dismiss",
+        "corner": "Microphone questions"
       },
       "warning": {
         "sharedUsesMic": "{{app}} is the app you're sharing and it uses your microphone. Friends will hear its voice chat.",

@@ -51,6 +51,7 @@ import {
 import styles from './native.module.css';
 import { ShareDetails } from './ShareDetails';
 import { ShareErrorNote } from './ShareErrorNote';
+import { useMicPromptHost } from './MicPromptCorner';
 import { useAudioBridge, useFriendsHear, useLevels } from './useAudio';
 import { useEncoderNotice, useShareView } from './useShareView';
 
@@ -104,6 +105,8 @@ export function NativeSharePanel({
   const audioBridge = useAudioBridge();
   const showsShare = phase !== 'idle' && phase !== 'picking' && phase !== 'confirming' && phase !== 'failed';
   const fh = useFriendsHear(showsShare ? audioBridge : null);
+  // The panel shows the mic prompts while it shows the share: the corner card (MicPromptCorner) steps aside.
+  useMicPromptHost(showsShare && audioBridge !== null);
 
   useEffect(() => {
     linkShareUi(store, ui);

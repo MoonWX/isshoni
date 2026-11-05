@@ -69,6 +69,8 @@ describe('sound step', () => {
     expect(await screen.findByText(/can't keep voice apps out on this PC/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Learn more' }));
     expect(d.opened).toEqual([SOUND_HELP]);
+    // The anchor the docs slice (WA85) adds to docs/troubleshooting.md: pending until then.
+    expect(SOUND_HELP).toBe('https://moonwx.github.io/isshoni/troubleshooting#desktop-sound');
   });
 
   it('device_busy: its text, Open sound settings, Try again and Continue', async () => {

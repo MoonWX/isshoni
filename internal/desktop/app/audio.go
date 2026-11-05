@@ -142,6 +142,10 @@ func (a *App) answerPrompt(promptID string, d audio.Decision) bool {
 // ToastDismissed is the shell's report that the user dismissed a toast (its ✕, or swiped it away), for a shell that
 // can tell: a mic prompt's toast then dismisses the prompt (05's DismissPrompt: kept out for this run, nothing saved,
 // 03 §15). Any other toast is only settled. A nonce this run didn't send does nothing.
+//
+// It has no caller yet: the pinned Wails notifications service (v3.0.0-beta.34) reports no toast dismissal, so a
+// swiped-away mic prompt stays pending (still kept out) until it is answered in the window. The slice that upgrades
+// Wails wires it from the shell once the service can report a dismissal.
 func (a *App) ToastDismissed(nonce string) {
 	p, ok := a.toasts.take(nonce)
 	if !ok || p.kind != ToastMicPrompt {
