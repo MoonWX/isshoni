@@ -661,7 +661,9 @@ the named sections)
     also when MF software's `probe: first AU only on drain` record shows complete drained AUs (`sps`, `pps` and `idr`
     all true); the skip prints that record. On a client Windows this outcome still fails the test, and the `VT_BOOL`
     patch stays a candidate. The owner's PC shows whether a client Windows behaves the same (04 §9.10, §17, §18.2;
-    §8).
+    §8). Open (WB11's review): `mf_sw_test.cpp`'s header comment still names only the MFT refusal as a skip and says
+    any other failure fails; the next slice or integration commit that touches `native/windows/tests/` rewords it to
+    name both skips.
 69. **FFmpeg r2 is published and locked** (the owner, 2026-11-04): `ffmpeg.yml`'s publish run from `m2/windows-app` at
     `957cce6` (the libvpl patch of item 64 and `build.sh`'s fallback to the published source archive when an upstream
     tarball download fails, 06 §4.3, since ffmpeg.org was unreachable from the runners) created `deps-ffmpeg-9.0.2-r2`,
