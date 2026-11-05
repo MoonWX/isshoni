@@ -44,23 +44,45 @@ const toastTitle = "isshoni"
 // maxToasts bounds the toasts whose buttons are still accepted: an older one's buttons are dropped.
 const maxToasts = 32
 
-// toastBook holds the nonces of the toasts sent in this run that haven't been settled.
+// toastRemover is the OS hooks' removal from Action Center (winos.Hooks.RemoveToasts; e2ehost's recorder): it takes
+// the toasts whose Notification.ID is among ids out of Action Center and reports how many went. The app finds it by
+// a type assertion on Deps.OS, like the other optional hooks; without it a stale toast stays in Action Center, its
+// buttons settled (they no longer act).
+//
+// Its contract (winos): calls are serialized with Shell.Notify and never made with App.mu held. The app keeps both
+// through toastBook.out: notify and removeStaleToasts are the only callers of Shell.Notify and RemoveToasts, both
+// hold out, and neither runs under App.mu.
+type toastRemover interface {
+	RemoveToasts(ids ...string) (int, error)
+}
+
+// toastBook holds the nonces of the toasts sent in this run that haven't been settled, and the IDs of the toasts
+// that were dropped (their question answered another way) and still have to leave Action Center.
 type toastBook struct {
+	// out serializes the app's toast output: Shell.Notify and toastRemover.RemoveToasts (RemoveToasts' contract: an
+	// untagged toast's removal clears the app's toasts and delivers the others again, so a toast shown meanwhile
+	// could be lost). It is taken before mu, never under App.mu.
+	out sync.Mutex
+
 	mu      sync.Mutex
 	seq     int
 	pending map[string]pendingToast // by nonce
 	order   []string                // the nonces, oldest first
+	stale   []string                // Notification IDs dropKind settled, not yet removed from Action Center
 }
 
 // pendingToast is a sent toast with buttons.
 type pendingToast struct {
+	id      string // the Notification's ID: what Action Center's removal finds it by
 	kind    string
 	ref     string // what the toast asks about: a mic prompt's id; "" for the others
 	actions []string
 }
 
 // notify shows a toast of kind with body; actions are its buttons, ids among the Toast* actions, with their titles
-// (the catalog's desktop.native.toast.*). A failing shell is logged once per toast and never retried.
+// (the catalog's desktop.native.toast.*). A failing shell is logged once per toast and never retried. Stale toasts
+// leave Action Center first, on the same serialized path (toastRemover's contract), so the new toast is never
+// shown while they are being removed. It must not be called with a.mu held.
 func (a *App) notify(kind, body string, actions ...NotificationAction) {
 	a.notifyRef(kind, "", body, actions...)
 }
@@ -70,6 +92,9 @@ func (a *App) notify(kind, body string, actions ...NotificationAction) {
 func (a *App) notifyRef(kind, ref, body string, actions ...NotificationAction) {
 	n := Notification{Kind: kind, Title: toastTitle, Body: body, Actions: actions}
 	b := &a.toasts
+	b.out.Lock()
+	defer b.out.Unlock()
+	a.removeStaleLocked()
 	b.mu.Lock()
 	b.seq++
 	n.ID = kind + "-" + strconv.Itoa(b.seq)
@@ -82,7 +107,7 @@ func (a *App) notifyRef(kind, ref, body string, actions ...NotificationAction) {
 		for i, act := range actions {
 			ids[i] = act.ID
 		}
-		b.pending[n.Nonce] = pendingToast{kind: kind, ref: ref, actions: ids}
+		b.pending[n.Nonce] = pendingToast{id: n.ID, kind: kind, ref: ref, actions: ids}
 		b.order = append(b.order, n.Nonce)
 		for len(b.order) > maxToasts {
 			delete(b.pending, b.order[0])
@@ -130,13 +155,15 @@ func (b *toastBook) take(nonce string) (pendingToast, bool) {
 }
 
 // dropRefsExcept settles every pending toast of kind whose ref isn't in keep: what it asks about was answered
-// another way, or is gone.
+// another way, or is gone. Like dropKind, it keeps their IDs as stale; they leave Action Center at the next notify
+// or removeStaleToasts (it only touches the book, so it makes no WinRT round trip on the caller's thread).
 func (b *toastBook) dropRefsExcept(kind string, keep []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.order = slices.DeleteFunc(b.order, func(n string) bool {
 		if p, ok := b.pending[n]; ok && p.kind == kind && !slices.Contains(keep, p.ref) {
 			delete(b.pending, n)
+			b.stale = append(b.stale, p.id)
 			return true
 		}
 		return false
@@ -144,17 +171,65 @@ func (b *toastBook) dropRefsExcept(kind string, keep []string) {
 }
 
 // dropKind settles every pending toast of kind without an action: its question was answered another way (the
-// tray, the panel, a later stop, the share's end), so its buttons, still in Action Center, no longer act.
+// tray, the panel, a later stop, the share's end), so its buttons, still in Action Center, no longer act. Their IDs
+// are kept as stale: the toasts themselves leave Action Center at the next removeStaleToasts or notify (03 §15). It
+// only touches the book, so callers may hold a.mu; they call removeStaleToasts once they released it.
 func (b *toastBook) dropKind(kind string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.order = slices.DeleteFunc(b.order, func(n string) bool {
 		if p, ok := b.pending[n]; ok && p.kind == kind {
 			delete(b.pending, n)
+			b.stale = append(b.stale, p.id)
 			return true
 		}
 		return false
 	})
+}
+
+// takeStale is the stale toasts' IDs, which it forgets.
+func (b *toastBook) takeStale() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ids := b.stale
+	b.stale = nil
+	return ids
+}
+
+// hasStale reports stale IDs waiting.
+func (b *toastBook) hasStale() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.stale) > 0
+}
+
+// removeStaleToasts takes the toasts dropKind settled out of Action Center (03 §15; WF13's review R3) through the
+// OS hooks' toastRemover, serialized with notify. It must not be called with a.mu held: the removal makes WinRT
+// round trips. With nothing to remove it returns at once, without waiting for a toast on its way out (the share
+// events call it for every state); a toast dropped later is removed by its own dropper's call.
+func (a *App) removeStaleToasts() {
+	if !a.toasts.hasStale() {
+		return
+	}
+	a.toasts.out.Lock()
+	defer a.toasts.out.Unlock()
+	a.removeStaleLocked()
+}
+
+// removeStaleLocked is removeStaleToasts with toastBook.out held. A failed removal is logged and not retried: the
+// toasts' buttons are settled already, so a toast left behind only looks stale.
+func (a *App) removeStaleLocked() {
+	ids := a.toasts.takeStale()
+	if len(ids) == 0 {
+		return
+	}
+	r, ok := a.d.OS.(toastRemover)
+	if !ok {
+		return
+	}
+	if _, err := r.RemoveToasts(ids...); err != nil {
+		a.log.Warn("app: stale toasts weren't removed from Action Center", "count", len(ids), errAttr(err))
+	}
 }
 
 // ToastAction is the shell's report of a toast activation: the nonce the toast carried ("" for none) and the

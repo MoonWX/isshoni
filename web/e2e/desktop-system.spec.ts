@@ -7,7 +7,8 @@
 //   "Sharing stopped because your PC went to sleep";
 // - an unlock after the first bound (lockResumeMs) leaves the share paused and asks "Resume sharing?" with the tray's
 //   Paused menu and a toast with Resume and Stop; a resume through the controller (the panel's) ends the lock pause,
-//   so keep-awake is back and the second bound no longer stops the share;
+//   so keep-awake is back, the answered toast leaves Action Center (03 §15) and the second bound no longer stops the
+//   share;
 // - a lock pause that reaches the second bound (lockStopMs) stops the share with the end reason system and the toast
 //   "Sharing stopped while your PC was locked";
 // - the end of the session: WM_QUERYENDSESSION stops the share and is acknowledged while the app keeps running (the
@@ -209,23 +210,22 @@ test('an unlock after the first bound asks "Resume sharing?"; a resume ends the 
   await desktop.call('Share', 'SetPaused', false);
   await expectShare(desktop, 'live');
   await expectKeepAwake(desktop, true);
+  // The question was answered, so its toast leaves Action Center (03 §15): the app calls the OS hooks' removal
+  // (winos.Hooks.RemoveToasts, which the harness records) with the toast's Notification ID.
+  await expect
+    .poll(async () => (await desktop.state()).removedToasts, {
+      timeout: STATE_TIMEOUT_MS,
+      message: 'the answered "Resume sharing?" toast removed from Action Center',
+    })
+    .toEqual([toast.ID]);
 
   // The second bound passes: the resumed share isn't stopped, and no "stopped while locked" toast comes.
   await desktop.page.waitForTimeout(Math.max(0, lockedAt + LOCK_STOP_MS + 1_000 - Date.now()));
   expect((await desktop.call<ShareView | null>('Share', 'Current'))?.state).toBe('live');
   expect(toastsOf(await desktop.state(), 'stopped-locked')).toEqual([]);
   expect((await desktop.state()).keepAwake).toBe(true);
-
-  // The question was answered, so its toast has left Action Center (03 §15) by now, once the app calls the OS
-  // hooks' removal (winos.Hooks.RemoveToasts, which the harness records). The app doesn't call it yet: the slice that
-  // owns internal/desktop/app wires it (toastBook.dropKind's IDs, on the serialized toast path) and turns this into
-  // a hard expect.poll(...).toEqual([toast.ID]).
-  const { removedToasts } = await desktop.state();
-  if (removedToasts.length === 0) {
-    test.info().annotations.push({ type: 'action-center', description: 'the app removes no toasts yet' });
-  } else {
-    expect(removedToasts).toEqual([toast.ID]);
-  }
+  // Nothing else left Action Center meanwhile.
+  expect((await desktop.state()).removedToasts).toEqual([toast.ID]);
 });
 
 test('a lock pause that reaches the second bound stops the share with a toast', async ({ startDesktop, server }) => {
