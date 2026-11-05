@@ -100,6 +100,8 @@ interface Setup {
   sharing?: boolean;
   path?: string;
   openH264?: OpenH264Control | null;
+  /** Settings.OpenH264()'s answer when the page uses Go's control (no openH264). */
+  h264?: OpenH264Status;
 }
 
 function renderSettings(o: Setup = {}) {
@@ -115,6 +117,7 @@ function renderSettings(o: Setup = {}) {
     { id: 'stop', combo: view.hotkeys.stop, state: 'idle' },
   ];
   d.fake.answers['updates.status'] = o.status ?? updateStatus('idle');
+  d.fake.answers['settings.openH264'] = o.h264 ?? { state: 'unavailable', version: '' };
   d.fake.answers['auth.servers'] = o.servers ?? SERVERS;
   d.fake.answers['share.capabilities'] = o.caps ?? CAPS;
   d.fake.answers['share.current'] = () => Promise.resolve(o.sharing === true ? shareView({ state: 'live' }) : null);
@@ -353,6 +356,23 @@ describe('Settings → Sharing', () => {
     await screen.findByTestId('encoders');
     expect(screen.queryByTestId('openh264')).not.toBeInTheDocument();
     expect(screen.queryByText(/OpenH264 Video Codec provided by Cisco/)).not.toBeInTheDocument();
+  });
+
+  it("the OpenH264 opt-in over Go's Settings methods (README WA84)", async () => {
+    const user = userEvent.setup();
+    const { d } = renderSettings({ h264: { state: 'off', version: '2.7.0' } });
+    d.fake.answers['settings.enableOpenH264'] = { state: 'on', version: '2.7.0' };
+    const optIn = await screen.findByTestId('openh264');
+    await user.click(within(optIn).getByRole('button', { name: 'Enable Cisco OpenH264…' }));
+    expect(
+      await within(optIn).findByText('Cisco OpenH264 2.7.0 is installed. isshoni uses it when no other encoder works.'),
+    ).toBeInTheDocument();
+    d.fake.answers['settings.disableOpenH264'] = () => Promise.reject(new BridgeError('busy'));
+    await user.click(within(optIn).getByRole('button', { name: /Turn off/ }));
+    expect(await within(optIn).findByRole('alert')).toBeInTheDocument();
+    expect(d.fake.callsOf('settings.openH264')).toHaveLength(1);
+    expect(d.fake.callsOf('settings.enableOpenH264')).toHaveLength(1);
+    expect(d.fake.callsOf('settings.disableOpenH264')).toHaveLength(1);
   });
 
   it('the OpenH264 opt-in: Cisco notice, enable (a failed download says so), attribution in About, turn off', async () => {

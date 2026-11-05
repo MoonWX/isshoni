@@ -34,7 +34,7 @@ type trayModel struct {
 }
 
 // SetUpdateReady shows "Restart and update to <version>" in the Idle menu; "" takes it away (06's update.state
-// ready; README WA84 calls it).
+// ready: updates.go follows the updater and calls it).
 func (a *App) SetUpdateReady(version string) {
 	a.tray.mu.Lock()
 	a.tray.updateReady = version
@@ -144,7 +144,7 @@ func (a *App) TrayClicked() { a.ShowWindow() }
 
 // TrayAction carries out a tray menu item (03 §11.1, §11.6). Pause and Resume go through the share controller as
 // every control does (03 §11.3); Stop ends the share with the end reason tray; "Stop sharing and quit" and Quit quit
-// with the share stopped first. "Restart and update" opens the window until README WA84 wires Updates.Install, and
+// with the share stopped first. "Restart and update" is InstallUpdate (updates.go; the window when it can't), and
 // "N questions waiting" opens it on the mic prompt card. An unknown action does nothing.
 func (a *App) TrayAction(act tray.Action) {
 	switch act {
@@ -165,8 +165,7 @@ func (a *App) TrayAction(act tray.Action) {
 	case tray.ActionStopAndQuit, tray.ActionQuit:
 		a.quit(true, share.CauseTray, true)
 	case tray.ActionRestart:
-		a.log.Info("app: Restart and update isn't wired yet; opening the window")
-		a.ShowWindow()
+		a.restartForUpdate("tray")
 	default:
 		a.log.Debug("app: unknown tray action", "action", string(act))
 	}

@@ -19,8 +19,8 @@ import (
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
-// exitUnavailable is the exit code of a mode this build doesn't have yet (03 §13.4; exitOK and exitFailed are in
-// oneshot.go).
+// exitUnavailable is the exit code of a mode this build doesn't have, such as --update-now without the updatetest tag
+// (03 §13.4; exitOK and exitFailed are in oneshot.go).
 const exitUnavailable = 2
 
 // installingMutex is the installer's mutex (06 §2.4): it exists while an installer runs (interactive, /S or a
@@ -63,9 +63,14 @@ type starter struct {
 	openServers    func(credstore.Store) (credentialForgetter, error)
 	dataRoot       func() (string, error)
 	removeAll      func(string) error
-	singleInstance func() (instance, error)    // step 3
-	holdRunning    func() error                // step 4: the running mutex
-	takePending    func() (app.Pending, error) // step 6
+	singleInstance func() (instance, error) // step 3
+	holdRunning    func() error             // step 4: the running mutex
+	// openUpdater is step 5's: 06's updater for the first instance (over settings.json, which step 7 then goes on
+	// with). nil skips step 5.
+	openUpdater func() (startUpdater, error)
+	takePending func() (app.Pending, error) // step 6
+	// updateNow is --update-now (06 §8.11): its exit code. nil in a build without the updatetest tag (exit 2).
+	updateNow func() int
 	// embedding is -Embedding's wait for the toast activation that COM started this process for (notify_*.go's
 	// awaitToastActivation): true when it is open, which continues as a normal start. nil drops every activation.
 	embedding func() (open bool)
@@ -80,7 +85,7 @@ type starter struct {
 }
 
 // start runs a start in 03 §13.4's order and returns the exit code. Each step is skipped or answered as that
-// section says; the steps that later slices own are marked where they go.
+// section says.
 func (s *starter) start(args []string) int {
 	p := app.ParseArgs(args)
 
@@ -158,8 +163,11 @@ func (s *starter) start(args []string) int {
 		s.log.Warn("desktop: the running mutex wasn't created", "err", err)
 	}
 
-	// Step 5, the start-time update with its Pending values (README WA84), goes here. A start that exits there also
-	// exits with what fwd queued meanwhile.
+	// Step 5: the start-time update (06 §8.7 (b)), never at an --autostart start. A link this start or a second
+	// launch brought goes to the Pending values first; a start that exits here drops what fwd queued.
+	if s.startTimeUpdate(p, fwd) {
+		return exitOK
+	}
 
 	// Step 6: the Pending values, read and deleted before anything of the app runs (03 §13.2).
 	pending, err := s.takePending()
@@ -352,9 +360,15 @@ func (s *starter) oneShot(p app.Args) int {
 			s.log.Error("desktop: the data folder wasn't deleted", "err", err)
 		}
 		return exitOK // exit 0 whatever happened (03 §13.4 step 1, 06 §2.4): the uninstaller only logs it (06 §6.8)
+	case app.ModeUpdateNow:
+		if s.updateNow == nil {
+			// Only builds with the updatetest tag have it (06 §8.11).
+			s.log.Error("desktop: --update-now is only in test builds")
+			return exitUnavailable
+		}
+		return s.updateNow()
 	default:
-		// --update-now (README WA84, updatetest builds only).
-		s.log.Error("desktop: this mode is not in this build yet", "mode", string(p.OneShot))
+		s.log.Error("desktop: this mode is not in this build", "mode", string(p.OneShot))
 		return exitUnavailable
 	}
 }

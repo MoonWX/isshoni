@@ -31,11 +31,13 @@ const (
 )
 
 // HotkeyStatus is one hotkey's state: its id, the combination in hotkey's text form and its state. The bound
-// Settings.Hotkeys (README WA84) answers with these.
+// Settings.Hotkeys and Settings.TestHotkey (README WA84) answer with these; TypesChar is TestHotkey's (prefs.go).
 type HotkeyStatus struct {
 	ID    HotkeyID
 	Combo string
 	State HotkeyState
+	// TypesChar: the combination types a character in the current keyboard layout (03 §11.2); TestHotkey only.
+	TypesChar bool
 }
 
 // charTyper is the OS hooks' check of a combination against the current keyboard layout (winos: VkKeyScanExW and

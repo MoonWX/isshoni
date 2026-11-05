@@ -27,6 +27,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/media/fake"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/update"
 )
 
 // fakeShell records what the app asked of the shell, in order.
@@ -697,7 +698,7 @@ func TestNewRequires(t *testing.T) {
 	}
 }
 
-// fakePart is a Session, AudioService or Updater that runs until ctx ends.
+// fakePart is a Session or AudioService that runs until ctx ends (fakeUpdater is the Updater's, updates_test.go).
 type fakePart struct {
 	ran, closed atomic.Bool
 }
@@ -717,7 +718,7 @@ func (f *fakePart) Close() error {
 // service, flushes the settings and quits the shell.
 func TestRunAndQuit(t *testing.T) {
 	e := newEnv(t, []string{"https://a.example.com"}, nil)
-	session, audio, updater := &fakePart{}, &fakePart{}, &fakePart{}
+	session, audio, updater := &fakePart{}, &fakePart{}, newFakeUpdater(update.Status{State: update.StateIdle})
 	e.app.d.Session, e.app.d.Audio, e.app.d.Updater = session, audio, updater
 	eng := fake.NewEngine(fake.EngineConfig{})
 	defer func() { _ = eng.Close() }()

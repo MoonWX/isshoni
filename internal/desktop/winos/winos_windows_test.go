@@ -505,9 +505,9 @@ func TestHooks(t *testing.T) {
 	if err := SetAppUserModelID("io.isshoni.test"); err != nil {
 		t.Error(err)
 	}
-	// Not there yet (README WA84): a clear error, never a silent success.
-	if err := h.SetAutostart(true, `C:\x.exe`); !errors.Is(err, errNotImplemented) {
-		t.Errorf("SetAutostart: %v", err)
+	// The Run value's own round trip is TestAutostartRunValue (on a test key); here only a path it can't hold.
+	if err := h.SetAutostart(true, `relative\isshoni.exe`); !errors.Is(err, errBadExe) {
+		t.Errorf("SetAutostart with a relative path: %v", err)
 	}
 	if h.Pill() == nil || h.Hotkeys() == nil || h.Events() == nil {
 		t.Error("Pill, Hotkeys or Events")
