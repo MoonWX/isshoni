@@ -199,7 +199,7 @@ func navMessages(nav *navGuard) func(application.Window, string, *application.Or
 		if info != nil {
 			top = info.TopOrigin
 		}
-		go nav.reported(n, top)
+		nav.reported(n, top)
 	}
 }
 

@@ -124,25 +124,42 @@ func TestNavGuard(t *testing.T) {
 		t.Fatalf("back home: %d homes, at home %v", r.homes, g.atHome())
 	}
 
-	// No answer (chrome.webview taken away, an error page): home after the deadline. A later number than any
-	// question asked answers nothing.
+	// An answer to a question never asked is ignored, even a foreign one.
 	g.navigated()
-	g.reported(99, "http://wails.localhost/")
+	g.reported(99, "https://example.com/phish")
+	if r.homes != 1 || !g.atHome() {
+		t.Fatalf("an answer to no question: %d homes, at home %v", r.homes, g.atHome())
+	}
+
+	// No answer (chrome.webview taken away, an error page): home after the deadline.
 	r.fire()
 	if r.homes != 2 || g.atHome() {
 		t.Fatalf("silence: %d homes, at home %v", r.homes, g.atHome())
 	}
 
 	// At most homeLimit per homeWindow.
-	g.reported(4, "about:blank")
-	g.reported(4, "about:blank")
+	g.navigated()
+	g.reported(5, "about:blank")
+	g.navigated()
+	g.reported(6, "about:blank")
 	if r.homes != homeLimit {
 		t.Fatalf("%d homes within a minute, want %d", r.homes, homeLimit)
 	}
 	r.now = r.now.Add(homeWindow)
-	g.reported(4, "about:blank")
+	g.navigated()
+	g.reported(7, "about:blank")
 	if r.homes != homeLimit+1 {
 		t.Fatalf("%d homes a minute later", r.homes)
+	}
+
+	// An older answer arriving after a newer one changes nothing.
+	g.navigated()
+	g.navigated()
+	g.reported(9, "http://wails.localhost/")
+	g.reported(8, "https://example.com/phish")
+	g.reported(9, "https://example.com/phish")
+	if r.homes != homeLimit+1 || !g.atHome() {
+		t.Fatalf("a late answer: %d homes, at home %v", r.homes, g.atHome())
 	}
 }
 

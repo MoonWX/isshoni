@@ -234,7 +234,8 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
   const after = pages();
   // A navigation no page script can cancel, started as the browser starts one (CDP's Page.navigate): Go's half of
   // the fallback (navguard.go) notices the foreign top level after WebViewNavigationCompleted and loads the start
-  // page again. Whether the window got there at all is recorded; that it is back home is asserted.
+  // page again. Both are asserted: that the window got there, so the check can't pass without leaving the asset
+  // origin, and that it is back home.
   const started = Date.now();
   const left = await page
     .goto('https://example.com/g', { waitUntil: 'commit', timeout: 15_000 })
@@ -258,6 +259,7 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
   expect(origin).toBe(DesktopAssetOriginWindows);
   expect(opened).toBe(true);
   expect(after).toBe(before);
+  expect(left).toBe('https://example.com');
 });
 
 test('W7: closing the window hides it; the app keeps running', async ({ app }) => {

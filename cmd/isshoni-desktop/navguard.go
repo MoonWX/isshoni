@@ -140,13 +140,16 @@ func (g *navGuard) arm(n uint64) {
 	})
 }
 
-// reported is the answer to question n with the browser's top-level source.
+// reported is the answer to question n with the browser's top-level source. An answer to a question never asked,
+// or one older than the last answer, says nothing about where the window is now and is ignored.
 func (g *navGuard) reported(n uint64, top string) {
 	away := foreignTop(top, g.origin)
 	g.mu.Lock()
-	if n <= g.asked && n > g.answered {
-		g.answered = n
+	if g.answered >= n || n > g.asked {
+		g.mu.Unlock()
+		return
 	}
+	g.answered = n
 	g.away = away
 	g.mu.Unlock()
 	if away {
