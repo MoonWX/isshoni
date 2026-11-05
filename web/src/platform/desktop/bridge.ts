@@ -399,6 +399,8 @@ export type BridgeEventName = keyof BridgeEvents;
 export interface NativeBridge {
   app: {
     info(): Promise<AppInfo>;
+    /** W17's watchdog beat (docs/m2/03 §3.2, §20): DesktopPlatform sends it every HeartbeatEveryMs. */
+    heartbeat(): void;
     openExternal(url: string): Promise<void>;
     openOSSettings(p: OSPage): Promise<void>;
     quit(stopShare: boolean): Promise<void>;
@@ -469,6 +471,7 @@ export interface NativeBridge {
 
 /** The fire-and-forget methods, as `group.method`: they return nothing, and a transport logs their failures. */
 export const VoidMethods: ReadonlySet<string> = new Set([
+  'app.heartbeat',
   'app.log',
   'app.ownConnections',
   'share.release',

@@ -794,6 +794,13 @@ export interface StartDesktopOptions {
   server?: string;
   /** How long Shell.Reload waits before it counts (-reload-delay), so a spec can act in the moment before it. */
   reloadDelayMs?: number;
+  /**
+   * 03 §11.6's first bound of a lock pause (-lock-resume; default 5 min): an unlock within it resumes the share, a
+   * later one asks "Resume sharing?".
+   */
+  lockResumeMs?: number;
+  /** 03 §11.6's second bound (-lock-stop; default 30 min): a lock pause that lasts this long stops the share. */
+  lockStopMs?: number;
   /** The app's command line, as the first instance's own (App.Boot). */
   args?: string[];
   /** 05's fake audio scenario (05 §13.3; ISSHONI_FAKE_AUDIO); default normal. */
@@ -828,7 +835,17 @@ export interface DesktopState {
   /** The runtime requests that passed the Guard and reached the stub /wails/runtime: W21's object and method ids. */
   runtimeCalls: { object: number; method: number }[];
   tray: unknown;
+  /** App.Heartbeat calls: the page's W17 watchdog beats (docs/m2/03 §3.2, §20). */
+  heartbeats: number;
+  /** The app's EndSessionHandled calls: WM_QUERYENDSESSION handled, then the quit at WM_ENDSESSION (03 §11.6). */
+  endSessionAcks: number;
+  /** The app.Notification IDs the app took out of Action Center (winos.Hooks.RemoveToasts, 03 §15). */
+  removedToasts: string[];
 }
+
+/** An OS event the harness injects (POST /__e2e/system; app.SystemEvent). */
+export type DesktopSystemEvent =
+  'lock' | 'unlock' | 'suspend' | 'resume' | 'end-session' | 'end-session-confirmed' | 'display-change';
 
 /** A bound method's rejection: 03 §6.4's {code, params} with the HTTP status. */
 export class DesktopCallError extends Error {
@@ -860,7 +877,7 @@ export interface DesktopApp {
   /** A hotkey press (POST /__e2e/hotkey). */
   hotkey(id: 'pause' | 'stop'): Promise<void>;
   /** An OS event (POST /__e2e/system). */
-  system(event: 'lock' | 'unlock' | 'suspend' | 'resume' | 'end-session' | 'display-change'): Promise<void>;
+  system(event: DesktopSystemEvent): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -912,6 +929,8 @@ async function launchDesktop(
   const flags = ['-data', dataDir];
   if (options.server !== undefined) flags.push('-server', options.server);
   if (options.reloadDelayMs !== undefined) flags.push(`-reload-delay=${String(options.reloadDelayMs)}ms`);
+  if (options.lockResumeMs !== undefined) flags.push(`-lock-resume=${String(options.lockResumeMs)}ms`);
+  if (options.lockStopMs !== undefined) flags.push(`-lock-stop=${String(options.lockStopMs)}ms`);
   const log = fs.openSync(logPath, 'a');
   let child: ChildProcess;
   try {

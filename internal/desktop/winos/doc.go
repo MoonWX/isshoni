@@ -9,8 +9,9 @@
 // (§13.4 step 4), the registry values (§13.2, §14.2), the AppUserModelID and OSBuild (README WA41); the winos
 // thread with its hidden window (§4.3: hotkey registration and WM_HOTKEY, lock and unlock, suspend and resume, the
 // end of the session with its 2 s handshake, display changes), keep-awake on that thread, WDA_EXCLUDEFROMCAPTURE
-// and its reset, the OS settings pages and OpenPath (README WA68). The pill (WA80) is a no-op and autostart (WA84)
-// returns "not implemented" on Windows until their slices.
+// and its reset, the OS settings pages and OpenPath (README WA68); Action Center (toasts.go: RemoveToasts takes a
+// toast that is no longer relevant out of it, 03 §15; WF13). The pill (WA80) is a no-op and autostart (WA84) returns
+// "not implemented" on Windows until their slices.
 //
 // Names (README §4 "Naming"): the single-instance id io.isshoni.desktop, the running mutex
 // Local\io.isshoni.desktop.running, the registry key HKCU\Software\isshoni.
@@ -28,6 +29,10 @@ const (
 var (
 	_ app.OSHooks      = (*Hooks)(nil)
 	_ app.PendingStore = (*Registry)(nil)
+	// The app finds the toast removal by a type assertion, like the other optional hooks.
+	_ interface {
+		RemoveToasts(ids ...string) (int, error)
+	} = (*Hooks)(nil)
 )
 
 // nopPill is the pill of the OSes without one (and of Windows until README WA80): Set does nothing and Actions

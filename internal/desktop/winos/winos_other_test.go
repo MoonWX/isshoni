@@ -74,4 +74,19 @@ func TestStubs(t *testing.T) {
 	if err := SetAppUserModelID(InstanceID); err != nil {
 		t.Error(err)
 	}
+
+	// No Action Center: the app's removals do nothing, the package's own functions say so.
+	if n, err := h.RemoveToasts("lock-paused-1"); n != 0 || err != nil {
+		t.Errorf("RemoveToasts: %d %v", n, err)
+	}
+	if _, err := DeliveredToasts(InstanceID); !errors.Is(err, app.ErrNotSupported) {
+		t.Errorf("DeliveredToasts: %v", err)
+	}
+	if _, err := RemoveDeliveredToasts(InstanceID, func(DeliveredToast) bool { return true }); !errors.Is(err,
+		app.ErrNotSupported) {
+		t.Errorf("RemoveDeliveredToasts: %v", err)
+	}
+	if err := ShowToast(InstanceID, Toast{XML: "<toast/>"}); !errors.Is(err, app.ErrNotSupported) {
+		t.Errorf("ShowToast: %v", err)
+	}
 }

@@ -64,6 +64,9 @@ export function createWailsBridge(opts: WailsBridgeOptions = {}): NativeBridge {
   return {
     app: {
       info: () => call(App.Info()),
+      heartbeat: () => {
+        fire('app.heartbeat', App.Heartbeat());
+      },
       openExternal: (url) => call(App.OpenExternal(url)),
       openOSSettings: (p) => call(App.OpenOSSettings(p)),
       quit: (stopShare) => call(App.Quit(stopShare)),
