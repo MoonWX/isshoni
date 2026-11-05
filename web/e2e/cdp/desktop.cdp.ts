@@ -1,42 +1,115 @@
-// The real app over CDP (M2 03 §22.4 B), the skeleton of README WA48: it starts the e2e build of isshoni.exe (or
-// attaches to a running one), connects Playwright to its WebView2 and checks the Wails checklist rows that only the
-// real webview can answer (03 §3.2): W1 (the asset origin), W2 (a secure context), W3 (the CSP is enforced), W5
-// (top-level navigation and new windows don't leave the asset origin; at beta.34 through the row's fallback) and W7
-// (closing the window hides it). Each test also writes
-// its row as an annotation ("Wails checklist"), for the PR. README DK13 (WA90's run) completes the spec: W9, W13,
-// W16, W21 in the webview, a device-flow link, a fake share watched in Chrome, close-to-tray while live, Quit.
+// The real app over CDP (M2 03 §22.4 B; README WA48's skeleton, completed by WA87 for DK13): it starts the e2e build
+// of isshoni.exe (or attaches to a running one), connects Playwright to its WebView2 and checks what only the real
+// webview can answer. The Wails checklist rows (03 §3.2): W1 (the asset origin; the server's CORS for it end to end
+// in the link case), W2 (a secure context), W3 (the CSP is enforced), W5 (top-level navigation and new windows don't
+// leave the asset origin; at beta.34 through the row's fallback), W7 (closing the window hides it), W9 (the WebView2
+// settings that CDP can observe: zoom and the browser accelerator keys), W13 (audio plays without a click), W16
+// (element fullscreen fills the screen and Esc returns), W21 (the runtime's own objects get 403 from the page and
+// nothing opens) and W19 (a production build opens no debugging port or pipe, and its WEBVIEW2_* scrub holds). Then
+// the app end to end against a real `isshoni serve`: a device-flow link approved in a second browser, a fake share
+// watched in Chrome, the window closed to the tray while live (the share goes on), and Quit (the share ends, the
+// process exits 0 within 3 s, 03 §20). Each check writes its row as an annotation ("Wails checklist"), which the PR
+// copies; the budgets of 03 §20 that this runner can show are annotations too ("Budget (03 §20)": startup to the
+// page with a new WebView2 profile, the private working sets while sharing the fake engine's 640x360). Those are CI
+// numbers, not the budget's: the budget is the owner's PC sharing 1080p60 (M-DESK-12).
 //
 // Environment (web/e2e/cdp/playwright.config.ts): ISSHONI_DESKTOP_EXE (the e2e build), or ISSHONI_CDP_ENDPOINT to
-// attach to a running app. Windows only. The app is started with --relaunched (so it stays this process's child),
-// ISSHONI_E2E_CDP_PORT (README WA72's e2e-only port) and ISSHONI_E2E_DATA_DIR: a temporary folder that stands in for
-// %LOCALAPPDATA% (03 §22.4 B), whose isshoni\settings.json keeps the app in the tray when its window closes (03
-// §11.6's closeToTray, so W7 needs no live share). Setting LOCALAPPDATA would not do: the app reads its data folder
-// from the shell's known folder, never from the environment (cmd/isshoni-desktop/platform_windows.go), so the e2e
-// build takes it from its own e2e-only variable (README WA72, flavor_e2e.go), as it takes the port. Once the endpoint
-// answers, the fixture checks that the app wrote into that folder (its log file or its WebView2 profile) and fails
-// before any test runs otherwise: an e2e build that ignored it would be using the owner's real servers, settings and
-// WebView2 profile.
+// attach to a running app (then only the checks that need no process of their own run). Windows only. The app is
+// started with --relaunched (so it stays this process's child), ISSHONI_E2E_CDP_PORT (README WA72's e2e-only port)
+// and ISSHONI_E2E_DATA_DIR: a temporary folder that stands in for %LOCALAPPDATA% (03 §22.4 B), whose
+// isshoni\settings.json the spec seeds (by default closeToTray, 03 §11.6, so W7 needs no live share, and wizardDone).
+// Setting LOCALAPPDATA would not do: the app reads its data folder from the shell's known folder, never from the
+// environment (cmd/isshoni-desktop/platform_windows.go), so the e2e build takes it from its own e2e-only variable
+// (README WA72, flavor_e2e.go), as it takes the port. Once the endpoint answers, the fixture checks that the app wrote
+// into that folder (its log file or its WebView2 profile) and fails before any test runs otherwise: an e2e build that
+// ignored it would be using the owner's real servers, settings and WebView2 profile.
+//
+// The servers come from ../fixtures.ts (ISSHONI_BIN; the config defaults it to bin/isshoni.exe, which the CI job
+// builds), and so do the browser contexts of the people (Google Chrome). The W19 case runs a production build too:
+// ISSHONI_DESKTOP_PROD_EXE, or in CI the stage's dist-desktop/stage/isshoni.exe. A production build has no e2e data
+// folder: it runs on the PC's real %LOCALAPPDATA%\isshoni, which is why it never runs unless asked for outside CI.
+// It also runs under the real app id (winos.InstanceID): an installed isshoni that is running takes the
+// single-instance forward and the build exits 0 at once (quit the installed app first), and Wails' notifications
+// service rewrites HKCU\Software\Classes\CLSID\{GUID}\LocalServer32 to this build's path, so the installed app's toast
+// activator points at it until the installed app next starts.
+//
+// What the runner can't show stays manual (03 §22.5, the owner's PC): W9's status bar, autofill and password save,
+// swipe, external drop, the default context menu and DevTools of a production build, and the real keyboard's
+// accelerators (CDP's key events enter at the renderer's widget; whether WebView2's own accelerator path sees them is
+// what the manual step adds).
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { chromium, expect, test as base, type Browser, type Page } from '@playwright/test';
+import { chromium, type Browser, type Page } from '@playwright/test';
 
 import { DesktopAssetOriginWindows } from '../../src/protocol/types.gen.ts';
+import { expect, test as e2e } from '../fixtures.ts';
+import { REPO_ROOT } from '../global-setup.ts';
+import { audioOf, readStats, waitForRoom, waitForState, waitForStats, videoOf } from '../stats.ts';
+import {
+  closeMainWindow,
+  type ChildProcessInfo,
+  descendants,
+  environmentNames,
+  mainWindow,
+  memory,
+  mib,
+  ps,
+  topWindows,
+  webviewProcesses,
+  windowState,
+} from './windows.ts';
 
 const execFileAsync = promisify(execFile);
 
 const EXE_ENV = 'ISSHONI_DESKTOP_EXE';
 const ENDPOINT_ENV = 'ISSHONI_CDP_ENDPOINT';
+/** A production build for W19 (outside CI: only when set; it runs on the PC's real %LOCALAPPDATA%\isshoni). */
+const PROD_EXE_ENV = 'ISSHONI_DESKTOP_PROD_EXE';
 /** The e2e build's own variable for its WebView2 debugging port (README WA72). */
 const PORT_ENV = 'ISSHONI_E2E_CDP_PORT';
 /** The e2e build's own variable for the folder that replaces %LOCALAPPDATA% (README WA72). */
 const DATA_DIR_ENV = 'ISSHONI_E2E_DATA_DIR';
 /** WebView2's first start (a new user data folder) takes a few seconds. */
 const START_TIMEOUT_MS = 60_000;
+/** A killed app is gone within this; the next start needs its single-instance mutex free (03 §13.3). */
+const EXIT_TIMEOUT_MS = 15_000;
+/** 03 §20: Quit waits at most 3 s for the server. */
+const QUIT_BUDGET_MS = 3_000;
+/** C2 connects, publishes and goes live; a viewer's sub PC follows. */
+const LIVE_TIMEOUT_MS = 30_000;
+const MEDIA_TIMEOUT_MS = 20_000;
+/** The device flow's poll interval is 5 s; an approval reaches the app within two of them. */
+const LINKED_TIMEOUT_MS = 30_000;
+/** The fake engine's picker names its window this way (internal/media/fake). */
+const FAKE_LABEL = 'Fake window';
+
+/** settings.json as the spec seeds it (03 §14.2, schema 1). */
+type SeedSettings = Readonly<Record<string, unknown>>;
+
+/** closeToTray, so W7's close hides without a live share; wizardDone, so a link goes straight to the room. */
+const DEFAULT_SETTINGS: SeedSettings = { schema: 1, closeToTray: true, wizardDone: true };
+
+interface LaunchOptions {
+  /** isshoni\settings.json in the data folder; default DEFAULT_SETTINGS. */
+  settings?: SeedSettings;
+  /** The command line after --relaunched (e.g. --server <origin>, 03 §13.1). */
+  args?: string[];
+  /** More environment for the app (W19's control sets WEBVIEW2_* here). */
+  env?: Readonly<Record<string, string>>;
+}
+
+/** How the app's process ended, and when (Date.now()). */
+interface Exit {
+  readonly code: number | null;
+  readonly at: number;
+}
 
 interface RealApp {
   readonly browser: Browser;
@@ -44,11 +117,24 @@ interface RealApp {
   readonly page: Page;
   /** The app's process, or null when the spec attached to a running app. */
   readonly process: ChildProcess | null;
+  /** Settles when the process exits; never, for an attached app. */
+  readonly exited: Promise<Exit>;
+  /** Kills the app (with its WebView2) unless it exited, waits for the exit and removes its data folder. */
+  stop(): Promise<void>;
 }
 
 /** Records a checklist row for the PR's "Wails checklist" (03 §3.2). */
 function row(id: string, result: string): void {
-  base.info().annotations.push({ type: 'Wails checklist', description: `${id}: ${result}` });
+  e2e.info().annotations.push({ type: 'Wails checklist', description: `${id}: ${result}` });
+}
+
+/** Records a number for 03 §20's budgets, measured on this runner. */
+function budget(what: string): void {
+  e2e.info().annotations.push({ type: 'Budget (03 §20)', description: what });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function freePort(): Promise<number> {
@@ -62,6 +148,66 @@ function freePort(): Promise<number> {
       });
     });
   });
+}
+
+/** Whether something accepts a TCP connection on 127.0.0.1:port within 2 s. */
+function portOpen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = (open: boolean): void => {
+      socket.destroy();
+      resolve(open);
+    };
+    socket.setTimeout(2_000, () => {
+      done(false);
+    });
+    socket.once('connect', () => {
+      done(true);
+    });
+    socket.once('error', () => {
+      done(false);
+    });
+  });
+}
+
+/**
+ * The app's environment: this process's without any ISSHONI_* variable (the config's ISSHONI_BIN, CI's
+ * ISSHONI_VERSION) and without WEBVIEW2_* (a developer's shell must not change the webview under test), plus extra.
+ */
+function appEnv(extra: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    const upper = name.toUpperCase();
+    if (!upper.startsWith('ISSHONI_') && !upper.startsWith('WEBVIEW2_')) env[name] = value;
+  }
+  return { ...env, ...extra };
+}
+
+/** Spawns an exe with --relaunched and follows its exit. */
+function spawnApp(
+  exe: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+): { child: ChildProcess; exited: Promise<Exit> } {
+  const child = spawn(path.resolve(exe), ['--relaunched', ...args], { env, stdio: 'ignore' });
+  const exited = new Promise<Exit>((resolve) => {
+    child.once('exit', (code) => {
+      resolve({ code, at: Date.now() });
+    });
+    child.once('error', () => {
+      resolve({ code: null, at: Date.now() });
+    });
+  });
+  return { child, exited };
+}
+
+/** Kills a process tree (the app and its WebView2) unless it is gone, and waits for its exit. */
+async function kill(child: ChildProcess, exited: Promise<Exit>): Promise<void> {
+  if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+    await execFileAsync('taskkill', ['/PID', String(child.pid), '/T', '/F']).catch(() => undefined);
+  }
+  const gone = await Promise.race([exited.then(() => true), sleep(EXIT_TIMEOUT_MS).then(() => false)]);
+  if (!gone) throw new Error(`isshoni.exe (${String(child.pid)}) did not exit within ${String(EXIT_TIMEOUT_MS)} ms`);
 }
 
 /**
@@ -103,71 +249,177 @@ async function waitForEndpoint(endpoint: string, child: ChildProcess | null): Pr
           `(task desktop:build:e2e) that reads ${PORT_ENV} (README WA72)?`,
       );
     }
-    await new Promise((r) => setTimeout(r, 250));
+    await sleep(250);
   }
 }
 
-const test = base.extend<{ app: RealApp }>({
+/** Connects Playwright to the endpoint and returns the page at the asset origin, once it has loaded. */
+async function attachPage(endpoint: string): Promise<{ browser: Browser; page: Page }> {
+  // noDefaults: by default Playwright turns on focus emulation for every page it attaches to, which keeps
+  // document.visibilityState 'visible' whatever the window does, so W7 could never see the hidden window (03 §4.4).
+  // It also leaves acceptDownloads and media emulation at the webview's own settings; no check here relies on them.
+  const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true });
+  const pages = (): Page[] => browser.contexts().flatMap((c) => c.pages());
+  await expect
+    .poll(() => pages().some((p) => p.url().startsWith(DesktopAssetOriginWindows)), { timeout: START_TIMEOUT_MS })
+    .toBe(true);
+  const page = pages().find((p) => p.url().startsWith(DesktopAssetOriginWindows));
+  if (page === undefined) throw new Error('no page at the asset origin');
+  await page.waitForLoadState('domcontentloaded');
+  return { browser, page };
+}
+
+/** Starts the e2e build (or attaches to the running app) and connects to its webview. */
+async function launch(options: LaunchOptions): Promise<RealApp> {
+  const attach = process.env[ENDPOINT_ENV];
+  if (attach !== undefined && attach !== '') {
+    const { browser, page } = await attachPage(attach.replace(/\/$/, ''));
+    return {
+      browser,
+      page,
+      process: null,
+      exited: new Promise<Exit>(() => undefined),
+      stop: () => browser.close(),
+    };
+  }
+  const exe = process.env[EXE_ENV];
+  if (exe === undefined || exe === '') throw new Error(`set ${EXE_ENV} or ${ENDPOINT_ENV}`);
+  const port = await freePort();
+  const endpoint = `http://127.0.0.1:${String(port)}`;
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'isshoni-cdp-'));
+  await fsp.mkdir(path.join(dataDir, 'isshoni'), { recursive: true });
+  await fsp.writeFile(
+    path.join(dataDir, 'isshoni', 'settings.json'),
+    JSON.stringify(options.settings ?? DEFAULT_SETTINGS),
+  );
+  const started = Date.now();
+  const { child, exited } = spawnApp(
+    exe,
+    options.args ?? [],
+    appEnv({ ...options.env, [DATA_DIR_ENV]: dataDir, [PORT_ENV]: String(port) }),
+  );
+  let browser: Browser | null = null;
+  const stop = async (): Promise<void> => {
+    // A browser whose endpoint went away with the app can take its time to notice: never wait on it for long.
+    if (browser !== null) await Promise.race([browser.close().catch(() => undefined), sleep(5_000)]);
+    await kill(child, exited);
+    // After a Quit, WebView2's processes outlive the app by a moment and hold its profile: a folder left in the
+    // runner's temp is no failure.
+    await fsp.rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 }).catch(() => undefined);
+  };
+  try {
+    await waitForEndpoint(endpoint, child);
+    await assertUsedDataDir(dataDir);
+    const attached = await attachPage(endpoint);
+    browser = attached.browser;
+    const attachedAt = Date.now();
+    // DOMContentLoaded as the page itself timed it (epoch ms on this machine's clock, as `started` is): the attach
+    // time adds this spec's endpoint poll, the data-folder check and connectOverCDP, so it is recorded on its own.
+    const dcl = await attached.page.evaluate(() => {
+      const n = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
+      return n === undefined || n.domContentLoadedEventEnd === 0
+        ? null
+        : performance.timeOrigin + n.domContentLoadedEventEnd;
+    });
+    budget(
+      `startup to the page (spawn of the e2e build, --relaunched, to DOMContentLoaded at the asset origin, a new ` +
+        `WebView2 profile; CI runner): ${dcl === null ? 'unreadable (no navigation timing)' : `${String(Math.round(dcl - started))} ms`}; ` +
+        `to Playwright attached: ${String(attachedAt - started)} ms`,
+    );
+    return { browser, page: attached.page, process: child, exited, stop };
+  } catch (err) {
+    await stop();
+    throw err;
+  }
+}
+
+const test = e2e.extend<{ launchApp: (options?: LaunchOptions) => Promise<RealApp>; app: RealApp }>({
   // eslint-disable-next-line no-empty-pattern -- Playwright reads the fixture names from this pattern
-  app: async ({}, use) => {
-    const attach = process.env[ENDPOINT_ENV];
-    let child: ChildProcess | null = null;
-    let dataDir: string | null = null;
-    let endpoint: string;
-    if (attach !== undefined && attach !== '') {
-      endpoint = attach.replace(/\/$/, '');
-    } else {
-      const exe = process.env[EXE_ENV];
-      if (exe === undefined || exe === '') throw new Error(`set ${EXE_ENV} or ${ENDPOINT_ENV}`);
-      const port = await freePort();
-      endpoint = `http://127.0.0.1:${String(port)}`;
-      dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'isshoni-cdp-'));
-      await fsp.mkdir(path.join(dataDir, 'isshoni'), { recursive: true });
-      await fsp.writeFile(
-        path.join(dataDir, 'isshoni', 'settings.json'),
-        JSON.stringify({ schema: 1, closeToTray: true, wizardDone: true }),
-      );
-      child = spawn(path.resolve(exe), ['--relaunched'], {
-        env: { ...process.env, [DATA_DIR_ENV]: dataDir, [PORT_ENV]: String(port) },
-        stdio: 'ignore',
-      });
-    }
-    try {
-      await waitForEndpoint(endpoint, child);
-      if (dataDir !== null) await assertUsedDataDir(dataDir);
-      // noDefaults: by default Playwright turns on focus emulation for every page it attaches to, which keeps
-      // document.visibilityState 'visible' whatever the window does, so W7 could never see the hidden window (03 §4.4).
-      // It also leaves acceptDownloads and media emulation at the webview's own settings; no check here relies on them.
-      const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true });
-      const pages = (): Page[] => browser.contexts().flatMap((c) => c.pages());
-      await expect
-        .poll(() => pages().some((p) => p.url().startsWith(DesktopAssetOriginWindows)), { timeout: START_TIMEOUT_MS })
-        .toBe(true);
-      const page = pages().find((p) => p.url().startsWith(DesktopAssetOriginWindows));
-      if (page === undefined) throw new Error('no page at the asset origin');
-      await page.waitForLoadState('domcontentloaded');
-      await use({ browser, page, process: child });
-      await browser.close(); // disconnects; the app keeps running
-    } finally {
-      if (child?.pid !== undefined && child.exitCode === null) {
-        await execFileAsync('taskkill', ['/PID', String(child.pid), '/T', '/F']).catch(() => undefined);
-      }
-      if (dataDir !== null) await fsp.rm(dataDir, { recursive: true, force: true, maxRetries: 5 });
-    }
+  launchApp: async ({}, use) => {
+    const own: RealApp[] = [];
+    await use(async (options = {}) => {
+      const app = await launch(options);
+      own.push(app);
+      return app;
+    });
+    for (const app of own) await app.stop();
+  },
+  app: async ({ launchApp }, use) => {
+    await use(await launchApp());
   },
 });
 
 test.skip(process.platform !== 'win32' && !process.env[ENDPOINT_ENV], 'the real app runs on Windows');
 
+/** The bound-method ids of the committed Wails bindings (03 §6.2; task gen:bindings writes them). */
+const BINDINGS = path.join(
+  REPO_ROOT,
+  'web/src/platform/desktop/bindings/github.com/MoonWX/isshoni/internal/desktop/bridge',
+);
+
+/** The method id that the generated binding of service.method calls ($Call.ByID), read from its file. */
+function methodId(service: 'App' | 'Auth' | 'Share', method: string): number {
+  const source = fs.readFileSync(path.join(BINDINGS, `${service.toLowerCase()}.ts`), 'utf8');
+  const m = new RegExp(`export function ${method}\\([^)]*\\)[^{]*\\{\\s*return \\$Call\\.ByID\\((\\d+)`).exec(source);
+  if (m?.[1] === undefined) throw new Error(`no ${service}.${method} in the committed bindings`);
+  return Number(m[1]);
+}
+
+/** A runtime request's answer, read in the page. */
+interface RuntimeAnswer {
+  readonly status: number;
+  readonly body: string;
+}
+
+/**
+ * Calls a bound method from the page with a raw /wails/runtime request, built as @wailsio/runtime builds a Call
+ * (object 0, method 0, {call-id, methodID, args}): what the SPA's bindings send, through the Guard (03 §5.6).
+ */
+async function bound(
+  page: Page,
+  service: 'App' | 'Auth' | 'Share',
+  method: string,
+  args: unknown[] = [],
+): Promise<RuntimeAnswer> {
+  const id = methodId(service, method);
+  return page.evaluate(
+    async ({ methodID, callArgs }) => {
+      const res = await fetch('/wails/runtime', {
+        method: 'POST',
+        headers: { 'x-wails-client-id': 'cdp', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          object: 0,
+          method: 0,
+          args: { 'call-id': `cdp-${String(Date.now())}`, methodID, args: callArgs },
+        }),
+      });
+      return { status: res.status, body: await res.text() };
+    },
+    { methodID: id, callArgs: args },
+  );
+}
+
+/** A bound method's result, which must be 200 with JSON. */
+async function boundJSON<T>(
+  page: Page,
+  service: 'App' | 'Auth' | 'Share',
+  method: string,
+  args: unknown[] = [],
+): Promise<T> {
+  const answer = await bound(page, service, method, args);
+  expect(answer.status, `${service}.${method}: ${answer.body}`).toBe(200);
+  return JSON.parse(answer.body) as T;
+}
+
 test('W1, W2: the page is at the asset origin, in a secure context', async ({ app }) => {
   const [origin, secure] = await app.page.evaluate(() => [location.origin, isSecureContext] as const);
   // W1's second half, "this value is in protocol.DesktopOrigins()", needs no webview: internal/protocol's
-  // TestDesktopOrigins asserts DesktopOrigins()[0] == DesktopAssetOriginWindows. The skeleton has no server whose CORS
-  // could show it end to end (README DK13's run links a server from this webview).
+  // TestDesktopOrigins asserts DesktopOrigins()[0] == DesktopAssetOriginWindows. The server's CORS for it is shown
+  // end to end by the link case below (the page reaches the server's REST API from this origin).
   row(
     'W1',
     `location.origin = ${origin}; DesktopOrigins membership: checked by internal/protocol's unit test ` +
-      `(TestDesktopOrigins)`,
+      `(TestDesktopOrigins); the server's CORS for it: the link case`,
   );
   row('W2', `isSecureContext = ${String(secure)}`);
   expect(origin).toBe(DesktopAssetOriginWindows);
@@ -263,39 +515,20 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
 });
 
 test('W7: closing the window hides it; the app keeps running', async ({ app }) => {
-  test.skip(app.process === null, 'needs the app this spec started (its pid)');
-  const pid = String(app.process?.pid);
-  // -EncodedCommand (base64 of UTF-16LE) so the C# below keeps its double quotes through Windows' argument quoting.
-  const ps = async (command: string): Promise<string> =>
-    (
-      await execFileAsync('powershell.exe', [
-        '-NoProfile',
-        '-NonInteractive',
-        '-EncodedCommand',
-        Buffer.from(command, 'utf16le').toString('base64'),
-      ])
-    ).stdout.trim();
+  test.skip(app.process?.pid === undefined, 'needs the app this spec started (its pid)');
+  const pid = app.process?.pid ?? 0;
   // The main window's HWND, read before the close: .NET leaves hidden windows out of MainWindowHandle.
-  const hwnd = await ps(`(Get-Process -Id ${pid}).MainWindowHandle.ToInt64()`);
+  const hwnd = await mainWindow(pid);
   expect(hwnd).toMatch(/^[1-9]\d*$/);
   // WM_CLOSE to the main window, as its close button sends it. False would mean it wasn't posted.
-  expect(await ps(`(Get-Process -Id ${pid}).CloseMainWindow()`)).toBe('True');
+  expect(await closeMainWindow(pid)).toBe(true);
   // The window itself, independent of Chromium: it still exists (not destroyed) and is hidden (Hide(), 03 §3.2 W7).
   // Read first, and both polls soft, so the row below always records the window's state and the webview's
   // separately: a WebView2 visibility quirk then reads apart from a broken close path.
-  const user32 =
-    "Add-Type -Namespace W -Name U -MemberDefinition '" +
-    '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); ' +
-    '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);' +
-    "'; ";
-  const windowState = async (): Promise<string[]> =>
-    (await ps(`${user32}$h = [IntPtr]${hwnd}; '{0} {1}' -f [W.U]::IsWindow($h), [W.U]::IsWindowVisible($h)`)).split(
-      ' ',
-    );
-  await expect.soft.poll(async () => (await windowState())[1], { timeout: 10_000 }).toBe('False');
+  await expect.soft.poll(async () => (await windowState(hwnd)).visible, { timeout: 10_000 }).toBe(false);
   // What M1's layer policy reads: the webview reports hidden (03 §4.4).
   await expect.soft.poll(() => app.page.evaluate(() => document.visibilityState), { timeout: 10_000 }).toBe('hidden');
-  const [exists, visible] = await windowState();
+  const { exists, visible } = await windowState(hwnd);
   // A dead app has no page to read: the row still gets written, and the asserts below fail on it.
   const state = await app.page
     .evaluate(() => document.visibilityState)
@@ -306,8 +539,546 @@ test('W7: closing the window hides it; the app keeps running', async ({ app }) =
     `after WM_CLOSE: IsWindow = ${String(exists)}, IsWindowVisible = ${String(visible)}, visibilityState = ${state}, ` +
       `process alive = ${String(alive)}`,
   );
-  expect(exists).toBe('True');
-  expect(visible).toBe('False');
+  expect(exists).toBe(true);
+  expect(visible).toBe(false);
   expect(state).toBe('hidden');
   expect(alive).toBe(true);
+});
+
+test('W9: zoom control and the browser accelerator keys are off', async ({ app }) => {
+  const { page, browser } = app;
+  // A mark that a reload (F5, Ctrl+R) would wipe, and the print path's event (Ctrl+P).
+  await page.evaluate(() => {
+    const w = window as { __cdpMark?: number; __cdpPrinted?: boolean };
+    w.__cdpMark = 1;
+    w.__cdpPrinted = false;
+    window.addEventListener('beforeprint', () => {
+      w.__cdpPrinted = true;
+    });
+  });
+  const zoom = (): Promise<{ dpr: number; scale: number; width: number }> =>
+    page.evaluate(() => ({
+      dpr: window.devicePixelRatio,
+      scale: window.visualViewport?.scale ?? 1,
+      width: window.innerWidth,
+    }));
+  const cdp = await browser.newBrowserCDPSession();
+  const targets = async (): Promise<string[]> =>
+    (await cdp.send('Target.getTargets')).targetInfos.map((t) => `${t.type} ${t.url}`);
+  const targetsBefore = await targets();
+  const zoomBefore = await zoom();
+
+  // Zoom in only (Ctrl + wheel up, Ctrl+=, Ctrl+numpad +): a zoom out after it could hide one. Chromium hands a
+  // wheel event the page didn't consume back to the browser side, where Ctrl + wheel zooms when zoom control is on.
+  const viewport = await page.evaluate(() => [window.innerWidth, window.innerHeight] as const);
+  await page.mouse.move(Math.floor(viewport[0] / 2), Math.floor(viewport[1] / 2));
+  await page.keyboard.down('Control');
+  for (let i = 0; i < 3; i++) await page.mouse.wheel(0, -240);
+  await page.keyboard.press('Equal');
+  await page.keyboard.press('NumpadAdd');
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(1_000);
+  const zoomAfter = await zoom();
+
+  // The accelerators of 03 §5.4: F5 and Ctrl+R (reload), Ctrl+P (print), Ctrl+F (find), Ctrl+U (view source),
+  // Ctrl+Shift+I and F12 (DevTools, which the e2e build has on, so a DevTools target would appear if they worked).
+  const keys = ['F5', 'Control+KeyR', 'Control+KeyP', 'Control+KeyF', 'Control+KeyU', 'Control+Shift+KeyI', 'F12'];
+  for (const key of keys) {
+    await page.keyboard.press(key);
+    await page.waitForTimeout(300);
+  }
+  await page.waitForTimeout(1_500);
+  const after = await page.evaluate(() => {
+    const w = window as { __cdpMark?: number; __cdpPrinted?: boolean };
+    return { mark: w.__cdpMark ?? 0, printed: w.__cdpPrinted === true, origin: location.origin };
+  });
+  const newTargets = (await targets()).filter((t) => !targetsBefore.includes(t));
+  await cdp.detach();
+  row(
+    'W9',
+    [
+      `zoom (devicePixelRatio, visualViewport.scale, innerWidth) ${JSON.stringify(zoomBefore)} → ` +
+        `${JSON.stringify(zoomAfter)} after Ctrl + wheel up ×3, Ctrl+= and Ctrl+numpad + (CDP input)`,
+      `after ${keys.join(', ')} (CDP input): page kept its state (no reload) = ${String(after.mark === 1)}, ` +
+        `beforeprint fired = ${String(after.printed)}, new targets = ${newTargets.length === 0 ? 'none' : newTargets.join(' | ')}`,
+      'status bar, autofill and password save, swipe, external drop, the context menu and DevTools of a ' +
+        'production build and the real keyboard: manual (03 §22.5, owner’s PC)',
+    ].join('; '),
+  );
+  expect(zoomAfter).toEqual(zoomBefore);
+  expect(after).toEqual({ mark: 1, printed: false, origin: DesktopAssetOriginWindows });
+  expect(newTargets).toEqual([]);
+});
+
+test('W13: audio plays without a click (the autoplay argument reaches WebView2)', async ({ app }) => {
+  const { page } = app;
+  // Playwright's page.evaluate runs as a user gesture, and activation sticks to a document: the check runs as an init
+  // script of the next document, which nothing activates, and the reload is CDP's (no gesture either). It plays a
+  // 0.2 s tone from a blob: URL (the CSP's media-src allows blob:) and keeps an AudioContext, whose state is read later.
+  // Nothing evaluates in the page before the reload either: Chromium's autoplay policy also lets a document play
+  // when the same origin's previous document had been activated.
+  await page.addInitScript(() => {
+    const w = window as {
+      __cdpAutoplay?: { activated: boolean; play: string; ctx: AudioContext | null; ctxError: string };
+    };
+    const result = {
+      activated: navigator.userActivation.hasBeenActive,
+      play: 'pending',
+      ctx: null as AudioContext | null,
+      ctxError: '',
+    };
+    w.__cdpAutoplay = result;
+    try {
+      result.ctx = new AudioContext();
+    } catch (e) {
+      result.ctxError = String(e);
+    }
+    const rate = 8000;
+    const samples = 1600;
+    const buf = new ArrayBuffer(44 + samples * 2);
+    const v = new DataView(buf);
+    const ascii = (at: number, s: string): void => {
+      for (let i = 0; i < s.length; i++) v.setUint8(at + i, s.charCodeAt(i));
+    };
+    ascii(0, 'RIFF');
+    v.setUint32(4, 36 + samples * 2, true);
+    ascii(8, 'WAVE');
+    ascii(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); // PCM
+    v.setUint16(22, 1, true); // mono
+    v.setUint32(24, rate, true);
+    v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true);
+    ascii(36, 'data');
+    v.setUint32(40, samples * 2, true);
+    for (let i = 0; i < samples; i++)
+      v.setInt16(44 + i * 2, Math.round(3000 * Math.sin((2 * Math.PI * 440 * i) / rate)), true);
+    const audio = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+    audio.play().then(
+      () => {
+        result.play = 'played';
+      },
+      (e: unknown) => {
+        result.play = e instanceof DOMException ? e.name : String(e);
+      },
+    );
+  });
+  await page.reload();
+  type Seen = { activated: boolean; play: string; ctx: string };
+  const read = (): Promise<Seen> =>
+    page.evaluate(() => {
+      const r = (
+        window as { __cdpAutoplay?: { activated: boolean; play: string; ctx: AudioContext | null; ctxError: string } }
+      ).__cdpAutoplay;
+      if (r === undefined) return { activated: true, play: 'no init script ran', ctx: '' };
+      return { activated: r.activated, play: r.play, ctx: r.ctx?.state ?? `none (${r.ctxError})` };
+    });
+  await expect.poll(async () => (await read()).play, { timeout: 15_000 }).not.toBe('pending');
+  await page.waitForTimeout(500);
+  const seen = await read();
+  row(
+    'W13',
+    `without a gesture (userActivation.hasBeenActive = ${String(seen.activated)}): <audio>.play() → ${seen.play}; ` +
+      `a new AudioContext is ${seen.ctx}; the user data folder is the e2e data root's (the fixture's check)`,
+  );
+  expect(seen.activated).toBe(false);
+  expect(seen.play).toBe('played');
+});
+
+test('W16: element fullscreen fills the screen and Esc brings the window back', async ({ app }) => {
+  test.skip(app.process?.pid === undefined, 'needs the app this spec started (its pid)');
+  const { page } = app;
+  const hwnd = await mainWindow(app.process?.pid ?? 0);
+  const size = (): Promise<{ w: number; h: number; sw: number; sh: number; fs: boolean }> =>
+    page.evaluate(() => ({
+      w: window.innerWidth,
+      h: window.innerHeight,
+      sw: window.screen.width,
+      sh: window.screen.height,
+      fs: document.fullscreenElement !== null,
+    }));
+  const before = await size();
+  // page.evaluate counts as a user gesture, which requestFullscreen needs. Wails' ContainsFullScreenElementChanged
+  // handler then makes the window itself fullscreen (Window.SetFullscreen's native half; beta.34's fullscreenChanged).
+  const entered = await page.evaluate(async () => {
+    try {
+      await document.documentElement.requestFullscreen();
+      return 'ok';
+    } catch (e) {
+      return String(e);
+    }
+  });
+  expect(entered).toBe('ok');
+  await expect
+    .poll(
+      async () => {
+        const s = await size();
+        return s.fs && s.w === s.sw && s.h === s.sh;
+      },
+      { timeout: 10_000, message: 'the fullscreen page fills the screen' },
+    )
+    .toBe(true);
+  const full = await size();
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => (await size()).fs, { timeout: 10_000, message: 'Esc leaves fullscreen' }).toBe(false);
+  await expect
+    .poll(
+      async () => {
+        const s = await size();
+        return [s.w, s.h];
+      },
+      { timeout: 10_000, message: 'the window is back at its size' },
+    )
+    .toEqual([before.w, before.h]);
+  const win = await windowState(hwnd);
+  row(
+    'W16',
+    `before ${String(before.w)}×${String(before.h)} on a ${String(before.sw)}×${String(before.sh)} screen; ` +
+      `fullscreen ${String(full.w)}×${String(full.h)} (fullscreenElement set); after Esc (CDP input) ` +
+      `fullscreenElement null and the window back at ${String(before.w)}×${String(before.h)}, visible = ${String(win.visible)}`,
+  );
+  expect(win).toEqual({ exists: true, visible: true });
+});
+
+/** Process names of the windows that Browser.OpenURL('ms-settings:…') or ('search-ms:…') would show. */
+const SETTINGS_OR_SEARCH = /^(SystemSettings|ApplicationFrameHost|SearchHost|SearchApp|SearchUI|explorer)$/i;
+
+test("W21: the runtime's own objects get 403 from the page and nothing opens; a bound method answers", async ({
+  app,
+}) => {
+  test.skip(app.process?.pid === undefined, 'needs the app this spec started (its pid)');
+  const { page } = app;
+  const hwnd = await mainWindow(app.process?.pid ?? 0);
+  const before = await topWindows();
+  // Built as the pinned runtime builds them (@wailsio/runtime's runtime.js: the x-wails-client-id header and
+  // {object, method, args}; 03 §3.2 W21's ids: Browser 9 OpenURL 0, Clipboard 1 Text 1, Window 6 Hide 11).
+  const statuses = await page.evaluate(async () => {
+    const send = (object: number, method: number, args?: unknown): Promise<number> =>
+      fetch('/wails/runtime', {
+        method: 'POST',
+        headers: { 'x-wails-client-id': 'cdp', 'Content-Type': 'application/json' },
+        body: JSON.stringify(args === undefined ? { object, method } : { object, method, args }),
+      }).then((r) => r.status);
+    return {
+      openSettings: await send(9, 0, { url: 'ms-settings:display' }),
+      openSearch: await send(9, 0, { url: 'search-ms:query=x' }),
+      clipboardText: await send(1, 1),
+      windowHide: await send(6, 11),
+      // The runtime's query form (an empty body) is refused the same way.
+      openSettingsByQuery: await fetch(
+        `/wails/runtime?object=9&method=0&args=${encodeURIComponent(JSON.stringify({ url: 'ms-settings:display' }))}`,
+        { method: 'POST', headers: { 'x-wails-client-id': 'cdp' } },
+      ).then((r) => r.status),
+    };
+  });
+  const info = await bound(page, 'App', 'Info');
+  // A Settings or search window takes a moment to appear.
+  await page.waitForTimeout(3_000);
+  const known = new Set(before.map((w) => w.hwnd));
+  const appeared = (await topWindows()).filter((w) => !known.has(w.hwnd));
+  const win = await windowState(hwnd);
+  const visibility = await page.evaluate(() => document.visibilityState);
+  row(
+    'W21',
+    `from the page: ${JSON.stringify(statuses)}; App.Info → ${String(info.status)}; new top-level windows after ` +
+      `3 s: ${appeared.length === 0 ? 'none' : appeared.map((w) => w.process).join(', ')}; main window visible = ` +
+      `${String(win.visible)}, visibilityState = ${visibility}`,
+  );
+  expect(statuses).toEqual({
+    openSettings: 403,
+    openSearch: 403,
+    clipboardText: 403,
+    windowHide: 403,
+    openSettingsByQuery: 403,
+  });
+  expect(info.status).toBe(200);
+  expect(typeof (JSON.parse(info.body) as { wizardDone?: unknown }).wizardDone).toBe('boolean');
+  expect(appeared.filter((w) => SETTINGS_OR_SEARCH.test(w.process))).toEqual([]);
+  expect(win).toEqual({ exists: true, visible: true });
+  expect(visibility).toBe('visible');
+});
+
+/** The friend's browser opens the approval page and approves the code. */
+async function approve(page: Page, url: string): Promise<void> {
+  await page.goto(url);
+  await expect(page.getByRole('heading', { level: 1, name: 'Link the isshoni app?' })).toBeVisible();
+  const tick = page.getByRole('checkbox', { name: 'I started this myself' });
+  if ((await tick.count()) > 0) await tick.check();
+  await page.getByRole('button', { name: /^Link( anyway)?$/ }).click();
+  await expect(page.getByRole('heading', { level: 1, name: 'Linked' })).toBeVisible();
+}
+
+test('the app end to end: a device-flow link, a fake share watched in Chrome, close to tray while live, Quit', async ({
+  launchApp,
+  startServer,
+  asUser,
+}) => {
+  test.skip(Boolean(process.env[ENDPOINT_ENV]), 'starts an app of its own (its arguments, its exit code)');
+  test.setTimeout(300_000);
+  const server = await startServer();
+  // Two people: the one who links the app (and owns the share), and a friend who watches it in Chrome. A tab of the
+  // sharer's own account would hand its playback over to the app (03 §12.2), so the viewer is someone else.
+  const owner = await asUser(server);
+  const friend = await asUser(server);
+  // closeToTray off: the close below hides the window because the app is live (03 §11.6), not because of the setting.
+  const app = await launchApp({
+    settings: { schema: 1, closeToTray: false, wizardDone: true },
+    args: ['--server', server.url],
+  });
+  const { page } = app;
+  const pid = app.process?.pid ?? 0;
+  const host = new URL(server.url).host;
+
+  // --server (03 §13.1): "Add server {host}?"; Add (the same host, so no confirm step), the window reloads into the
+  // link step with its code. In an e2e build an http loopback server is allowed (03 §8.1).
+  await expect(page.getByRole('heading', { level: 1, name: `Add server ${host}?` })).toBeVisible({
+    timeout: START_TIMEOUT_MS,
+  });
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  const codeEl = page.getByTestId('link-code');
+  await expect(codeEl).toHaveText(/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/, {
+    timeout: LINKED_TIMEOUT_MS,
+  });
+  const code = (await codeEl.textContent()) ?? '';
+  // The app also opened the system browser at this URL (Shell.OpenURL); the owner approves in Chrome instead.
+  await approve(owner.page, `${server.url}/link?code=${code}`);
+  await expect(page).toHaveURL(/\/r\/[^/]+$/, { timeout: LINKED_TIMEOUT_MS });
+  const roomId = new URL(page.url()).pathname.split('/').pop() ?? '';
+  const auth = await boundJSON<{ status: string; origin: string; user: { username: string } | null }>(
+    page,
+    'Auth',
+    'State',
+  );
+  expect(auth).toMatchObject({ status: 'linked', origin: server.url });
+  expect(auth.user?.username).toBe(owner.account.username);
+  row(
+    'W1',
+    `end to end: the page at ${DesktopAssetOriginWindows} linked by the device flow and opened room ${roomId} on ` +
+      `${server.url} (the server's CORS answers the desktop origin)`,
+  );
+
+  // The friend watches the room in Chrome.
+  await friend.page.goto(`${server.url}/r/${roomId}`);
+  await waitForRoom(friend.page, roomId, { timeout: LIVE_TIMEOUT_MS });
+
+  // Share → the desktop ShareSheet → the fake pick → the first-share sheet → Go live.
+  await page.getByRole('banner').getByRole('button', { name: 'Share', exact: true }).click();
+  await page
+    .getByRole('dialog', { name: 'Share your screen' })
+    .getByRole('button', { name: 'Share', exact: true })
+    .click();
+  const first = page.getByRole('dialog', { name: 'Ready to go live?' });
+  await expect(first.getByText(`Friends will see: ${FAKE_LABEL}`)).toBeVisible();
+  await first.getByRole('button', { name: 'Go live' }).click();
+  const panel = page.getByRole('region', { name: 'Your share' });
+  await expect(panel.getByText(`You're live · ${FAKE_LABEL} · Auto ·`)).toBeVisible({ timeout: LIVE_TIMEOUT_MS });
+
+  const share = await waitForState(friend.page, (s) => s.viewer.shares.find((sh) => !sh.own && sh.status === 'live'), {
+    timeout: LIVE_TIMEOUT_MS,
+    message: "the app's share is live on the friend's page",
+  });
+  const watched = await waitForStats(friend.page, (s) => (videoOf(s, share.id)?.framesDecoded ?? 0) > 10 && s, {
+    timeout: MEDIA_TIMEOUT_MS,
+    message: 'the friend decodes frames of the share',
+  });
+  await expect(panel.getByText(`You're live · ${FAKE_LABEL} · Auto · 1 watching`)).toBeVisible({
+    timeout: MEDIA_TIMEOUT_MS,
+  });
+  // The runner has no audio device; the tone's energy is recorded, the frames are what is asserted.
+  const energy = audioOf(watched, share.id)?.totalAudioEnergy ?? 0;
+  const mem = await memory(pid);
+  budget(
+    `while sharing the fake engine's 640×360 with 1 watching (CI runner, not the budget's 1080p60): isshoni.exe ` +
+      `${mem.app === null ? 'unreadable' : mib(mem.app)} private working set; its ${String(mem.webviewProcesses)} ` +
+      `WebView2 processes ${
+        mem.webview === null
+          ? `unreadable (${String(mem.webviewRead)} of ${String(mem.webviewProcesses)} processes read)`
+          : `${mib(mem.webview)} together`
+      } (the budget's own case, watching one focused share and 8 thumbnails, is M-DESK-12's)`,
+  );
+
+  // Close the window while live (03 §11.6): it hides to the tray, the process lives and the share goes on.
+  const hwnd = await mainWindow(pid);
+  expect(hwnd).toMatch(/^[1-9]\d*$/);
+  expect(await closeMainWindow(pid)).toBe(true);
+  await expect.poll(async () => (await windowState(hwnd)).visible, { timeout: 10_000 }).toBe(false);
+  expect((await windowState(hwnd)).exists).toBe(true);
+  expect(app.process?.exitCode).toBeNull();
+  expect((await boundJSON<{ state: string } | null>(page, 'Share', 'Current'))?.state).toBe('live');
+  const framesAtClose = videoOf(await readStats(friend.page), share.id)?.framesDecoded ?? 0;
+  await waitForStats(friend.page, (s) => (videoOf(s, share.id)?.framesDecoded ?? 0) > framesAtClose + 30 && s, {
+    timeout: MEDIA_TIMEOUT_MS,
+    message: 'the friend still gets frames after the window closed',
+  });
+
+  // Quit (Settings → "Quit isshoni" → "Stop sharing and quit", App.Quit(true)): the share ends for the friend and the
+  // process exits 0 within 3 s (03 §11.6, §20). The request isn't awaited: the app is gone before it could answer.
+  const quitId = methodId('App', 'Quit');
+  const sent = Date.now();
+  await page.evaluate((methodID) => {
+    void fetch('/wails/runtime', {
+      method: 'POST',
+      headers: { 'x-wails-client-id': 'cdp', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ object: 0, method: 0, args: { 'call-id': 'cdp-quit', methodID, args: [true] } }),
+    }).catch(() => undefined);
+  }, quitId);
+  const exit = await Promise.race([app.exited, sleep(10_000).then(() => null)]);
+  expect(exit, 'the app exited after Quit').not.toBeNull();
+  const quitMs = (exit?.at ?? 0) - sent;
+  await waitForState(friend.page, (s) => !s.viewer.shares.some((sh) => sh.id === share.id) && s, {
+    timeout: 10_000,
+    message: "the share is gone from the friend's page after Quit",
+  });
+  const goneMs = Date.now() - sent;
+  row(
+    'close-to-tray and Quit (03 §11.6, §22.4 B)',
+    `closed while live (closeToTray off): hidden, process alive, Share.Current live, the friend got 30 more frames; ` +
+      `Quit: exit code ${String(exit?.code)} after ${String(quitMs)} ms, the share gone at the friend within ` +
+      `${String(goneMs)} ms; the friend heard ${energy > 0 ? 'the tone' : 'no tone (no audio device on the runner)'}`,
+  );
+  budget(`Quit while live → process exit: ${String(quitMs)} ms (≤ ${String(QUIT_BUDGET_MS)} ms)`);
+  expect(exit?.code).toBe(0);
+  expect(quitMs).toBeLessThanOrEqual(QUIT_BUDGET_MS);
+});
+
+/** The five WEBVIEW2_* placeholders that the pinned Wails sets in every build (cmd/isshoni-desktop: wailsWebView2Values). */
+const WAILS_PLACEHOLDERS = [
+  'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS',
+  'WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER',
+  'WEBVIEW2_BROWSER_EXECUTABLE_FOLDER',
+  'WEBVIEW2_USER_DATA_FOLDER',
+  'WEBVIEW2_RELEASE_CHANNEL_PREFERENCE',
+];
+
+/** The production build W19 runs, or null outside CI unless ISSHONI_DESKTOP_PROD_EXE names one. */
+function productionExe(): string | null {
+  const given = process.env[PROD_EXE_ENV];
+  if (given !== undefined && given !== '') return path.resolve(REPO_ROOT, given);
+  if (process.env['CI']) return path.join(REPO_ROOT, 'dist-desktop', 'stage', 'isshoni.exe');
+  return null;
+}
+
+/** Whether \\.\pipe\<name> exists. */
+async function pipeExists(name: string): Promise<boolean> {
+  try {
+    return fs.readdirSync('\\\\.\\pipe\\').some((p) => p.toLowerCase() === name.toLowerCase());
+  } catch {
+    return (await ps(`[IO.File]::Exists('\\\\.\\pipe\\${name}')`)) === 'True';
+  }
+}
+
+test("W19: a production build opens no debugging port or pipe, and scrubs the parent's WEBVIEW2_*", async ({
+  launchApp,
+}) => {
+  test.skip(Boolean(process.env[ENDPOINT_ENV]), 'starts the builds itself');
+  const prod = productionExe();
+  test.skip(
+    prod === null,
+    `set ${PROD_EXE_ENV} to a production isshoni.exe: it runs on this PC's real %LOCALAPPDATA%\\isshoni under ` +
+      `the real app id, so quit any installed isshoni first (else the single-instance forward ends the build at once), ` +
+      `and the installed app's toast activator (HKCU CLSID LocalServer32) points at this build until the installed ` +
+      `app next starts`,
+  );
+  if (prod === null) return;
+  if (!fs.existsSync(prod)) throw new Error(`no production build at ${prod} (task desktop:package:windows stages it)`);
+  test.setTimeout(240_000);
+  const port = await freePort();
+  const pipe = `isshoni-test-${randomBytes(6).toString('hex')}`;
+  const vars = {
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${String(port)}`,
+    WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER: pipe,
+    WEBVIEW2_X: '1',
+  };
+  const upperNames = (names: readonly string[]): string[] => names.map((n) => n.toUpperCase());
+
+  // The control: the e2e build, which keeps WEBVIEW2_*, started with the same variables, still has WEBVIEW2_X in its
+  // environment block, so the reader below sees what a parent passed (a scrub-less production build would look so).
+  // Its WebView2 browser process (no --type=) is read too, so the reader is proven on the webview side as well.
+  const browserOf = (tree: readonly ChildProcessInfo[]): ChildProcessInfo[] =>
+    webviewProcesses(tree).filter((p) => !p.commandLine.includes('--type='));
+  const control = await launchApp({ env: vars });
+  const controlPid = control.process?.pid ?? 0;
+  const controlNames = await environmentNames(controlPid);
+  const controlBrowserEnvs = await Promise.all(
+    browserOf(await descendants(controlPid)).map((p) => environmentNames(p.pid)),
+  );
+  await control.stop();
+  expect(controlNames, "the e2e build's environment can be read").not.toBeNull();
+  expect(upperNames(controlNames ?? [])).toContain('WEBVIEW2_X');
+  const controlBrowserRead = controlBrowserEnvs.filter((e): e is string[] => e !== null);
+  expect(controlBrowserRead.length, "the e2e build's WebView2 browser process environment can be read").toBeGreaterThan(
+    0,
+  );
+  expect(
+    controlBrowserRead.some((e) => upperNames(e).includes('WEBVIEW2_X')),
+    "the e2e build's WebView2 browser process has WEBVIEW2_X",
+  ).toBe(true);
+
+  // The production build. It has no e2e data folder: remember whether %LOCALAPPDATA%\isshoni was there before.
+  const localAppData = process.env['LOCALAPPDATA'] ?? '';
+  const dataRoot = path.join(localAppData, 'isshoni');
+  const hadData = localAppData === '' || fs.existsSync(dataRoot);
+  const { child, exited } = spawnApp(prod, [], appEnv(vars));
+  try {
+    const pid = child.pid ?? 0;
+    const deadline = Date.now() + START_TIMEOUT_MS;
+    for (;;) {
+      if (child.exitCode === 0) {
+        throw new Error(
+          'the production build exited 0 at once: another isshoni (same single-instance id) is probably running; ' +
+            'quit it (tray → Quit) and run again',
+        );
+      }
+      if (child.exitCode !== null) throw new Error(`the production build exited (${String(child.exitCode)})`);
+      if (webviewProcesses(await descendants(pid)).length > 0 && (await mainWindow(pid)) !== '0') break;
+      if (Date.now() > deadline) throw new Error('the production build showed no window with a WebView2 within 60 s');
+      await sleep(500);
+    }
+    // The browser process opens a port or a pipe as it starts; give it the time the e2e build's port takes.
+    await sleep(3_000);
+    const open = await portOpen(port);
+    const piped = await pipeExists(pipe);
+    const tree = await descendants(pid);
+    const webviews = webviewProcesses(tree);
+    const leaking = tree.filter(
+      (p) =>
+        p.commandLine.includes('--remote-debugging-port') ||
+        p.commandLine.includes(pipe) ||
+        /WEBVIEW2_/i.test(p.commandLine),
+    );
+    const names = await environmentNames(pid);
+    const left = upperNames(names ?? []).filter((n) => n.startsWith('WEBVIEW2_') && !WAILS_PLACEHOLDERS.includes(n));
+    // WebView2's browser process (no --type=): its environment too, where it can be read.
+    const browserProcs = browserOf(tree);
+    const browserEnvs = await Promise.all(browserProcs.map((p) => environmentNames(p.pid)));
+    const browserX = browserEnvs.filter((e) => e !== null && upperNames(e).includes('WEBVIEW2_X')).length;
+    row(
+      'W19',
+      [
+        `production build started with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<p>, ` +
+          `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER=isshoni-test-<random>, WEBVIEW2_X=1`,
+        `port open = ${String(open)}, pipe exists = ${String(piped)}`,
+        `${String(webviews.length)} WebView2 processes, command lines naming the port, the pipe or WEBVIEW2_: ${String(leaking.length)}`,
+        `isshoni.exe's environment: WEBVIEW2_* beyond Wails' five placeholders: ${left.length === 0 ? 'none' : left.join(', ')}`,
+        `WebView2 browser processes read: ${String(browserEnvs.filter((e) => e !== null).length)}/${String(browserProcs.length)}, with WEBVIEW2_X: ${String(browserX)}`,
+        `control: the e2e build kept WEBVIEW2_X (its own block and ${String(controlBrowserRead.length)} WebView2 browser process read)`,
+      ].join('; '),
+    );
+    expect(open, 'the debugging port is open').toBe(false);
+    expect(piped, 'the script-debugger pipe exists').toBe(false);
+    expect(leaking.map((p) => p.name)).toEqual([]);
+    expect(names, "the production build's environment can be read").not.toBeNull();
+    expect(left).toEqual([]);
+    // Not vacuous: at least one browser process's environment was read (it is the user's own, unsandboxed process).
+    expect(
+      browserEnvs.filter((e) => e !== null).length,
+      "a WebView2 browser process's environment can be read",
+    ).toBeGreaterThan(0);
+    expect(browserX).toBe(0);
+  } finally {
+    await kill(child, exited);
+    if (!hadData) await fsp.rm(dataRoot, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
+  }
 });
