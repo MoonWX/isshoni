@@ -226,29 +226,55 @@ func receive(t *testing.T, got <-chan []string, want ...string) {
 }
 
 // ciPipePattern is the PowerShell -like pattern by which the windows-desktop jobs' cleanup (ci.yml) and windows-full's
-// (nightly.yml) find the single-instance pipes below \\.\pipe\; TestSingleInstanceNames reads it from both files.
+// (nightly.yml) find the single-instance pipes below \\.\pipe\; TestPipeNames reads it from both files.
 const ciPipePattern = `*io.isshoni.desktop.*`
 
 // ciPipeLike matches the cleanup's pipe filter: GetFiles('\\.\pipe\') piped into Where-Object { $_ -like '<pattern>' }.
 var ciPipeLike = regexp.MustCompile(`GetFiles\('\\\\\.\\pipe\\'\) \| Where-Object \{ \$_ -like '([^']*)' \}`)
 
-// TestSingleInstanceNames: the mutex and the pipe have the same scope, the user's data root (03 §13.3; README WF19,
-// §3 item 118). Both are in a namespace every session shares (Global\ and \\.\pipe\) and carry the user's instance
-// secret, never the SID, so each secret gets one pair and two secrets two. The workflows' cleanup pattern matches the
-// pipe.
-func TestSingleInstanceNames(t *testing.T) {
-	const secret = "0123456789abcdef0123456789abcdef"
-	got := singleInstanceNames(InstanceID, secret)
-	want := lockNames{mutex: `Global\io.isshoni.desktop.v1.` + secret, pipe: `\\.\pipe\io.isshoni.desktop.v1.` + secret}
-	if got != want {
-		t.Errorf("names %+v, want %+v", got, want)
+// ciPipesUse is every use of the cleanup's $pipes: only its assignment and its count may appear, so the pipes' names
+// are never printed (03 §13.3: neither the pipe's name nor the lock file's content is logged).
+var ciPipesUse = regexp.MustCompile(`\$pipes\b(\s*=\s*@\(|\.Count\b)?`)
+
+// TestPipeNames: the pipe's name is \\.\pipe\<id>.v1.<32 hex digits>, new each run; instance.lock's content gives it
+// back only when it is exactly such a name of the same id (03 §13.3; README §3 item 119). The workflows' cleanup
+// pattern matches it, and the cleanup prints the leftover pipes' count, never their names.
+func TestPipeNames(t *testing.T) {
+	a, err := newPipeName(InstanceID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	other := singleInstanceNames(InstanceID, "fedcba9876543210fedcba9876543210")
-	if other.mutex == got.mutex || other.pipe == got.pipe {
-		t.Errorf("two secrets share a name: %+v %+v", other, got)
+	b, err := newPipeName(InstanceID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if tn := singleInstanceNames("io.isshoni.test-1", secret); tn.mutex == got.mutex || tn.pipe == got.pipe {
-		t.Errorf("another id shares a name: %+v", tn)
+	if a == b {
+		t.Errorf("two runs share a pipe name: %q", a)
+	}
+	if !regexp.MustCompile(`^\\\\\.\\pipe\\io\.isshoni\.desktop\.v1\.[0-9a-f]{32}$`).MatchString(a) {
+		t.Errorf("pipe name %q", a)
+	}
+	for _, data := range []string{a, a + "\r\n", " " + a + "\n"} {
+		if got, ok := pipeFromLock(InstanceID, []byte(data)); !ok || got != a {
+			t.Errorf("pipeFromLock(%q) = %q %v, want %q", data, got, ok, a)
+		}
+	}
+	token := a[len(pipePrefix(InstanceID)):]
+	for _, data := range []string{
+		"",
+		"   ",
+		a[:len(a)-1],       // half written
+		a + "0",            // too long
+		strings.ToUpper(a), // not as written
+		pipePrefix(InstanceID) + strings.Repeat("g", 32),
+		pipePrefix("io.isshoni.test-1") + token, // another id's
+		`\\.\pipe\..\` + token,
+		`C:\Users\x\file.v1.` + token,
+		a + "\n" + a,
+	} {
+		if got, ok := pipeFromLock(InstanceID, []byte(data)); ok {
+			t.Errorf("pipeFromLock(%q) = %q, want none", data, got)
+		}
 	}
 
 	// The cleanup's pattern, as PowerShell's -like applies it to GetFiles' full names (no '/' in them, so path.Match's
@@ -266,31 +292,51 @@ func TestSingleInstanceNames(t *testing.T) {
 		if m[0][1] != ciPipePattern {
 			t.Errorf("%s: the pipe filter is %q, want %q", wf, m[0][1], ciPipePattern)
 		}
+		uses := ciPipesUse.FindAllStringSubmatch(string(data), -1)
+		if len(uses) < 2 {
+			t.Errorf("%s: $pipes is used %d times, want its assignment and its count", wf, len(uses))
+		}
+		for _, u := range uses {
+			if u[1] == "" {
+				t.Errorf("%s: $pipes is used other than by its count (its names would be printed)", wf)
+			}
+		}
 	}
-	for _, p := range []string{got.pipe, other.pipe} {
+	for _, p := range []string{a, b} {
 		if ok, err := path.Match(ciPipePattern, p); !ok || err != nil {
 			t.Errorf("%q doesn't match the cleanup's %q: %v", p, ciPipePattern, err)
 		}
 	}
 }
 
-// TestStateOf: only a mutex this user owns is the user's; a mutex of another owner, one whose owner can't be read,
-// one the user may not open and another kind of object of the name are not (03 §13.3; README §3 item 118).
-func TestStateOf(t *testing.T) {
+// TestLockState: only a plain instance.lock this user owns is the lock; on it, a held range is a first instance and
+// another handle's range a second one; a link, a file of another owner (or one whose owner can't be read) and any
+// other lock error start the launch without the lock, never as a second instance (03 §13.3).
+func TestLockState(t *testing.T) {
+	errViolation := errors.New("lock violation")
+	errOther := errors.New("something else")
 	for _, c := range []struct {
-		o           createOutcome
-		ownerIsUser bool
-		want        mutexState
+		name  string
+		f     lockFacts
+		first bool
+		err   bool
 	}{
-		{createdNew, false, mutexCreated},
-		{openedExists, true, mutexOfUser},
-		{openedExists, false, mutexNotOurs},
-		{deniedAccess, false, mutexNotOurs},
-		{otherObject, false, mutexNotOurs},
+		{"held", lockFacts{ownerIsUser: true}, true, false},
+		{"held elsewhere", lockFacts{ownerIsUser: true, lockErr: errViolation, violation: true}, false, false},
+		{"another lock error", lockFacts{ownerIsUser: true, lockErr: errOther}, false, true},
+		{"a link", lockFacts{reparse: true, ownerIsUser: true}, false, true},
+		{"a link, held elsewhere", lockFacts{reparse: true, ownerIsUser: true, lockErr: errViolation, violation: true},
+			false, true},
+		{"another owner", lockFacts{}, false, true},
+		{"another owner, held elsewhere", lockFacts{lockErr: errViolation, violation: true}, false, true},
 	} {
-		if got := stateOf(c.o, c.ownerIsUser); got != c.want {
-			t.Errorf("stateOf(%d, %v) = %d, want %d", c.o, c.ownerIsUser, got, c.want)
+		first, err := lockState(c.f)
+		if first != c.first || (err != nil) != c.err {
+			t.Errorf("%s: %v %v, want first %v, error %v", c.name, first, err, c.first, c.err)
 		}
+	}
+	if _, err := lockState(lockFacts{reparse: true}); !errors.Is(err, errLockNotOurs) {
+		t.Errorf("a link: %v isn't errLockNotOurs", err)
 	}
 }
 

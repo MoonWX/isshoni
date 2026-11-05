@@ -1928,9 +1928,9 @@ again (only when the updater e2e ran), then the e2e exe and the CDP spec. What t
   from its own (medium integrity, `CreateProcessAsUserW` through `Add-Type` C#) and checks that such a shell is not in
   the Administrators role first;
 - its cleanup, which runs whatever failed, names and ends every `isshoni.exe` still running in any folder or session,
-  waits up to 15 s for the single-instance pipe (`*io.isshoni.desktop.*` under `\\.\pipe\`) to go, and uninstalls a
+  waits up to 15 s for the single-instance pipes (`*io.isshoni.desktop.*` under `\\.\pipe\`) to go, and uninstalls a
   leftover install; an `isshoni.exe` or a pipe that outlived the step then **fails the step** (after the cleanup, so
-  the later steps still get a clean session).
+  the later steps still get a clean session). Of the pipes it prints only their count, never a name (03 §13.3).
 
 The step passed on its first Windows run, PR #56's first `windows-desktop` run (where the autostart round trip, which
 then ran once, later in the job, failed: that led to the checks above and to the round trip on both sides of the

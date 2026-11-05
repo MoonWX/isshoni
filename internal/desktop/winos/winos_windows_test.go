@@ -30,7 +30,7 @@ import (
 const (
 	childEnv = "ISSHONI_WINOS_TEST_CHILD" // "first", "second" or "mutex"
 	idEnv    = "ISSHONI_WINOS_TEST_ID"
-	rootEnv  = "ISSHONI_WINOS_TEST_ROOT" // the data root of the instance secret
+	rootEnv  = "ISSHONI_WINOS_TEST_ROOT" // the data root, whose instance.lock is the lock
 	outEnv   = "ISSHONI_WINOS_TEST_OUT"
 )
 
@@ -117,9 +117,6 @@ func childCmd(t *testing.T, role, id, root, out string, args ...string) *exec.Cm
 	return cmd
 }
 
-// testSecretFiles are the instance secret's real files on Windows (singleinstance_secret_test.go).
-func testSecretFiles(t *testing.T) secretFiles { return osSecretFiles(mustSID(t)) }
-
 // newInstance is NewSingleInstance of id and root, failing the test on an error.
 func newInstance(t *testing.T, id, root string, log *slog.Logger) *SingleInstance {
 	t.Helper()
@@ -130,57 +127,59 @@ func newInstance(t *testing.T, id, root string, log *slog.Logger) *SingleInstanc
 	return si
 }
 
-// TestSingleInstanceNamesFromSecret: NewSingleInstance names the mutex and the pipe after the instance secret of its
-// data root (03 §13.3; README §3 item 118), the mutex in the namespace every session shares; the serving pipe has that
-// name below \\.\pipe\ while the mutex exists by its name. Two instances of one root see each other; of two roots
-// they don't.
-func TestSingleInstanceNamesFromSecret(t *testing.T) {
-	id, root := randomID(t), t.TempDir()
-	si := newInstance(t, id, root, nil)
-	secret, err := os.ReadFile(filepath.Join(root, instanceSecretFile))
-	if err != nil || !validSecret(string(secret)) {
-		t.Fatalf("the secret's file: %q %v", secret, err)
-	}
-	mutex, pipe := si.Names()
-	if want := `Global\` + id + ".v1." + string(secret); mutex != want {
-		t.Errorf("mutex %q, want %q", mutex, want)
-	}
-	if want := `\\.\pipe\` + id + ".v1." + string(secret); pipe != want {
-		t.Errorf("pipe %q, want %q", pipe, want)
-	}
-	if strings.Contains(mutex, mustSID(t)) {
-		t.Errorf("the mutex's name holds the SID: %q", mutex)
-	}
-	if first, err := si.Acquire(); err != nil || !first {
-		t.Fatalf("Acquire: %v %v", first, err)
-	}
-	t.Cleanup(func() { _ = si.Close() })
-	if ok, err := MutexExists(mutex); !ok || err != nil {
-		t.Errorf("MutexExists(%q) while held: %v %v", mutex, ok, err)
-	}
-	if err := si.Serve(func([]string) {}); err != nil {
-		t.Fatal(err)
-	}
-	pattern, err := windows.UTF16PtrFromString(pipe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var fd windows.Win32finddata
-		h, err := windows.FindFirstFile(pattern, &fd)
-		if err == nil {
-			_ = windows.FindClose(h)
-			break
+// waitForName waits until si's pipe name is in instance.lock and returns it.
+func waitForName(t *testing.T, si *SingleInstance) string {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if name, ok := si.readPipeName(); ok {
+			return name
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no pipe %s while serving: %v", pipe, err)
+			t.Fatal("no pipe name in instance.lock while serving")
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
+}
 
-	// Same root: the second instance. Another root (another data root of the same user, as an e2e build's): its own
-	// first instance.
+// receiveArgs waits for one command line on got and compares it with want.
+func receiveArgs(t *testing.T, got <-chan []string, want ...string) {
+	t.Helper()
+	select {
+	case g := <-got:
+		if !slices.Equal(g, want) {
+			t.Errorf("received %q, want %q", g, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%q wasn't received", want)
+	}
+}
+
+// TestSingleInstanceLock: the lock is instance.lock in the data root (03 §13.3; README §3 item 119). Of one root the
+// second Acquire is a second instance, of another root a first one; the lock is a byte range past the content, so the
+// pipe's name stays readable while it is held; LockHeld sees it; Close clears the name and frees the lock.
+func TestSingleInstanceLock(t *testing.T) {
+	id, root := randomID(t), t.TempDir()
+	if held, err := LockHeld(root); held || err != nil {
+		t.Fatalf("LockHeld without a file: %v %v", held, err)
+	}
+	a := newInstance(t, id, root, nil)
+	if first, err := a.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire: %v %v", first, err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	if held, err := LockHeld(root); !held || err != nil {
+		t.Errorf("LockHeld while held: %v %v", held, err)
+	}
+	if err := a.Serve(func([]string) {}); err != nil {
+		t.Fatal(err)
+	}
+	name := waitForName(t, a)
+	if !strings.HasPrefix(name, pipePrefix(id)) {
+		t.Errorf("the pipe's name doesn't start with %q", pipePrefix(id))
+	}
+	data, err := os.ReadFile(filepath.Join(root, lockFile)) // a reader isn't blocked by the held range
+	if err != nil || string(data) != name {
+		t.Errorf("instance.lock holds %q (%v), want the pipe's name", data, err)
+	}
 	if first, err := newInstance(t, id, root, nil).Acquire(); err != nil || first {
 		t.Errorf("Acquire of the same root: %v %v, want a second instance", first, err)
 	}
@@ -189,46 +188,50 @@ func TestSingleInstanceNamesFromSecret(t *testing.T) {
 		t.Errorf("Acquire of another root: %v %v, want a first instance", first, err)
 	}
 	_ = other.Close()
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := LockHeld(root); held || err != nil {
+		t.Errorf("LockHeld after Close: %v %v", held, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, lockFile)); err != nil || len(data) != 0 {
+		t.Errorf("instance.lock after Close holds %d bytes (%v)", len(data), err)
+	}
 }
 
-// TestSingleInstanceMutexOwner: the first instance's mutex and pipe are owned by this user's SID, set explicitly (an
-// elevated process, as on CI, would otherwise give them BUILTIN\Administrators); the mutex is open to the user and
-// SYSTEM only and the pipe to the user only. A second instance of the user reads the mutex's owner through a
-// SYNCHRONIZE|READ_CONTROL handle and is a second instance; its Forward reads the pipe's owner and forwards (03 §13.3).
-func TestSingleInstanceMutexOwner(t *testing.T) {
+// TestSingleInstanceSecurity: instance.lock and the pipe are owned by this user's SID, set explicitly (an elevated
+// process, as on CI, would otherwise give them BUILTIN\Administrators); the file is open to the user and SYSTEM only,
+// its DACL protected, and the pipe to the user only. checkServer accepts the pipe by its owner, which works whether or
+// not the server runs elevated (03 §13.3).
+func TestSingleInstanceSecurity(t *testing.T) {
 	got := make(chan []string, 4)
 	a, b := serving(t, func(args []string) { got <- args })
-	p, err := windows.UTF16PtrFromString(a.names.mutex)
+	sd, err := windows.GetNamedSecurityInfo(filepath.Join(a.root, lockFile), windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := windows.OpenMutex(windows.READ_CONTROL, false, p)
-	if err != nil {
-		t.Fatalf("OpenMutex(READ_CONTROL): %v", err)
-	}
-	defer func() { _ = windows.CloseHandle(h) }()
-	checkSecurity(t, "the mutex", h, a.sid, []string{a.sid, "S-1-5-18"})
-	if !a.ownedByUser(h) {
-		t.Error("ownedByUser: false for this user's own mutex")
+	checkSD(t, "instance.lock", sd, a.sid, []string{a.sid, "S-1-5-18"})
+	if control, _, err := sd.Control(); err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		t.Errorf("instance.lock's DACL isn't protected from inheritance: %#x %v", control, err)
 	}
 
 	// The pipe, as Forward opens it (this connection is a client the server drops: it sends nothing).
-	pp, err := windows.UTF16PtrFromString(a.names.pipe)
+	pp, err := windows.UTF16PtrFromString(waitForName(t, a))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ph windows.Handle
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
-		ph, err = windows.CreateFile(pp, windows.GENERIC_WRITE|windows.READ_CONTROL, 0, nil, windows.OPEN_EXISTING,
-			windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
-		if err == nil || time.Now().After(deadline) {
-			break
-		}
-	}
+	ph, err := windows.CreateFile(pp, windows.GENERIC_WRITE|windows.READ_CONTROL, 0, nil, windows.OPEN_EXISTING,
+		windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 	if err != nil {
 		t.Fatalf("opening the pipe: %v", err)
 	}
-	checkSecurity(t, "the pipe", ph, a.sid, []string{a.sid})
+	psd, err := windows.GetSecurityInfo(ph, windows.SE_KERNEL_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSD(t, "the pipe", psd, a.sid, []string{a.sid})
 	if err := a.checkServer(ph); err != nil {
 		t.Errorf("checkServer of this user's pipe: %v", err)
 	}
@@ -240,25 +243,7 @@ func TestSingleInstanceMutexOwner(t *testing.T) {
 	if err := b.Forward([]string{"--autostart"}); err != nil {
 		t.Fatalf("Forward to this user's pipe: %v", err)
 	}
-	select {
-	case g := <-got:
-		if !slices.Equal(g, []string{"--autostart"}) {
-			t.Errorf("received %q", g)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("nothing received")
-	}
-}
-
-// checkSecurity fails the test unless h's owner is owner and its DACL allows exactly allowed, in order.
-func checkSecurity(t *testing.T, what string, h windows.Handle, owner string, allowed []string) {
-	t.Helper()
-	sd, err := windows.GetSecurityInfo(h, windows.SE_KERNEL_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		t.Fatalf("%s: %v", what, err)
-	}
-	checkSD(t, what, sd, owner, allowed)
+	receiveArgs(t, got, "--autostart")
 }
 
 func checkSD(t *testing.T, what string, sd *windows.SECURITY_DESCRIPTOR, owner string, allowed []string) {
@@ -270,35 +255,6 @@ func checkSD(t *testing.T, what string, sd *windows.SECURITY_DESCRIPTOR, owner s
 	if got := daclSIDs(t, sd); !slices.Equal(got, allowed) {
 		t.Errorf("%s's DACL allows %q, want %q", what, got, allowed)
 	}
-}
-
-// TestInstanceSecretFileSecurity: the secret's file is owned by the user, its DACL protected and allowing the user and
-// SYSTEM only, so another account can't read it and so can't learn the names (03 §13.3; README §3 item 118).
-func TestInstanceSecretFileSecurity(t *testing.T) {
-	root := t.TempDir()
-	newInstance(t, randomID(t), root, nil)
-	sid := mustSID(t)
-	sd, err := windows.GetNamedSecurityInfo(filepath.Join(root, instanceSecretFile), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkSD(t, "the secret's file", sd, sid, []string{sid, "S-1-5-18"})
-	control, _, err := sd.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
-		t.Errorf("the secret's DACL isn't protected from inheritance: %#x %v", control, err)
-	}
-	// A regenerated secret (the temp file renamed over a malformed one) keeps that security.
-	if err := os.WriteFile(filepath.Join(root, instanceSecretFile), []byte("garbage"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	newInstance(t, randomID(t), root, slog.New(slog.DiscardHandler))
-	sd, err = windows.GetNamedSecurityInfo(filepath.Join(root, instanceSecretFile), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkSD(t, "the regenerated secret's file", sd, sid, []string{sid, "S-1-5-18"})
 }
 
 // daclSIDs lists the SIDs of sd's DACL's access-allowed ACEs, in order; it fails the test on any other kind of ACE.
@@ -322,46 +278,15 @@ func daclSIDs(t *testing.T, sd *windows.SECURITY_DESCRIPTOR) []string {
 	return sids
 }
 
-// squat takes name the way another account could take a name it knows (the SID-derived names of earlier builds, or a
-// leaked secret's) before this user's launch, and returns the squatter's handle: "denied", a mutex of a DACL that lets
-// this user read its owner but not SYNCHRONIZE; "event", an event of that name; "owner", a mutex open to everyone but
-// owned by BUILTIN\Administrators, which only a process with that group as an owner can create (an elevated one, as
-// on CI; the test is skipped otherwise).
-func squat(t *testing.T, how, name string) windows.Handle {
+func attrs(t *testing.T, sddl string) *windows.SecurityAttributes {
 	t.Helper()
-	p, err := windows.UTF16PtrFromString(name)
+	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		t.Fatal(err)
 	}
-	attrs := func(sddl string) *windows.SecurityAttributes {
-		sd, err := windows.SecurityDescriptorFromString(sddl)
-		if err != nil {
-			t.Fatal(err)
-		}
-		sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
-		sa.Length = uint32(unsafe.Sizeof(*sa))
-		return sa
-	}
-	sid := mustSID(t)
-	var h windows.Handle
-	switch how {
-	case "denied":
-		h, err = windows.CreateMutexEx(attrs("D:P(A;;GA;;;SY)(A;;RC;;;"+sid+")"), p, 0, windows.READ_CONTROL)
-	case "event":
-		h, err = windows.CreateEvent(nil, 1, 0, p)
-	case "owner":
-		h, err = windows.CreateMutexEx(attrs("O:BAD:P(A;;GA;;;WD)"), p, 0, windows.SYNCHRONIZE)
-		if errors.Is(err, windows.ERROR_INVALID_OWNER) {
-			t.Skip("BUILTIN\\Administrators can't own this process's objects (not elevated)")
-		}
-	default:
-		t.Fatalf("squat %q", how)
-	}
-	if err != nil {
-		t.Fatalf("squatting %s (%s): %v", name, how, err)
-	}
-	t.Cleanup(func() { _ = windows.CloseHandle(h) })
-	return h
+	sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
+	sa.Length = uint32(unsafe.Sizeof(*sa))
+	return sa
 }
 
 func mustSID(t *testing.T) string {
@@ -373,14 +298,88 @@ func mustSID(t *testing.T) string {
 	return u.User.Sid.String()
 }
 
-// TestSingleInstanceOldNamesIgnored: objects at the names of earlier builds, derived from the user's SID alone (README
-// §3 items 115 and 117: Global\<id>.v1.<SID>, its per-session fallback Local\<id>.v1.<SID> and the pipe
-// \\.\pipe\<id>.v1.<SID>), which another account could create, change nothing: the launch is the first instance and a
-// second launch forwards to it.
+// TestSingleInstanceLockNotOurs: an instance.lock that isn't this user's plain file never makes a launch a second
+// instance, even while another handle holds its range: Acquire fails without a lock, so main starts as the first
+// instance (with a warning), and Serve then refuses (03 §13.3). "owner": a file owned by BUILTIN\Administrators,
+// which only a process with that group as an owner can create (an elevated one, as on CI; skipped otherwise);
+// "symlink": a symbolic link to a file of the user (skipped without the right to create one); "hardlink": a second
+// name of a file elsewhere; "directory": a folder at the name.
+func TestSingleInstanceLockNotOurs(t *testing.T) {
+	for _, how := range []string{"owner", "symlink", "hardlink", "directory"} {
+		t.Run(how, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, lockFile)
+			target := filepath.Join(t.TempDir(), "elsewhere")
+			if err := os.WriteFile(target, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			switch how {
+			case "owner":
+				p, err := windows.UTF16PtrFromString(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
+					windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, attrs(t, "O:BAD:P(A;;GA;;;WD)"),
+					windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+				if errors.Is(err, windows.ERROR_INVALID_OWNER) {
+					t.Skip("BUILTIN\\Administrators can't own this process's files (not elevated)")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = windows.CloseHandle(h) }()
+				// Another holder of the range: it must still not make this launch a second instance.
+				if err := windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0,
+					1, 0, lockRange()); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink(target, path); err != nil {
+					t.Skipf("no symbolic link: %v", err)
+				}
+			case "hardlink":
+				if err := os.Link(target, path); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			si := newInstance(t, randomID(t), root, slog.New(slog.DiscardHandler))
+			first, err := si.Acquire()
+			if err == nil || first {
+				t.Fatalf("Acquire at %s: %v %v, want an error", how, first, err)
+			}
+			if strings.Contains(err.Error(), root) {
+				t.Errorf("the error holds the path: %v", err)
+			}
+			if err := si.Serve(func([]string) {}); !errors.Is(err, ErrNotFirst) {
+				t.Errorf("Serve without the lock: %v", err)
+			}
+			if data, err := os.ReadFile(target); err != nil || len(data) != 0 {
+				t.Errorf("the linked file was written: %q %v", data, err)
+			}
+		})
+	}
+}
+
+// TestSingleInstanceOldNamesIgnored: objects at the names of earlier builds (README §3 items 115, 117 and 118: the
+// mutexes Global\<id>.v1.<SID> and Local\<id>.v1.<SID>, the pipe \\.\pipe\<id>.v1.<SID>), which another account could
+// create, change nothing: the launch is the first instance and a second launch forwards to it.
 func TestSingleInstanceOldNamesIgnored(t *testing.T) {
 	id, sid := randomID(t), mustSID(t)
 	for _, name := range []string{`Global\` + id + ".v1." + sid, `Local\` + id + ".v1." + sid} {
-		squat(t, "event", name)
+		p, err := windows.UTF16PtrFromString(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := windows.CreateEvent(nil, 1, 0, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = windows.CloseHandle(h) })
 	}
 	oldPipe, err := windows.UTF16PtrFromString(`\\.\pipe\` + id + ".v1." + sid)
 	if err != nil {
@@ -391,57 +390,93 @@ func TestSingleInstanceOldNamesIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = windows.CloseHandle(ph) })
-	root := t.TempDir()
-	a := newInstance(t, id, root, nil)
-	if first, err := a.Acquire(); err != nil || !first {
-		t.Fatalf("Acquire beside the old names: %v %v", first, err)
-	}
-	t.Cleanup(func() { _ = a.Close() })
 	got := make(chan []string, 1)
-	if err := a.Serve(func(args []string) { got <- args }); err != nil {
-		t.Fatal(err)
-	}
-	b := newInstance(t, id, root, nil)
+	_, b := serving(t, func(args []string) { got <- args })
 	if first, err := b.Acquire(); err != nil || first {
 		t.Fatalf("second Acquire: %v %v", first, err)
 	}
 	if err := b.Forward([]string{"--open-url", "isshoni://watch.example.com/"}); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case g := <-got:
-		if !slices.Equal(g, []string{"--open-url", "isshoni://watch.example.com/"}) {
-			t.Errorf("received %q", g)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("nothing received")
+	receiveArgs(t, got, "--open-url", "isshoni://watch.example.com/")
+}
+
+// TestForwardStaleName: a name in instance.lock that no pipe serves (the last run's, while this one starts) is
+// retried until ForwardTimeout, then Forward fails cleanly, with an error that doesn't hold the name.
+func TestForwardStaleName(t *testing.T) {
+	id, root := randomID(t), t.TempDir()
+	a := newInstance(t, id, root, nil)
+	if first, err := a.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire: %v %v", first, err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	stale, err := newPipeName(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.publish(stale); err != nil {
+		t.Fatal(err)
+	}
+	b := newInstance(t, id, root, nil)
+	if first, err := b.Acquire(); err != nil || first {
+		t.Fatalf("second Acquire: %v %v", first, err)
+	}
+	start := time.Now()
+	err = b.Forward([]string{"x"})
+	if err == nil {
+		t.Fatal("Forward to a stale name succeeded")
+	}
+	if d := time.Since(start); d < ForwardTimeout || d > ForwardTimeout+time.Second {
+		t.Errorf("Forward gave up after %v, want about %v", d, ForwardTimeout)
+	}
+	if strings.Contains(err.Error(), stale[len(pipePrefix(id)):]) {
+		t.Errorf("the error holds the name: %v", err)
 	}
 }
 
-// TestSingleInstanceNotOurs: an object under the secret name that isn't this user's mutex (only a corrupted or leaked
-// secret puts one there) never makes a launch a second instance: Acquire fails without a lock, so main starts as the
-// first instance, and its error doesn't hold the name (03 §13.3).
-func TestSingleInstanceNotOurs(t *testing.T) {
-	for _, how := range []string{"denied", "event", "owner"} {
-		t.Run(how, func(t *testing.T) {
-			si := newInstance(t, randomID(t), t.TempDir(), slog.New(slog.DiscardHandler))
-			squat(t, how, si.names.mutex)
-			first, err := si.Acquire()
-			if err == nil || first {
-				t.Fatalf("Acquire with the name taken: %v %v, want an error", first, err)
-			}
-			if strings.Contains(err.Error(), si.names.mutex[len(`Global\`):]) {
-				t.Errorf("the error holds the name: %v", err)
-			}
-			if err := si.Serve(func([]string) {}); !errors.Is(err, ErrNotFirst) {
-				t.Errorf("Serve without the lock: %v", err)
-			}
-		})
+// TestForwardSquattedName: a pipe that another account created at the name in instance.lock (a stale name it listed)
+// gets nothing: its owner isn't the user's SID, so Forward refuses it until ForwardTimeout (errServerNotUser). The
+// squatter's pipe is owned by BUILTIN\Administrators, which only an elevated process can set (as on CI; skipped
+// otherwise); TestForwardChecksTheServer covers the check itself everywhere.
+func TestForwardSquattedName(t *testing.T) {
+	id, root := randomID(t), t.TempDir()
+	a := newInstance(t, id, root, nil)
+	if first, err := a.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire: %v %v", first, err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	stale, err := newPipeName(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := windows.UTF16PtrFromString(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateNamedPipe(p, windows.PIPE_ACCESS_INBOUND, windows.PIPE_TYPE_BYTE,
+		windows.PIPE_UNLIMITED_INSTANCES, 0, pipeBuffer, 0, attrs(t, "O:BAD:P(A;;GA;;;WD)"))
+	if errors.Is(err, windows.ERROR_INVALID_OWNER) {
+		t.Skip("BUILTIN\\Administrators can't own this process's pipes (not elevated)")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = windows.CloseHandle(h) })
+	if err := a.publish(stale); err != nil {
+		t.Fatal(err)
+	}
+	b := newInstance(t, id, root, nil)
+	err = b.Forward([]string{"--open-url", "isshoni://watch.example.com/r/lounge"})
+	if !errors.Is(err, errServerNotUser) {
+		t.Fatalf("Forward to a squatted pipe: %v, want errServerNotUser", err)
+	}
+	if strings.Contains(err.Error(), stale[len(pipePrefix(id)):]) {
+		t.Errorf("the error holds the name: %v", err)
 	}
 }
 
 // TestSingleInstanceInProcess: the second holder of the lock forwards to the first, which receives the arguments
-// unchanged; Close stops serving and frees the name.
+// unchanged; Close stops serving and frees the lock.
 func TestSingleInstanceInProcess(t *testing.T) {
 	id, root := randomID(t), t.TempDir()
 	a := newInstance(t, id, root, nil)
@@ -471,37 +506,22 @@ func TestSingleInstanceInProcess(t *testing.T) {
 		if err := b.Forward(args); err != nil {
 			t.Fatal(err)
 		}
-		select {
-		case g := <-got:
-			if !slices.Equal(g, args) {
-				t.Errorf("received %q, want %q", g, args)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("nothing received")
-		}
+		receiveArgs(t, got, args...)
 	}
 	// A client that connects and sends garbage is dropped; the server keeps serving.
-	name, _ := windowsPipeName(a)
-	if f, err := os.OpenFile(name, os.O_WRONLY, 0); err == nil {
+	if f, err := os.OpenFile(waitForName(t, a), os.O_WRONLY, 0); err == nil {
 		_, _ = f.Write([]byte("not json"))
 		_ = f.Close()
 	}
 	if err := b.Forward([]string{"after"}); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case g := <-got:
-		if !slices.Equal(g, []string{"after"}) {
-			t.Errorf("received %q", g)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the server stopped after a bad client")
-	}
+	receiveArgs(t, got, "after")
 	_ = b.Close()
 	if err := a.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The name is free again, and nobody serves: Forward gives up within its bound.
+	// The lock is free again, and nobody serves: Forward gives up within its bound.
 	c := newInstance(t, id, root, nil)
 	start := time.Now()
 	if err := c.Forward([]string{"x"}); err == nil {
@@ -515,8 +535,6 @@ func TestSingleInstanceInProcess(t *testing.T) {
 	}
 	_ = c.Close()
 }
-
-func windowsPipeName(s *SingleInstance) (string, error) { return s.names.pipe, nil }
 
 // serving returns a first instance of a new id and data root that serves onArgs, and a second instance of the same
 // id and root.
@@ -534,28 +552,21 @@ func serving(t *testing.T, onArgs func([]string)) (a, b *SingleInstance) {
 	return a, newInstance(t, id, root, nil)
 }
 
-// TestForwardChecksTheServer: a second launch forwards nothing to a pipe that isn't this user's (only a corrupted or
-// leaked secret lets another account create the name); the pipe's owner is compared by SID.
+// TestForwardChecksTheServer: a second launch forwards nothing to a pipe that isn't this user's; the pipe's owner is
+// compared by SID.
 func TestForwardChecksTheServer(t *testing.T) {
 	got := make(chan []string, 2)
 	_, b := serving(t, func(args []string) { got <- args })
 	own := b.sid
 	b.sid = "S-1-5-18" // as if this launch ran as another account than the server
-	if err := b.Forward([]string{"--open-url", "isshoni://watch.example.com/"}); err == nil {
-		t.Error("forwarded to a server of another account")
+	if err := b.Forward([]string{"--open-url", "isshoni://watch.example.com/"}); !errors.Is(err, errServerNotUser) {
+		t.Errorf("forwarded to a server of another account: %v", err)
 	}
 	b.sid = own
 	if err := b.Forward([]string{"--autostart"}); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case g := <-got:
-		if !slices.Equal(g, []string{"--autostart"}) {
-			t.Errorf("received %q: the refused forward arrived", g)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("nothing received")
-	}
+	receiveArgs(t, got, "--autostart")
 }
 
 // TestServesWhileHandling: while onArgs handles one command line, the pipe's name stays served (the next instance
@@ -639,7 +650,7 @@ func TestCloseDoesntWaitForOnArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = b.Close() }()
-	release <- struct{}{} // the old server's goroutine ends and lets go of the name
+	release <- struct{}{} // the old server's goroutine ends and closes its pipe
 	select {
 	case <-a.done:
 	case <-time.After(5 * time.Second):
@@ -653,7 +664,7 @@ func TestCloseDoesntWaitForOnArgs(t *testing.T) {
 		if !slices.Equal(g, []string{"after"}) {
 			t.Errorf("received %q", g)
 		}
-	case <-time.After(firstPipeWait + 5*time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("the new first instance doesn't serve")
 	}
 }

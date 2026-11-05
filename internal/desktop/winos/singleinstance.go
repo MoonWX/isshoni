@@ -1,92 +1,101 @@
 package winos
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
-// Single instance (03 §13.3): one instance per Windows user and data root on the PC, across all of that user's
-// sessions. The first instance holds a named mutex and serves a named pipe; a second launch finds the mutex, sends its
-// arguments (os.Args[1:], unchanged) through the pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback
-// (singleInstanceNames): the mutex Global\<id>.v1.<secret> and the pipe \\.\pipe\<id>.v1.<secret>, distinct from the
-// running mutex. The pinned Wails' own single-instance option can't be used: it acquires its lock inside
-// application.New, after 03 §13.4's steps 4–6, so a second instance would read and delete the Pending values and take
-// the running mutex's place in the order (README WA41's PR).
+// Single instance (03 §13.3; README §3 item 119): one instance per Windows user and data root on the PC, across all
+// of that user's sessions, elevated or not. The pinned Wails' own single-instance option can't be used: it acquires its
+// lock inside application.New, after 03 §13.4's steps 4–6, so a second instance would read and delete the Pending
+// values and take the running mutex's place in the order (README WA41's PR).
 //
-// Both names have one scope, the user's data root (README WF19, §3 item 118). The pipe's namespace, \\.\pipe\, is
-// shared by every session, and a Global\ mutex is too, so one secret gives each user one pair, shared by the user's
-// sessions. The scope is the user and not the session because what the app keeps is per user: one data root,
-// %LOCALAPPDATA%\isshoni (06 §2.2: settings.json, servers.json, the WebView2 user data folder, logs, updates), and the
-// device credentials in Credential Manager (02). Two instances of one user would share all of it: settings.json's last
-// writer would win, both WebView2 environments would use one user data folder from two sessions, and both would
-// refresh the same device's tokens, each from the copy it read at start, so the later refresh presents a spent token
-// and the server's reuse detection revokes the device (02 §1 decision 6, §6.2). The cost: a launch in a second session
-// (fast user switching, RDP beside the console) forwards into the instance of the session that started first, whose
-// window the second session doesn't show.
+// The lock is a file lock in the data root, %LOCALAPPDATA%\isshoni (per user and per PC; the e2e build's
+// ISSHONI_E2E_DATA_DIR replaces the folder above it, so each test data root has its own lock): the first instance holds
+// LockFileEx on a byte range of instance.lock far past its content (lockOffset), which no other process can take until
+// it closes the file or exits. The folder is the user's own (only the user, SYSTEM and administrators may open it), so
+// no name in a namespace that other accounts share decides who is first, and nothing needs to stay unknown: another
+// account can neither take the lock nor put a file or a link at its name. The scope is the user and not the session
+// because what the app keeps is per user: one data root (06 §2.2: settings.json, servers.json, the WebView2 user data
+// folder, logs, updates) and the device credentials in Credential Manager (02); two instances of one user would share
+// all of it (03 §13.3 says how that ends). The cost: a launch in a second session forwards into the instance of the
+// session that started first.
 //
-// The secret (instanceSecret, singleinstance_secret.go) is 16 random bytes in a file of the data root that only the
-// user and SYSTEM may open. Names derived from public data (the user's SID, README §3 item 117) let any local account
-// create them first, or a symbolic link at them, and so keep the user's every launch from starting or from forwarding;
-// another account can't read the secret, so it can't name, squat or link either object. The mutex keeps an explicit
-// security descriptor as defence in depth: owner the user's SID (set, not defaulted: an elevated administrator's
-// objects are otherwise owned by BUILTIN\Administrators), and a DACL of the user and SYSTEM only. A launch that finds
-// the name taken opens it for SYNCHRONIZE|READ_CONTROL only, rights the no-write-up label never denies, so an elevated
-// and a non-elevated instance of one user see each other; the mutex is the user's only when its owner, read through
-// that handle, is the user's SID. Anything else under the secret name means a corrupted or leaked secret: the launch
-// starts as the first instance without the lock (Acquire's error; main logs a warning), never as a second one.
-//
-// The pipe is owned by the user (set explicitly, as the mutex) and accepts only the user (its DACL) and no remote
-// client; the first instance treats what arrives as untrusted arguments (app.HandleArgs). The first instance creates
-// the next pipe instance before it closes the one it served, so the name is never free while it serves; a second
-// launch connects at identification level only (the server can't impersonate it) and forwards nothing to a pipe that
-// another account owns (serverCheck).
+// The pipe: the first instance creates \\.\pipe\<id>.v1.<16 random bytes in hex>, a new name each run, with
+// FILE_FLAG_FIRST_PIPE_INSTANCE, owned by the user and open to the user only, and then writes its name into
+// instance.lock. A second launch reads the name there, opens the pipe and forwards only when the pipe's owner is the
+// user's SID (serverCheck), so a pipe that another account created at a name it learnt (every pipe's name is listable)
+// gets nothing. The first instance treats what arrives as untrusted arguments (app.HandleArgs); it creates the next
+// pipe instance before it closes the one it served, so the name is never free while it serves, and a second launch
+// connects at identification level only (the server can't impersonate it). Neither the pipe's name nor the file's
+// content is ever logged or put in an error: not secret, but nobody's business.
 
-// lockNames is one pair of single-instance names: the mutex and the pipe the holder of the mutex serves.
-type lockNames struct {
-	mutex, pipe string
+// pipeTokenBytes is the random part of the pipe's name.
+const pipeTokenBytes = 16
+
+// pipePrefix is the pipe's name of id (InstanceID; tests use their own) up to its random part. The
+// "io.isshoni.desktop." in it is what the workflows' cleanup looks for (ciPipePattern in the tests).
+func pipePrefix(id string) string { return `\\.\pipe\` + id + ".v1." }
+
+// newPipeName returns a pipe name of id with a new random part.
+func newPipeName(id string) (string, error) {
+	b := make([]byte, pipeTokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("winos: a random pipe name: %w", err)
+	}
+	return pipePrefix(id) + hex.EncodeToString(b), nil
 }
 
-// singleInstanceNames derives the single-instance names of id (InstanceID; tests use their own) from the user's
-// instance secret: Global\<id>.v1.<secret> and \\.\pipe\<id>.v1.<secret>, both in a namespace every session shares.
-// The names hold the secret: they are never logged.
-func singleInstanceNames(id, secret string) lockNames {
-	base := id + ".v1." + secret
-	return lockNames{mutex: `Global\` + base, pipe: `\\.\pipe\` + base}
+// pipeFromLock returns the pipe name that instance.lock's content data holds for id: the prefix and 32 lowercase hex
+// digits, surrounded by white space at most. Anything else (an empty file while the first instance starts, a
+// half-written one, another id's name, garbage) gives ok false; the content is never in a log or an error.
+func pipeFromLock(id string, data []byte) (pipe string, ok bool) {
+	s := strings.TrimSpace(string(data))
+	token, found := strings.CutPrefix(s, pipePrefix(id))
+	if !found || len(token) != 2*pipeTokenBytes {
+		return "", false
+	}
+	for _, c := range token {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return s, true
 }
 
-// createOutcome is how creating a single-instance mutex's name ended (CreateMutexExW).
-type createOutcome int
+// errLockNotOurs: instance.lock isn't a plain file owned by this user. Only another account with rights over the
+// user's profile (an administrator) or a bug puts such a thing there; the launch then starts without the lock.
+var errLockNotOurs = errors.New("winos: the single-instance lock file isn't this user's own plain file; " +
+	"starting without the lock")
 
-const (
-	createdNew   createOutcome = iota // the name was free: this process created the mutex
-	openedExists                      // ERROR_ALREADY_EXISTS: a handle to the existing mutex
-	deniedAccess                      // ERROR_ACCESS_DENIED: a mutex of that name this user may not open
-	otherObject                       // ERROR_INVALID_HANDLE: another kind of object has the name
-)
+// lockFacts is what Acquire found at instance.lock.
+type lockFacts struct {
+	reparse     bool  // a reparse point (a symbolic link or junction), opened as itself
+	ownerIsUser bool  // its owner, read through the handle, is this user's SID (false when unread)
+	lockErr     error // LockFileEx's error; nil: this process holds the lock
+	violation   bool  // lockErr is ERROR_LOCK_VIOLATION: another handle holds the range
+}
 
-// mutexState is whom a single-instance mutex's name belongs to.
-type mutexState int
-
-const (
-	mutexCreated mutexState = iota // this process created it and holds it now
-	mutexOfUser                    // another instance of this user holds it
-	mutexNotOurs                   // anything that isn't provably this user's: a corrupted or leaked secret
-)
-
-// stateOf classifies a creation's outcome; ownerIsUser reports whether an existing mutex's owner, read through the
-// handle, is this user's SID (false when it can't be read). Only a mutex owned by the user is the user's: the
-// instances set that owner explicitly, and no other account can (03 §13.3).
-func stateOf(o createOutcome, ownerIsUser bool) mutexState {
+// lockState is Acquire's decision (03 §13.3): only a plain file this user owns is the lock. On it, the held range
+// makes this the first instance, and a range another handle holds (any process of the user and data root, in any
+// session, elevated or not) a second instance. Anything else is an error, so the caller starts as the first instance
+// without the lock and never exits as a second one because of a file it can't trust.
+func lockState(f lockFacts) (first bool, err error) {
 	switch {
-	case o == createdNew:
-		return mutexCreated
-	case o == openedExists && ownerIsUser:
-		return mutexOfUser
+	case f.reparse || !f.ownerIsUser:
+		return false, errLockNotOurs
+	case f.lockErr == nil:
+		return true, nil
+	case f.violation:
+		return false, nil
 	default:
-		return mutexNotOurs
+		return false, fmt.Errorf("winos: the single-instance lock: %w", f.lockErr)
 	}
 }
 
@@ -139,7 +148,8 @@ var errStopped = errors.New("winos: stopped")
 // around it, serveLoop, is portable, so its order is tested on every OS (singleinstance_test.go).
 type pipeServer interface {
 	// create makes an instance of the pipe that a client may connect to at once, before accept is called. The first
-	// one is made with nobody else holding the name. It returns errStopped when Close ended its retries.
+	// one gets a new random name that nobody else holds, which is then published in instance.lock; later ones take
+	// that name. It returns errStopped when Close ended its retries.
 	create(first bool) (pipeInstance, error)
 	// stopped reports whether Close ran.
 	stopped() bool

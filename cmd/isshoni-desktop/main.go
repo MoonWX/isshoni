@@ -94,8 +94,8 @@ func run(args []string) int {
 		dataRoot:         dataRoot,
 		removeAll:        os.RemoveAll,
 		singleInstance: func() (instance, error) {
-			// The names come from the user's instance secret in the data root (03 §13.3), so an e2e build with its
-			// own ISSHONI_E2E_DATA_DIR has its own.
+			// The lock is instance.lock in the data root (03 §13.3), so an e2e build with its own
+			// ISSHONI_E2E_DATA_DIR has its own.
 			root, err := dataRoot()
 			if err != nil {
 				return nil, err

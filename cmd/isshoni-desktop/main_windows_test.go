@@ -194,7 +194,7 @@ func TestSingleInstanceAndRunningMutex(t *testing.T) {
 	id := randomName(t)
 	running := `Local\` + randomName(t) + ".running"
 	out := filepath.Join(t.TempDir(), "received.json")
-	// Both launches share one data root, so one instance secret names their lock (03 §13.3).
+	// Both launches share one data root, so one instance.lock is their lock (03 §13.3).
 	env := []string{idEnv + "=" + id, rootEnv + "=" + t.TempDir(), runningEnv + "=" + running, outEnv + "=" + out}
 
 	first := childCmd(t, "first", env)

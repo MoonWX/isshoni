@@ -1241,11 +1241,12 @@ the named sections)
      (`isshoni_hw`, then `isshoni_hw production`), M-DESK-12's budgets (§8) (03 §3.2, §20).
 116. **Group 18 as run**: one fix slice, WF19 (the CDP spec's annotations printed and in the job summary, its results
      uploaded on success too, one scope for the single-instance mutex and pipe; items 113–115), and WB16 (group 17's
-     and PR #56's write-backs, items 110–115); the integration then closed the squatting hole WF19 opened (item 117,
-     superseded by item 118: names from a per-user secret).
+     and PR #56's write-backs, items 110–115); the integration then closed the squatting hole WF19 opened (items 117
+     and 118, both superseded by item 119: a file lock in the data root).
      WA89 (the owner's M-DA runs) can run on the owner's PC; WA90 and WA91 come last. §7 question 11 stays open.
 117. **The single-instance mutex can't be squatted by another account** (group 18's integration, after WF19;
-     **superseded by item 118**, which keeps its owner checks and drops its per-session fallback): WF19's
+     **superseded by item 118**, which kept its owner checks and dropped its per-session fallback, **and both by
+     item 119**): WF19's
      per-user `Global\io.isshoni.desktop.v1.<SID>` was created with `CreateMutexW(nil, …)`, so any other local account
      could create the name first (the SID is no secret), and this user's every start took it for a first instance,
      forwarded into nothing and exited: a denial of service across accounts that the per-session `Local\` name had not
@@ -1264,7 +1265,8 @@ the named sections)
      lasts, and a start after the squat ends beside a per-session instance still running. 03 §13.3 and the W6 rows of 03
      §3.2 say it; the Windows half (`TestSingleInstanceMutexOwner`, `TestSingleInstanceSquatted`) is to be read from the
      next `windows-go` run.
-118. **The single-instance names come from a per-user secret** (group 18's integration, after item 117): item 117's
+118. **The single-instance names come from a per-user secret** (group 18's integration, after item 117;
+     **superseded by item 119**: object names are listable, so the secret leaked on the first run): item 117's
      adversarial review found that names derived from public data stay attackable. A symbolic link at the predictable
      `Global\` name pointing to another mutex the user owns passed the owner check, so the launch exited (the denial of
      service remained); another account that created the predictable pipe names first swallowed every later launch's
@@ -1294,6 +1296,37 @@ the named sections)
      `TestSingleInstanceMutexOwner`, `TestInstanceSecretFileSecurity`, `TestSingleInstanceOldNamesIgnored`,
      `TestSingleInstanceNotOurs`, `TestAutostartRoundTrip`) is to be read from the next `windows-go` and
      `windows-desktop` runs.
+119. **Single instance by a file lock in the data root** (group 18's integration, after item 118; supersedes items
+     116–118's single-instance design): WF19's SID-derived names, item 117's owner checks and item 118's secret all
+     rested on another account not creating an object at the user's name first, and every name in `\\.\pipe\` and
+     `\BaseNamedObjects` can be listed by any local account, so item 118's secret leaked the first time the app ran.
+     So the lock moves where other accounts can't reach at all, the user's own data root, and the pipe's name becomes
+     public and single-use, trusted only through its owner, so that no name has to stay unknown. Decided: the lock is
+     `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on one byte at offset 2^40 of `instance.lock` in
+     the data root (`%LOCALAPPDATA%\isshoni`, or the e2e build's `ISSHONI_E2E_DATA_DIR\isshoni`), opened with
+     `GENERIC_READ | GENERIC_WRITE`, `FILE_SHARE_READ | FILE_SHARE_WRITE`, `OPEN_ALWAYS` and
+     `FILE_FLAG_OPEN_REPARSE_POINT`, and created owned by the user with `D:P(A;;GA;;;<SID>)(A;;GA;;;SY)`: held is the
+     first instance, `ERROR_LOCK_VIOLATION` a second one (any session, elevated or not), and the lock dies with the
+     process. A reparse point, a folder, a second hard link or another owner at `instance.lock` starts the launch
+     without the lock, with a warning, never as a second instance. The first instance creates
+     `\\.\pipe\io.isshoni.desktop.v1.<16 random bytes in hex>`, new each run, with `FILE_FLAG_FIRST_PIPE_INSTANCE`
+     (a held name is given up for another, up to 8 times), owned by and open to the user only, and writes that name
+     into `instance.lock` only once the pipe exists (it clears the last run's name when it takes the lock, and its own
+     on Close); a second launch reads the name, opens the pipe with `GENERIC_WRITE | READ_CONTROL` and forwards only
+     when the pipe's owner is the user's SID (the token comparison only when the owner can't be read), retrying a
+     missing, stale, busy or foreign pipe until the 2 s bound. Dropped as moot: the `Global\` instance mutex, the
+     `instance.secret` file and its code and tests, and every per-session leftover; kept unchanged: the running mutex
+     `Local\io.isshoni.desktop.running` that the installer waits for. Neither the pipe's name nor the file's content is
+     logged or in an error, and the updater e2e's cleanup in ci.yml and nightly.yml prints only the count of leftover
+     pipes (same pattern, same failure; `TestPipeNames` checks both files). `--purge-data` while an instance runs can't
+     delete `instance.lock` (open without delete sharing): `removeDataRoot` deletes everything else and reports the
+     failure after its budget, never a success (`TestPurgeWhileRunning`). `TestAutostartRoundTrip`'s preflight probes
+     its data root's lock (`winos.LockHeld`). Builds before this one and this one don't see each other; across an
+     update that is harmless for item 118's reasons (the unchanged running mutex, `WaitForApp`, step 2a). 03 §13.3,
+     §14.1, §16.1 and the W6 rows of 03 §3.2 say it; the Windows half (`TestSingleInstanceLock`,
+     `TestSingleInstanceSecurity`, `TestSingleInstanceLockNotOurs`, `TestForwardStaleName`, `TestForwardSquattedName`,
+     `TestPurgeWhileRunning`, `TestAutostartRoundTrip`) is to be read from the next `windows-go` and `windows-desktop`
+     runs.
 
 **Re-cut in this plan**
 - 04 E1 splits into the header and native skeleton (WA03) and the binding's pure Go half, which joins E2's Go loader

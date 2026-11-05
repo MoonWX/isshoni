@@ -229,3 +229,40 @@ func TestInstallerHandoverWindows(t *testing.T) {
 		t.Errorf("exit %d, single instance reached %v", code, reached)
 	}
 }
+
+// TestPurgeWhileRunning: a running first instance keeps its data root's instance.lock open without delete sharing, so
+// --purge-data's removeDataRoot can't delete that file while it runs: it deletes everything else, retries until its
+// budget and reports the failure (never a success with the app still running), and leaves instance.lock and the
+// lock held. Once the instance is closed, the purge succeeds (03 §13.3, §13.4).
+func TestPurgeWhileRunning(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "isshoni")
+	si, err := winos.NewSingleInstance(winos.InstanceID+".test", root, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first, err := si.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire: %v %v", first, err)
+	}
+	t.Cleanup(func() { _ = si.Close() })
+	if err := os.WriteFile(filepath.Join(root, "settings.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeDataRoot(t.Context(), root, 300*time.Millisecond, 20*time.Millisecond, os.RemoveAll); err == nil {
+		t.Fatal("the purge reported success while an instance holds the lock")
+	}
+	if _, err := os.Stat(filepath.Join(root, "settings.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("settings.json is still there: %v", err)
+	}
+	if held, err := winos.LockHeld(root); !held || err != nil {
+		t.Errorf("the lock after the failed purge: held %v, %v", held, err)
+	}
+	if err := si.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeDataRoot(t.Context(), root, 5*time.Second, 20*time.Millisecond, os.RemoveAll); err != nil {
+		t.Fatalf("the purge after Close: %v", err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the data root is still there: %v", err)
+	}
+}

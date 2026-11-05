@@ -54,6 +54,9 @@ func TestStubs(t *testing.T) {
 	if err := si.Close(); err != nil {
 		t.Error(err)
 	}
+	if held, err := LockHeld(t.TempDir()); held || err != nil {
+		t.Errorf("LockHeld: %v %v", held, err)
+	}
 
 	if err := HoldRunningMutex(RunningMutex); err != nil {
 		t.Error(err)
@@ -90,6 +93,3 @@ func TestStubs(t *testing.T) {
 		t.Errorf("ShowToast: %v", err)
 	}
 }
-
-// testSecretFiles are the instance secret's real files on this OS (singleinstance_secret_test.go).
-func testSecretFiles(*testing.T) secretFiles { return osSecretFiles() }

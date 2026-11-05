@@ -1915,9 +1915,9 @@ jobs:
             # run, the CDP spec) need neither. smoke.ps1 ends the installed app and uninstalls it when every case
             # passed, so any isshoni.exe still running here, in any folder or session, outlived the test: it is named
             # and ended, and the step FAILS for it (after this cleanup, so the later steps still get a clean session).
-            # The single-instance pipe (per user, as its Global\ mutex: M2 03 13.3) must be gone with them: a holder
-            # would take a later start's forward, so one that outlives every isshoni.exe fails the step too. Its
-            # pattern is the one winos' TestSingleInstanceNames checks (ciPipePattern).
+            # The single-instance pipes (a random name each run, M2 03 13.3) must be gone with them: one that outlives
+            # every isshoni.exe means a process the step didn't end still serves, so it fails the step too. Only their
+            # count is printed, never a name (03 13.3); the pattern is the one winos' TestPipeNames checks.
             $outlived = New-Object System.Collections.ArrayList
             foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'")) {
               $m = "the updater e2e left isshoni.exe $($p.ProcessId) running (session $($p.SessionId)): $($p.ExecutablePath) $($p.CommandLine)"
@@ -1930,7 +1930,7 @@ jobs:
               $pipes = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like '*io.isshoni.desktop.*' })
               if ($pipes.Count -eq 0) { break }
               if ((Get-Date) -gt $deadline) {
-                $m = "the single-instance pipe outlived every isshoni.exe of the updater e2e: $($pipes -join ', ')"
+                $m = "$($pipes.Count) single-instance pipe(s) outlived every isshoni.exe of the updater e2e"
                 "::error::$m"
                 [void]$outlived.Add($m)
                 break
