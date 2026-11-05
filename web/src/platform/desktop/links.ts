@@ -1,4 +1,5 @@
-// The desktop SPA never navigates away (docs/m2/03 §5.5, layer 1 of 3; Go cancels foreign navigation as layer 2, and
+// The desktop SPA never navigates away (docs/m2/03 §5.5, layer 1 of 3; layer 2 cancels foreign navigation, at the
+// pinned Wails through its fallback: bridge.js's navigate listener, the HTML's CSP sandbox and Go's navigation guard;
 // the /wails/* guard is layer 3). DesktopPlatform installs, at construction:
 // - capture-phase click and auxclick (middle button) listeners on document: an <a> (or <area>) whose resolved URL is
 //   not on the asset origin is cancelled and handed to openExternal; a modified click or middle click on an

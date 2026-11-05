@@ -15,7 +15,9 @@ type Shell interface {
 	HideWindow()
 	WindowVisible() bool
 	SetFullscreen(on bool)
-	Reload() // reloads the SPA (every change of the active server, crash recovery)
+	// Reload reloads the SPA at the window's current address (every change of the active server, crash recovery); a
+	// window that isn't showing the asset origin gets the start page instead (W5's fallback, 03 §3.2).
+	Reload()
 	MainWindowHandle() uintptr
 	Emit(name string, data any) // Wails event to the SPA
 	// OpenURL opens the system browser. It validates with App.OpenExternal's rule itself (03 §5.5): absolute https,

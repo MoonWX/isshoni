@@ -33,6 +33,32 @@ func TestBridgeJSExample(t *testing.T) {
 	}
 }
 
+// TestNavigationGuardJS: bridge.js's second statement listens to navigate on window.navigation, cancels only a
+// cancelable navigation off the page's own scheme://host, and opens nothing (§5.5 layer 2, W5's fallback). Its behavior
+// is desktop-security.spec's (Chrome) and the CDP spec's W5 (WebView2).
+func TestNavigationGuardJS(t *testing.T) {
+	for _, want := range []string{`(window.navigation);`, `n.addEventListener("navigate",`, `e.cancelable&&`,
+		`o(e.destination.url)!==o(location.href)`, `u.protocol+"//"+u.host`, `e.preventDefault()`} {
+		if !strings.Contains(navigationGuardJS, want) {
+			t.Errorf("the guard lacks %s: %s", want, navigationGuardJS)
+		}
+	}
+	for _, bad := range []string{"open", "postMessage", "<", "\n"} {
+		if strings.Contains(navigationGuardJS, bad) {
+			t.Errorf("the guard holds %q: %s", bad, navigationGuardJS)
+		}
+	}
+	body, err := bridgeBody(BridgeConfig{V: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement, guard, ok := strings.Cut(string(body), "\n")
+	if !ok || guard != navigationGuardJS {
+		t.Fatalf("bridge.js: %s", body)
+	}
+	checkBridgeJS(t, []byte(statement))
+}
+
 func TestBridgeJSEscapes(t *testing.T) {
 	name := "</script><script>alert(1)</script> &    <!-- -->"
 	got, err := BridgeJS(BridgeConfig{V: 1, Server: &ServerFacts{Name: name, Origin: "https://a.example"}})

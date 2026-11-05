@@ -1,7 +1,8 @@
 // The real app over CDP (M2 03 §22.4 B), the skeleton of README WA48: it starts the e2e build of isshoni.exe (or
 // attaches to a running one), connects Playwright to its WebView2 and checks the Wails checklist rows that only the
 // real webview can answer (03 §3.2): W1 (the asset origin), W2 (a secure context), W3 (the CSP is enforced), W5
-// (top-level navigation and new windows are cancelled) and W7 (closing the window hides it). Each test also writes
+// (top-level navigation and new windows don't leave the asset origin; at beta.34 through the row's fallback) and W7
+// (closing the window hides it). Each test also writes
 // its row as an annotation ("Wails checklist"), for the PR. README DK13 (WA90's run) completes the spec: W9, W13,
 // W16, W21 in the webview, a device-flow link, a fake share watched in Chrome, close-to-tray while live, Quit.
 //
@@ -199,8 +200,15 @@ test("W3: the asset handler's CSP is enforced", async ({ app }) => {
 
 test('W5: navigation and new windows stay on the asset origin', async ({ app }) => {
   const { page } = app;
-  const before = app.browser.contexts().flatMap((c) => c.pages()).length;
-  // The SPA never does this (03 §5.5 layer 1); Go's NavigationStarting cancels it (layer 2).
+  const pages = (): number => app.browser.contexts().flatMap((c) => c.pages()).length;
+  const before = pages();
+  // The CSP sandbox (03 §5.3) must leave WebView2's own channel to Go in place: Wails' runtime and the navigation
+  // guard's answer (navguard.go) post through it.
+  const channel = await page.evaluate(
+    () => typeof (window as { chrome?: { webview?: { postMessage?: unknown } } }).chrome?.webview?.postMessage,
+  );
+  // The SPA never does this (03 §5.5 layer 1). Beta.34 lets Go cancel nothing (W5 fails; 03 §3.2 records the
+  // fallback): bridge.js's navigate listener cancels it (03 §5.2).
   await page.evaluate(() => {
     location.href = 'https://example.com/';
   });
@@ -209,7 +217,8 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
   // The native window.open. DesktopPlatform replaced window's own (links.ts), and Window is a [Global] interface, so
   // open is an own property of window and Window.prototype has none. A src-less iframe's window still has the native
   // one (its about:blank needs no navigation, so the CSP's frame-src 'none' doesn't apply). Called on this window, it
-  // opens from the main frame, as a script in the SPA would; NewWindowRequested must cancel it.
+  // opens from the main frame, as a script in the SPA would. Beta.34 has no NewWindowRequested handler: the HTML's
+  // CSP sandbox, without allow-popups, refuses it and the call returns null (03 §5.3).
   const opened = await page.evaluate(() => {
     const frame = document.createElement('iframe');
     document.body.append(frame);
@@ -222,14 +231,32 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
     }
   });
   await page.waitForTimeout(1_000);
-  const after = app.browser.contexts().flatMap((c) => c.pages()).length;
+  const after = pages();
+  // A navigation no page script can cancel, started as the browser starts one (CDP's Page.navigate): Go's half of
+  // the fallback (navguard.go) notices the foreign top level after WebViewNavigationCompleted and loads the start
+  // page again. Whether the window got there at all is recorded; that it is back home is asserted.
+  const started = Date.now();
+  const left = await page
+    .goto('https://example.com/g', { waitUntil: 'commit', timeout: 15_000 })
+    .then(() => new URL(page.url()).origin)
+    .catch((e: unknown) => `not reached (${e instanceof Error ? (e.message.split('\n')[0] ?? '') : String(e)})`);
+  await expect
+    .poll(() => page.evaluate(() => location.origin).catch(() => ''), { timeout: 20_000 })
+    .toBe(DesktopAssetOriginWindows);
+  const back = Date.now() - started;
   row(
     'W5',
-    `after location.href: ${origin}; native window.open returned null: ${String(opened)}; pages ${String(
-      before,
-    )} → ${String(after)}`,
+    [
+      `chrome.webview.postMessage: ${channel}`,
+      `after location.href: ${origin}`,
+      `native window.open returned null: ${String(opened)}`,
+      `pages ${String(before)} → ${String(after)}`,
+      `browser-started navigation reached ${left}, back on the asset origin after ${String(back)} ms`,
+    ].join('; '),
   );
+  expect(channel).toBe('function');
   expect(origin).toBe(DesktopAssetOriginWindows);
+  expect(opened).toBe(true);
   expect(after).toBe(before);
 });
 

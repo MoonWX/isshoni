@@ -23,6 +23,9 @@ const specPolicyNoServer = "default-src 'self'; script-src 'self'; style-src 'se
 	"media-src 'self' blob:; connect-src 'self'; worker-src 'none'; manifest-src 'none'; font-src 'self'; " +
 	"object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'"
 
+// specSandbox is the header's last directive (03 §5.3; W5's fallback, §5.5): no allow-popups, never in the <meta>.
+const specSandbox = "; sandbox allow-scripts allow-same-origin allow-forms"
+
 func testDist(t *testing.T) fstest.MapFS {
 	t.Helper()
 	index, err := os.ReadFile("testdata/index.html")
@@ -191,10 +194,11 @@ func policies(t *testing.T, h http.Handler) (header, meta string) {
 	return resp.Header.Get("Content-Security-Policy"), html.UnescapeString(m[0][1])
 }
 
-func TestCSPHeaderAndMetaAreEqual(t *testing.T) {
+// TestCSPHeaderAndMeta: the header is the <meta> policy plus the sandbox directive, which a <meta> can't carry.
+func TestCSPHeaderAndMeta(t *testing.T) {
 	h, src := newTestHandler(t, Options{})
 	header, meta := policies(t, h)
-	if header != specPolicyNoServer || meta != specPolicyNoServer {
+	if header != specPolicyNoServer+specSandbox || meta != specPolicyNoServer {
 		t.Fatalf("no server:\nheader %q\nmeta   %q\nwant   %q", header, meta, specPolicyNoServer)
 	}
 
@@ -202,7 +206,7 @@ func TestCSPHeaderAndMetaAreEqual(t *testing.T) {
 	header, meta = policies(t, h)
 	want := strings.Replace(specPolicyNoServer, "connect-src 'self'",
 		"connect-src 'self' https://watch.example.com wss://watch.example.com", 1)
-	if header != want || meta != want {
+	if header != want+specSandbox || meta != want {
 		t.Fatalf("active server:\nheader %q\nmeta   %q\nwant   %q", header, meta, want)
 	}
 
@@ -253,7 +257,7 @@ func TestCSPConnectSrcByOrigin(t *testing.T) {
 		src.server.Store(&ServerFacts{Origin: c.origin})
 		header, meta := policies(t, h)
 		want := strings.Replace(specPolicyNoServer, "connect-src 'self'", "connect-src 'self'"+c.want, 1)
-		if header != want || meta != want {
+		if header != want+specSandbox || meta != want {
 			t.Errorf("origin %q dev %v:\n got %q\nwant %q", c.origin, c.dev, header, want)
 		}
 	}
@@ -288,6 +292,17 @@ func TestHTMLHeaders(t *testing.T) {
 	} {
 		if got := resp.Header.Get(k); got != want {
 			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
+	// W5's fallback (03 §5.5 layer 2): the page may run scripts, keep its origin and handle a submit, but never open
+	// a window or navigate its top level from a frame.
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.HasSuffix(csp, specSandbox) || strings.Count(csp, "sandbox") != 1 {
+		t.Errorf("CSP %q: no single trailing %q", csp, specSandbox)
+	}
+	for _, flag := range []string{"allow-popups", "allow-top-navigation", "allow-modals", "allow-downloads"} {
+		if strings.Contains(csp, flag) {
+			t.Errorf("CSP %q allows %s", csp, flag)
 		}
 	}
 }
@@ -384,7 +399,8 @@ func TestBridgeJSRoute(t *testing.T) {
 	resp := get(t, h, http.MethodGet, BridgePath)
 	got := resp.Body
 	want := `window.__ISSHONI_DESKTOP__=Object.freeze({"v":1,"transport":"wails","app":{"version":"0.2.0",` +
-		`"os":"windows","osBuild":26100,"arch":"amd64"},"server":null,"serverIds":[],"dev":false});`
+		`"os":"windows","osBuild":26100,"arch":"amd64"},"server":null,"serverIds":[],"dev":false});` + "\n" +
+		navigationGuardJS
 	if resp.StatusCode != http.StatusOK || got != want {
 		t.Fatalf("GET %s: %d\n got %s\nwant %s", BridgePath, resp.StatusCode, got, want)
 	}

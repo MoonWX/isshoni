@@ -45,6 +45,7 @@ const appID = winos.InstanceID
 // The main window (03 §4.4).
 const (
 	windowTitle     = "isshoni"
+	mainWindowName  = "main"
 	windowWidth     = 1200
 	windowHeight    = 760
 	windowMinWidth  = 800
@@ -251,8 +252,13 @@ func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst
 	audioSvc := newAudioService(engine, st, webviewData)
 	// Wails' own logger never logs below Info, whatever the log level is: at Debug the pinned Wails logs every
 	// bound call's raw arguments and result (03 §17).
-	wailsApp := application.New(appOptions(handler, assetGuard(), webviewData, wailsLog))
+	// W5's fallback (03 §3.2, §5.5 layer 2): Go sends a window that left the asset origin back to the start page.
+	nav := newNavGuard(assetOrigin, slog.Default())
+	opts := appOptions(handler, assetGuard(), webviewData, wailsLog)
+	opts.RawMessageHandler = navMessages(nav)
+	wailsApp := application.New(opts)
 	shell := newShell(wailsApp, mainWindowOptions(), slog.Default())
+	shell.guardNavigation(nav)
 	deps := app.Deps{
 		Settings:         st,
 		Servers:          srv,
@@ -520,7 +526,7 @@ var deniedPermissions = map[application.PermissionType]application.Permission{
 // bar, the browser accelerator keys and swipe navigation.
 func mainWindowOptions() application.WebviewWindowOptions {
 	return application.WebviewWindowOptions{
-		Name:                       "main",
+		Name:                       mainWindowName,
 		Title:                      windowTitle,
 		Width:                      windowWidth,
 		Height:                     windowHeight,

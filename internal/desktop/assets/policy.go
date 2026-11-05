@@ -14,9 +14,21 @@ import (
 const permissionsPolicy = "fullscreen=(self), picture-in-picture=(self), autoplay=(self), display-capture=(), " +
 	"camera=(), microphone=(), geolocation=(), usb=(), payment=()"
 
-// setHTMLHeaders sets the headers of §5.3 on an HTML response.
+// htmlSandbox is the header policy's sandbox directive (§5.3, §5.5 layer 2, W5's fallback): without allow-popups the
+// page and its frames can't open a window, whichever way (window.open, target=_blank, a modified click), which the
+// pinned Wails gives Go no way to cancel. allow-same-origin keeps the asset origin (its storage and the Guard's Origin
+// check), allow-scripts the SPA, and allow-forms the submit event the SPA's forms handle themselves (form-action
+// 'none' still refuses every real submission). No allow-modals, allow-downloads or allow-top-navigation*: the SPA
+// uses none of them. Only in the header: browsers ignore sandbox in a <meta> policy and log an error.
+const htmlSandbox = "sandbox allow-scripts allow-same-origin allow-forms"
+
+// headerPolicy is the Content-Security-Policy header of an HTML response: the page's policy (its <meta> too) with
+// htmlSandbox.
+func headerPolicy(csp string) string { return csp + "; " + htmlSandbox }
+
+// setHTMLHeaders sets the headers of §5.3 on an HTML response; csp is the policy without htmlSandbox.
 func setHTMLHeaders(h http.Header, csp string) {
-	h.Set("Content-Security-Policy", csp)
+	h.Set("Content-Security-Policy", headerPolicy(csp))
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")

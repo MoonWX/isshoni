@@ -17,7 +17,8 @@ import (
 // removing one, Sign out, the auth.state event, and the approval page of a new link code in the browser. Every
 // change of the active server reloads the window once (03 §8.1), so a page only ever runs with the bridge.js, CSP
 // and token origin of the active server; the page puts the address it wants to come back at into its own history
-// first (Shell.Reload reloads the window's current address).
+// first (Shell.Reload reloads the window's current address, which is the SPA's: a window off the asset origin gets
+// the start page).
 
 // ErrNotFound is a server origin the list doesn't have (the bridge's not_found).
 var ErrNotFound = errors.New("app: no such server")

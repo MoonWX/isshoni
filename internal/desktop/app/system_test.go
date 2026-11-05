@@ -924,6 +924,42 @@ func TestWatchdog(t *testing.T) {
 	}
 }
 
+// homeRecShell is a shell that can load the start page (the app's homeShell), as the Wails shell does.
+type homeRecShell struct{ *sysShell }
+
+func (s *homeRecShell) ReturnHome() { s.record("home") }
+
+// TestWatchdogReturnsHome: a reload that brings no beat back is followed by the start page, through a shell that can
+// load it (W5's and W17's fallbacks: Wails' Reload runs in the page); a beat starts over with a reload.
+func TestWatchdogReturnsHome(t *testing.T) {
+	s := newSysEnv(t)
+	s.app.d.Shell = &homeRecShell{sysShell: s.shell}
+	count := s.env.shell.count
+	s.app.watchdogTick() // shown
+	s.app.Heartbeat()
+	s.clock.Advance(HeartbeatTimeout + time.Second)
+	s.app.watchdogTick()
+	if count("reload") != 1 || count("home") != 0 {
+		t.Fatalf("first miss: %d reloads, %d homes", count("reload"), count("home"))
+	}
+	s.clock.Advance(HeartbeatTimeout + time.Second)
+	s.app.watchdogTick()
+	if count("reload") != 1 || count("home") != 1 {
+		t.Fatalf("second miss: %d reloads, %d homes", count("reload"), count("home"))
+	}
+	s.clock.Advance(HeartbeatTimeout + time.Second)
+	s.app.watchdogTick()
+	if count("home") != 2 {
+		t.Fatalf("third miss: %d homes", count("home"))
+	}
+	s.app.Heartbeat()
+	s.clock.Advance(HeartbeatTimeout + time.Second)
+	s.app.watchdogTick()
+	if count("reload") != 2 || count("home") != 2 {
+		t.Fatalf("a miss after a beat: %d reloads, %d homes", count("reload"), count("home"))
+	}
+}
+
 // TestOpenPaths: OpenLogsFolder and OpenNotices need their path and the OS's opener; failures are ErrIO.
 func TestOpenPaths(t *testing.T) {
 	s := newSysEnv(t)
