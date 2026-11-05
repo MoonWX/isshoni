@@ -1799,6 +1799,12 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\isshoni'
           $utf8 = New-Object Text.UTF8Encoding($false)
           if (Test-Path -LiteralPath $installDir) { throw "$installDir exists before the test (left by an earlier step?)" }
+          # Anything named isshoni.exe before this step was left by an earlier one: name it here, so the cleanup below
+          # blames only what this step left.
+          $earlier = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'")
+          if ($earlier.Count -gt 0) {
+            throw "isshoni.exe runs before the updater e2e (left by an earlier step): $(($earlier | ForEach-Object { "$($_.ProcessId) $($_.ExecutablePath)" }) -join '; ')"
+          }
 
           $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
           $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/.build/uninst/uninstall.exe'

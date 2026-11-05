@@ -3057,6 +3057,12 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\isshoni'
           $utf8 = New-Object Text.UTF8Encoding($false)
           if (Test-Path -LiteralPath $installDir) { throw "$installDir exists before the test (left by an earlier step?)" }
+          # Anything named isshoni.exe before this step was left by an earlier one: name it here, so the cleanup below
+          # blames only what this step left.
+          $earlier = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'")
+          if ($earlier.Count -gt 0) {
+            throw "isshoni.exe runs before the updater e2e (left by an earlier step): $(($earlier | ForEach-Object { "$($_.ProcessId) $($_.ExecutablePath)" }) -join '; ')"
+          }
 
           $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/stage'
           $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'dist-desktop/.build/uninst/uninstall.exe'
@@ -3204,7 +3210,7 @@ jobs:
           if ($outlived.Count -gt 0) { throw "the updater e2e outlived itself: $($outlived -join '; ')" }
 
       - name: The autostart round trip after the updater e2e (TestAutostartRoundTrip again)
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.update-e2e.outcome != 'skipped' && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
         run: |
           # The same test, as strict, in its original place: after the updater e2e (when that step ran), where PR #56's
           # first run failed. When the run before the updater e2e passed, a failure here points at what that step

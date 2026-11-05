@@ -148,8 +148,9 @@ func TestAutostartRoundTrip(t *testing.T) {
 		fail("the second launch: %v", err)
 	}
 	// Step 3 logs a forward that failed (or a lock it couldn't take) and still exits 0.
+	// Only step 2a's handover lines mean no forward; "couldn't tell whether an installer runs" goes on to forward.
 	for _, msg := range []string{"didn't take this start's arguments", "single instance unavailable",
-		"an installer runs"} {
+		"desktop: an installer runs;", "desktop: an installer runs and"} {
 		if strings.Contains(secondErr.String(), msg) {
 			fail("the second launch didn't forward to the first instance (%q)", msg)
 		}
