@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -114,29 +113,23 @@ func childCmd(t *testing.T, role, id, out string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// TestSingleInstanceNamesOfThisSession: NewSingleInstance names the mutex and the pipe after this process's user and
-// session (03 §13.3; README WF19), the session read here from the token (TokenSessionId) rather than as the code reads
-// it (ProcessIdToSessionId), and the serving pipe has that name below \\.\pipe\.
-func TestSingleInstanceNamesOfThisSession(t *testing.T) {
-	tok := windows.GetCurrentProcessToken()
-	u, err := tok.GetTokenUser()
+// TestSingleInstanceNamesOfThisUser: NewSingleInstance names the mutex and the pipe after this process's user (03
+// §13.3; README WF19), the mutex in the namespace every session shares, and the serving pipe has that name below
+// \\.\pipe\ while the mutex exists by its name.
+func TestSingleInstanceNamesOfThisUser(t *testing.T) {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		t.Fatal(err)
-	}
-	var session, n uint32
-	if err := windows.GetTokenInformation(tok, windows.TokenSessionId, (*byte)(unsafe.Pointer(&session)),
-		uint32(unsafe.Sizeof(session)), &n); err != nil {
-		t.Fatalf("TokenSessionId: %v", err)
 	}
 	id := randomID(t)
 	si, err := NewSingleInstance(id, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `Local\` + id + ".v1"; si.mutexName != want {
+	if want := `Global\` + id + ".v1." + u.User.Sid.String(); si.mutexName != want {
 		t.Errorf("mutex %q, want %q", si.mutexName, want)
 	}
-	want := fmt.Sprintf(`\\.\pipe\%s.v1.%s.%d`, id, u.User.Sid.String(), session)
+	want := `\\.\pipe\` + id + ".v1." + u.User.Sid.String()
 	if si.pipeName != want {
 		t.Errorf("pipe %q, want %q", si.pipeName, want)
 	}
@@ -144,6 +137,9 @@ func TestSingleInstanceNamesOfThisSession(t *testing.T) {
 		t.Fatalf("Acquire: %v %v", first, err)
 	}
 	t.Cleanup(func() { _ = si.Close() })
+	if ok, err := MutexExists(si.mutexName); !ok || err != nil {
+		t.Errorf("MutexExists(%q) while held: %v %v", si.mutexName, ok, err)
+	}
 	if err := si.Serve(func([]string) {}); err != nil {
 		t.Fatal(err)
 	}

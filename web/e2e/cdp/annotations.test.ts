@@ -1,5 +1,7 @@
 // The CDP spec's reporter (annotations.ts) on fake results: one stdout line per annotation, the Markdown table in
-// annotations.md and the job summary. Runs on any OS: node --test e2e/cdp/annotations.node.test.ts (from web/).
+// annotations.md and the job summary. Runs on any OS: node --test e2e/cdp/annotations.test.ts (from web/), in CI's
+// web job and in task test:web. Not a Vitest file: Vitest covers src/ and build/ only, and *.node.test.ts names
+// Vitest files of the node environment here.
 // node:test's describe and it return promises that its runner awaits itself, hence the voids.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

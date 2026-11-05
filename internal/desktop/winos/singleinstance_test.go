@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"os"
+	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -222,32 +225,53 @@ func receive(t *testing.T, got <-chan []string, want ...string) {
 	}
 }
 
-// TestSingleInstanceNames: the mutex and the pipe have the same scope, one user session (03 §13.3; README WF19). The
-// mutex is Local\ (the session's namespace) and the pipe, in the namespace all sessions share, carries the user's SID
-// and the session id, so two sessions of one user get two pipes and two users in one session two as well.
+// ciPipePattern is the PowerShell -like pattern by which the windows-desktop jobs' cleanup (ci.yml) and windows-full's
+// (nightly.yml) find the single-instance pipes below \\.\pipe\; TestSingleInstanceNames reads it from both files.
+const ciPipePattern = `*io.isshoni.desktop.*`
+
+// ciPipeLike matches the cleanup's pipe filter: GetFiles('\\.\pipe\') piped into Where-Object { $_ -like '<pattern>' }.
+var ciPipeLike = regexp.MustCompile(`GetFiles\('\\\\\.\\pipe\\'\) \| Where-Object \{ \$_ -like '([^']*)' \}`)
+
+// TestSingleInstanceNames: the mutex and the pipe have the same scope, the user (03 §13.3; README WF19). Both are in
+// a namespace every session shares (Global\ and \\.\pipe\) and carry the user's SID, so each user gets one pair and
+// two users two. The workflows' cleanup pattern still matches the pipe.
 func TestSingleInstanceNames(t *testing.T) {
 	const sid = "S-1-5-21-1004336348-1177238915-682003330-1001"
-	mutex, pipe := singleInstanceNames(InstanceID, sid, 1)
-	if want := `Local\io.isshoni.desktop.v1`; mutex != want {
+	mutex, pipe := singleInstanceNames(InstanceID, sid)
+	if want := `Global\io.isshoni.desktop.v1.` + sid; mutex != want {
 		t.Errorf("mutex %q, want %q", mutex, want)
 	}
-	if want := `\\.\pipe\io.isshoni.desktop.v1.` + sid + ".1"; pipe != want {
+	if want := `\\.\pipe\io.isshoni.desktop.v1.` + sid; pipe != want {
 		t.Errorf("pipe %q, want %q", pipe, want)
 	}
-	_, other := singleInstanceNames(InstanceID, sid, 4294967295)
-	if want := `\\.\pipe\io.isshoni.desktop.v1.` + sid + ".4294967295"; other != want {
-		t.Errorf("pipe %q, want %q", other, want)
+	otherMutex, otherPipe := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002")
+	if otherMutex == mutex || otherPipe == pipe {
+		t.Errorf("two users share the mutex %q or the pipe %q", mutex, pipe)
 	}
-	_, otherUser := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002", 1)
-	if m, _ := singleInstanceNames(InstanceID, "S-1-5-21-1-2-3-1002", 4); m != mutex {
-		t.Errorf("the mutex depends on the session or the user: %q", m)
+	if tm, tp := singleInstanceNames("io.isshoni.test-1", sid); tm == mutex || tp == pipe {
+		t.Errorf("another id shares the mutex %q or the pipe %q", tm, tp)
 	}
-	if other == pipe || otherUser == pipe {
-		t.Errorf("two sessions or two users share the pipe %q", pipe)
+
+	// The cleanup's pattern, as PowerShell's -like applies it to GetFiles' full names (no '/' in them, so path.Match's
+	// '*' is -like's): it must be ciPipePattern in both workflows and match the pipe.
+	for _, wf := range []string{"../../../.github/workflows/ci.yml", "../../../.github/workflows/nightly.yml"} {
+		data, err := os.ReadFile(wf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := ciPipeLike.FindAllStringSubmatch(string(data), -1)
+		if len(m) != 1 {
+			t.Errorf("%s: %d single-instance pipe filters, want 1", wf, len(m))
+			continue
+		}
+		if m[0][1] != ciPipePattern {
+			t.Errorf("%s: the pipe filter is %q, want %q", wf, m[0][1], ciPipePattern)
+		}
 	}
-	// The CI cleanup's pattern (ci.yml and nightly.yml's windows-desktop) still matches the name below \\.\pipe\.
-	if !strings.Contains(strings.TrimPrefix(pipe, `\\.\pipe\`), "io.isshoni.desktop.") {
-		t.Errorf("pipe %q no longer matches *io.isshoni.desktop.*", pipe)
+	for _, p := range []string{pipe, otherPipe} {
+		if ok, err := path.Match(ciPipePattern, p); !ok || err != nil {
+			t.Errorf("%q doesn't match the cleanup's %q: %v", p, ciPipePattern, err)
+		}
 	}
 }
 

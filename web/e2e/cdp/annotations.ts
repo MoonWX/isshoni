@@ -5,7 +5,8 @@
 // outputDir (which windows-desktop uploads as cdp-test-results, passed or failed) and, when GITHUB_STEP_SUMMARY is
 // set, are appended to that file, the job summary. Annotations of other types (skip, fixme, …) are left out.
 //
-// The formatting is plain functions, tested on fake results by annotations.node.test.ts (node --test).
+// The formatting is plain functions, tested on fake results by annotations.test.ts (node --test, in CI's web job
+// and in task test:web).
 import fs from 'node:fs';
 import path from 'node:path';
 

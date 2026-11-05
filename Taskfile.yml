@@ -263,7 +263,7 @@ tasks:
       - go -C tools test -race -count=1 -timeout 15m ./...
 
   test:web:
-    desc: Run the web unit tests (Vitest, and Node's test runner for the license script's tests)
+    desc: Run the web unit tests (Vitest, and Node's test runner for the license script's and the CDP reporter's tests)
     cmds:
       - cmd: "echo 'test:web: skipped, web/package.json does not exist yet'"
         silent: true
@@ -273,6 +273,9 @@ tasks:
       # Vitest covers src/ and build/ only; CI runs this file in its licenses job.
       - cmd: cd web && node --test scripts/licenses.test.mjs
         if: '[ -f web/scripts/licenses.test.mjs ]'
+      # The CDP spec's reporter (M2 03 §22.4 B); CI runs it in its web job.
+      - cmd: cd web && node --test e2e/cdp/annotations.test.ts
+        if: '[ -f web/e2e/cdp/annotations.test.ts ]'
 
   test:sh:
     desc: >-

@@ -55,11 +55,7 @@ func NewSingleInstance(id string, log *slog.Logger) (*SingleInstance, error) {
 		return nil, fmt.Errorf("winos: the user's SID: %w", err)
 	}
 	sid := u.User.Sid.String()
-	var session uint32
-	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil {
-		return nil, fmt.Errorf("winos: the session id: %w", err)
-	}
-	mutex, pipe := singleInstanceNames(id, sid, session)
+	mutex, pipe := singleInstanceNames(id, sid)
 	return &SingleInstance{
 		mutexName: mutex,
 		pipeName:  pipe,
@@ -68,8 +64,8 @@ func NewSingleInstance(id string, log *slog.Logger) (*SingleInstance, error) {
 	}, nil
 }
 
-// Acquire takes the lock: first is true when no other instance of this user session holds it. A second instance
-// calls Forward and exits.
+// Acquire takes the lock: first is true when no other instance of this user, in any of the user's sessions, holds it.
+// A second instance calls Forward and exits.
 func (s *SingleInstance) Acquire() (first bool, err error) {
 	name, err := windows.UTF16PtrFromString(s.mutexName)
 	if err != nil {
