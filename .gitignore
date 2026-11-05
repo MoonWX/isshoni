@@ -41,3 +41,6 @@ docs/.vitepress/release.json
 .DS_Store
 *.swp
 .claude/worktrees/
+
+# a local `go build ./internal/desktop/e2ehost` at the repo root
+/e2ehost

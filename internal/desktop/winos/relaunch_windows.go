@@ -19,8 +19,9 @@ import (
 // true: the caller exits 0. It reports false, nil when no relaunch is needed: args start with RelaunchedFlag, the
 // parent is gone or its PID was reused (it was created after this process), or it is Explorer or a launcher. Any
 // failure (ErrNoShell without a shell window, errShellElsewhere for a shell in another session or of another user,
-// access denied, CreateProcessW) is false with the error, and the start goes on in place (the caller logs a WARN). The caller skips it while the running mutex exists (this start only
-// forwards). Nothing names an exe in its errors or logs (README §4 "Logging").
+// access denied, CreateProcessW) is false with the error, and the start goes on in place (the caller logs a WARN).
+// The caller skips it while the running mutex exists (this start only forwards). Nothing names an exe in its errors
+// or logs (README §4 "Logging").
 func RelaunchUnderShell(args []string) (bool, error) {
 	if len(args) > 0 && args[0] == RelaunchedFlag {
 		return false, nil
