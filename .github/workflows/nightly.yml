@@ -2102,6 +2102,11 @@ jobs:
     # snapshot's version is windows-full's, 0.0.0-nightly.<run>. It runs when windows-full uploaded those files, also
     # when a later check of windows-full failed.
     #
+    # On a night when windows-full uploaded no desktop files (web, windows-full-native or an early step of
+    # windows-full failed), the server half is still checked (every independent failure in one round, 06 §10.1):
+    # release:desktop-stubs writes the ISSHONI-DESKTOP-STUB stand-ins (with the desktop SBOM), release:assets runs
+    # FULL=true DESKTOP_STUBS=true, and the job's last step fails it, because there were no real desktop files.
+    #
     # Not signed (--skip=sign): cosign's keyless signature needs the job's OIDC token, which this job does not
     # get, because it also runs npm (release.yml keeps the two apart, 06 §9.3), and a nightly snapshot needs no
     # signature in the public transparency log. The asset check therefore gets an empty stand-in for the one asset
@@ -2114,14 +2119,16 @@ jobs:
     env:
       ISSHONI_SNAPSHOT_VERSION: 0.0.0-nightly.${{ github.run_number }}
     steps:
-      - name: windows-full made the desktop files
+      - name: Did windows-full make the desktop files
+        id: desktop
         env:
           DESKTOP_FILES: ${{ needs.windows-full.outputs.desktop-files }}
           WINDOWS_FULL: ${{ needs.windows-full.result }}
         run: |
-          if [ "$DESKTOP_FILES" != true ]; then
-            echo "::error::windows-full ($WINDOWS_FULL) uploaded no desktop files, so there is no snapshot with real desktop files to check"
-            exit 1
+          real=$([ "$DESKTOP_FILES" = true ] && echo true || echo false)
+          echo "real=$real" >> "$GITHUB_OUTPUT"
+          if [ "$real" != true ]; then
+            echo "::warning::windows-full ($WINDOWS_FULL) uploaded no desktop files: the server half is checked over desktop stubs, and the job fails at its end"
           fi
 
       - name: Check out
@@ -2130,18 +2137,21 @@ jobs:
           persist-credentials: false
 
       - name: Download desktop-release (into dist-desktop/)
+        if: steps.desktop.outputs.real == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: desktop-release
           path: dist-desktop
 
       - name: Download desktop-stage (into dist-desktop/stage/)
+        if: steps.desktop.outputs.real == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: desktop-stage
           path: dist-desktop/stage
 
       - name: Keep windows-full's install-desktop.ps1 for release:assets
+        if: steps.desktop.outputs.real == 'true'
         # goreleaser's before hook (task release:prepare) stamps dist-desktop/install-desktop.ps1 again from
         # deploy/install-desktop.ps1; release:assets then compares the two copies (M2 06 §11.2).
         run: |
@@ -2211,6 +2221,7 @@ jobs:
           .bin/goreleaser --version
 
       - name: The SBOM of the desktop app's install tree (syft over the stage)
+        if: steps.desktop.outputs.real == 'true'
         # M2 06 §2.1: isshoni-desktop_<v>_windows_amd64.sbom.json, SPDX JSON, from desktop-stage, the tree the
         # installer packs, as release.yml's build job writes it.
         run: |
@@ -2237,6 +2248,11 @@ jobs:
       - name: The web app for ${{ env.ISSHONI_SNAPSHOT_VERSION }}
         run: task build:web VERSION="$ISSHONI_SNAPSHOT_VERSION"
 
+      - name: Desktop stubs (windows-full made no desktop files)
+        # The stand-ins .goreleaser.yaml's desktop globs need, the desktop SBOM among them (release:desktop-stubs).
+        if: steps.desktop.outputs.real != 'true'
+        run: task release:desktop-stubs VERSION="$ISSHONI_SNAPSHOT_VERSION"
+
       - name: goreleaser check
         run: .bin/goreleaser check
 
@@ -2245,16 +2261,23 @@ jobs:
         # install-desktop.ps1). dist-desktop/ holds windows-full's desktop files, which the config's extra_files take.
         run: PATH="$PWD/.bin:$PATH" .bin/goreleaser release --snapshot --clean --skip=sign
 
-      - name: task release:assets FULL=true DESKTOP=true (the assets of 06 §3 and M2 06 §2.1; the cosign bundle is a stand-in)
+      - name: task release:assets FULL=true, DESKTOP=true or DESKTOP_STUBS=true (the assets of 06 §3 and M2 06 §2.1; the cosign bundle is a stand-in)
+        env:
+          REAL_DESKTOP: ${{ steps.desktop.outputs.real }}
         run: |
           # The one difference from a release: this run does not sign (see the job's comment). release:assets only
           # checks that the cosign bundle exists, and checksums.txt does not list it, so an empty stand-in lets
           # every other check gate unchanged: any failure of the task fails this step. DESKTOP=true refuses a
-          # desktop stub and checks the desktop files themselves; PKG_PS1 is windows-full's stamped copy.
+          # desktop stub and checks the desktop files themselves; PKG_PS1 is windows-full's stamped copy. Without
+          # real desktop files, DESKTOP_STUBS=true accepts release:desktop-stubs' stand-ins (the job fails at its end).
           trap 'rm -f dist/checksums.txt.sigstore.json' EXIT
           : > dist/checksums.txt.sigstore.json
-          task release:assets VERSION="$ISSHONI_SNAPSHOT_VERSION" FULL=true DESKTOP=true \
-            PKG_PS1="$RUNNER_TEMP/desktop-pkg/install-desktop.ps1"
+          if [ "$REAL_DESKTOP" = true ]; then
+            task release:assets VERSION="$ISSHONI_SNAPSHOT_VERSION" FULL=true DESKTOP=true \
+              PKG_PS1="$RUNNER_TEMP/desktop-pkg/install-desktop.ps1"
+          else
+            task release:assets VERSION="$ISSHONI_SNAPSHOT_VERSION" FULL=true DESKTOP_STUBS=true
+          fi
 
       - name: The SBOMs describe the archives
         run: |
@@ -2301,6 +2324,15 @@ jobs:
           for arch in amd64 arm64; do
             docker image rm "ghcr.io/moonwx/isshoni:$ISSHONI_SNAPSHOT_VERSION-$arch" > /dev/null 2>&1 || true
           done
+
+      - name: The snapshot had real desktop files
+        # The server half was checked above; a snapshot over stubs is not the full release build (M2 06 §10.3).
+        if: ${{ !cancelled() && steps.desktop.outputs.real != 'true' }}
+        env:
+          WINDOWS_FULL: ${{ needs.windows-full.result }}
+        run: |
+          echo "::error::windows-full ($WINDOWS_FULL) uploaded no desktop files, so the snapshot was checked over desktop stubs only"
+          exit 1
 
   compat-servers:
     # The client core against the last two final server releases (M2 06 §10.3, §11.6): this commit's app talks to
