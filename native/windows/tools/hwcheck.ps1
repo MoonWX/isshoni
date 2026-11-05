@@ -15,7 +15,8 @@ and the FFmpeg DLLs, flat) in this order, each step in a folder of its own:
      <= 16 ms (04 section 18.4 asks for encode p99 <= 16 ms; bench reports the stats' p95 only, which is a necessary
      condition, so the summary says "p95");
   4. sessions -count 5 (every session starts; fallbacks allowed);
-  5. protect-check (the pattern is absent while protected, present after).
+  5. protect-check -wgc off (the pattern is absent while protected, present after; Desktop Duplication only, as
+     the WGC half waits on the OS picker and runs as its own interactive step: isshoni-enginetest protect-check).
 
 soak -hours 2 and avsync run separately (04 section 18.4, 05 section 19.3).
 
@@ -294,8 +295,8 @@ Test-Bench -Step $bench
 # 4. sessions -count 5.
 $null = Invoke-EngineTest -Name 'sessions' -Arguments @('sessions', '-count', '5') -LimitSeconds $script:LimitShort
 
-# 5. protect-check.
-$null = Invoke-EngineTest -Name 'protect-check' -Arguments @('protect-check') -LimitSeconds $script:LimitShort
+# 5. protect-check: unattended, so without the WGC half (its default -wgc pick waits on the OS picker).
+$null = Invoke-EngineTest -Name 'protect-check' -Arguments @('protect-check', '-wgc', 'off') -LimitSeconds $script:LimitShort
 
 # The streams stay on the PC; the access-unit fixtures (aus\) are small and go with the reports.
 Get-ChildItem -LiteralPath $script:Work -Recurse -File | Where-Object { $_.Extension -in @('.h264', '.ogg') -and $_.Directory.Name -ne 'aus' -and $_.Directory.Parent.Name -ne 'aus' } |

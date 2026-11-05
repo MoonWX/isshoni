@@ -230,11 +230,9 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
   }, [bridge, finish, firstAudioStep]);
   /** The voice step's Done: the steps were seen (wizardDone), then the end. */
   const audioDone = (): void => {
-    // SettingsPatch's wizardDone (Go's bridge.SettingsPatch has it; bridge.ts's type gets it with a later change of
-    // platform/desktop, so it goes through as a plain object here).
-    const patch: Record<string, unknown> = { wizardDone: true };
+    const patch: SettingsPatch = { wizardDone: true };
     bridge.settings
-      .update(patch as SettingsPatch)
+      .update(patch)
       .catch(() => undefined)
       .finally(finish);
   };

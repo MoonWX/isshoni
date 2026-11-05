@@ -330,6 +330,8 @@ export interface SettingsView {
 
 /** Every field optional; only these are accepted (docs/m2/03 §14.2). */
 export interface SettingsPatch {
+  /** Only ever set: the wizard's sound and voice steps were seen (docs/m2/03 §8.2). */
+  wizardDone?: true;
   closeToTray?: boolean;
   autostart?: boolean;
   hideFromCapture?: boolean;

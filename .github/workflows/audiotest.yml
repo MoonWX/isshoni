@@ -572,20 +572,13 @@ jobs:
           $script = Join-Path $hw 'hwcheck.ps1'
           if (-not (Test-Path -LiteralPath $script)) { throw 'the tools have no hwcheck.ps1 (README WA76 adds it to native:dist)' }
 
-          # The contract with hwcheck.ps1 (04 section 14; WA76 writes the script): no arguments, a result zip in the
-          # current folder, no machine names or paths in it. 04 section 14 names no output argument and WA76 isn't on
-          # this base yet, so the zip next to the script is accepted too. At integration with WA76, pass its
-          # documented output argument here explicitly and drop that fallback.
+          # hwcheck.ps1 (04 section 14; README WA76) writes its bundle, hwcheck-<time>.zip, into -Out, with no
+          # machine names or paths in it.
           Set-Location -LiteralPath $bundle
-          $start = Get-Date
           $ErrorActionPreference = 'Continue'
-          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script -Out $bundle
           $code = $LASTEXITCODE
           $ErrorActionPreference = 'Stop'
-          # A bundle hwcheck.ps1 wrote next to itself instead counts too.
-          Get-ChildItem -LiteralPath $hw -Filter '*.zip' -File |
-            Where-Object { $_.Name -ne 'isshoni-native-tools.zip' -and $_.LastWriteTime -ge $start } |
-            ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $bundle }
           $files = @(Get-ChildItem -LiteralPath $bundle -Filter '*.zip' -File)
           $lines = @("### hwcheck: $env:TARGET_OS", '', "hwcheck.ps1 exit code $code", '')
           foreach ($f in $files) { $lines += "- $($f.Name) ($($f.Length) bytes)" }

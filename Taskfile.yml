@@ -881,7 +881,7 @@ tasks:
       the engine DLLs in NATIVE_DIR (on the Mac with Homebrew's makensis and a plain WriteUninstaller; never
       released, docs/m2/06 §5.4, §6)
     # 06 §5.4, §6, §9.2: isshoni.exe (desktop:exe:windows, unless SKIP_EXE=true), the desktop THIRD_PARTY_NOTICES
-    # (tools/notices for cmd/isshoni-desktop on windows; README WA78 adds the native section and its gate), the stage
+    # (tools/notices for cmd/isshoni-desktop on windows, with the native section and its gate, 06 §9), the stage
     # (`desktoppkg stage`, -release with RELEASE=true), the installer (`desktoppkg nsis`: makensis -WX), then
     # `desktoppkg check` (the strings rule, the stage's binaries, the size budget). Variables:
     #   NATIVE_DIR=<dir>           isshoni-media.dll, the FFmpeg DLLs that native/ffmpeg/lock.json names and
@@ -930,7 +930,8 @@ tasks:
           build='{{.ROOT_DIR}}/dist-desktop/.build'
           mkdir -p "$build"
           go -C tools run ./notices -root .. -pkg ./cmd/isshoni-desktop -goos windows -goarch amd64 \
-            -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt -version "$v" \
+            -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt \
+            -native ../deploy/notices/native-windows.json -native-root "$native" -version "$v" \
             -o "$build/THIRD_PARTY_NOTICES-desktop"
           release=
           if [ '{{.RELEASE}}' = true ]; then release=-release; fi
