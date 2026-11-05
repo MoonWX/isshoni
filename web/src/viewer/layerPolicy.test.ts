@@ -92,4 +92,16 @@ describe('desiredSubscriptions', () => {
       audio: 'off',
     });
   });
+
+  it('rule 9 (M2): a tab handed off to the desktop app subscribes to nothing, PiP and local shares included', () => {
+    // docs/m2/03 §12.2: "Now watching in the isshoni app".
+    expect(wants({ handedOff: true })).toEqual(['s_a off/off', 's_b off/off', 's_c off/off']);
+    expect(wants({ handedOff: true, pip: 's_b', localShares: ['s_own'], visible: { s_own: true } })).toEqual([
+      's_a off/off',
+      's_b off/off',
+      's_c off/off',
+      's_own off/off',
+    ]);
+    expect(wants({ handedOff: false })).toEqual(wants());
+  });
 });

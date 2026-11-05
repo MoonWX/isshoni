@@ -26,6 +26,7 @@ import {
   RateLimitMinWaitMs,
   ReconnectCloseCode,
   SignalClient,
+  WebHelloFeatures,
   type SignalClientOptions,
   type SignalState,
   type SignalStateInfo,
@@ -150,6 +151,27 @@ describe('handshake', () => {
   it('sends features: [] when none are given', async () => {
     await readyClient();
     expect(server.hellos[0]?.features).toEqual([]);
+  });
+
+  it("featureActive follows the last welcome's features: none before it, kept through a drop, cleared by stop()", async () => {
+    const c = makeClient({ features: [...WebHelloFeatures] });
+    expect(c.featureActive(P.FeatureAgentRelay)).toBe(false);
+    server.welcomeDefaults = { features: [P.FeatureAgentRelay] };
+    c.start();
+    await tick();
+    expect(server.hellos[0]?.features).toEqual([P.FeatureAgentRelay, P.FeatureUserConnections]);
+    expect(c.featureActive(P.FeatureAgentRelay)).toBe(true);
+    // Asked for, but the server left it out (an older server): not active.
+    expect(c.featureActive(P.FeatureUserConnections)).toBe(false);
+    server.drop();
+    expect(c.featureActive(P.FeatureAgentRelay)).toBe(true);
+    c.stop();
+    c.start();
+    expect(c.featureActive(P.FeatureAgentRelay)).toBe(false);
+  });
+
+  it('asks for agent.relay and user.connections as the web client (docs/m2/03 §7.6)', () => {
+    expect(WebHelloFeatures).toEqual(['agent.relay', 'user.connections']);
   });
 
   it('re-reads caps on every (re)connect', async () => {

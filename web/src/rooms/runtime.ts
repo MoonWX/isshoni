@@ -28,7 +28,13 @@
 //   ready, whenever it says its share or connections changed (platform.sharing.onChange: its chunk and Go's answers
 //   can come after the room's snapshot, and a quiet room sends no other), with every room.state and when the desired
 //   room changes. platform.sharing.localConnectionIds() (C2) goes to the viewer, which counts that connection's
-//   shares as this page's, again on every such change (connectViewer.ts).
+//   shares as this page's, again on every such change (connectViewer.ts);
+// - the handoff (docs/m2/03 §12.2, handoff.ts): the user's own connections (user.connections), the desktop app's
+//   playback.stop when it is brought into a room, the tabs' "Now watching in the isshoni app" and their
+//   playback.state; it lives here, with the viewer it reads and writes, so it holds on every page;
+// - the endpoint mute of the desktop app (docs/m2/03 §12.1, viewer/endpointMute.ts): while its share uses 05's
+//   endpoint engine nothing is heard, also while the room page isn't mounted (the audible share keeps playing
+//   there, 05 §11.1).
 import type { AppServices } from '../app/context';
 import type { UiStore } from '../app/uiStore';
 import { addLogoutStep } from '../auth/logout';
@@ -40,10 +46,12 @@ import { ApiError } from '../protocol/rest';
 import type { ActiveShare, Platform } from '../platform/types';
 import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeInvalidate, type RoomState } from '../protocol/types.gen';
+import { attachEndpointMute } from '../viewer/endpointMute';
 import { createViewer, type ViewerServices } from '../viewer/services';
 import { createConnection, createConnectionStore, type Stores } from './connection';
 import { connectStats } from './connectStats';
 import { connectViewer } from './connectViewer';
+import { attachHandoff, type Handoff } from './handoff';
 import { lazySubscriber } from './lazySubscriber';
 import { loadRoomMedia } from './loadMedia';
 import { RoomSession, type SessionMedia } from './RoomSession';
@@ -58,6 +66,8 @@ export interface RoomRuntime {
    * gives its ViewerLayout, and what the session's sub PC writes.
    */
   readonly viewer: ViewerServices;
+  /** The handoff (handoff.ts): the user's own connections, playback.stop and playback.state. */
+  readonly handoff: Handoff;
   /** Connects, unless the client already runs: the first room page calls it, and so does one after a new login. */
   start(): void;
   /** Signing out: stops the client (close 1000) and leaves the room locally. A later start() connects anew. */
@@ -124,6 +134,16 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     onLocalChange,
   });
   const offAdopt = followPlatformShare(platform, session, stores.room);
+  const handoff = attachHandoff({
+    platform,
+    signal,
+    session,
+    room: stores.room,
+    viewer: viewer.store,
+    log: log.child('handoff'),
+  });
+  const bridge = platform.desktop?.bridge;
+  const offEndpointMute = bridge !== undefined ? attachEndpointMute(viewer.store, bridge) : () => undefined;
   const offStats = connectStats({
     viewer,
     room: stores.room,
@@ -187,12 +207,15 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     session,
     stores,
     viewer,
+    handoff,
     start() {
       signal.start();
     },
     stop,
     dispose() {
       offAdopt();
+      handoff.dispose();
+      offEndpointMute();
       offStats();
       offViewer();
       offLogoutShares();

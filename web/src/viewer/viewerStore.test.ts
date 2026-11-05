@@ -657,8 +657,10 @@ describe('viewerStore: actions', () => {
     store.getState().setVideoBlocked(true);
     store.getState().setMedia('connected');
     store.getState().setPageHidden(99);
+    store.getState().setHandedOff(true);
 
     expect(store.getState().inRoom).toBe(true);
+    expect(store.getState().handedOff).toBe(true);
     store.getState().reset();
     expect(store.getState()).toMatchObject({
       shares: [],
@@ -673,6 +675,8 @@ describe('viewerStore: actions', () => {
       visible: {},
       status: {},
       frozen: {},
+      // A room switch ends the handoff (docs/m2/03 §12.2).
+      handedOff: false,
       // The page's own:
       volume: 0.5,
       audio: 'playing',

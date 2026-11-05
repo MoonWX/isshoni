@@ -262,6 +262,33 @@ describe('join', () => {
     expect(room().joinState).toBe('joined');
   });
 
+  it('emits join for a room it asked for, never for a resync nor a join() of the room a welcome is re-joining', async () => {
+    const asked: string[] = [];
+    session().on('join', (roomId) => asked.push(roomId));
+    await inRoom('lounge');
+    expect(asked).toEqual(['lounge']);
+    // The room page mounts again: nothing new.
+    await session().join('lounge');
+    expect(asked).toEqual(['lounge']);
+
+    // A drop the server forgot: the welcome re-joins the room ('joining'), and a room page that mounts meanwhile
+    // asks for the same room. No new ask: the desktop's playback.stop must not go out again (03 §12.2).
+    h.server.restart();
+    await reconnectToHello();
+    h.server.welcome();
+    expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joining' });
+    const again = track(session().join('lounge'));
+    expect(asked).toEqual(['lounge']);
+    await tick();
+    expect(again).toEqual({ done: true, value: undefined });
+    expect(room().joinState).toBe('joined');
+    expect(asked).toEqual(['lounge']);
+
+    // Another room is a new ask.
+    await session().join('games');
+    expect(asked).toEqual(['lounge', 'games']);
+  });
+
   it('a later join() replaces an earlier one: its reply is ignored and its promise resolves', async () => {
     await inRoom('lounge');
     h.hub.names['movies'] = 'Movies';

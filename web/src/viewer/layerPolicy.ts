@@ -15,6 +15,9 @@
 // 8. M2 (docs/m2/03 §12.1, 05 §11.2): while the desktop app shares with 05's `endpoint` engine (audioMuted), every
 //    subscription's audio is `off`: endpoint loopback would send the page's own playback to friends. Video is
 //    unchanged; 05's viewer-muted banner says why.
+// 9. M2 (docs/m2/03 §12.2): a tab handed off to the user's desktop app ("Now watching in the isshoni app",
+//    viewerStore.handedOff) subscribes to nothing: every share {video: off, audio: off}, PiP included, until "Watch
+//    here instead".
 //
 // subscriptions.ts builds the inputs from viewerStore and gives the result to the session's SubscriptionSync, which
 // sends the changes in one subscribe.update (05 §12.3). The rules are written out with this slice (S47), which
@@ -51,6 +54,8 @@ export interface LayerInputs {
   pip: string | null;
   /** M2: rule 8, the desktop app's endpoint share mutes every subscription (viewerStore.audioMutedForShare). */
   audioMuted?: boolean;
+  /** M2: rule 9, the tab was handed off to the desktop app (viewerStore.handedOff). */
+  handedOff?: boolean;
 }
 
 function videoLayer(shareId: string, i: LayerInputs): VideoLayer {
@@ -63,9 +68,17 @@ function videoLayer(shareId: string, i: LayerInputs): VideoLayer {
 
 /**
  * The desired video layer and audio of every remote share, in the order of remoteShares, then of every local share
- * without a preview (rule 7): {shareId, video, audio}.
+ * without a preview (rule 7): {shareId, video, audio}. A handed-off tab gets every one {off, off} (rule 9).
  */
 export function desiredSubscriptions(i: LayerInputs): SubscriptionWant[] {
+  if (i.handedOff === true) {
+    // Rule 9: nothing at all, whatever else the inputs say.
+    return [...i.remoteShares, ...(i.localShares ?? [])].map((shareId) => ({
+      shareId,
+      video: VideoLayerOff,
+      audio: AudioStateOff,
+    }));
+  }
   const remote = i.remoteShares.map((shareId): SubscriptionWant => ({
     shareId,
     video: videoLayer(shareId, i),

@@ -180,3 +180,17 @@
   gap: var(--space-2);
   list-style: none;
 }
+
+/* A tab handed off to the desktop app (docs/m2/03 §12.2): the stage's empty state, a line and Watch here instead. */
+.handedOff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: center;
+  text-align: center;
+}
+
+.handedOffText {
+  margin: 0;
+  font-size: var(--text-lg);
+}

@@ -2,10 +2,10 @@
 // own playback, so while a share is live and 05's FriendsHear.engine is `endpoint`, viewerStore.audioMutedForShare
 // turns every subscription's audio off (layerPolicy's rule 8). It reverts when the engine leaves `endpoint` or the
 // share ends; 05's viewer-muted banner explains it. In the browser there is no bridge and nothing to do.
-import { useEffect } from 'react';
-
+//
+// The room runtime attaches it once per page (rooms/runtime.ts), with the viewer's store, so the mute holds on every
+// page of the app, not only while the room page's viewer is mounted (README §3 item 87's move). No React here.
 import type { FriendsHear, NativeBridge } from '../platform/desktop/bridge';
-import type { Platform } from '../platform/types';
 import type { ViewerStore } from './viewerStore';
 
 /** Whether a FriendsHear mutes the page's viewer. */
@@ -34,10 +34,4 @@ export function attachEndpointMute(store: ViewerStore, bridge: Pick<NativeBridge
     off();
     store.getState().setAudioMutedForShare(false);
   };
-}
-
-/** attachEndpointMute for as long as the component that calls it is mounted, in the desktop app only. */
-export function useEndpointMute(store: ViewerStore, platform: Platform | null): void {
-  const bridge = platform?.desktop?.bridge ?? null;
-  useEffect(() => (bridge === null ? undefined : attachEndpointMute(store, bridge)), [store, bridge]);
 }

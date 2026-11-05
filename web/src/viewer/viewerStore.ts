@@ -152,6 +152,13 @@ export interface ViewerData extends FocusState<ViewerShare> {
    * the browser. It belongs to the page: reset() keeps it.
    */
   readonly audioMutedForShare: boolean;
+  /**
+   * M2 (docs/m2/03 §12.2): "Now watching in the isshoni app". The user's desktop app joined this room and sent
+   * playback.stop (rooms/handoff.ts), so this tab subscribes to nothing (every subscription {video: off, audio: off},
+   * layerPolicy) and the stage offers "Watch here instead", which clears it. The page's own share is untouched. It
+   * ends with a room switch (reset()) or a reload.
+   */
+  readonly handedOff: boolean;
 }
 
 export interface ViewerActions {
@@ -194,10 +201,13 @@ export interface ViewerActions {
   setCodecWait(wait: CodecWait | null): void;
   /** endpointMute.ts: whether the desktop app's endpoint share mutes every subscription (docs/m2/03 §12.1). */
   setAudioMutedForShare(muted: boolean): void;
+  /** rooms/handoff.ts: playback.stop from the user's desktop app (true); "Watch here instead" (false). */
+  setHandedOff(handedOff: boolean): void;
   /**
    * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
-   * no memory of ended shares, `inRoom` false. (fullscreen.ts and pip.ts follow: they leave the browser's
-   * fullscreen and close its PiP window when the store says so.) Call it when the user leaves the room, not for a
+   * no memory of ended shares, `inRoom` false, not handed off (docs/m2/03 §12.2). (fullscreen.ts and pip.ts follow:
+   * they leave the browser's fullscreen and close its PiP window when the store says so.) Call it when the user
+   * leaves the room, not for a
    * reconnect: after a welcome that was not resumed the room's snapshots keep going to syncRoom, so that
    * re-published shares take over (01 §10.6). What belongs to the page stays: the volume, the audio unlock and the
    * refused videos, the sub PC's state (SubscriberPC.close() resets that one), the page's visibility, and the codec
@@ -234,6 +244,7 @@ function initialData(volume: number): ViewerData {
     media: 'idle',
     codecWait: null,
     audioMutedForShare: false,
+    handedOff: false,
   };
 }
 
@@ -457,6 +468,9 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       setAudioMutedForShare(audioMutedForShare) {
         if (get().audioMutedForShare !== audioMutedForShare) set({ audioMutedForShare });
       },
+      setHandedOff(handedOff) {
+        if (get().handedOff !== handedOff) set({ handedOff });
+      },
       setCodecWait(codecWait) {
         const before = get().codecWait;
         if (before === codecWait) return;
@@ -481,6 +495,7 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
           visible: {},
           status: {},
           frozen: {},
+          handedOff: false,
         });
       },
     };
