@@ -802,7 +802,7 @@ slice E1 from these numbers (including 05's audio structs).
 `im_build_info`:
 ```json
 {"engine":"0.4.0","abi":65536,"commit":"0affed6","testHooks":false,"os":"windows","arch":"amd64",
- "compiler":"MSVC 19.44","ffmpeg":{"loaded":true,"dir":".","tag":"deps-ffmpeg-9.0.2-r1","avcodec":"NN.NN.100",
+ "compiler":"MSVC 19.44","ffmpeg":{"loaded":true,"dir":".","tag":"deps-ffmpeg-9.0.2-r2","avcodec":"NN.NN.100",
  "avutil":"NN.NN.100","license":"LGPL version 2.1 or later"},"opus":"libopus 1.5.2",
  "openh264":{"loaded":false,"version":null}}
 ```
