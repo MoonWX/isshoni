@@ -27,7 +27,8 @@
 #   verify-windows as the artifact release-signed.
 # - verify-windows installs the app the way a user does: the released install-desktop.ps1 under Windows PowerShell
 #   5.1 against a mirror of the signed files (tools/relserve), then deploy/test/windows/smoke.ps1 -Mode release and
-#   an uninstall that must leave nothing. It holds no write token either (M2 06 §11.4).
+#   an uninstall that must leave nothing, then isshoni-audiotest selfcheck from isshoni-exit-tools (M2 06 R13). It
+#   holds no write token either (M2 06 §11.4).
 # - verify installs those files with their own install.sh in rootless systemd containers (podman), and checks the
 #   cosign signatures and the attestations. It holds no write token: the container runs third-party code as its
 #   root, from Docker Hub bases pinned by digest (06 §4.13; README §6 "Decided after group 10" (1), review R4).
@@ -1517,7 +1518,9 @@ jobs:
     # The desktop app as a user gets it (M2 06 §11.4): the signed files checked with Windows' inbox ssh-keygen, the
     # installer's attestation, then the released, stamped install-desktop.ps1 under Windows PowerShell 5.1 against a
     # mirror of those files (tools/relserve over HTTPS), then smoke.ps1 -Mode release on what it installed and an
-    # uninstall (/S /PURGE) that must leave nothing behind. In a dry run the script and the checks use sign-dry's keys.
+    # uninstall (/S /PURGE) that must leave nothing behind; last, isshoni-audiotest selfcheck from desktop-pkg's
+    # isshoni-exit-tools (M2 06 R13: the hand-over to audiotest.yml loads the release DLL). In a dry run the script and
+    # the checks use sign-dry's keys.
     # Like verify, it takes the files from sign's artifact and holds no write token; GH_TOKEN, read-only, is set only
     # on the attestation step.
     needs: [version, build, sign, sign-dry, desktop-pkg]
@@ -1701,6 +1704,24 @@ jobs:
         # uninstall.exe /S /PURGE, which must leave nothing of M2 06 §2.2 and §2.3.
         run: |
           ./deploy/test/windows/smoke.ps1 -Mode release -Version $env:VERSION -Stage (Join-Path $env:RUNNER_TEMP 'stage')
+
+      - name: Download isshoni-exit-tools (desktop-pkg's hand-over to audiotest.yml)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: isshoni-exit-tools
+          path: ${{ runner.temp }}/exit-tools
+
+      - name: isshoni-audiotest selfcheck (isshoni-exit-tools, the release DLL)
+        # 7. M2 06 R13: the hand-over runs, not only its SHA-256s. selfcheck loads isshoni-media.dll and the FFmpeg
+        # DLLs from beside the exe (the artifact's flat layout), checks im_version and every export, runs the probe,
+        # starts and stops the watcher and runs the analyzer on synthetic signals. No sound: the hosted runner has no
+        # audio endpoint, as in ci.yml's windows-desktop.
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'exit-tools\isshoni-audiotest.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "isshoni-exit-tools has no isshoni-audiotest.exe" }
+          & $exe selfcheck
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "isshoni-audiotest selfcheck exited $code" }
 
   publish:
     # 06 §9.3: refuses notes with a TODO, and a draft that is no longer what sign signed: it downloads the draft

@@ -165,7 +165,8 @@ jobs:
             # its packaging reads, the SPA it bundles included. windows-go, desktop-macos,
             # windows-native and windows-desktop run on it (README WA67 adds the installer smoke, one
             # of windows-desktop's own inputs; README WA72 its isshoni-audiotest selfcheck and the ps1 install, which
-            # tools/relserve serves).
+            # tools/relserve serves; README WA81 its server-rendered ps1 test, which builds cmd/isshoni and serves the
+            # script through the server's handler and wiring with deploy/dev/isshoni.e2e.toml).
             desktop:
               - 'cmd/isshoni-desktop/**'
               - 'cmd/isshoni-enginetest/**'
@@ -180,6 +181,11 @@ jobs:
               - 'deploy/test/windows/smoke.ps1'
               - 'deploy/install-desktop.ps1'
               - 'deploy/embed.go'
+              - 'cmd/isshoni/**'
+              - 'internal/server/httpapi/desktopscripts*.go'
+              - 'internal/server/wire.go'
+              - 'internal/server/http.go'
+              - 'deploy/dev/isshoni.e2e.toml'
               - 'deploy/notices/native-windows.json'
               # README WA78: the native gate's exceptions and the license files it reads from the repository.
               - 'deploy/notices/exceptions.md'

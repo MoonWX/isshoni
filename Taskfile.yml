@@ -1647,15 +1647,25 @@ tasks:
     env:
       ISSHONI_SNAPSHOT_VERSION: '{{.SNAPSHOT_VERSION}}'
       # The release notes' desktop lines (.goreleaser.yaml's release.header, docs/m2/06 §11.7), as release.yml's
-      # build job exports them.
+      # build job exports them. Read with sed, not jq, so that a snapshot needs no jq; the first step says which one
+      # is missing. pins.json keeps each pin on one line: "ffmpeg": {"version": "<v>", ...}.
       ISSHONI_DESKTOP_MIN_VERSION:
-        sh: tr -d '\r' < deploy/desktop/min-version | sed -n '1s/^[[:space:]]*//; 1s/[[:space:]]*$//; 1p'
+        sh: (tr -d '\r' < deploy/desktop/min-version) 2>/dev/null | sed -n '1s/^[[:space:]]*//; 1s/[[:space:]]*$//; 1p'
       ISSHONI_FFMPEG_VERSION:
-        sh: jq -r .ffmpeg.version native/ffmpeg/pins.json
+        sh: >-
+          sed -n 's/^[[:space:]]*"ffmpeg"[[:space:]]*:[[:space:]]*{.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+          native/ffmpeg/pins.json 2>/dev/null || true
     cmds:
       - cmd: "echo 'release:snapshot: skipped, .goreleaser.yaml does not exist yet'"
         silent: true
         if: '[ ! -f .goreleaser.yaml ]'
+      - cmd: |
+          if [ -z "$ISSHONI_DESKTOP_MIN_VERSION" ] || [ -z "$ISSHONI_FFMPEG_VERSION" ]; then
+            echo "release:snapshot: deploy/desktop/min-version ('$ISSHONI_DESKTOP_MIN_VERSION') or native/ffmpeg/pins.json's ffmpeg version ('$ISSHONI_FFMPEG_VERSION') is missing; .goreleaser.yaml's release notes need both" >&2
+            exit 1
+          fi
+        silent: true
+        if: '[ -f .goreleaser.yaml ]'
       - task: release:goreleaser
         if: '[ -f .goreleaser.yaml ]'
       - task: build:web
@@ -1677,31 +1687,9 @@ tasks:
             fi
           done
         silent: true
-      # .goreleaser.yaml uploads the desktop files from dist-desktop/ (docs/m2/06 §2.1, §11.2), and goreleaser fails
-      # on an extra_files glob that matches nothing. A snapshot without a Windows build gets stubs for them, files
-      # that say ISSHONI-DESKTOP-STUB (06 §10.1): goreleaser checks the config's globs by name, release:assets checks
-      # the names, and its FULL=true refuses a stub. Earlier stubs go first (they carry another snapshot's
-      # version); a real file of this version is kept. install-desktop.ps1 comes from the before hook.
-      - cmd: |
-          set -eu
-          v='{{.SNAPSHOT_VERSION}}'
-          mkdir -p dist-desktop
-          for f in dist-desktop/isshoni-desktop*; do
-            [ -f "$f" ] || continue
-            if [ "$(head -c 20 "$f")" = ISSHONI-DESKTOP-STUB ]; then rm -f "$f"; fi
-          done
-          if [ -f "dist-desktop/isshoni-desktop_${v}_windows_amd64_setup.exe" ]; then
-            echo "release:snapshot: dist-desktop/ has the desktop files of $v, so no stubs"
-            exit 0
-          fi
-          for name in "isshoni-desktop_${v}_windows_amd64_setup.exe" "isshoni-desktop_${v}_windows_amd64_symbols.zip" \
-            "isshoni-desktop_${v}_windows_amd64.sbom.json" "isshoni-desktop_${v}_ffmpeg-source.tar" \
-            isshoni-desktop-update.json; do
-            printf 'ISSHONI-DESKTOP-STUB: a stand-in for %s in a snapshot without a Windows build (docs/m2/06 §10.1)\n' \
-              "$name" >"dist-desktop/$name"
-          done
-          echo "release:snapshot: wrote stub desktop files for $v into dist-desktop/"
-        silent: true
+      # Stubs for the desktop files that a snapshot without a Windows build lacks (release:desktop-stubs).
+      - task: release:desktop-stubs
+        vars: {VERSION: '{{.SNAPSHOT_VERSION}}'}
         if: '[ -f .goreleaser.yaml ]'
       # The before hook runs `task release:prepare`: with .bin/ first in PATH, it finds the pinned Task there too.
       - cmd: PATH="$PWD/.bin:$PATH" .bin/goreleaser{{exeExt}} release --snapshot --clean --skip=sign,sbom {{.CLI_ARGS}}
@@ -1726,17 +1714,54 @@ tasks:
         silent: true
         if: '[ -f .goreleaser.yaml ] && command -v docker >/dev/null 2>&1'
 
+  release:desktop-stubs:
+    desc: >-
+      Write ISSHONI-DESKTOP-STUB stand-ins for the desktop files into dist-desktop/ (VERSION=<v>), for a goreleaser
+      snapshot without a Windows build; release:snapshot runs it, and nightly.yml's goreleaser-full until it has real
+      desktop files (README WA81, WA86)
+    requires:
+      vars: [VERSION]
+    cmds:
+      # .goreleaser.yaml uploads the desktop files from dist-desktop/ (docs/m2/06 §2.1, §11.2), and goreleaser fails
+      # on an extra_files glob that matches nothing. A snapshot without a Windows build gets stubs for them, files
+      # that say ISSHONI-DESKTOP-STUB (06 §10.1): goreleaser checks the config's globs by name, release:assets checks
+      # the names, and its FULL=true refuses a stub. Earlier stubs go first (they carry another snapshot's
+      # version); a real file of this version is kept. install-desktop.ps1 comes from the before hook.
+      - cmd: |
+          set -eu
+          v='{{.VERSION}}'
+          mkdir -p dist-desktop
+          for f in dist-desktop/isshoni-desktop*; do
+            [ -f "$f" ] || continue
+            if [ "$(head -c 20 "$f")" = ISSHONI-DESKTOP-STUB ]; then rm -f "$f"; fi
+          done
+          if [ -f "dist-desktop/isshoni-desktop_${v}_windows_amd64_setup.exe" ]; then
+            echo "release:desktop-stubs: dist-desktop/ has the desktop files of $v, so no stubs"
+            exit 0
+          fi
+          for name in "isshoni-desktop_${v}_windows_amd64_setup.exe" "isshoni-desktop_${v}_windows_amd64_symbols.zip" \
+            "isshoni-desktop_${v}_windows_amd64.sbom.json" "isshoni-desktop_${v}_ffmpeg-source.tar" \
+            isshoni-desktop-update.json; do
+            printf 'ISSHONI-DESKTOP-STUB: a stand-in for %s in a snapshot without a Windows build (docs/m2/06 §10.1)\n' \
+              "$name" >"dist-desktop/$name"
+          done
+          echo "release:desktop-stubs: wrote stub desktop files for $v into dist-desktop/"
+        silent: true
+
   release:assets:
     desc: >-
       Check dist/ and dist-desktop/ after a goreleaser run against the release assets of docs/m1/06-deploy-and-ci.md §3
       and docs/m2/06 §2.1 (VERSION=<v>; FULL=true for a real release, which also has SBOMs and the cosign bundle and no
-      desktop stubs; DESKTOP=true checks the desktop files themselves, PKG_PS1=<file> the packaging job's script)
+      desktop stubs unless DESKTOP_STUBS=true; DESKTOP=true checks the desktop files themselves, PKG_PS1=<file> the
+      packaging job's script)
     # The desktop assets (docs/m2/06 §2.1, §11.2) are in dist-desktop/: release.yml's build job downloads the
     # desktop-pkg job's files there, and `task release:snapshot` writes stubs (ISSHONI-DESKTOP-STUB) when there are
     # none, so that .goreleaser.yaml's desktop globs match. goreleaser lists them in checksums.txt either way, so
-    # this task always checks their names and checksums; FULL=true refuses a stub. DESKTOP=true (release.yml) also
-    # checks: the update manifest's version, channel, minVersion (deploy/desktop/min-version) and artifacts[0] against
-    # the installer and the tag; the FFmpeg source tar's SHA-256 against native/ffmpeg/lock.json; install-desktop.ps1
+    # this task always checks their names and checksums; FULL=true refuses a stub, unless DESKTOP_STUBS=true:
+    # nightly.yml's goreleaser-full runs FULL=true over release:desktop-stubs' stubs until it builds real desktop
+    # files (README WA81 hands that to WA86). DESKTOP=true always refuses a stub, and (release.yml) also checks: the
+    # update manifest's version, channel, minVersion (deploy/desktop/min-version) and artifacts[0] against the
+    # installer and the tag; the FFmpeg source tar's SHA-256 against native/ffmpeg/lock.json; install-desktop.ps1
     # as deploy/install-desktop.ps1 stamped with <v>, with the production key block (and equal to PKG_PS1, the copy
     # the packaging job stamped, when given); the symbols zip's and the SBOM's contents; and the installer's file
     # list (7z l, which reads NSIS archives) against the stage's install-files.txt (dist-desktop/stage/). It needs jq,
@@ -1744,6 +1769,7 @@ tasks:
     vars:
       FULL: '{{.FULL | default "false"}}'
       DESKTOP: '{{.DESKTOP | default "false"}}'
+      DESKTOP_STUBS: '{{.DESKTOP_STUBS | default "false"}}'
       PKG_PS1: '{{.PKG_PS1 | default ""}}'
     cmds:
       - cmd: |
@@ -1751,6 +1777,7 @@ tasks:
           v='{{.VERSION}}'
           full='{{.FULL}}'
           desktop='{{.DESKTOP}}'
+          desktop_stubs='{{.DESKTOP_STUBS}}'
           pkg_ps1='{{.PKG_PS1}}'
           # The packages' own version puts "~" before a prerelease, so that it sorts before the release: 0.1.0-rc.1
           # is the deb and rpm version 0.1.0~rc.1. Their file names have "-" there (.goreleaser.yaml): GitHub
@@ -1852,12 +1879,12 @@ tasks:
             [ -f "dist-desktop/$name" ] || continue
             if [ "$(head -c 20 "dist-desktop/$name")" = ISSHONI-DESKTOP-STUB ]; then
               stubs=$((stubs + 1))
-              if [ "$full" = true ] || [ "$desktop" = true ]; then
+              if [ "$desktop" = true ] || { [ "$full" = true ] && [ "$desktop_stubs" != true ]; }; then
                 problem "dist-desktop/$name is a stub (ISSHONI-DESKTOP-STUB): a release needs the file from release.yml's desktop-pkg job"
               fi
             fi
           done <"$tmp/desktop.stubbable"
-          if [ "$stubs" != 0 ] && [ "$full" != true ] && [ "$desktop" != true ]; then
+          if [ "$stubs" != 0 ] && [ "$desktop" != true ] && { [ "$full" != true ] || [ "$desktop_stubs" = true ]; }; then
             echo "release:assets: note: $stubs of the desktop files in dist-desktop/ are stubs, so only their names and checksums were checked"
           fi
 
