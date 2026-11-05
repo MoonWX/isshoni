@@ -1,8 +1,9 @@
 // What a session sees of a running capture (docs/m2/04-windows-engine.md §7.3, §7.6–§7.8; README WF12), and which
 // capture runs a source.
 //
-// A session whose source a capture area captures (today a WGC pick, wgc_capture.h; README WA60's Desktop Duplication
-// later) starts it on the engine worker with StartSourceCapture, after its frame slots exist and its encoders opened:
+// A session whose source a capture area captures (a WGC pick, wgc_capture.h; a Desktop Duplication monitor, a Windows
+// 10 monitor pick or a listed "mon:" id, dd_capture.h, README WA60) starts it on the engine worker with
+// StartSourceCapture, after its frame slots exist and its encoders opened:
 //   - the capture writes each frame into the session's slots (gpu/slots.h) and tells the session through CaptureSink;
 //   - the session's supervisor polls minimized() for an identified window and turns the sink's reports into events;
 //   - the video thread calls SetFps after a layer-0 fps re-init;
@@ -40,6 +41,14 @@ public:
   // IM_ERR_SOURCE_GONE when the source went away mid-frame, else IM_ERR_INTERNAL); detail is im_last_error's text.
   // No frame follows.
   virtual void OnFailed(im_status status, std::string_view detail) noexcept = 0;
+  // Desktop Duplication lost its duplication (§7.4: a mode change, the secure desktop, the lock screen): no frame
+  // comes until OnResumed, and the session keeps repeating the last one (CAPTURE_INTERRUPTED). cause is one of
+  // dd_policy.h's kCause* ("access_lost", "secure_desktop", "mode_change"). Called once per interruption.
+  // README WA60 adds these with empty bodies: the session's sink (session_object.cpp) turns them into
+  // CAPTURE_INTERRUPTED / CAPTURE_RESUMED once a session slice wires them.
+  virtual void OnInterrupted(std::string_view cause) noexcept { (void)cause; }
+  // The duplication is back (CAPTURE_RESUMED, with the interruption's cause); OnResized follows when the size changed.
+  virtual void OnResumed(std::string_view cause) noexcept { (void)cause; }
 };
 
 struct CaptureOptions {
@@ -55,6 +64,10 @@ public:
 
   // The session runs without Windows' capture border (IM_SESS_NO_OS_INDICATOR, §7.1).
   virtual bool borderless() const noexcept = 0;
+  // The IM_CAPTURE_* path that actually runs, which can differ from the pick's SourceSpec::capture_path when a
+  // factory falls back (a Windows 10 monitor whose output DXGI won't duplicate on the session's adapter runs WGC, a
+  // Windows 11 pick WGC can't open runs DD): im_session_info's capture_path and the stats' path should report this.
+  virtual uint32_t capture_path() const noexcept = 0;
   // The identified window (§7.6) the supervisor polls; 0 for monitors and unidentified windows.
   virtual WindowHandle window() const noexcept = 0;
   // Whether window() is minimized now (IsIconic); false without a window. The supervisor's thread.
@@ -82,9 +95,13 @@ public:
                           CaptureSink *sink, std::unique_ptr<CaptureSource> *out) noexcept = 0;
 };
 
+// The LUID of the adapter that owns a Desktop Duplication source's output (0 for every other source): DD runs only
+// on a device of that adapter (§7.4, §8.1), so the session's device should be created there.
+uint64_t OutputAdapterLuid(const session::SourceSpec &source) noexcept;
+
 // Whether a capture area captures source (otherwise the session draws its own test pattern).
 bool Captures(const session::SourceSpec &source) noexcept;
-// Whether that capture needs frame slots (a WGC pick: yes).
+// Whether that capture needs frame slots (WGC and Desktop Duplication: yes).
 bool NeedsSlots(const session::SourceSpec &source) noexcept;
 // Starts the capture of source; IM_ERR_INTERNAL when no capture area handles it, or when it needs slots and slots is
 // null. Failures set the thread's detail (wgc_capture.h lists WGC's).

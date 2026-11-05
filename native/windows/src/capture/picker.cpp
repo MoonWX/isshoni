@@ -8,6 +8,7 @@
 #include <thread>
 #include <utility>
 
+#include "capture/outputs_win.h"
 #include "capture/window_system_win.h"
 #include "engine/os.h"
 #include "im/abi/status.h"
@@ -247,6 +248,30 @@ im_status Picker::Thread::Describe(const wgc::GraphicsCaptureItem &item, PickRes
   auto picked = std::make_shared<PickedItem>();
   picked->item = item;
   picked->identity = id;
+
+  // §7.1, §7.5: a monitor is mapped to its DXGI output (Desktop Duplication on Windows 10; on Windows 11 the output is
+  // kept for the DD fallback and monitor_id).
+  PickFacts facts;
+  facts.kind = out->kind;
+  facts.windows11 = WindowsBuild() >= kWindows11Build;
+  facts.borderless = out->borderless;
+  facts.self = out->self;
+  MonitorMatch match;
+  if (out->kind == IM_SOURCE_MONITOR) {
+    Win32Outputs outputs;
+    const std::vector<DisplayOutput> list = outputs.Outputs();
+    match = MatchPickedMonitor(list, item_size, out->name);
+    facts.match = &match;
+    picked->output = match.output;
+    // Step 5 logs at info; neither the item's name nor an output's is logged.
+    log::Info("capture", match.output ? "monitor mapped" : "monitor not mapped",
+              {{"outcome", MapOutcomeName(match.result.outcome)},
+               {"outputs", list.size()},
+               {"size_matches", match.result.size_matches},
+               {"name_matches", match.result.name_matches},
+               {"windows11", facts.windows11}});
+  }
+  out->plan = PlanPick(facts);
   out->picked = std::move(picked);
   // Never the title or the process (README §4 "Logging").
   log::Info("capture", "picked",
@@ -256,7 +281,8 @@ im_status Picker::Thread::Describe(const wgc::GraphicsCaptureItem &item, PickRes
              {"identified", id.identified()},
              {"pid_known", id.pid != 0},
              {"self", out->self},
-             {"borderless", out->borderless}});
+             {"borderless", out->borderless},
+             {"path", out->plan.capture_path}});
   return IM_OK;
 }
 

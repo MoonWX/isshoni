@@ -45,6 +45,8 @@ namespace im::capture {
 class WgcCapture final : public CaptureSource {
 public:
   // Whether source is a pick this area captures with WGC (capture_path IM_CAPTURE_WGC with a picked item).
+  // Start takes any source with a picked item: capture_source.cpp also starts WGC for a Windows 10 monitor pick whose
+  // Desktop Duplication can't run on the session's device (README WA60).
   static bool Handles(const session::SourceSpec &source) noexcept;
 
   // Starts capturing source into slots (whose device is the session's). On failure nothing runs and the thread's
@@ -59,6 +61,7 @@ public:
 
   // The session runs without Windows' capture border (IM_SESS_NO_OS_INDICATOR).
   bool borderless() const noexcept override { return borderless_; }
+  uint32_t capture_path() const noexcept override { return IM_CAPTURE_WGC; }
   // The identified window (§7.6) for minimize polling; 0 for monitors and unidentified windows.
   WindowHandle window() const noexcept override { return window_; }
   // IsIconic(window()) (window_system_win.h's WindowMinimized).
