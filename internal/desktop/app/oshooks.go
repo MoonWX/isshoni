@@ -94,6 +94,13 @@ type Pill interface {
 	Actions() <-chan PillAction
 }
 
+// PillShowing is a Pill that knows whether it is on screen: Shown is false while it is hidden, and when the OS
+// refused to show it (on Windows, a failed CreateWindowExW or WDA_EXCLUDEFROMCAPTURE). A Pill without it is taken
+// to show what it was last asked to.
+type PillShowing interface {
+	Shown() bool
+}
+
 // PillMode is what the pill says.
 type PillMode string
 
@@ -113,7 +120,7 @@ type PillState struct {
 	Watching       int
 	VoiceAppsHeard bool   // 05's FriendsHear.alert.voiceAppsHeard: "Friends hear voice apps"
 	Questions      int    // 05's FriendsHear.alert.questions: the amber marker
-	Monitor        string // the captured monitor's device name; "" = the primary monitor
+	Monitor        string // the shared monitor's device name (share.View.Monitor); "" (a window share) = the primary
 	// Positions are settings.json's pill.positions: the last position per monitor device name, which the pill clamps
 	// to that monitor's work area (03 §11.4); nil when none was saved.
 	Positions map[string]PillPoint

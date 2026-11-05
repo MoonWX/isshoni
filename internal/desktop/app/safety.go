@@ -285,8 +285,12 @@ func (a *App) followPauseToast(v *share.View) {
 	a.safe.mu.Unlock()
 }
 
-// pillShown reports a pill on screen.
+// pillShown reports a pill on screen: the pill's own answer when it has one (PillShowing), else the Visible it was
+// last given.
 func (a *App) pillShown() bool {
+	if ps, ok := a.pill.(PillShowing); ok {
+		return ps.Shown()
+	}
 	a.safe.pillMu.Lock()
 	defer a.safe.pillMu.Unlock()
 	return a.safe.pillSet && a.safe.lastPill.Visible
@@ -326,6 +330,7 @@ func (a *App) pillState() PillState {
 		Visible:          v.Pill || st.Pill.Mode == settings.PillAlways,
 		Mode:             mode,
 		Watching:         v.Watching,
+		Monitor:          v.Monitor,
 		VoiceAppsHeard:   voice,
 		Questions:        questions,
 		PauseUnavailable: noPause,

@@ -122,3 +122,15 @@ func pillButtons(s app.PillState) (first string, firstAct app.PillActionKind, pa
 	}
 	return s.Text.Pause, app.PillPause, !s.PauseUnavailable
 }
+
+// pillName is the pill window's name, which Narrator reads: the line and the marker's name ("Sharing · 3 watching ·
+// 1 question waiting"), or the collapsed dot's name while collapsed (its buttons are hidden then).
+func pillName(t app.PillText, collapsed bool) string {
+	if collapsed {
+		return t.Collapsed
+	}
+	if t.Questions != "" {
+		return t.Line + " · " + t.Questions
+	}
+	return t.Line
+}

@@ -5,7 +5,9 @@
 // WindowNoticeShown) once it is on screen in a visible page, never while the window is hidden.
 //
 // Go's side: App.WindowNotice() (the pull, null while the window is hidden or nothing is due), the window.notice
-// event when the window opens with a notice due, and App.WindowNoticeShown(code). The bound methods are the bridge's
+// event when App.ShowWindow opens the window with a notice due, and App.WindowNoticeShown(code). The page pulls
+// again each time it becomes visible, so a window shown another way (a deep link, a second launch) still shows a
+// notice that is due. The bound methods are the bridge's
 // (internal/desktop/bridge); a bridge without them shows nothing, and the toast stays the only notice.
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -59,7 +61,8 @@ export function WindowNotice({ bridge: given }: WindowNoticeProps) {
   const [notice, setNotice] = useState<WindowNoticeView | null>(null);
   const [dismissed, setDismissed] = useState<string | null>(null);
 
-  // Subscribe first, then pull (03 §6.3), so a notice due right now is never missed.
+  // Subscribe first, then pull (03 §6.3), so a notice due right now is never missed; pull again whenever the page
+  // becomes visible (Go answers null while the window is hidden, and not every way of showing it emits the event).
   useEffect(() => {
     const app = windowNoticeApp(bridge);
     if (bridge === null || app === null) return undefined;
@@ -67,11 +70,19 @@ export function WindowNotice({ bridge: given }: WindowNoticeProps) {
     const take = (v: unknown): void => {
       if (alive && isNotice(v)) setNotice(v);
     };
+    const pull = (): void => {
+      app.windowNotice().then(take, () => undefined);
+    };
+    const onVisible = (): void => {
+      if (document.visibilityState === 'visible') pull();
+    };
     const off = bridge.on(WINDOW_NOTICE_EVENT as BridgeEventName, take);
-    app.windowNotice().then(take, () => undefined);
+    pull();
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       alive = false;
       off();
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, [bridge]);
 

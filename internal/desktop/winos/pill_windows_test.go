@@ -118,6 +118,9 @@ func TestPillWindow(t *testing.T) {
 	if !visible(hwnd) {
 		t.Fatal("the pill isn't visible")
 	}
+	if !h.pill.Shown() {
+		t.Error("Shown is false with the pill on screen")
+	}
 	dpi, _, _ := procGetDpiForWindow.Call(hwnd)
 	w, h0 := pillSize(int(dpi), false)
 	if r := windowRect(t, hwnd); r.width() != w || r.height() != h0 {
@@ -148,6 +151,9 @@ func TestPillWindow(t *testing.T) {
 	setPill(t, h, app.PillState{Mode: app.PillPaused, Text: pillText})
 	if visible(hwnd) {
 		t.Fatal("Visible false didn't hide the pill")
+	}
+	if h.pill.Shown() {
+		t.Error("Shown is true with the pill hidden")
 	}
 }
 
@@ -180,12 +186,18 @@ func TestPillButtonClicks(t *testing.T) {
 	if r := windowRect(t, hwnd); r.width() != scale(pillCollapsed, int(dpi)) || visible(first) {
 		t.Errorf("collapsed: %d px wide, buttons visible %v", r.width(), visible(first))
 	}
+	if got := windowText(hwnd); got != "Sharing" {
+		t.Errorf("collapsed: the pill's name %q, want the dot's", got)
+	}
 	_, _, _ = procSendMessageW.Call(hwnd, wmNCLButtonDblClk, htCaption, 0)
 	if a := nextAction(t, h); a.Kind != app.PillExpand {
 		t.Errorf("second double click: %+v", a)
 	}
 	if !visible(first) || !visible(stop) {
 		t.Error("the buttons didn't come back")
+	}
+	if got := windowText(hwnd); got != "Sharing · 3 watching · 1 question waiting" {
+		t.Errorf("expanded: the pill's name %q", got)
 	}
 	if r, _, _ := procSendMessageW.Call(hwnd, wmMouseActivate, hwnd, 0); r != maNoActivate {
 		t.Errorf("WM_MOUSEACTIVATE = %d, want MA_NOACTIVATE", r)

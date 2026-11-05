@@ -936,6 +936,39 @@ func TestStopDuringStart(t *testing.T) {
 	})
 }
 
+// TestViewMonitor: a monitor share's view names the monitor for the pill (04's MonitorID without "mon:"), kept
+// across a republish (replaces); a window share's is "" (03 §11.4).
+func TestViewMonitor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		e.eng.set(func(f *fakeEngine) {
+			f.src.Kind, f.src.PID, f.src.MonitorID, f.src.Capture = media.SourceScreen, 0, `mon:\\.\DISPLAY2`, "dd"
+		})
+		s := e.start(t, "lounge", false)
+		synctest.Wait()
+		if v := e.ctl.Current(); v == nil || v.Monitor != `\\.\DISPLAY2` {
+			t.Fatalf("starting view %+v", v)
+		}
+		goLive(s)
+		s.update(func(snap *core.ShareSnapshot) { snap.ID = "s_newid00000000001" })
+		synctest.Wait()
+		if v := e.ctl.Current(); v == nil || v.ShareID != "s_newid00000000001" || v.Monitor != `\\.\DISPLAY2` {
+			t.Fatalf("after replaces %+v", v)
+		}
+	})
+	t.Run("window", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t)
+			e.eng.set(func(f *fakeEngine) { f.src.MonitorID = `mon:\\.\DISPLAY2` })
+			e.start(t, "lounge", false)
+			synctest.Wait()
+			if v := e.ctl.Current(); v == nil || v.Monitor != "" {
+				t.Fatalf("window view %+v", v)
+			}
+		})
+	})
+}
+
 // TestSharedPIDHandOff: 05 learns the picked window's process right after the pick, and 0 once the pick is released,
 // expires, is replaced by a pick that was cancelled, or was a monitor; while a share runs only 05's OnShare* calls
 // name it (03 §10.1, 05 §22; README WA77).

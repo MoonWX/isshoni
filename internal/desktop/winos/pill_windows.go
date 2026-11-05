@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -207,6 +208,9 @@ type pill struct {
 	t       *thread
 	log     *slog.Logger
 	actions chan app.PillAction
+	// onScreen is shown for other goroutines (Shown): set by ShowWindow(SW_SHOWNOACTIVATE), cleared when the pill
+	// is hidden or destroyed. It stays false when the window or its WDA_EXCLUDEFROMCAPTURE failed.
+	onScreen atomic.Bool
 
 	// Only the winos thread touches these.
 	hwnd, first, stop uintptr
@@ -220,7 +224,10 @@ type pill struct {
 	font, bold        uintptr
 }
 
-var _ app.Pill = (*pill)(nil)
+var (
+	_ app.Pill        = (*pill)(nil)
+	_ app.PillShowing = (*pill)(nil)
+)
 
 func newPill(t *thread, log *slog.Logger) *pill {
 	return &pill{t: t, log: log, actions: make(chan app.PillAction, 16), dpi: baseDPI}
@@ -232,6 +239,10 @@ func (p *pill) Set(s app.PillState) {
 		p.log.Debug("winos: the pill's state didn't reach the thread", "err", err)
 	}
 }
+
+// Shown reports a pill on screen (app.PillShowing): false while hidden, and when Windows refused to create the
+// window or to exclude it from capture, so the app sends the toasts meant for no pill (03 §15).
+func (p *pill) Shown() bool { return p.onScreen.Load() }
 
 // Actions delivers what the user did on the pill.
 func (p *pill) Actions() <-chan app.PillAction { return p.actions }
@@ -254,6 +265,7 @@ func (p *pill) apply(s app.PillState) {
 			_, _, _ = procShowWindow.Call(p.hwnd, swHide)
 		}
 		p.shown = false
+		p.onScreen.Store(false)
 		return
 	}
 	if p.failed {
@@ -273,6 +285,7 @@ func (p *pill) apply(s app.PillState) {
 	if !p.shown {
 		_, _, _ = procShowWindow.Call(p.hwnd, swShowNoActivate)
 		p.shown = true
+		p.onScreen.Store(true)
 	}
 	_, _, _ = procInvalidateRect.Call(p.hwnd, 0, 1)
 }
@@ -331,17 +344,15 @@ func (p *pill) destroy() {
 		pills.Delete(p.hwnd)
 	}
 	p.hwnd, p.first, p.stop, p.shown = 0, 0, 0, false
+	p.onScreen.Store(false)
 	p.deleteFonts()
 }
 
-// updateTexts gives the window and the buttons their names (Narrator reads them) and enables Pause by the state.
+// updateTexts gives the window and the buttons their names (Narrator reads them; collapsed, the window's is the
+// dot's) and enables Pause by the state.
 func (p *pill) updateTexts() {
 	s := p.state
-	name := s.Text.Line
-	if s.Text.Questions != "" {
-		name += " · " + s.Text.Questions
-	}
-	setText(p.hwnd, name)
+	setText(p.hwnd, pillName(s.Text, p.collapsed))
 	label, act, enabled := pillButtons(s)
 	p.firstAct = act
 	if !enabled && s.Text.PauseUnavailable != "" {
@@ -538,6 +549,7 @@ func (p *pill) layout() {
 // toggleCollapsed collapses the pill to its dot or expands it, keeping its top left corner, and reports it.
 func (p *pill) toggleCollapsed() {
 	p.collapsed = !p.collapsed
+	setText(p.hwnd, pillName(p.state.Text, p.collapsed))
 	w, h := pillSize(p.dpi, p.collapsed)
 	_, _, _ = procSetWindowPos.Call(p.hwnd, 0, 0, 0, uintptr(w), uintptr(h), swpNoMove|swpNoZOrder|swpNoActivate)
 	p.layout()

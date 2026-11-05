@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
 	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/desktop/tray"
+	"github.com/MoonWX/isshoni/internal/media"
+	"github.com/MoonWX/isshoni/internal/media/fake"
 	"github.com/MoonWX/isshoni/internal/protocol"
 )
 
@@ -324,6 +327,60 @@ func TestPauseToast(t *testing.T) {
 	}
 }
 
+// TestPauseToastPillNotShown (03 §15): a pill that was asked to show but isn't on screen (Windows refused its window
+// or WDA_EXCLUDEFROMCAPTURE) doesn't stop the pause toast.
+func TestPauseToastPillNotShown(t *testing.T) {
+	s := newSafetyEnv(t)
+	np := &notShownPill{recPill: s.sos.pill}
+	s.app.pill = np
+	if err := s.app.d.Settings.Update(func(st *settings.Settings) { st.Pill.Mode = settings.PillAlways }); err != nil {
+		t.Fatal(err)
+	}
+	s.goLive(t)
+	s.waitRegs(t, "+pause Ctrl+Alt+Shift+F9", "+stop Ctrl+Alt+Shift+F10")
+	s.waitPill(t, func(p PillState) bool { return p.Visible }, "asked to show")
+	s.app.HideWindow()
+	s.app.onHotkey(HotkeyPause)
+	s.waitState(t, share.StatePaused)
+	if toasts := s.shell.toastsOf(ToastPaused); len(toasts) != 1 {
+		t.Fatalf("%d pause toasts with no pill on screen, want 1", len(toasts))
+	}
+	if np.calls.Load() == 0 {
+		t.Fatal("Shown wasn't asked")
+	}
+}
+
+// notShownPill is a recPill that reports no pill on screen.
+type notShownPill struct {
+	*recPill
+	calls atomic.Int32
+}
+
+func (p *notShownPill) Shown() bool { p.calls.Add(1); return false }
+
+// TestPillOnTheSharedMonitor (03 §11.4): a monitor share's pill goes on that monitor: PillState.Monitor follows the
+// view's (04's MonitorID without "mon:").
+func TestPillOnTheSharedMonitor(t *testing.T) {
+	s := newSafetyEnv(t)
+	eng := fake.NewEngine(fake.EngineConfig{PickResult: &media.Source{Kind: media.SourceScreen, Name: "Display 2",
+		Width: 1920, Height: 1080, MonitorID: `mon:\\.\DISPLAY2`, Capture: "dd"}})
+	t.Cleanup(func() { _ = eng.Close() })
+	a := s.app
+	a.d.Engine = eng
+	ctl := newShares(a.d, a.clients)
+	t.Cleanup(ctl.Close)
+	a.shares, a.sharing = ctl, ctl.Live
+	t.Cleanup(ctl.Subscribe(a.onShareEvent))
+	s.goLive(t)
+	if v := a.shares.Current(); v == nil || v.Monitor != `\\.\DISPLAY2` {
+		t.Fatalf("view %+v", v)
+	}
+	p := s.waitPill(t, func(p PillState) bool { return p.Mode == PillLive }, "live")
+	if p.Monitor != `\\.\DISPLAY2` {
+		t.Fatalf("pill monitor %q", p.Monitor)
+	}
+}
+
 // TestPillFollowsTheShare (03 §11.4): hidden without a share; with the OS border and the default mode the state is
 // kept but not shown; with "Always" it shows "Sharing · 1 watching", "Paused", the alert's text in place of the
 // count, the marker, the lock prompt; the end hides it.
@@ -336,7 +393,7 @@ func TestPillFollowsTheShare(t *testing.T) {
 	s.goLive(t)
 	// The fake engine's pick has the OS border: the pill isn't due, but its state follows.
 	p := s.waitPill(t, func(p PillState) bool { return p.Mode == PillLive }, "live")
-	if p.Visible || p.Watching != 1 || p.Text.Line != "Sharing · 1 watching" {
+	if p.Visible || p.Watching != 1 || p.Text.Line != "Sharing · 1 watching" || p.Monitor != "" {
 		t.Fatalf("live with the border %+v", p)
 	}
 	if err := s.app.d.Settings.Update(func(st *settings.Settings) { st.Pill.Mode = settings.PillAlways }); err != nil {

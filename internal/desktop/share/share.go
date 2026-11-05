@@ -141,6 +141,7 @@ type View struct {
 	RoomID       string
 	Kind         protocol.ShareKind // screen or window
 	Label        string
+	Monitor      string // the shared monitor's device name for the pill (MonitorID without "mon:"); "" for a window
 	Preset       protocol.Preset
 	WithAudio    bool // the share was started with sound
 	AudioOn      bool // Share sound is on (WithAudio and not switched off)

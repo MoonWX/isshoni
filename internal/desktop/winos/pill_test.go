@@ -130,3 +130,18 @@ func TestPillButtons(t *testing.T) {
 		}
 	}
 }
+
+// TestPillName: the window's name is the line and the marker's name, or the dot's name while collapsed.
+func TestPillName(t *testing.T) {
+	text := app.PillText{Line: "Sharing · 3 watching", Collapsed: "Sharing"}
+	if got := pillName(text, false); got != "Sharing · 3 watching" {
+		t.Errorf("expanded %q", got)
+	}
+	text.Questions = "1 question waiting"
+	if got := pillName(text, false); got != "Sharing · 3 watching · 1 question waiting" {
+		t.Errorf("expanded with a question %q", got)
+	}
+	if got := pillName(text, true); got != "Sharing" {
+		t.Errorf("collapsed %q", got)
+	}
+}

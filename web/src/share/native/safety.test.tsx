@@ -227,6 +227,26 @@ describe('the window notice (docs/m2/03 §11.6)', () => {
     expect(setup.fake.callsOf('app.windowNoticeShown')).toEqual([['still-sharing']]);
   });
 
+  it('pulls again when the page becomes visible: a window shown without the event still shows the notice', async () => {
+    const state = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    let due: unknown = null; // Go answers null while the window is hidden
+    const setup = await renderNotice(() => Promise.resolve(due));
+    await waitFor(() => {
+      expect(setup.fake.callsOf('app.windowNotice')).toHaveLength(1);
+    });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    due = NOTICE;
+    state.mockReturnValue('visible');
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(await screen.findByText(NOTICE.text)).toBeInTheDocument();
+    expect(setup.fake.callsOf('app.windowNotice')).toHaveLength(2);
+    await waitFor(() => {
+      expect(setup.fake.callsOf('app.windowNoticeShown')).toEqual([['still-sharing']]);
+    });
+  });
+
   it('a pulled answer that isn’t a notice shows nothing', async () => {
     const setup = await renderNotice(null);
     await waitFor(() => {
