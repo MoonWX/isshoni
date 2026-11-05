@@ -2668,7 +2668,7 @@ with `-tags e2e`: the fake engine with 05's audio scenarios (as in A), http serv
 `WEBVIEW2_*` scrub off, DevTools on, and `credstore.Open(credstore.Options{Prefix: "isshoni-test:<random>:"})` whose
 entries are deleted at exit (never the user's `isshoni:v1:` entries). The spec starts an `isshoni` server
 (`tls.mode=off` on `127.0.0.1`), launches the app with `--relaunched` (so Playwright keeps its process), a remote
-debugging port and a temporary data root, and attaches with `chromium.connectOverCDP`. **The data root can't come
+debugging port and a temporary data root, and attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation would keep `document.visibilityState` `visible`, so W7 couldn't see the window hide (W7 also checks the main HWND with `IsWindow`/`IsWindowVisible`). **The data root can't come
 through `LOCALAPPDATA`** either (WA48's review): the app reads `FOLDERID_LocalAppData` through the shell's known
 folder, never from the environment, so `flavor_e2e.go` (WA72) also takes the data root from the e2e-only
 `ISSHONI_E2E_DATA_DIR`, and the port from `ISSHONI_E2E_CDP_PORT`. WA48's skeleton (`web/e2e/cdp/`) sets both, seeds

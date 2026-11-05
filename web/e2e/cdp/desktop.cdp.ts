@@ -134,7 +134,10 @@ const test = base.extend<{ app: RealApp }>({
     try {
       await waitForEndpoint(endpoint, child);
       if (dataDir !== null) await assertUsedDataDir(dataDir);
-      const browser = await chromium.connectOverCDP(endpoint);
+      // noDefaults: by default Playwright turns on focus emulation for every page it attaches to, which keeps
+      // document.visibilityState 'visible' whatever the window does, so W7 could never see the hidden window (03 §4.4).
+      // It also leaves acceptDownloads and media emulation at the webview's own settings; no check here relies on them.
+      const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true });
       const pages = (): Page[] => browser.contexts().flatMap((c) => c.pages());
       await expect
         .poll(() => pages().some((p) => p.url().startsWith(DesktopAssetOriginWindows)), { timeout: START_TIMEOUT_MS })
@@ -203,8 +206,21 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
   });
   await page.waitForTimeout(1_500);
   const origin = await page.evaluate(() => location.origin);
-  // The native window.open (DesktopPlatform replaces window.open itself): NewWindowRequested cancels it.
-  const opened = await page.evaluate(() => Window.prototype.open.call(window, 'https://example.com/w') === null);
+  // The native window.open. DesktopPlatform replaced window's own (links.ts), and Window is a [Global] interface, so
+  // open is an own property of window and Window.prototype has none. A src-less iframe's window still has the native
+  // one (its about:blank needs no navigation, so the CSP's frame-src 'none' doesn't apply). Called on this window, it
+  // opens from the main frame, as a script in the SPA would; NewWindowRequested must cancel it.
+  const opened = await page.evaluate(() => {
+    const frame = document.createElement('iframe');
+    document.body.append(frame);
+    try {
+      const own = frame.contentWindow;
+      if (own === null) throw new Error('the fresh frame has no window');
+      return own.open.call(window, 'https://example.com/w') === null;
+    } finally {
+      frame.remove();
+    }
+  });
   await page.waitForTimeout(1_000);
   const after = app.browser.contexts().flatMap((c) => c.pages()).length;
   row(
@@ -220,15 +236,39 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
 test('W7: closing the window hides it; the app keeps running', async ({ app }) => {
   test.skip(app.process === null, 'needs the app this spec started (its pid)');
   const pid = String(app.process?.pid);
-  // WM_CLOSE to the main window, as its close button sends it.
-  await execFileAsync('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-Command',
-    `$null = (Get-Process -Id ${pid}).CloseMainWindow()`,
-  ]);
+  // -EncodedCommand (base64 of UTF-16LE) so the C# below keeps its double quotes through Windows' argument quoting.
+  const ps = async (command: string): Promise<string> =>
+    (
+      await execFileAsync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-EncodedCommand',
+        Buffer.from(command, 'utf16le').toString('base64'),
+      ])
+    ).stdout.trim();
+  // The main window's HWND, read before the close: .NET leaves hidden windows out of MainWindowHandle.
+  const hwnd = await ps(`(Get-Process -Id ${pid}).MainWindowHandle.ToInt64()`);
+  expect(hwnd).toMatch(/^[1-9]\d*$/);
+  // WM_CLOSE to the main window, as its close button sends it. False would mean it wasn't posted.
+  expect(await ps(`(Get-Process -Id ${pid}).CloseMainWindow()`)).toBe('True');
+  // What M1's layer policy reads: the webview reports hidden (03 §4.4).
   await expect.poll(() => app.page.evaluate(() => document.visibilityState), { timeout: 10_000 }).toBe('hidden');
+  // The window itself, independent of Chromium: it still exists (not destroyed) and is hidden (Hide(), 03 §3.2 W7).
+  const user32 =
+    "Add-Type -Namespace W -Name U -MemberDefinition '" +
+    '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); ' +
+    '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);' +
+    "'; ";
+  const [exists, visible] = (
+    await ps(`${user32}$h = [IntPtr]${hwnd}; '{0} {1}' -f [W.U]::IsWindow($h), [W.U]::IsWindowVisible($h)`)
+  ).split(' ');
   const alive = app.process?.exitCode === null;
-  row('W7', `after WM_CLOSE: visibilityState hidden, process alive = ${String(alive)}`);
+  row(
+    'W7',
+    `after WM_CLOSE: visibilityState hidden, IsWindow = ${String(exists)}, IsWindowVisible = ${String(visible)}, ` +
+      `process alive = ${String(alive)}`,
+  );
+  expect(exists).toBe('True');
+  expect(visible).toBe('False');
   expect(alive).toBe(true);
 });
