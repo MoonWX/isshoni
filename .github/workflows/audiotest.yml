@@ -100,12 +100,20 @@ jobs:
             if grep -q 'HTTP 403' "$err"; then
               # The contents: read default token may lack the permission environments need; the repository is
               # public, so the same read works without a token (no actions: read here: fetch is the only job with it).
+              # Unauthenticated reads share 60 an hour per IP with every job on that hosted runner's address, so
+              # retry, and name a rate limit apart from other failures.
               echo "the token can't read environments ($(tr '\n' ' ' <"$err")); reading it without a token"
-              if env_json=$(curl -fsS -H 'Accept: application/vnd.github+json' \
+              headers="$RUNNER_TEMP/environment-headers.txt"
+              if env_json=$(curl -fsS --retry 4 --retry-delay 15 --retry-all-errors -D "$headers" \
+                -H 'Accept: application/vnd.github+json' \
                 "$GITHUB_API_URL/repos/$REPO/environments/audiotest" 2>"$err"); then
                 : # read; checked below
               elif grep -q 'error: 404' "$err"; then
                 echo "::error::the environment audiotest does not exist: create it with $OWNER as required reviewer first (deploy/windows/runner/README.md)"
+                exit 1
+              elif [ "$(grep -i '^x-ratelimit-remaining:' "$headers" 2>/dev/null | tail -n 1 | tr -dc '0-9')" = "0" ]; then
+                reset=$(grep -i '^x-ratelimit-reset:' "$headers" | tail -n 1 | tr -dc '0-9' || true)
+                echo "::error::GitHub's unauthenticated rate limit for this runner's address is used up until $(date -u -d "@${reset:-0}" '+%H:%M UTC'): re-run this job after that"
                 exit 1
               else
                 echo "::error::could not read the environment audiotest, with or without a token: $(tr '\n' ' ' <"$err")"
@@ -564,7 +572,10 @@ jobs:
           $script = Join-Path $hw 'hwcheck.ps1'
           if (-not (Test-Path -LiteralPath $script)) { throw 'the tools have no hwcheck.ps1 (README WA76 adds it to native:dist)' }
 
-          # The result bundle lands in the current folder; hwcheck.ps1 keeps machine names and paths out of it (04 section 14).
+          # The contract with hwcheck.ps1 (04 section 14; WA76 writes the script): no arguments, a result zip in the
+          # current folder, no machine names or paths in it. 04 section 14 names no output argument and WA76 isn't on
+          # this base yet, so the zip next to the script is accepted too. At integration with WA76, pass its
+          # documented output argument here explicitly and drop that fallback.
           Set-Location -LiteralPath $bundle
           $start = Get-Date
           $ErrorActionPreference = 'Continue'
