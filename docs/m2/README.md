@@ -810,23 +810,22 @@ the named sections)
     workflow guards), and WB12 (§5 "As run").
 
 **Decided at group 14's merge, for group 15** (WB13 wrote each into the named sections)
-86. **WF14 is built: the desktop account menu and the app's toast removal** (group 14's WF14 review; R1 fixed, R2 and
-    R3 handed on): the desktop menu is Settings, Switch server (more than one server in `Auth.Servers()`, read each
-    time the menu opens), Account ↗, Invite friends, My invites ↗ (members with `createInvites`; opened in the system
-    browser like Account and Admin, because `/admin/invites` is behind `RequireBrowser`), Admin ↗, Test my
-    connection, About and "Sign out of <server>" (asks first, then `Auth.Unlink()`, never `POST /auth/logout`; an
-    unconfirmed unlink leaves a toast that stays), with no Notifications; the browser's menu is unchanged. **Switch
-    server goes to Settings → Servers** (`/desktop/settings#servers`, the Offline screen's target too), not to an
-    embedded `ServerSwitcher`, which would pull the `desktop` chunk and its lazy namespace into the main bundle; so
-    WA82's `#servers` section must render `desktop/ServerSwitcher` (Switch, Sign out, Remove, Add), with a component
-    test that two servers show Switch; until then the link lands on a settings page that has only WA77's Audio
-    section. Accepted: the texts are new `room.menu.*` keys in `en.json` (the menu is in the main bundle, where
-    `check:i18n` forbids `desktop.*`); `AccountMenu.test.tsx` is new. The toast removal: `toastBook.dropKind` keeps the dropped toasts'
-    ids, `removeStaleToasts` removes them once `App.mu` is released through the optional `toastRemover`
-    (`winos.Hooks.RemoveToasts`, kept in step by compile-time checks), serialized with `Shell.Notify`, and `notify`
-    removes stale toasts before it shows a new one; group 14's merge resolved `toasts.go` with WA77 (a pending toast
-    keeps both its id and its ref, and `dropRefsExcept` records dropped mic-prompt toasts as stale) (03 §7.5, §15;
-    the WF14 and WA82 rows).
+86. **WF14 is built: the desktop account menu and the app's toast removal** (group 14's WF14 review; R1 fixed, R2 and R3
+    handed on): the desktop menu is Settings, Switch server (more than one server in `Auth.Servers()`, read each time
+    the menu opens), Account ↗, Invite friends, My invites ↗ (members with `createInvites`; opened in the system browser
+    like Account and Admin, because `/admin/invites` is behind `RequireBrowser`), Admin ↗, Test my connection, About and
+    "Sign out of <server>" (asks first, then `Auth.Unlink()`, never `POST /auth/logout`; an unconfirmed unlink leaves a
+    toast that stays), with no Notifications; the browser's menu is unchanged. **Switch server goes to Settings →
+    Servers** (`/desktop/settings#servers`, the Offline screen's target too), not to an embedded `ServerSwitcher`, which
+    would pull the `desktop` chunk and its lazy namespace into the main bundle; so WA82's `#servers` section must render
+    `desktop/ServerSwitcher` (Switch, Sign out, Remove, Add), with a component test that two servers show Switch; until
+    then the link lands on a settings page that has only WA77's Audio section. Accepted: the texts are new `room.menu.*`
+    keys in `en.json` (the menu is in the main bundle, where `check:i18n` forbids `desktop.*`); `AccountMenu.test.tsx`
+    is new. The toast removal: `toastBook.dropKind` keeps the dropped toasts' ids, `removeStaleToasts` removes them once
+    `App.mu` is released through the optional `toastRemover` (`winos.Hooks.RemoveToasts`, kept in step by compile-time
+    checks), serialized with `Shell.Notify`, and `notify` removes stale toasts before it shows a new one; group 14's
+    merge resolved `toasts.go` with WA77 (a pending toast keeps both its id and its ref, and `dropRefsExcept` records
+    dropped mic-prompt toasts as stale) (03 §7.5, §15; the WF14 and WA82 rows).
 87. **WA77 is built, and its deviations are accepted** (group 14's WA77 review; all six findings were fixed): `main.go`
     passes 05's `audio.Service` as `app.Deps.Audio` and `bridge.Deps.Audio`. **`wizardDone`**: no spec said how the
     voice step's Done sets it, so `Settings.Update` applies `{wizardDone: true}` alone before WA84 (`false` is
@@ -1066,23 +1065,22 @@ first, branches and PRs) apply unchanged. This section lists only what M2 adds o
   that counts frames after a request counts those captured after it (`mediatest.Conformance` check 4, 01 §6.4, after
   a slow `desktop-macos` runner); `DeviceLinkPage`'s three remaining focus checks wait for the effect, like group 7's;
   and `internal/server/itest` took about 700 s under `-race` on the Mac, past `go test`'s default 10 minutes, so it is
-  run with `-timeout 25m` as `task test:go` runs it. Groups 13–14 and PR #53 added (§3 items 75, 90–92; each a class
-  to check across a whole diff before it goes to the Windows jobs): MSVC's `/W4 /WX` (C4996's CRT calls, C4127,
-  narrowing) and gosec's G115 (`golangci-lint`, also with `GOOS=windows`, on every integer conversion) fail what the
-  Mac's builds accept, so a slice runs the pinned linters itself; never link an umbrella library (`windowsapp`,
-  `onecore`): C++/WinRT uses `runtimeobject.lib`, and an API whose import would add an API set is resolved at run
-  time; the engine holds the MTA for the process; a crash on a thread other than gtest's main one ends a test binary
-  silently unless `tests/support/crash_report.cpp` prints it; ctest counts an all-skipped binary as passed, so the
-  skips are listed (gtest XML, `go test -v`); the `windows-2025` runner has no GPU (Basic Render) and, in
-  `windows-native`, no audio device, its job is elevated with an elevated Explorer in another session, a process
-  relaunched under that Explorer dies with 0xC0000142, and toasts need the process's AppUserModelID; PowerShell under
-  `Set-StrictMode -Version 3` needs `@()` around a function's result before `.Count`, PSScriptAnalyzer fails an
-  unused parameter, scripts stay ASCII and 5.1-compatible; makensis on Windows splits paths only at `\`; Task's shell
-  on Windows has no `/tmp` and its `mktemp` takes no folder; host state (the registry's ducking preference) must not
-  leak into a fixture; Playwright over CDP needs `connectOverCDP(…, { noDefaults: true })` to see `visibilityState`;
-  Wails beta.34 can't cancel a navigation or a new window (03 §3.2 W5's fallback) and its `Reload()` reloads the page
-  showing (`SetURL("/")` goes home); and events can arrive in either order, so a test that waits for two accepts both
-  orders.
+  run with `-timeout 25m` as `task test:go` runs it. Groups 13–14 and PR #53 added (§3 items 75, 90–92; each a class to
+  check across a whole diff before it goes to the Windows jobs): MSVC's `/W4 /WX` (C4996's CRT calls, C4127, narrowing)
+  and gosec's G115 (`golangci-lint`, also with `GOOS=windows`, on every integer conversion) fail what the Mac's builds
+  accept, so a slice runs the pinned linters itself; never link an umbrella library (`windowsapp`, `onecore`): C++/WinRT
+  uses `runtimeobject.lib`, and an API whose import would add an API set is resolved at run time; the engine holds the
+  MTA for the process; a crash on a thread other than gtest's main one ends a test binary silently unless
+  `tests/support/crash_report.cpp` prints it; ctest counts an all-skipped binary as passed, so the skips are listed
+  (gtest XML, `go test -v`); the `windows-2025` runner has no GPU (Basic Render) and, in `windows-native`, no audio
+  device, its job is elevated (UAC off, one full admin token) with an elevated Explorer in the job's own session, a
+  process relaunched under that Explorer dies with 0xC0000142, and toasts need the process's AppUserModelID; PowerShell
+  under `Set-StrictMode -Version 3` needs `@()` around a function's result before `.Count`, PSScriptAnalyzer fails an
+  unused parameter, scripts stay ASCII and 5.1-compatible; makensis on Windows splits paths only at `\`; Task's shell on
+  Windows has no `/tmp` and its `mktemp` takes no folder; host state (the registry's ducking preference) must not leak
+  into a fixture; Playwright over CDP needs `connectOverCDP(…, { noDefaults: true })` to see `visibilityState`; Wails
+  beta.34 can't cancel a navigation or a new window (03 §3.2 W5's fallback) and its `Reload()` reloads the page showing
+  (`SetURL("/")` goes home); and events can arrive in either order, so a test that waits for two accepts both orders.
 - The owner's PC (dual boot Win11 24H2 or later and Win10 22H2) runs what needs hardware, audio endpoints or the
   picker. Its items are written as exact steps in the specs (02 §16.4, 03 §22.5, 04 §18.4, 05 §18.9); a slice's
   "Manual:" items are recorded in its PR, with the `hwcheck` bundle attached where one applies, and don't block the

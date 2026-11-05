@@ -2220,15 +2220,16 @@ on (plan "A/V sync").
   also the engine-side proof that excluded windows vanish from both capture paths.
 - **As built (WA70; README §3 item 88)**: `native/windows/src/window/protect.cpp`. Every call, `flags` 0 and
   `IM_PROTECT_OFF` alike, needs **a top-level window of this process**: the checks run in this order, NULL → unknown
-  flags → build below 19041 (`IM_ERR_UNSUPPORTED_OS`, `os_too_old`) → not a window (`IsWindow`) → another process's
-  window (`GetWindowThreadProcessId`) → **not top-level** (`GetAncestor(hwnd, GA_ROOT) != hwnd`), each but the build
-  `IM_ERR_INVALID_ARG`. So a child window of this process is refused (and WebView2's, which another process owns,
-  already fails the process check): the caller passes the top-level window, whose affinity covers everything composed into it. Any thread of the process
-  may call. A `SetWindowDisplayAffinity` that fails, or an affinity that doesn't read back as asked
-  (`GetWindowDisplayAffinity`), is `IM_ERR_INTERNAL` with a WARN carrying only the Win32 code; the INFO line records
-  `protected`/`unprotected` and the build, never the window's title, class or process. The Go binding's
-  `ProtectWindow(hwnd)` refuses a zero handle as `invalid` without a DLL call and has no `IM_PROTECT_OFF` method
-  (§12.2 lists `ProtectWindow` only); `protect-check` undoes the affinity with its own
+  flags → build below 19041 (`IM_ERR_UNSUPPORTED_OS`, `os_too_old`; skipped when the build can't be read) → not a window
+  (`IsWindow`) → another process's window (`GetWindowThreadProcessId`) → **not top-level** (`GetAncestor(hwnd, GA_ROOT)
+  != hwnd`), each but the build `IM_ERR_INVALID_ARG`. So a child window of this process is refused (and WebView2's,
+  which another process owns, already fails the process check): the caller passes the top-level window, whose affinity
+  covers everything composed into it. Any thread of the process may call. A `SetWindowDisplayAffinity` that fails is
+  `IM_ERR_INTERNAL` with a WARN carrying the Win32 code; a `GetWindowDisplayAffinity` that fails is `IM_ERR_INTERNAL`
+  (no WARN); an affinity that doesn't read back as asked is `IM_ERR_INTERNAL` with a WARN carrying the wanted and read
+  values; the INFO line records `protected`/`unprotected` and the build, never the window's title, class or process. The
+  Go binding's `ProtectWindow(hwnd)` refuses a zero handle as `invalid` without a DLL call and has no `IM_PROTECT_OFF`
+  method (§12.2 lists `ProtectWindow` only); `protect-check` undoes the affinity with its own
   `SetWindowDisplayAffinity(WDA_NONE)`, and the C++ tests cover the flag.
 - What the engine guarantees for any excluded window, whoever set the affinity: it vanishes from WGC monitor captures
   and from DD alike (the content behind it shows), so friends never see the isshoni window, its viewer or the pill.
