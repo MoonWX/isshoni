@@ -82,7 +82,7 @@ const PORT_ENV = 'ISSHONI_E2E_CDP_PORT';
 const DATA_DIR_ENV = 'ISSHONI_E2E_DATA_DIR';
 /** WebView2's first start (a new user data folder) takes a few seconds. */
 const START_TIMEOUT_MS = 60_000;
-/** A killed app is gone within this; the next start needs its single-instance mutex free (03 §13.3). */
+/** A killed app is gone within this; the next start needs the data root's single-instance lock released (03 §13.3). */
 const EXIT_TIMEOUT_MS = 15_000;
 /** 03 §20: Quit waits at most 3 s for the server. */
 const QUIT_BUDGET_MS = 3_000;
@@ -1147,7 +1147,7 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
     for (;;) {
       if (child.exitCode === 0) {
         throw new Error(
-          'the production build exited 0 at once: another isshoni (same single-instance id) is probably running; ' +
+          'the production build exited 0 at once: another isshoni (same data root) is probably running; ' +
             'quit it (tray → Quit) and run again',
         );
       }

@@ -30,7 +30,7 @@ import (
 const (
 	childEnv   = "ISSHONI_DESKTOP_TEST_CHILD"
 	idEnv      = "ISSHONI_DESKTOP_TEST_ID"      // the single-instance id
-	rootEnv    = "ISSHONI_DESKTOP_TEST_ROOT"    // the data root whose instance secret names the single instance
+	rootEnv    = "ISSHONI_DESKTOP_TEST_ROOT"    // the data root whose instance.lock is the lock
 	runningEnv = "ISSHONI_DESKTOP_TEST_RUNNING" // the running mutex's name
 	outEnv     = "ISSHONI_DESKTOP_TEST_OUT"     // a file the child writes
 )

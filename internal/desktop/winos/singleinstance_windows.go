@@ -35,6 +35,9 @@ const (
 	lockFile = "instance.lock"
 	// lockReadLimit bounds what a second launch reads of instance.lock: a valid content is one pipe name.
 	lockReadLimit = 512
+	// openPatience bounds openLock's retries of a sharing violation, openPause spaces them.
+	openPatience = time.Second
+	openPause    = 25 * time.Millisecond
 )
 
 var (
@@ -93,33 +96,36 @@ func lockRange() *windows.Overlapped {
 	return &windows.Overlapped{Offset: uint32(lockOffset & 0xFFFFFFFF), OffsetHigh: uint32(lockOffset >> 32)}
 }
 
-// openLock opens path, instance.lock. With create it opens or creates it (OPEN_ALWAYS; a new file gets sa) for
-// reading and writing, or, when writing is denied, an existing one for reading only (LockFileEx needs either);
-// without, an existing one for reading. FILE_FLAG_OPEN_REPARSE_POINT opens a link as itself, which checkLock refuses.
-// The handle shares reading and writing, never deletion, so the file can't go while an instance holds it. Its errors
-// hold no path.
-func openLock(path string, create bool, sa *windows.SecurityAttributes) (h windows.Handle, writable bool, err error) {
+// openLock opens path, instance.lock: for reading and writing with write, else for reading only, with disposition
+// (OPEN_ALWAYS, OPEN_EXISTING or CREATE_NEW; a new file gets sa). FILE_FLAG_OPEN_REPARSE_POINT opens a link as itself,
+// which checkLock refuses. The handle shares reading and writing, never deletion, so the file can't go while an
+// instance holds it. A sharing violation (another process, a backup or a scanner, has the file open without sharing
+// writes for a moment) is retried every openPause for up to patience. Its errors hold no path.
+func openLock(path string, write bool, disposition uint32, sa *windows.SecurityAttributes,
+	patience time.Duration,
+) (windows.Handle, error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return windows.InvalidHandle, false, errors.New("winos: the data root's path has a NUL")
+		return windows.InvalidHandle, errors.New("winos: the data root's path has a NUL")
 	}
 	const share = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE
 	const flags = windows.FILE_ATTRIBUTE_NORMAL | windows.FILE_FLAG_OPEN_REPARSE_POINT
-	if create {
-		h, err = windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE, share, sa, windows.OPEN_ALWAYS,
-			flags, 0)
+	access := uint32(windows.GENERIC_READ)
+	if write {
+		access |= windows.GENERIC_WRITE
+	}
+	deadline := time.Now().Add(patience)
+	for {
+		h, err := windows.CreateFile(p, access, share, sa, disposition, flags, 0)
 		if err == nil {
-			return h, true, nil
+			return h, nil
 		}
-		if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			return windows.InvalidHandle, false, err
+		busy := errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_LOCK_VIOLATION)
+		if !busy || !time.Now().Before(deadline) {
+			return windows.InvalidHandle, err
 		}
+		time.Sleep(openPause)
 	}
-	h, err = windows.CreateFile(p, windows.GENERIC_READ, share, nil, windows.OPEN_EXISTING, flags, 0)
-	if err != nil {
-		return windows.InvalidHandle, false, err
-	}
-	return h, false, nil
 }
 
 // checkLock reads what lockState needs to know about an open instance.lock apart from the lock: whether it is a plain
@@ -137,10 +143,32 @@ func (s *SingleInstance) checkLock(h windows.Handle) (lockFacts, error) {
 	}, nil
 }
 
+// openChecked opens instance.lock for reading and writing (openLock) and reads its facts. On an error no handle is
+// left open.
+func (s *SingleInstance) openChecked(path string, disposition uint32, sa *windows.SecurityAttributes) (
+	windows.Handle, lockFacts, error,
+) {
+	h, err := openLock(path, true, disposition, sa, openPatience)
+	if err != nil {
+		return windows.InvalidHandle, lockFacts{}, err
+	}
+	facts, err := s.checkLock(h)
+	if err != nil {
+		_ = windows.CloseHandle(h)
+		return windows.InvalidHandle, lockFacts{}, err
+	}
+	return h, facts, nil
+}
+
 // Acquire takes the lock: first is true when no other process of this user and data root, in any of the user's
-// sessions, elevated or not, holds it. A second instance calls Forward and exits. An instance.lock that isn't this
-// user's plain file never makes this launch a second instance: Acquire returns an error, so the caller starts as the
-// first instance without a lock (03 §13.3).
+// sessions, elevated or not, holds it. A second instance calls Forward and exits.
+//
+// An instance.lock that isn't this user's plain file, or that can't be opened for writing (read-only, a folder), came
+// from a copy, a restore or a migration of the data root (which only the user, SYSTEM and administrators may write
+// to): Acquire deletes that name, never what a link points to, and takes the lock on a new file (repairLock). When
+// that fails it never makes this launch a second instance: a file it can't trust gives an error, so the caller starts
+// as the first instance without a lock, and one it can only read is locked read-only, without a pipe for second
+// launches to find (03 §13.3).
 func (s *SingleInstance) Acquire() (first bool, err error) {
 	if err := os.MkdirAll(s.root, 0o700); err != nil { //nolint:gosec // G703: the app's own data root
 		var pe *fs.PathError
@@ -153,19 +181,50 @@ func (s *SingleInstance) Acquire() (first bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	h, writable, err := openLock(filepath.Join(s.root, lockFile), true, sa)
+	path := filepath.Join(s.root, lockFile)
+	h, facts, err := s.openChecked(path, windows.OPEN_ALWAYS, sa)
+	denied := errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	if denied || (err == nil && (facts.reparse || !facts.ownerIsUser)) {
+		why := "not this user's plain file"
+		if denied {
+			why = "not writable"
+		}
+		if h != windows.InvalidHandle {
+			_ = windows.CloseHandle(h) // its handle doesn't share deletion
+		}
+		if rerr := repairLock(path); rerr != nil {
+			s.log.Warn("winos: the single-instance lock file can't be replaced", "file", lockFile, "why", why,
+				"err", rerr)
+			h, facts, err = s.openChecked(path, windows.OPEN_ALWAYS, sa) // another launch may have replaced it
+		} else {
+			h, facts, err = s.openChecked(path, windows.CREATE_NEW, sa)
+			if errors.Is(err, windows.ERROR_FILE_EXISTS) { // another launch created it first
+				h, facts, err = s.openChecked(path, windows.OPEN_ALWAYS, sa)
+			}
+			if err == nil {
+				s.log.Warn("winos: the single-instance lock file was replaced", "file", lockFile, "why", why)
+			}
+		}
+		denied = errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	}
+	writable := !denied
+	if denied { // still not writable: an existing file it can read is locked all the same
+		h, err = openLock(path, false, windows.OPEN_EXISTING, nil, openPatience)
+		if err == nil {
+			if facts, err = s.checkLock(h); err != nil {
+				_ = windows.CloseHandle(h)
+			}
+		}
+	}
 	if err != nil {
 		return false, fmt.Errorf("winos: the single-instance lock file: %w", err)
 	}
-	facts, err := s.checkLock(h)
-	if err == nil && !facts.reparse && facts.ownerIsUser {
+	if !facts.reparse && facts.ownerIsUser {
 		facts.lockErr = windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0,
 			1, 0, lockRange())
 		facts.violation = errors.Is(facts.lockErr, windows.ERROR_LOCK_VIOLATION)
 	}
-	if err == nil {
-		first, err = lockState(facts)
-	}
+	first, err = lockState(facts)
 	if err != nil || !first {
 		_ = windows.CloseHandle(h)
 		return false, err
@@ -182,6 +241,41 @@ func (s *SingleInstance) Acquire() (first bool, err error) {
 	s.lock, s.writable = h, writable
 	s.mu.Unlock()
 	return true, nil
+}
+
+// repairLock deletes the name path, an instance.lock that Acquire can't use, without following a link: a file, a
+// symbolic link or a hard link goes by DeleteFile (a link's target, or the file's other names, stay), a junction or a
+// directory symbolic link by RemoveDirectory, and a real directory only when it is empty. A read-only file's attribute
+// is cleared first. A name that is gone already (another launch repaired it) is no error. Its errors hold no path.
+func repairLock(path string) error {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return errors.New("winos: the data root's path has a NUL")
+	}
+	attrs, err := windows.GetFileAttributes(p) // of the link itself, not its target
+	switch {
+	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
+		return nil
+	case err != nil:
+		return err
+	case attrs&windows.FILE_ATTRIBUTE_DIRECTORY != 0:
+		err = windows.RemoveDirectory(p) // a link: the link; a real directory: ERROR_DIR_NOT_EMPTY unless empty
+	default:
+		if attrs&windows.FILE_ATTRIBUTE_READONLY != 0 && attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+			rest := attrs &^ windows.FILE_ATTRIBUTE_READONLY
+			if rest == 0 {
+				rest = windows.FILE_ATTRIBUTE_NORMAL
+			}
+			if err := windows.SetFileAttributes(p, rest); err != nil {
+				return err
+			}
+		}
+		err = windows.DeleteFile(p)
+	}
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return nil
+	}
+	return err
 }
 
 // writeLock replaces instance.lock's content with data, from offset 0, and flushes it. Its errors hold neither.
@@ -221,7 +315,8 @@ func (s *SingleInstance) publish(name string) error {
 // readPipeName reads the first instance's pipe name from instance.lock: ok false while there is none (the first
 // instance still starts), and for a file that isn't this user's plain file.
 func (s *SingleInstance) readPipeName() (pipe string, ok bool) {
-	h, _, err := openLock(filepath.Join(s.root, lockFile), false, nil)
+	// Not retried here: Forward retries the whole read.
+	h, err := openLock(filepath.Join(s.root, lockFile), false, windows.OPEN_EXISTING, nil, 0)
 	if err != nil {
 		return "", false
 	}
@@ -249,7 +344,7 @@ func (s *SingleInstance) readPipeName() (pipe string, ok bool) {
 // moment (cmd/isshoni-desktop's TestAutostartRoundTrip checks that nothing does before it starts the app). No
 // instance.lock is no lock.
 func LockHeld(root string) (bool, error) {
-	h, _, err := openLock(filepath.Join(root, lockFile), false, nil)
+	h, err := openLock(filepath.Join(root, lockFile), false, windows.OPEN_EXISTING, nil, openPatience)
 	switch {
 	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND), errors.Is(err, windows.ERROR_PATH_NOT_FOUND):
 		return false, nil
@@ -491,24 +586,23 @@ var errNoPipeName = errors.New("winos: the first instance hasn't published its p
 // Forward sends args to the first instance, within ForwardTimeout (03 §13.3). It calls
 // AllowSetForegroundWindow(ASFW_ANY) first, so the first instance may come to the front. It reads the pipe's name
 // from instance.lock and retries until the bound while there is none, the pipe isn't there or busy, or the pipe
-// isn't this user's (a stale name another account took: the first instance may still be publishing its own).
+// isn't this user's (a stale name another account took: the first instance may still be publishing its own); a pipe
+// it refused is what its error says, even when later attempts found the pipe busy (retryOpen).
 func (s *SingleInstance) Forward(args []string) error {
 	data, err := encodeArgs(args)
 	if err != nil {
 		return err
 	}
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(asfwAny))
-	deadline := time.Now().Add(ForwardTimeout)
-	for {
-		h, err := s.openServer()
-		if err == nil {
-			return writeAll(h, data)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("winos: the first instance didn't answer within %v: %w", ForwardTimeout, err)
-		}
-		time.Sleep(forwardPause)
+	var h windows.Handle
+	err = retryOpen(ForwardTimeout, forwardPause, func() (err error) {
+		h, err = s.openServer()
+		return err
+	})
+	if err != nil {
+		return err
 	}
+	return writeAll(h, data)
 }
 
 // openServer opens the pipe whose name instance.lock holds and checks that it is this user's. Its errors hold no
@@ -518,6 +612,11 @@ func (s *SingleInstance) openServer() (windows.Handle, error) {
 	if !ok {
 		return windows.InvalidHandle, errNoPipeName
 	}
+	return s.dial(pipe)
+}
+
+// dial opens the pipe pipe and checks that it is this user's (checkServer). Its errors hold no name.
+func (s *SingleInstance) dial(pipe string) (windows.Handle, error) {
 	name, err := windows.UTF16PtrFromString(pipe)
 	if err != nil {
 		return windows.InvalidHandle, errNoPipeName

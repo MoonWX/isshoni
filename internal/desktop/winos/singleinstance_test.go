@@ -3,6 +3,7 @@ package winos
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path"
@@ -371,6 +372,38 @@ func TestServerCheck(t *testing.T) {
 		if err != nil && !errors.Is(err, errServerNotUser) {
 			t.Errorf("%s: %v isn't errServerNotUser", c.name, err)
 		}
+	}
+}
+
+// TestRetryOpen: Forward's loop returns at the first success; on the timeout a refused server is its error even when
+// later attempts failed otherwise (a refused pipe that stays leaves its instance busy), and without a refusal the
+// last attempt's error is.
+func TestRetryOpen(t *testing.T) {
+	errBusy, errGone := errors.New("busy"), errors.New("gone")
+	const timeout, pause = 100 * time.Millisecond, time.Millisecond
+	seq := func(errs ...error) func() error {
+		n := 0
+		return func() error {
+			err := errs[min(n, len(errs)-1)]
+			n++
+			return err
+		}
+	}
+	refused := fmt.Errorf("%w (its owner: x)", errServerNotUser)
+	if err := retryOpen(timeout, pause, seq(errBusy, refused, nil)); err != nil {
+		t.Errorf("a success after failures: %v", err)
+	}
+	start := time.Now()
+	err := retryOpen(timeout, pause, seq(refused, errBusy))
+	if !errors.Is(err, errServerNotUser) {
+		t.Errorf("refused once, then busy: %v, want errServerNotUser", err)
+	}
+	if d := time.Since(start); d < timeout {
+		t.Errorf("gave up after %v, before the timeout", d)
+	}
+	if err := retryOpen(timeout, pause, seq(errBusy, errGone)); !errors.Is(err, errGone) ||
+		errors.Is(err, errServerNotUser) {
+		t.Errorf("never refused: %v, want the last error", err)
 	}
 }
 

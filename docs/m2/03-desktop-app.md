@@ -106,7 +106,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
 | W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and the native `window.open(…)` (from a fresh frame) leave the page on the asset origin, the open returns `null` and no page appears; a browser-started navigation (CDP `Page.navigate`) to a foreign URL comes back to the asset origin by itself; `chrome.webview.postMessage` is still there under the CSP sandbox | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, the start page again. **Fails at beta.34, fallback taken**: Wails registers no `NewWindowRequested` handler (the COM types exist in `internal/webview2/pkg/webview2`, nothing subscribes), and its `NavigationStarting` callback drops the event's arguments (`edge/chromium.go`, `application/webview_window_windows.go`'s `navigationStarting`), so Go can cancel neither, and no Wails option or reachable WebView2 setting blocks them. The fallback, §5.5 layer 2: (1) `bridge.js`'s Navigation API `navigate` listener cancels a script's foreign navigation (§5.2); (2) the HTML response's header CSP ends with `sandbox allow-scripts allow-same-origin allow-forms`, no `allow-popups`, so Blink refuses every new window before WebView2 sees one (§5.3); (3) after each `WebViewNavigationCompleted`, Go asks the page where it is and loads the start page (`SetURL("/")`) when the browser-reported top-level source (`OriginInfo.TopOrigin`) is not the asset origin or no answer comes within 5 s once the runtime is up (`navguard.go`; a window that keeps leaving is sent back at most 3 times a minute). `Shell.Reload()` can't be the fallback: at beta.34 it is `location.reload()` of whatever page is showing, so the shell loads the start page instead when the window was last seen elsewhere, and W17's watchdog loads it after a reload that brought no beat back. The CDP check is written against the fallback, and PR #53's `windows-desktop` run passed it (README §3 item 92): it reaches the native `window.open` through a fresh `src`-less iframe's window (`DesktopPlatform` replaced `window.open` itself), asserts that it returns `null` with no new page, and asserts that a browser-started navigation really reached the foreign origin before it came back; `desktop-security.spec` checks (1) and (2) in Chrome too. Not covered: a new window the browser starts itself (the default context menu's "Open link in new window", on only in dev and e2e builds, §5.4), and a foreign page that loads runs until Go sends it back (layer 3 keeps it off `/wails/*`). Re-check at every bump; drop (3) and the sandbox once Wails can cancel |
-| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own lock and pipe in `winos` (per user and data root, §13.3; distinct from the running mutex of §13.4): a `LockFileEx` file lock on `instance.lock` in the data root (owner the user, DACL the user and SYSTEM; a link, a hard link, a folder or a file of another owner there is refused and the launch starts without the lock) and the pipe `\\.\pipe\io.isshoni.desktop.v1.<random>`, a new name each run, owned by and open to the user only, whose name the first instance writes into `instance.lock`; a second launch forwards only when the pipe's owner is the user's SID. No name needs to stay unknown (README §3 item 119). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
+| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own lock and pipe in `winos` (per user and data root, §13.3; distinct from the running mutex of §13.4): a `LockFileEx` file lock on `instance.lock` in the data root (owner the user, DACL the user and SYSTEM; a link, a hard link, a folder, a read-only file or a file of another owner there is replaced by a new file, and the launch starts without the lock only when that fails) and the pipe `\\.\pipe\io.isshoni.desktop.v1.<random>`, a new name each run, owned by and open to the user only, whose name the first instance writes into `instance.lock`; a second launch forwards only when the pipe's owner is the user's SID. No name needs to stay unknown (README §3 item 119). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
 | W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test. **Holds at beta.34** (PR #53's `windows-desktop` run; README §3 item 92; again in PR #56's green run, README §3 item 113): after `WM_CLOSE` (posted to the main window's HWND, as its close button sends it: the process's one enabled top-level window of Wails' class `WailsWebviewWindow`, since beta.34 also makes a hidden `WS_DISABLED` one of that class, `__wails_hidden_mainthread`, and .NET's `MainWindowHandle`/`CloseMainWindow()`, which PR #53's check used, take the first visible unowned window, the topmost Sharing pill while a share is live) the main HWND still exists (`IsWindow`) and is hidden (`IsWindowVisible` false), the page reports `document.visibilityState` `hidden`, and the process lives. The spec attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation keeps `visibilityState` `visible` whatever the window does, so without it the row could never see the hide. The two state polls are soft, so the row records the window's and the webview's state apart | Window option to hide on close, plus our own quit path from the tray |
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
 | W9 | WebView2 settings: DevTools off in production builds, default context menu off, zoom control off, browser accelerator keys off, general autofill and password save off, status bar off, swipe navigation off, external drop off | CDP e2e per setting where observable; else manual | The SPA-level mitigations of §5.4 |
@@ -2275,7 +2275,7 @@ for it), so every later reload sends the page back to the setup page (WA83-R4).
   lock** is a file lock in the data root (§14.1; `%LOCALAPPDATA%\isshoni`, per user and per PC, or the e2e build's
   `ISSHONI_E2E_DATA_DIR\isshoni`, §22.4 B, which so has its own lock): a launch opens `instance.lock` there with
   `CreateFileW(GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_ALWAYS,
-  FILE_FLAG_OPEN_REPARSE_POINT)` (read-only when writing is denied; a new file gets the security descriptor
+  FILE_FLAG_OPEN_REPARSE_POINT)` (a new file gets the security descriptor
   `O:<user SID>D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)`, the owner set explicitly since an elevated administrator's files
   are otherwise owned by `BUILTIN\Administrators`, the DACL protected from inheritance) and takes
   `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on the one byte at offset 2^40, far past the
@@ -2284,7 +2284,21 @@ for it), so every later reload sends the page back to the setup page (WA83-R4).
   dies with the handle, so with the process however it ends; there is no stale lock to clean up. Before it locks, the
   launch checks that `instance.lock` is the user's own plain file: not a reparse point (opened as itself, so a symbolic
   link or junction is seen, never followed), not a directory, no other hard link, and owned by the user's SID
-  (`GetSecurityInfo(SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION)`). Anything else, or a lock error other than
+  (`GetSecurityInfo(SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION)`). An open that fails with `ERROR_SHARING_VIOLATION`
+  (or `ERROR_LOCK_VIOLATION`: another process, a backup or a scanner, has the file open for a moment without sharing
+  writes) is retried every 25 ms for up to 1 s before it counts as an error.
+- **Repair**: since the data root is the user's own, anything else at `instance.lock` (a file of another owner, a link,
+  a second hard link, a directory, a read-only file or one whose open for writing is denied) came from a copy, a
+  restore or a migration of the data root, not from another account; left there it would make every launch run
+  without the lock, so two instances could share one data root. The launch closes its handle and deletes that name
+  without following it: `DeleteFileW` for a file, a symbolic link or a hard link (a link's target and a file's other
+  names stay), `RemoveDirectoryW` for a junction, a directory symbolic link or a directory, which goes only when empty;
+  a read-only file's `FILE_ATTRIBUTE_READONLY` is cleared first. It then opens the name once more with `CREATE_NEW`
+  and the user-only security descriptor and takes the lock on the new file (when another launch's repair created it
+  first, `ERROR_FILE_EXISTS`, it opens and checks that one as usual), and logs a warning that the lock file was
+  replaced (its base name and the reason only). When the repair fails (another process keeps the file open without
+  delete sharing, a directory that isn't empty), the launch goes on as before: a file it can only read is locked
+  read-only, without a pipe that second launches could find; anything else, or a lock error other than
   `ERROR_LOCK_VIOLATION`, makes the launch start as the first instance without a lock (step 3's existing rule, with a
   warning that names no path), never as a second instance, which would exit.
 - **The pipe**: the first instance creates `\\.\pipe\io.isshoni.desktop.v1.<32 hex digits>`, 16 `crypto/rand` bytes
@@ -2297,7 +2311,8 @@ for it), so every later reload sends the page back to the setup page (WA83-R4).
   instance runs elevated; comparing the server process's token, which a non-elevated client can't open for an elevated
   server (`ERROR_ACCESS_DENIED`), is only the fallback when the owner can't be read. No name yet (the first instance
   still starts), a name with no pipe, a busy pipe and a pipe that isn't the user's are retried until the 2 s bound,
-  then the launch logs the failure and exits 0.
+  then the launch logs the failure and exits 0. A refused pipe is what that failure reports even when later attempts
+  found it busy (a squatter's pipe whose server never disconnects stays busy).
 - **Why no name needs to stay secret** (README §3 items 117–119): every name in `\\.\pipe\` and `\BaseNamedObjects`
   can be listed by any local account, so WF19's SID-derived names and item 118's per-user secret both leaked to
   another account the moment the app first ran, and such an account could create them first. Nothing here depends on
@@ -2343,12 +2358,15 @@ for it), so every later reload sends the page back to the setup page (WA83-R4).
   forward into a dead window would otherwise block the exit). The macOS dev build has no single instance.
 - Tests: `winos`' `TestPipeNames` (the name's form, `instance.lock`'s content parsed only as such a name of the same id,
   the CI cleanup's pattern and that it prints no name), `TestLockState` and `TestServerCheck` (every OS); and
-  `TestSingleInstanceLock`, `TestSingleInstanceSecurity`, `TestSingleInstanceLockNotOurs`,
+  `TestRetryOpen` (a refusal outlives later busy attempts) and `TestSingleInstanceLock`, `TestSingleInstanceSecurity`,
+  `TestSingleInstanceLockNotOurs`, `TestSingleInstanceLockNotRepaired`, `TestSingleInstanceSharingViolation`,
   `TestSingleInstanceOldNamesIgnored`, `TestForwardStaleName`, `TestForwardSquattedName`, `TestForwardChecksTheServer`
   and `TestSingleInstanceAcrossProcesses` (Windows: one root's second instance forwards, two roots don't see each
-  other, the file's and the pipe's owner and DACL, a file of another owner, a link, a hard link or a folder at
-  `instance.lock` never makes a second instance, a stale name is retried and fails cleanly, a squatted stale name is
-  refused; the `owner` and squatted cases need an elevated process, as on CI); `cmd/isshoni-desktop`'s
+  other, the file's and the pipe's owner and DACL, a file of another owner, a link, a hard link, an empty folder or a
+  read-only file at `instance.lock` is replaced and the new lock serves a second launch, one held open by another
+  process or a folder with a file in it never makes a second instance, a file open for 200 ms without write sharing
+  only delays the lock, a stale name is retried and fails cleanly, a squatted stale name is refused; the `owner` and
+  squatted cases need an elevated process, as on CI); `cmd/isshoni-desktop`'s
   `TestPurgeWhileRunning` (Windows) checks the purge against a held lock.
 - A second launch forwards `os.Args[1:]` unchanged to the first and exits 0 within 2 s; before forwarding it calls
   `AllowSetForegroundWindow(ASFW_ANY)`, so the first instance may come to the front (Windows' focus rules otherwise
@@ -2704,8 +2722,9 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   runs" still forwards), and when the first instance exits while the window is awaited, and its timeout says whether
   `winos`' `serveLoop` logged the forward as arrived (it logs each delivered command line by its count only, never its
   arguments). A failure prints both starts' stderr and the first instance's log files. CI runs it twice, before and
-  after the updater e2e (06 §10.1), and PR #56's green run passed both. PR #56's runs had a per-session mutex and a per-user pipe,
-  a scope mismatch that WF19 resolved: both are per user now (§13.3; README §3 item 115).
+  after the updater e2e (06 §10.1), and PR #56's green run passed both. PR #56's runs had a per-session mutex and a
+  per-user pipe, a scope mismatch that WF19 resolved (README §3 item 115); since item 119 the lock is `instance.lock`
+  in the data root and the pipe's name is new each run (§13.3).
 
 ### 16.2 Updates (the UI; 06 owns the updater)
 

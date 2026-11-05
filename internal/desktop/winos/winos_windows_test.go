@@ -3,6 +3,7 @@
 package winos
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -298,14 +299,15 @@ func mustSID(t *testing.T) string {
 	return u.User.Sid.String()
 }
 
-// TestSingleInstanceLockNotOurs: an instance.lock that isn't this user's plain file never makes a launch a second
-// instance, even while another handle holds its range: Acquire fails without a lock, so main starts as the first
-// instance (with a warning), and Serve then refuses (03 §13.3). "owner": a file owned by BUILTIN\Administrators,
-// which only a process with that group as an owner can create (an elevated one, as on CI; skipped otherwise);
-// "symlink": a symbolic link to a file of the user (skipped without the right to create one); "hardlink": a second
-// name of a file elsewhere; "directory": a folder at the name.
+// TestSingleInstanceLockNotOurs: an instance.lock that isn't this user's plain writable file (one a copy, a restore or
+// a migration of the data root left) is replaced: its name is deleted, never what it links to, and the launch takes
+// the lock on a new file of its own, which a second launch of the same root sees and forwards to (03 §13.3). "owner":
+// a file owned by BUILTIN\Administrators, which only a process with that group as an owner can create (an elevated
+// one, as on CI; skipped otherwise); "symlink": a symbolic link to a file of the user (skipped without the right to
+// create one); "hardlink": a second name of a file elsewhere; "directory": an empty folder at the name; "read-only":
+// the user's own file with FILE_ATTRIBUTE_READONLY.
 func TestSingleInstanceLockNotOurs(t *testing.T) {
-	for _, how := range []string{"owner", "symlink", "hardlink", "directory"} {
+	for _, how := range []string{"owner", "symlink", "hardlink", "directory", "read-only"} {
 		t.Run(how, func(t *testing.T) {
 			root := t.TempDir()
 			path := filepath.Join(root, lockFile)
@@ -315,25 +317,7 @@ func TestSingleInstanceLockNotOurs(t *testing.T) {
 			}
 			switch how {
 			case "owner":
-				p, err := windows.UTF16PtrFromString(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
-					windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, attrs(t, "O:BAD:P(A;;GA;;;WD)"),
-					windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
-				if errors.Is(err, windows.ERROR_INVALID_OWNER) {
-					t.Skip("BUILTIN\\Administrators can't own this process's files (not elevated)")
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() { _ = windows.CloseHandle(h) }()
-				// Another holder of the range: it must still not make this launch a second instance.
-				if err := windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0,
-					1, 0, lockRange()); err != nil {
-					t.Fatal(err)
-				}
+				_ = windows.CloseHandle(adminOwned(t, path, false))
 			case "symlink":
 				if err := os.Symlink(target, path); err != nil {
 					t.Skipf("no symbolic link: %v", err)
@@ -346,22 +330,166 @@ func TestSingleInstanceLockNotOurs(t *testing.T) {
 				if err := os.Mkdir(path, 0o700); err != nil {
 					t.Fatal(err)
 				}
+			case "read-only":
+				if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0o400); err != nil { // FILE_ATTRIBUTE_READONLY
+					t.Fatal(err)
+				}
 			}
-			si := newInstance(t, randomID(t), root, slog.New(slog.DiscardHandler))
+			var logs bytes.Buffer
+			id := randomID(t)
+			a := newInstance(t, id, root, slog.New(slog.NewTextHandler(&logs, nil)))
+			if first, err := a.Acquire(); err != nil || !first {
+				t.Fatalf("Acquire at %s: %v %v, want the repaired lock", how, first, err)
+			}
+			t.Cleanup(func() { _ = a.Close() })
+			if !strings.Contains(logs.String(), "lock file was replaced") {
+				t.Errorf("no warning that the lock file was replaced: %s", logs.String())
+			}
+			if strings.Contains(logs.String(), root) {
+				t.Errorf("the log holds the path: %s", logs.String())
+			}
+			// The new file is a plain one of the user's, open to the user and SYSTEM only.
+			fi, err := os.Lstat(path)
+			if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0o200 == 0 {
+				t.Fatalf("instance.lock after the repair: %v %v", fi, err)
+			}
+			sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+				windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkSD(t, "the new instance.lock", sd, a.sid, []string{a.sid, "S-1-5-18"})
+			if data, err := os.ReadFile(target); err != nil || len(data) != 0 {
+				t.Errorf("the linked file was written or deleted: %q %v", data, err)
+			}
+			if held, err := LockHeld(root); !held || err != nil {
+				t.Errorf("LockHeld after the repair: %v %v", held, err)
+			}
+			got := make(chan []string, 1)
+			if err := a.Serve(func(args []string) { got <- args }); err != nil {
+				t.Fatal(err)
+			}
+			b := newInstance(t, id, root, nil)
+			if first, err := b.Acquire(); err != nil || first {
+				t.Fatalf("a second Acquire of the repaired root: %v %v, want a second instance", first, err)
+			}
+			if err := b.Forward([]string{"--autostart"}); err != nil {
+				t.Fatal(err)
+			}
+			receiveArgs(t, got, "--autostart")
+		})
+	}
+}
+
+// TestSingleInstanceLockNotRepaired: an instance.lock that can't be replaced never makes a launch a second instance:
+// Acquire fails without a lock, so main starts as the first instance (with a warning), and Serve then refuses (03
+// §13.3). "owner, held": a file of BUILTIN\Administrators (elevated only, as on CI) that another handle keeps open,
+// its range locked; "full directory": a folder at the name that holds a file.
+func TestSingleInstanceLockNotRepaired(t *testing.T) {
+	for _, how := range []string{"owner, held", "full directory"} {
+		t.Run(how, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, lockFile)
+			switch how {
+			case "owner, held":
+				h := adminOwned(t, path, true)
+				t.Cleanup(func() { _ = windows.CloseHandle(h) })
+			case "full directory":
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "kept"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var logs bytes.Buffer
+			si := newInstance(t, randomID(t), root, slog.New(slog.NewTextHandler(&logs, nil)))
 			first, err := si.Acquire()
 			if err == nil || first {
 				t.Fatalf("Acquire at %s: %v %v, want an error", how, first, err)
 			}
-			if strings.Contains(err.Error(), root) {
-				t.Errorf("the error holds the path: %v", err)
+			if strings.Contains(err.Error(), root) || strings.Contains(logs.String(), root) {
+				t.Errorf("the error or the log holds the path: %v %s", err, logs.String())
 			}
 			if err := si.Serve(func([]string) {}); !errors.Is(err, ErrNotFirst) {
 				t.Errorf("Serve without the lock: %v", err)
 			}
-			if data, err := os.ReadFile(target); err != nil || len(data) != 0 {
-				t.Errorf("the linked file was written: %q %v", data, err)
+			if how == "full directory" {
+				if _, err := os.Stat(filepath.Join(path, "kept")); err != nil {
+					t.Errorf("the directory's file is gone: %v", err)
+				}
 			}
 		})
+	}
+}
+
+// adminOwned creates path as a file owned by BUILTIN\Administrators and open to everyone, and returns its handle;
+// with lock it holds the lock's range. It skips the test when this process can't set that owner (not elevated).
+func adminOwned(t *testing.T, path string, lock bool) windows.Handle {
+	t.Helper()
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, attrs(t, "O:BAD:P(A;;GA;;;WD)"),
+		windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if errors.Is(err, windows.ERROR_INVALID_OWNER) {
+		t.Skip("BUILTIN\\Administrators can't own this process's files (not elevated)")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock {
+		// Another holder of the range: it must still not make this launch a second instance.
+		if err := windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0,
+			lockRange()); err != nil {
+			_ = windows.CloseHandle(h)
+			t.Fatal(err)
+		}
+	}
+	return h
+}
+
+// TestSingleInstanceSharingViolation: another process that has instance.lock open for a moment without sharing writes
+// (a backup, a scanner) delays Acquire, which retries the open, instead of failing it.
+func TestSingleInstanceSharingViolation(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, lockFile)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(p, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(200 * time.Millisecond)
+		_ = windows.CloseHandle(h)
+	}()
+	t.Cleanup(func() { <-released })
+	a := newInstance(t, randomID(t), root, nil)
+	start := time.Now()
+	first, err := a.Acquire()
+	if err != nil || !first {
+		t.Fatalf("Acquire while the file is open without sharing writes for 200 ms: %v %v", first, err)
+	}
+	defer func() { _ = a.Close() }()
+	if d := time.Since(start); d < 150*time.Millisecond {
+		t.Errorf("Acquire returned after %v, before the file was released", d)
+	}
+	if !a.writable {
+		t.Error("the lock file wasn't opened for writing")
 	}
 }
 
@@ -553,16 +681,21 @@ func serving(t *testing.T, onArgs func([]string)) (a, b *SingleInstance) {
 }
 
 // TestForwardChecksTheServer: a second launch forwards nothing to a pipe that isn't this user's; the pipe's owner is
-// compared by SID.
+// compared by SID. The other SID is set for dial only: with it, instance.lock (the user's) wouldn't be read either.
 func TestForwardChecksTheServer(t *testing.T) {
 	got := make(chan []string, 2)
-	_, b := serving(t, func(args []string) { got <- args })
+	a, b := serving(t, func(args []string) { got <- args })
+	name := waitForName(t, a)
 	own := b.sid
 	b.sid = "S-1-5-18" // as if this launch ran as another account than the server
-	if err := b.Forward([]string{"--open-url", "isshoni://watch.example.com/"}); !errors.Is(err, errServerNotUser) {
-		t.Errorf("forwarded to a server of another account: %v", err)
-	}
+	h, err := b.dial(name)
 	b.sid = own
+	if !errors.Is(err, errServerNotUser) {
+		if err == nil {
+			_ = windows.CloseHandle(h)
+		}
+		t.Errorf("dialled a server of another account: %v", err)
+	}
 	if err := b.Forward([]string{"--autostart"}); err != nil {
 		t.Fatal(err)
 	}

@@ -69,8 +69,9 @@ func pipeFromLock(id string, data []byte) (pipe string, ok bool) {
 	return s, true
 }
 
-// errLockNotOurs: instance.lock isn't a plain file owned by this user. Only another account with rights over the
-// user's profile (an administrator) or a bug puts such a thing there; the launch then starts without the lock.
+// errLockNotOurs: instance.lock isn't a plain file owned by this user, and Acquire couldn't replace it (another
+// process has it open). A copy, a restore or a migration of the data root, or a bug, puts such a thing there; the
+// launch then starts without the lock.
 var errLockNotOurs = errors.New("winos: the single-instance lock file isn't this user's own plain file; " +
 	"starting without the lock")
 
@@ -126,6 +127,31 @@ func serverCheck(sid, owner string, ownerErr error, token func() (string, error)
 
 // ForwardTimeout bounds a second instance's forward (03 §13.3, §20).
 const ForwardTimeout = 2 * time.Second
+
+// retryOpen calls open, every pause, until it succeeds or timeout has passed (Forward's loop). On the timeout it
+// returns errServerNotUser, wrapped, when any attempt refused the pipe's server: a refused pipe that stays (another
+// account's, whose server never disconnects) leaves its instance busy, so later attempts fail otherwise, and the
+// refusal is what the launch must report. Without a refusal it returns the last attempt's error.
+func retryOpen(timeout, pause time.Duration, open func() error) error {
+	deadline := time.Now().Add(timeout)
+	var refused error
+	for {
+		err := open()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errServerNotUser) {
+			refused = err
+		}
+		if time.Now().After(deadline) {
+			if refused != nil {
+				err = refused
+			}
+			return fmt.Errorf("winos: the first instance didn't answer within %v: %w", timeout, err)
+		}
+		time.Sleep(pause)
+	}
+}
 
 // The limits of a forwarded message: a command line is short, and what arrives is untrusted.
 const (

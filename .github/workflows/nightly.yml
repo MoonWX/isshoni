@@ -1759,8 +1759,9 @@ jobs:
           # prerequisite into a failure, and the test must PASS (not skip). It runs without -race (CGO_ENABLED=0). It
           # builds its own e2e exe, and runs twice: here, before the updater e2e (a session nothing else has touched),
           # and again right after it, where PR #56's first run failed: that step starts installed apps, installers
-          # and mutex helpers in this session, and the test needs the single-instance names (the per-user pipe
-          # included) that nothing else holds. The two runs tell a broken product path from the updater e2e's leftover.
+          # and mutex helpers in this session, and the test needs its temp data root's instance.lock free
+          # (winos.LockHeld) and a pipe of its own. The two runs tell a broken product path from the updater e2e's
+          # leftover.
           $env:CGO_ENABLED = '0'
           $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
           $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart.log'
