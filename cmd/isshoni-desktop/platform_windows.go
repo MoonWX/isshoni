@@ -27,11 +27,19 @@ const clientOS = protocol.ClientOSWindows
 const defaultDeviceName = "Windows PC"
 
 // dataRoot returns %LOCALAPPDATA%\isshoni (03 §14.1) from the shell's known folder, never from the environment
-// (README §4: release builds read no environment variable for paths).
+// (README §4: release builds read no environment variable for paths). The e2e build alone takes the folder from
+// ISSHONI_E2E_DATA_DIR when it is set (flavor.localAppData, 03 §22.4 B), so a CDP run never touches the user's data.
 func dataRoot() (string, error) {
-	local, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
-	if err != nil {
-		return "", err
+	if flavor.err != nil {
+		return "", flavor.err
+	}
+	local := flavor.localAppData
+	if local == "" {
+		var err error
+		local, err = windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
+		if err != nil {
+			return "", err
+		}
 	}
 	if !filepath.IsAbs(local) {
 		return "", errors.New("the LocalAppData folder is not an absolute path")
