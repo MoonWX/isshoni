@@ -408,7 +408,15 @@
       "admin": "Admin",
       "install": "Install app",
       "about": "About isshoni",
-      "signOut": "Sign out"
+      "signOut": "Sign out",
+      "settings": "Settings",
+      "switchServer": "Switch server",
+      "inBrowser": "(opens in your browser)",
+      "signOutOf": "Sign out of {{server}}",
+      "signOutConfirm": "Sign out isshoni on this PC from {{server}}?",
+      "signOutBody": "The server stays in your list as Not linked. A share on it stops.",
+      "signOutUnconfirmed": "Remove {{device}} on your Devices page to finish.",
+      "thisPC": "this PC"
     },
     "invite": {
       "title": "Invite friends",

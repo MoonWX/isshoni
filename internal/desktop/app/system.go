@@ -197,6 +197,7 @@ func (a *App) askResume(gen int) {
 		a.toasts.dropKind(ToastLockPaused)
 	}
 	a.mu.Unlock()
+	a.removeStaleToasts()
 }
 
 // endLockPause ends the lock pause gen (a resume from anywhere).
@@ -206,10 +207,12 @@ func (a *App) endLockPause(gen int) {
 		a.clearLockLocked()
 	}
 	a.mu.Unlock()
+	a.removeStaleToasts()
 }
 
 // clearLockLocked forgets the lock pause; a.mu is held. Its question is answered: a "Resume sharing?" toast still
-// in Action Center no longer acts (03 §15: its buttons are for that question only).
+// in Action Center no longer acts (03 §15: its buttons are for that question only) and is marked stale; the caller
+// takes it out of Action Center with removeStaleToasts (or the next notify) once a.mu is released.
 func (a *App) clearLockLocked() {
 	if a.sys.stopTimer != nil {
 		a.sys.stopTimer.Stop()
@@ -234,6 +237,7 @@ func (a *App) lockStopReached(gen int) {
 	a.mu.Unlock()
 	if v == nil || v.State == share.StateLive || v.State == share.StateEnded ||
 		v.State == share.StateFailed {
+		a.removeStaleToasts()
 		a.syncAwake()
 		a.scheduleTray()
 		return
@@ -242,6 +246,7 @@ func (a *App) lockStopReached(gen int) {
 	a.shares.Stop(ctx, share.CauseSystem)
 	cancel()
 	t := a.d.I18n
+	// notify removes the stale "Resume sharing?" toast first, on the same serialized path, then shows this one.
 	a.notify(ToastStoppedLock, t.T("desktop.native.toast.stoppedLocked"),
 		NotificationAction{ID: ToastOpen, Title: t.T("desktop.native.toast.open")})
 	a.syncAwake()
@@ -261,6 +266,7 @@ func (a *App) resume() {
 	a.mu.Lock()
 	a.clearLockLocked()
 	a.mu.Unlock()
+	a.removeStaleToasts()
 	a.syncAwake()
 	a.scheduleTray()
 }
@@ -278,6 +284,7 @@ func (a *App) onSuspend() {
 	a.sys.suspendStopped = true
 	a.clearLockLocked()
 	a.mu.Unlock()
+	a.removeStaleToasts()
 	a.syncAwake()
 	a.scheduleTray()
 }
@@ -355,6 +362,7 @@ func (a *App) onShareEvent(ev share.Event) {
 		a.clearLockLocked() // resumed: the panel, the hotkey, the tray, the pill or a toast
 	}
 	a.mu.Unlock()
+	a.removeStaleToasts()
 	a.syncAwake()
 	a.scheduleTray()
 }
