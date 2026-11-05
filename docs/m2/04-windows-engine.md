@@ -830,8 +830,9 @@ field, `ENCODER_CHANGED`'s `from`/`to`, Go's `media.EncoderInfo.Name` and `media
 {"monitors":[{"id":"mon:\\\\.\\DISPLAY1","name":"DELL U2723QE","primary":true,"x":0,"y":0,"width":3840,
  "height":2160,"dpi":144,"refreshHz":60,"rotation":0,"hdr":false,"adapter":0}],"windows":[]}
 ```
-Coordinates are physical pixels in the virtual desktop; `dpi` is `GetDpiForMonitor(MDT_EFFECTIVE_DPI)`; `rotation`
-is 0/90/180/270; `adapter` indexes `im_caps.adapters`.
+Coordinates are physical pixels in the virtual desktop; `dpi` is `GetDpiForMonitor(MDT_EFFECTIVE_DPI)`, resolved at
+run time from System32's `shcore.dll` (96 when it can't be, §13.1; PR #53); `rotation` is 0/90/180/270; `adapter`
+indexes `im_caps.adapters`.
 
 `im_get_stats`:
 ```json
@@ -1503,6 +1504,21 @@ Unidentified windows simply lack these extras; capture is unaffected.
   conversion error, a re-init's failed open, a recovery whose re-opens fail or run out, and a failed pattern render
   end the session as `device_removed` (and mark the probe's cache stale) when the device is gone, instead of falling
   back or ending as a plain `encoder_lost`.
+- **COM, WinRT and the link line under the GPU path** (PR #53's CI lessons; README §3 items 75, 90): every D3D11,
+  DXGI, Media Foundation and C++/WinRT call runs on an engine thread inside the MTA (§6.1), and **the engine holds
+  the MTA for the life of the process** (`CoIncrementMTAUsage`, never released): C++/WinRT caches the activation
+  factories of WGC's and the probe's WinRT classes for as long as the DLL is loaded, so COM must never be torn down
+  under them (§6.1, "COM stays up"). The engine links **no umbrella library** (`windowsapp`, `onecore`,
+  `onecoreuap`, `mincore`; `im_engine` passes `/NODEFAULTLIB` for each): `windowsapp.lib` after `kernel32.lib` bound
+  the static CRT's and C++/WinRT's `/alternatename` targets to unlisted `api-ms-win-core-*` sets and failed
+  `dll-check`. C++/WinRT's `Ro*` and `Windows*String` functions come from `runtimeobject.lib` (`winrt_support.h`),
+  its other functions from `ole32`, `oleaut32`, `kernel32` and `d3d11`, all on the link line (§13.1). An API whose
+  import library would add a new API-set import is resolved at run time instead: `GetDpiForMonitor` comes from
+  System32's `shcore.dll` through `GetProcAddress` (`capture/outputs_win.cpp`, §5.6), so `shcore` is on neither the
+  link line nor `dll-imports.txt`. The same PR's engine-thread fixes: a WGC start uses the borderless answer its pick
+  kept (`BorderlessAllowed(0)`, §7.3) rather than waiting inside `im_start`'s budget; DD capture creates its owner
+  before its thread, so a throw unwinds through `Stop`'s join; a picker thread that starts late is told to quit; and
+  `RunOnMta` carries an exception's detail back from the audio thread.
 
 ### 8.2 Frame slots
 
@@ -2202,6 +2218,19 @@ on (plan "A/V sync").
   owns the window (the engine is in-process). `IM_ERR_UNSUPPORTED_OS` before build 19041; `IM_ERR_INVALID_ARG` for a
   window of another process. In M2 its only caller is `enginetest protect-check` (Go `ProtectWindow`), which is
   also the engine-side proof that excluded windows vanish from both capture paths.
+- **As built (WA70; README §3 item 88)**: `native/windows/src/window/protect.cpp`. Every call, `flags` 0 and
+  `IM_PROTECT_OFF` alike, needs **a top-level window of this process**: the checks run in this order, NULL → unknown
+  flags → build below 19041 (`IM_ERR_UNSUPPORTED_OS`, `os_too_old`; skipped when the build can't be read) → not a window
+  (`IsWindow`) → another process's window (`GetWindowThreadProcessId`) → **not top-level** (`GetAncestor(hwnd, GA_ROOT)
+  != hwnd`), each but the build `IM_ERR_INVALID_ARG`. So a child window of this process is refused (and WebView2's,
+  which another process owns, already fails the process check): the caller passes the top-level window, whose affinity
+  covers everything composed into it. Any thread of the process may call. A `SetWindowDisplayAffinity` that fails is
+  `IM_ERR_INTERNAL` with a WARN carrying the Win32 code; a `GetWindowDisplayAffinity` that fails is `IM_ERR_INTERNAL`
+  (no WARN); an affinity that doesn't read back as asked is `IM_ERR_INTERNAL` with a WARN carrying the wanted and read
+  values; the INFO line records `protected`/`unprotected` and the build, never the window's title, class or process. The
+  Go binding's `ProtectWindow(hwnd)` refuses a zero handle as `invalid` without a DLL call and has no `IM_PROTECT_OFF`
+  method (§12.2 lists `ProtectWindow` only); `protect-check` undoes the affinity with its own
+  `SetWindowDisplayAffinity(WDA_NONE)`, and the C++ tests cover the flag.
 - What the engine guarantees for any excluded window, whoever set the affinity: it vanishes from WGC monitor captures
   and from DD alike (the content behind it shows), so friends never see the isshoni window, its viewer or the pill.
 - The affinity applies to the top-level window and everything composed into it, which should include WebView2's
@@ -2839,12 +2868,66 @@ kind, no GPU), **64** usage. At startup, before loading the DLL, it calls
 | `sessions -count N` | N sessions of `test:pattern` at 1080p60 with two layers, through `StartExtra` | reports each layer's encoder; passes when every session started (fallbacks allowed) |
 | `soak -hours H` | one session; samples private bytes, handles, GDI objects, threads every 60 s | after the first 10 min, growth ≤ 5 %; no `RING_OVERFLOW`; no `ENDED` |
 | `avsync [-source pick\|mon:<id>] [-seconds 25]` | 05 §19.3: starts the flash window (a borderless 1280×720 flip-model swap chain, white for 100 ms once a second; each white frame's `SyncQPCTime` from `IDXGISwapChain::GetFrameStatistics` is `P_k`) and the click process (`im_test_render_bursts`, 5 ms clicks once a second, predicted times `A_k`) as children of `explorer.exe`; captures with real capture and `-audio mix` (`TapPCM`) at 1080p60; `V_k` = `capture_ts_ns` of the first frame after each flash whose mean luma in the luma tap exceeds 50 %, `U_k` = each click's PCM-tap onset; pairs each flash with the nearest click. Needs a DLL with `IM_TEST_HOOKS` (the luma tap): `-dll` points at the `win-x64-ci` DLL (06 §5.1's `isshoni-native-tools` carries it in `ci\`) | over ≥ 15 pairs, \|median((U_k − V_k) − (A_k − P_k))\| ≤ 20 ms (05 §19.3); writes `avsync.json` with every pair |
-| `protect-check` | creates a window with a known pattern, protects it, captures its monitor with DD and with WGC (listed source); then unprotects and captures again | the pattern is absent while protected and present after |
+| `protect-check [-seconds S] [-wgc pick\|off]` | creates a window with a known pattern, protects it, captures its monitor with DD (the listed `mon:` source) and with WGC (a monitor pick); then unprotects and captures again. As built (WA70): see below | the pattern is absent while protected and present after |
 | `openh264 install\|verify\|remove [-dir DIR] [-engine]` | the app's own Go code; as built (WA51), `verify -engine` also hands the verified file to the engine (`SetOpenH264Path`) and runs a full probe | hash checks; with `-engine`, the engine reports the pinned version loaded and OpenH264 tested (CB only); exit 1 for a file that is not the pinned release or an engine that refuses it, 2 for the environment |
 
 `native/windows/tools/hwcheck.ps1` runs the automated set on the owner's PC (probe, `capture` per available encoder,
 `bench`, `sessions -count 5`, `protect-check`) and zips the reports, so one command gives a result bundle to attach
 to the slice's PR. No machine names or paths go into the reports (they are attached to a public repository).
+
+**`protect-check` as built (WA70, group 14; README §3 items 88, 89)** (`protect.go`, `protect_windows.go`,
+`protect_other.go`, tests in `protect_test.go`):
+- **The pattern and how presence is judged.** The window is noise: a topmost, never-activated window over a quarter
+  of the primary monitor that draws new random blocks about 60 times a second. The shipped DLL has no luma tap and
+  the tool has no H.264 decoder, so it reads no pixels: presence is **what the noise costs the encoder**, layer `f`'s
+  slice bytes of non-keyframe access units per second, counted by capture time (periodic IDRs, re-inits, SEI and
+  filler NAL units left out), at a 6 Mbit/s target. A path passes when the unprotected rate is at least 500 kbit/s
+  (`protectMinShownBps`) and the protected one at most 20 % of it (`protectMaxRatio`). The desktop behind the window
+  must be still during the run (no video, no animation); the tool says so before it starts. The pixel check is
+  `protect_window_test`'s (§18.2), for raw Desktop Duplication only.
+- **One session per path**, protected before `Start` (1.5 s warm-up) and unprotected half-way (0.7 s settle), each
+  half `-seconds` long (default 3, 1–60), so one pick token covers both halves.
+- **Which path a source takes.** A listed `mon:` id always runs DD (§7.4, §7.5), so "WGC (listed source)" can't
+  happen: WGC monitor capture is reached only through a monitor pick (`-wgc pick`, the default; the pattern window
+  hides while the picker is open). On Windows 10 a monitor pick maps to DD (§7.5), so WGC runs only where the
+  mapping fails; on Windows 11 a WGC start that fails falls back to DD (§7.1). The verdict follows the path the
+  session **runs** on (`native.CapturePath`, from `im_session_info.capture_path`), not the pick's planned one, and
+  reports WGC as `not_reachable` whenever the session ran DD. A picked monitor other than the noise window's (Windows
+  11 fills `media.Source.MonitorID` for a monitor pick) is an operator error, exit 2, not a failure.
+- **Exit codes**: 0 when DD passed and WGC passed, was `not_reachable`, or was `off`; 1 when a path failed (the
+  pattern showed while protected, didn't show after, or the affinity didn't read back); 2 for the environment (the
+  engine, the window, a build below 19041, a source that can't start, a cancelled pick, the wrong monitor, an
+  interrupted run: Ctrl-C is 2, not 1). So **"passes on Win10 for WGC"** is met as `not_reachable` with exit 0 on
+  DD's result alone, and so is a Windows 11 run whose WGC start fell back to DD. Whether that is acceptable is an
+  owner decision, open in README §7 (question 11); until it is answered, the exit run reads a WGC `not_reachable` as
+  "WGC not covered on this PC", never as a WGC pass. `-json` writes each path's `outcome` (`pass`, `fail`, `error`,
+  `not_reachable`, `cancelled`, `off`), `capture`, encoder, both rates and frame counts, and names no monitor or
+  window.
+- **Unattended runs pass `-wgc off`**: the default `-wgc pick` waits on the OS picker, so `hwcheck.ps1` (and the
+  `audiotest` workflow's `hwcheck` suite, which runs it) calls `protect-check -wgc off` (DD only), and the WGC half
+  is its own interactive step on the owner's PC: `isshoni-enginetest protect-check` with a pick of the pattern
+  window's monitor, on Windows 11 and again on Windows 10 (§18.4).
+
+**`soak`, `avsync` and `hwcheck.ps1` as built (WA76, group 14; README §3 item 89)**:
+- `soak -hours H` defaults to `-audio tone`, so the Opus stage is soaked too (`off` and `mix` are available). Growth
+  is measured from the first sample at or after the 10-minute warm-up to the last sample (the peak is reported, not
+  judged); a metric that is 0 at the baseline must still be 0 at the end. `RING_OVERFLOW` is counted from the
+  binding's warn message, whose prefix a test ties to `internal/media/native`'s text.
+- `avsync`'s luma tap is declared (`lumaTap`, `newLumaTap`) and, as group 14 merged, answers a "not implemented"
+  dependency error (exit 2) before any helper starts: no session emits `IM_PACKET_DEBUG` and the binding drops it.
+  WF16 (group 15) builds the producer, its payload (§5) and the binding's option. Until then `avsync -no-luma` runs the
+  flash window, the click process and the session and reports `P_k`, `A_k`, `U_k` and `U − A`, never a pass, so the
+  Windows half can be checked first.
+- `bench` reports the engine stats' encode p95, not p99, so `hwcheck.ps1` checks encode p95 ≤ 16 ms (necessary for
+  §18.4's p99 ≤ 16 ms, not proof of it; its step notes say so) and capture-to-packet p95 ≤ 25 ms when layer `f`'s
+  encoder is hardware.
+- `hwcheck.ps1` runs `capture` only for encoders the probe lists as available and hardware (none: a note, no
+  capture), each with a 5 s run (`-keyframes 500ms -dump-aus 12`, so the Windows access-unit fixtures of the "As
+  built (WA44)" list below come with the bundle) and a 25 s `-bitrate-steps 8M,2M,8M` run; then `bench`,
+  `sessions -count 5` and `protect-check -wgc off`. It drops the streams, replaces user, host, domain and path names
+  in every report with `<redacted:…>` tokens, then checks the text without those tokens for leftovers (a user named
+  "User" or "host" never matches a token), and zips the bundle into `-Out DIR` (default the current folder; the
+  `audiotest` workflow passes its bundle path).
 
 **As built (WA44, group 10; README §3 item 55)**: the tool has `probe`, `capture` and `bench` (later subcommands are
 one file each, README §5). Where the merged tool differs from the table:
@@ -2984,6 +3067,7 @@ exception. It also makes stdout unbuffered, so a test's own `printf` reaches cte
 | `session_gpu_test` (WF2) | a session's GPU path through the C ABI on WARP, with the test hooks: the test lists an encoder of its own first in the catalog (`session::SetCatalogPrefixForTest`; `testhooks::Reset` doesn't clear it, the test does), one that takes pixels on a WARP device, reads every converted picture back and leaves the access unit to `IM_ENC_FAKE`. Such a session runs the GPU path (`session::GpuPathOf`; an `IM_ENC_FAKE` one doesn't); each layer's first packet `KEYFRAME\|REINIT` within 500 ms; every picture of a new frame shows that frame's counter and flash box (the frame whose grid instant is its `capture_ts_ns`) on `f` (1:1) and `q` (2:1); on a static screen refreshes and keyframes show the one frame again; with no frame at all the first keyframe is black (Y 16, Cb/Cr 128); while paused every picture shows one frame captured before the pause, and resuming shows new frames; device loss that first shows as an ordinary error (a conversion's target, a recovery's re-opens, a re-init's open; `session::SetDeviceRemovedForTest` stands in, since WARP can't be removed) ends the session `ENDED{IM_ERR_ENCODER_LOST}` `device_removed` with the probe's cache stale, while the same failure on a sound device is an encode error the session recovers from. The two 500 ms first-keyframe bounds on WARP may be tight in the nightly `win-x64-asan` run |
 | `session_frames_test` (WF2) | the session's two portable frame pieces, without a GPU or the test hooks (every test build): `PatternGrid` (frame times exact at whole seconds and WA23's arithmetic for 1 to 240 Hz, late frames below half an interval with every third on time, `NewestDue` the newest due frame and never one before `next`) and `FrameTimes` (fresh, skipped and the newest time; across two threads every published frame is taken or skipped and the times taken only grow, bounded by a 10 s deadline). Being portable it also builds on the Mac against the host preset's GoogleTest (group 5's integration ran it plain, under TSan and under ASan+UBSan), though no host target lists it |
 | `audio_bridge_test` | with a fake `AudioEngine`: `im_init`/`im_shutdown` call `Init`/`Shutdown`; every audio export forwards its arguments (rules, flags, `shared_pid` copied); `im_start_config.exclusions` → `SetRules` before `Mixer::Start`; modes OFF and TEST_TONE create no mixer; after `im_init(IM_INIT_NO_AUDIO)`, `im_start` with `IM_AUDIO_MODE_EXCLUDE_APPS` and exclusions calls neither `SetRules` nor `NewMixer` (05 §4.3, README §3 item 35); `im_start` with `audio.mode` `IM_AUDIO_MODE_EVERYTHING` and `im_audio_set_mode(IM_AUDIO_MODE_EVERYTHING)` → `IM_ERR_INVALID_ARG`, no mixer created and the fake's mode unchanged; `im_set_paused` → `Mixer::SetPaused`; the fake mixer's chunks come out as Opus packets every 20 ms and, with `IM_AUDIOF_TAP_PCM`, PCM packets every 10 ms |
+| `protect_window_test` (WA70) | `im_protect_window` through the C ABI (§11): a top-level window of this process gets `WDA_EXCLUDEFROMCAPTURE` (read back with `GetWindowDisplayAffinity`), a second call is fine, `IM_PROTECT_OFF` sets `WDA_NONE`, and another thread of the process may call; NULL, unknown flags, a destroyed window, a child window and another process's window (the desktop window) are `IM_ERR_INVALID_ARG` and leave the affinity alone; below build 19041 (`window::ProtectOnBuild`'s seam) `IM_ERR_UNSUPPORTED_OS` with `os_too_old`; the log records the outcome, never the window's title; and raw Desktop Duplication leaves a protected solid magenta window out of a fresh duplication's image (five sample points show what is behind it) and shows it again once unprotected. That last case skips with the reason where DD can't run (no output, a secure desktop, a remote session) or where even the unprotected window doesn't reach the image (another window above it), since without that control an absence proves nothing. WGC's half and both paths through a real session are `protect-check`'s (§14), on the owner's PC. The Go half is `internal/media/native`'s `TestDLLProtectWindow` (with `ISSHONI_TEST_ENGINE_DLL`) and, everywhere, `TestProtectWindow` and `TestCapturePath` over the binding's fake caller |
 | `window_match_test` | §7.6's matcher over a fake window list: one match gives `window` and `pid`; two matches or none give 0; cloaked windows skipped; an `applicationframehost.exe` match takes its `Windows.UI.Core.CoreWindow` child's pid, and 0 without one |
 | `gpu_warp_test` | on WARP: the shader converter against a CPU BT.709 limited-range reference (≤ 1 code value on flat areas, ≤ 2 on edges); the VideoProcessor against the shader output (≤ 2) when WARP offers one, else skipped with the reason; letterbox geometry; rotation 90/180/270; cursor blending of color, masked and monochrome shapes against golden images, and no blend with `IM_START_HIDE_CURSOR`; the GPU test pattern renders (pixel for pixel against `pattern_layout.h`'s model, and through slots and converters on two threads, the frame counter decoded from the NV12); slot growth steps, one VideoProcessor per slot size, the planar readback and its refused sources, the context lock free while the readback waits (test hook). The goldens are text pictures in `tests/testdata/gpu/`, and the portable `tests/gpu_warp_support.h` checks them on any OS; both belong to this test (§4). With `IM_GPU_TEST_HARDWARE=1`, `GpuHardware.*` compares the VideoProcessor with the shader on every hardware adapter (the owner's-PC check) |
 | `ffmpeg_load_test` | with the pinned artifact: loads, versions check, encoders listed (none available without a GPU, MF software if the runner has Media Foundation); `ffmpeg_dir` pointed at an empty folder → `IM_ERR_DEPENDENCY` (`missing`) and an audio-only test-tone session still works; a stub DLL with another major → `IM_ERR_DEPENDENCY` (`version`). As built (WA44): the other major is the real avutil DLL offered under another major's name, and a minor below the build's is `version` too; it also checks §9.10 step 4 (`audio_flags` from `ProbeFlags()`, a fake `AudioEngine`) and, in a child process, `dll_search_test`'s vendor-runtime and libvpl part (markers `nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, `libmfx64-gen.dll`, `libmfxhw64.dll` in the current directory and on `PATH`, `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` at them; the two libvpl names also next to the child's executable; after a full probe the child also opens `h264_nvenc`, `h264_qsv` and `h264_amf` on a default device, since a GPU-less runner's probe plans none of them, and on a device without video support (Basic Render: no `ID3D11VideoDevice`, so FFmpeg's D3D11VA device init fails before `avcodec_open2`) opens them without a device, where FFmpeg loads the same runtimes; each open must reach its runtime or libvpl's dispatcher in FFmpeg's log; no marker loads). The FFmpeg folder is `ISSHONI_TEST_FFMPEG_DIR` (the locked zip's `bin`); without it the cases skip, except in CI, where they fail |

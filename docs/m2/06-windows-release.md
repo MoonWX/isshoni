@@ -755,6 +755,13 @@ tools/desktoppkg/            winver, stage, nsis defines, check, manifest, ffmpe
 Only built-in NSIS plugins are used (System, nsDialogs, Banner, plus the headers LogicLib, FileFunc, WordFunc, WinVer,
 x64, MUI2). `makensis -WX` (warnings are errors). `SetCompressor /SOLID lzma`. `Unicode true`.
 
+**Source paths use backslashes** (PR #53's CI; README §3 item 90): makensis on Windows splits a `File` source path
+into folder and pattern only at `\`, so `"${STAGE}/${FILE_LIST}"` looked for a file literally named
+`stage/install-files.txt` in `dist-desktop` and the `windows-desktop` job's `desktop:package:windows` failed. Every
+`File` source joins `${STAGE}` with `\` (`"${STAGE}\${FILE_LIST}"`, `File /r /x "${FILE_LIST}" "${STAGE}\*"`);
+the Mac's makensis turns `\` into `/`, so the same script builds on both. The files packed are the same, and
+`desktoppkg check -installer` still compares the installer with the stage.
+
 ### 6.2 Defines passed by `tools/desktoppkg nsis`
 
 `VERSION` (SemVer), `WINVER`, `STAGE` (the staged tree), `OUTFILE`, `PREBUILT_UNINSTALLER` (path, CI only),
@@ -1843,6 +1850,35 @@ New `changes` filters:
 
 Windows jobs: every third-party action pinned by SHA (M1 06 §8.1), `persist-credentials: false`, `contents: read`,
 `shell: pwsh` by default and `powershell` (5.1) where 5.1 behaviour is the point.
+
+**Every independent failure and every skip in one round** (as built, PR #53's preflight; README §3 item 90). A Windows
+round costs about an hour, so the Windows jobs report all they can each time:
+- `windows-desktop` gates each check on **its own prerequisites**, not on every step before it: the setup steps
+  carry ids (`go`, `task`, `webdist`, `native`, `gcc`, `webview2`, `node`, `npmci`, …) and each later check runs
+  `if: ${{ !cancelled() && steps.<prerequisite>.outcome == 'success' … }}`, so a failed smoke or notices step no
+  longer hides the CDP spec's result (the server-rendered ps1 test needs only the package step, and refuses to start
+  over an install a failed smoke left behind). The job fails on
+  any of them.
+- `windows-go` runs the `CGO_ENABLED=0` tests also after a failed gcc step or `-race` run (the mode the app ships
+  in reports its own failures in the same round); both runs use `go test -v` and write every `--- SKIP` line with
+  its reason to the step summary ("skipped tests (N)"). The job's limit is 30 minutes (two runs of up to 12 minutes
+  each).
+- **Native skips are listed**: ctest counts a binary whose cases all call `GTEST_SKIP` as passed and prints nothing,
+  so every Windows test writes gtest's XML (`GTEST_OUTPUT=xml:…/gtest-xml/`, `native/windows/CMakeLists.txt`), and
+  `windows-native`'s "The native tests that skipped, and why" step (always run) lists each skipped case with its
+  reason in the step summary: the skips this runner is known to take (`MfSoftware.*` on Windows Server,
+  `Protect.DesktopDuplicationLeavesTheWindowOut` without a DD output, the audio cases without an endpoint or process
+  loopback, the child-process cases, the opt-in `GpuHardware.*`) are notices, and any other is a warning marked
+  **unexpected**. A run that wrote no XML is a warning too.
+- The `-tags e2e` step runs only `flavor_e2e_test.go`'s three tests (`TestE2ESettings`, `TestAppOptionsE2EPort`,
+  `TestE2ECredentials`) and requires a `--- PASS` line for each, so a rename can't silently match nothing; the CDP
+  results upload from `web/test-results/cdp/` (`if-no-files-found: warn`) when the CDP step failed.
+- `install-desktop.ps1`'s stderr check runs the script with progress off and ignores a CLIXML block of progress
+  records only (5.1's "Preparing modules for first use."); any other record still fails it.
+- `openh264_test` retries its download, and CI caches the verified DLL keyed by `openh264_pin.h` (re-checked against
+  the pinned size and SHA-256 on every run; saved only from a green job).
+- `lint:ps` and `test:ps` make their temp folder without `mktemp` (Task's shell on Windows has no `/tmp`, and its
+  `mktemp` takes no folder in the template), and `lint:ps` says when it can't run the byte checks.
 
 ### 10.2 Caches
 
