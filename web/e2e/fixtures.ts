@@ -471,6 +471,21 @@ function adminSocketPath(): string {
   return Buffer.byteLength(inTmp) <= 103 ? inTmp : path.join('/tmp', name);
 }
 
+/**
+ * Whether the admin socket's file is there. On Windows an AF_UNIX socket is a reparse point that stat can't open
+ * (libuv's stat follows it and gets ERROR_CANT_ACCESS_FILE, so existsSync says false), but its folder lists it: the
+ * real-app CDP spec (cdp/desktop.cdp.ts) starts its servers there.
+ */
+function socketExists(p: string): boolean {
+  if (process.platform !== 'win32') return fs.existsSync(p);
+  try {
+    const name = path.basename(p).toLowerCase();
+    return fs.readdirSync(path.dirname(p)).some((entry) => entry.toLowerCase() === name);
+  } catch {
+    return false;
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -641,7 +656,7 @@ class Server implements E2EServer {
     // the HTTP port (04 §6.1 step 6), so it exists only when this process holds the port.
     const deadline = Date.now() + READY_TIMEOUT_MS;
     while (alive(child)) {
-      if (fs.existsSync(this.socket) && (await isReady(this.url)) && alive(child)) return 'ready';
+      if (socketExists(this.socket) && (await isReady(this.url)) && alive(child)) return 'ready';
       if (Date.now() >= deadline) {
         await this.terminate();
         return 'timeout';

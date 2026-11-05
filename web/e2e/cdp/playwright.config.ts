@@ -12,7 +12,17 @@
 // owner's servers, settings, WebView2 profile or isshoni:v1: entries; the spec refuses an app that ignored the folder.
 // ISSHONI_CDP_ENDPOINT=http://127.0.0.1:<port> attaches to an app that is already running instead of starting one. CI
 // runs it in windows-desktop from WA72 on.
+//
+// The spec's end-to-end case starts `isshoni serve` through ../fixtures.ts, whose binary is ISSHONI_BIN (a relative
+// value counts from the repository root). Unset, it is bin/isshoni.exe, which windows-desktop builds next to the e2e
+// isshoni.exe (go build ./cmd/isshoni, with web/dist embedded). The people's browsers are the installed Google Chrome
+// (channel 'chrome', as in the main config), headless: they only approve a link and watch a share, which needs no
+// picker. The W19 case also runs a production build: ISSHONI_DESKTOP_PROD_EXE, or in CI the stage's isshoni.exe.
 import { defineConfig } from '@playwright/test';
+
+import { chromeArgs } from '../fixtures.ts';
+
+process.env['ISSHONI_BIN'] ??= process.platform === 'win32' ? 'bin/isshoni.exe' : 'bin/isshoni';
 
 export default defineConfig({
   testDir: '.',
@@ -25,4 +35,10 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 15_000 },
   reporter: [['list']],
+  use: {
+    channel: 'chrome',
+    headless: true,
+    launchOptions: { args: chromeArgs() },
+    serviceWorkers: 'block',
+  },
 });
