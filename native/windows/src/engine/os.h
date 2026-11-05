@@ -58,6 +58,8 @@ void ClearLibvplSearchPaths() noexcept;
 
 // Called first and last on the engine worker's thread (04 §6.1): COM in the multithreaded apartment and the thread's
 // name. EnterWorkerThread returns 0 (S_OK) or the failing HRESULT; LeaveWorkerThread is called only after a success.
+// The first EnterWorkerThread also holds the MTA for the life of the process (CoIncrementMTAUsage), so a worker's
+// CoUninitialize never ends COM in the process and C++/WinRT's cached factories stay valid across im_init cycles.
 int32_t EnterWorkerThread() noexcept;
 void LeaveWorkerThread() noexcept;
 

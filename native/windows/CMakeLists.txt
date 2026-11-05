@@ -147,6 +147,12 @@ if(IM_BUILD_TESTS)
   endforeach()
   target_link_options(im-test-dlprobe-flag PRIVATE /DEPENDENTLOADFLAG:0x800)
 
+  # Every test binary prints an unhandled exception's code, module+offset and stack before it dies: gtest's own guard
+  # covers the main thread's test bodies only (tests/support/crash_report.cpp). An OBJECT library, so its static
+  # initializer is always linked in.
+  add_library(im_test_crash_report OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/crash_report.cpp")
+  target_link_libraries(im_test_crash_report PRIVATE im_build_flags)
+
   file(GLOB _tests CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
   foreach(_src IN LISTS _tests)
     get_filename_component(_name "${_src}" NAME_WE)
@@ -155,7 +161,7 @@ if(IM_BUILD_TESTS)
                           "native/common and native/windows")
     endif()
     add_executable(${_name} "${_src}")
-    target_link_libraries(${_name} PRIVATE im_engine GTest::gmock_main)
+    target_link_libraries(${_name} PRIVATE im_engine GTest::gmock_main im_test_crash_report)
     target_compile_definitions(
       ${_name}
       PRIVATE "IM_NATIVE_DIR=\"${IM_NATIVE_DIR}\"" "IM_TESTDATA_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata\""

@@ -197,6 +197,19 @@ int32_t EnterWorkerThread() noexcept {
   if (FAILED(hr)) {
     return static_cast<int32_t>(hr);
   }
+  // C++/WinRT keeps the activation factories it got (GraphicsCaptureSession's, ApiInformation's,
+  // GraphicsCaptureAccess's) in a cache that lives as long as the engine's DLL. When im_shutdown's CoUninitialize below
+  // ends the process's last apartment, COM unloads the DLLs those factories live in, and the next im_init's probe
+  // calls through a dangling cache entry: an access violation on this thread. Holding the MTA for the life of the
+  // process (the cookie is never released) keeps COM, and those DLLs, loaded across im_shutdown and im_init.
+  static const HRESULT kMtaHeld = [] {
+    CO_MTA_USAGE_COOKIE cookie = nullptr;
+    return CoIncrementMTAUsage(&cookie);
+  }();
+  if (FAILED(kMtaHeld)) {
+    CoUninitialize();
+    return static_cast<int32_t>(kMtaHeld);
+  }
   NameThread(L"isshoni engine worker");
   return 0;
 }
