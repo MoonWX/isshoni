@@ -58,12 +58,13 @@ func TestAutostartRoundTrip(t *testing.T) {
 		skip("an isshoni app runs on this PC")
 	}
 	// The build uses the real single-instance names: anything that still holds them (a process an earlier step left
-	// in this session or another one; the pipe's name is per user, not per session) would take the second launch's
-	// forward, or keep the first instance from serving.
-	if held, _ := winos.MutexExists(`Local\` + winos.InstanceID + ".v1"); held {
-		skip("another process holds the single-instance mutex " + winos.InstanceID + ".v1")
+	// in this session or another one; both names are per user, 03 §13.3) would take the second launch's forward, or
+	// keep the first instance from serving.
+	pipe := singleInstancePipe(t)
+	if held, _ := winos.MutexExists(`Global\` + pipe); held {
+		skip(`another process holds the single-instance mutex Global\` + pipe)
 	}
-	if pipe := singleInstancePipe(t); pipeExists(t, pipe) {
+	if pipeExists(t, pipe) {
 		skip(`another process serves the single-instance pipe \\.\pipe\` + pipe)
 	}
 	goTool, err := exec.LookPath("go")
@@ -213,7 +214,8 @@ func logFiles(dir string) string {
 	return b.String()
 }
 
-// singleInstancePipe is the name, below \\.\pipe\, of the single-instance pipe of this user (winos.NewSingleInstance's).
+// singleInstancePipe is the name, below \\.\pipe\, of the single-instance pipe of this user, which is also the
+// single-instance mutex's name below Global\ (winos.NewSingleInstance's, 03 §13.3: <id>.v1.<user SID>).
 func singleInstancePipe(t *testing.T) string {
 	t.Helper()
 	u, err := windows.GetCurrentProcessToken().GetTokenUser()

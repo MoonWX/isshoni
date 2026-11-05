@@ -8,17 +8,37 @@ import (
 	"time"
 )
 
-// Single instance (03 §13.3): one instance per Windows user session. The first instance holds a named mutex and
-// serves a named pipe; a second launch finds the mutex, sends its arguments (os.Args[1:], unchanged) through the
-// pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback: the mutex Local\<id>.v1 and the pipe
-// \\.\pipe\<id>.v1.<user SID>, distinct from the running mutex. The pinned Wails' own single-instance option can't
-// be used: it acquires its lock inside application.New, after 03 §13.4's steps 4–6, so a second instance would
-// read and delete the Pending values and take the running mutex's place in the order (README WA41's PR).
+// Single instance (03 §13.3): one instance per Windows user on the PC, across all of that user's sessions. The first
+// instance holds a named mutex and serves a named pipe; a second launch finds the mutex, sends its arguments
+// (os.Args[1:], unchanged) through the pipe and exits 0 within 2 s. The names are 03 §3.2's W6 fallback
+// (singleInstanceNames): the mutex Global\<id>.v1.<user SID> and the pipe \\.\pipe\<id>.v1.<user SID>, distinct
+// from the running mutex. The pinned Wails' own single-instance option can't be used: it acquires its lock inside
+// application.New, after 03 §13.4's steps 4–6, so a second instance would read and delete the Pending values and
+// take the running mutex's place in the order (README WA41's PR).
+//
+// Both names have one scope, the user (README WF19). The pipe's namespace, \\.\pipe\, is shared by every session,
+// and a Global\ mutex is too, so the user's SID in both names gives each user one pair, shared by the user's sessions.
+// (Until WF19 the mutex was Local\, per session, and the pipe per user: a second session of the same user took the
+// mutex as a first instance but couldn't create the pipe.) The scope is the user and not the session because what
+// the app keeps is per user: one data root, %LOCALAPPDATA%\isshoni (06 §2.2: settings.json, servers.json, the
+// WebView2 user data folder, logs, updates), and the device credentials in Credential Manager (02). Two instances of
+// one user would share all of it: settings.json's last writer would win, both WebView2 environments would use one
+// user data folder from two sessions, and both would refresh the same device's tokens, each from the copy it read at
+// start, so the later refresh presents a spent token and the server's reuse detection revokes the device (02 §1
+// decision 6, §6.2). The cost: a launch in a second session (fast user switching, RDP beside the console) forwards
+// into the instance of the session that started first, whose window the second session doesn't show.
 //
 // The pipe accepts only the current user (its DACL) and no remote client; the first instance treats what arrives as
 // untrusted arguments (app.HandleArgs). The first instance creates the next pipe instance before it closes the one it
 // served, so the name is never free while it serves; a second launch connects at identification level only (the
 // server can't impersonate it) and forwards nothing to a server that runs as another account.
+
+// singleInstanceNames derives the single-instance names of id (InstanceID; tests use their own) for the user whose
+// SID is sid: the mutex Global\<id>.v1.<sid> and the pipe \\.\pipe\<id>.v1.<sid>, both in the namespace every session
+// shares.
+func singleInstanceNames(id, sid string) (mutex, pipe string) {
+	return `Global\` + id + ".v1." + sid, `\\.\pipe\` + id + ".v1." + sid
+}
 
 // ForwardTimeout bounds a second instance's forward (03 §13.3, §20).
 const ForwardTimeout = 2 * time.Second

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/MoonWX/isshoni/internal/desktop/app"
@@ -110,6 +111,55 @@ func childCmd(t *testing.T, role, id, out string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(t.Context(), os.Args[0], append([]string{"-test.run=^$", "--"}, args...)...)
 	cmd.Env = append(os.Environ(), childEnv+"="+role, idEnv+"="+id, outEnv+"="+out)
 	return cmd
+}
+
+// TestSingleInstanceNamesOfThisUser: NewSingleInstance names the mutex and the pipe after this process's user (03
+// §13.3; README WF19), the mutex in the namespace every session shares, and the serving pipe has that name below
+// \\.\pipe\ while the mutex exists by its name.
+func TestSingleInstanceNamesOfThisUser(t *testing.T) {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := randomID(t)
+	si, err := NewSingleInstance(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `Global\` + id + ".v1." + u.User.Sid.String(); si.mutexName != want {
+		t.Errorf("mutex %q, want %q", si.mutexName, want)
+	}
+	want := `\\.\pipe\` + id + ".v1." + u.User.Sid.String()
+	if si.pipeName != want {
+		t.Errorf("pipe %q, want %q", si.pipeName, want)
+	}
+	if first, err := si.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire: %v %v", first, err)
+	}
+	t.Cleanup(func() { _ = si.Close() })
+	if ok, err := MutexExists(si.mutexName); !ok || err != nil {
+		t.Errorf("MutexExists(%q) while held: %v %v", si.mutexName, ok, err)
+	}
+	if err := si.Serve(func([]string) {}); err != nil {
+		t.Fatal(err)
+	}
+	pattern, err := windows.UTF16PtrFromString(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var fd windows.Win32finddata
+		h, err := windows.FindFirstFile(pattern, &fd)
+		if err == nil {
+			_ = windows.FindClose(h)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no pipe %s while serving: %v", want, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // TestSingleInstanceInProcess: the second holder of the lock forwards to the first, which receives the arguments

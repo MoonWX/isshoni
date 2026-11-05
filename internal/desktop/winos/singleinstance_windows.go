@@ -55,16 +55,17 @@ func NewSingleInstance(id string, log *slog.Logger) (*SingleInstance, error) {
 		return nil, fmt.Errorf("winos: the user's SID: %w", err)
 	}
 	sid := u.User.Sid.String()
+	mutex, pipe := singleInstanceNames(id, sid)
 	return &SingleInstance{
-		mutexName: `Local\` + id + ".v1",
-		pipeName:  `\\.\pipe\` + id + ".v1." + sid,
+		mutexName: mutex,
+		pipeName:  pipe,
 		sid:       sid,
 		log:       log.With("component", "winos"),
 	}, nil
 }
 
-// Acquire takes the lock: first is true when no other instance of this user session holds it. A second instance
-// calls Forward and exits.
+// Acquire takes the lock: first is true when no other instance of this user, in any of the user's sessions, holds it.
+// A second instance calls Forward and exits.
 func (s *SingleInstance) Acquire() (first bool, err error) {
 	name, err := windows.UTF16PtrFromString(s.mutexName)
 	if err != nil {
