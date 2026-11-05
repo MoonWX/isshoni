@@ -385,7 +385,7 @@ func (c *actionCenter) remove(tag, group string) error {
 	defer g.free()
 	if hr, _, _ := syscall.SyscallN(method(c.history, slotHistoryRemoveGroupedTagWithID), uintptr(c.history),
 		uintptr(t), uintptr(g), uintptr(c.app)); failed(hr) {
-		return hrError("RemoveGroupedTagWithId", hr)
+		return hrError(fmt.Sprintf("RemoveGroupedTagWithId(%q, %q, %q)", tag, group, c.app.String()), hr)
 	}
 	return nil
 }
