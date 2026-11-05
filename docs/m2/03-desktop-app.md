@@ -106,8 +106,8 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W3 | Response headers from the asset handler (CSP) are enforced | CDP e2e: an injected inline script is refused and logs a CSP violation | The `<meta>` CSP that the handler injects anyway (§5.3) |
 | W4 | `AssetOptions.Middleware` sees the runtime's `/wails/*` requests | Go test on the middleware + CDP e2e: a request with a foreign `Origin` gets 403 | Record it; navigation stays locked (§5.5), which is what makes a foreign page impossible |
 | W5 | Top-level navigation and new windows can be cancelled (WebView2 `NavigationStarting`, `NewWindowRequested`) | CDP e2e: `location.href = 'https://example.com'` and the native `window.open(…)` (from a fresh frame) leave the page on the asset origin, the open returns `null` and no page appears; a browser-started navigation (CDP `Page.navigate`) to a foreign URL comes back to the asset origin by itself; `chrome.webview.postMessage` is still there under the CSP sandbox | The SPA-level interception of §5.5 (always present); on a foreign URL after `NavigationCompleted`, the start page again. **Fails at beta.34, fallback taken**: Wails registers no `NewWindowRequested` handler (the COM types exist in `internal/webview2/pkg/webview2`, nothing subscribes), and its `NavigationStarting` callback drops the event's arguments (`edge/chromium.go`, `application/webview_window_windows.go`'s `navigationStarting`), so Go can cancel neither, and no Wails option or reachable WebView2 setting blocks them. The fallback, §5.5 layer 2: (1) `bridge.js`'s Navigation API `navigate` listener cancels a script's foreign navigation (§5.2); (2) the HTML response's header CSP ends with `sandbox allow-scripts allow-same-origin allow-forms`, no `allow-popups`, so Blink refuses every new window before WebView2 sees one (§5.3); (3) after each `WebViewNavigationCompleted`, Go asks the page where it is and loads the start page (`SetURL("/")`) when the browser-reported top-level source (`OriginInfo.TopOrigin`) is not the asset origin or no answer comes within 5 s once the runtime is up (`navguard.go`; a window that keeps leaving is sent back at most 3 times a minute). `Shell.Reload()` can't be the fallback: at beta.34 it is `location.reload()` of whatever page is showing, so the shell loads the start page instead when the window was last seen elsewhere, and W17's watchdog loads it after a reload that brought no beat back. The CDP check is written against the fallback, and PR #53's `windows-desktop` run passed it (README §3 item 92): it reaches the native `window.open` through a fresh `src`-less iframe's window (`DesktopPlatform` replaced `window.open` itself), asserts that it returns `null` with no new page, and asserts that a browser-started navigation really reached the foreign origin before it came back; `desktop-security.spec` checks (1) and (2) in Chrome too. Not covered: a new window the browser starts itself (the default context menu's "Open link in new window", on only in dev and e2e builds, §5.4), and a foreign page that loads runs until Go sends it back (layer 3 keeps it off `/wails/*`). Re-check at every bump; drop (3) and the sandbox once Wails can cancel |
-| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own named mutex `Local\io.isshoni.desktop.v1` plus pipe `\\.\pipe\io.isshoni.desktop.v1.<user SID>` in `winos` (distinct from the running mutex of §13.4). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
-| W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test. **Holds at beta.34** (PR #53's `windows-desktop` run; README §3 item 92): after `WM_CLOSE` (`CloseMainWindow()` on the app's process) the main HWND still exists (`IsWindow`) and is hidden (`IsWindowVisible` false), the page reports `document.visibilityState` `hidden`, and the process lives. The spec attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation keeps `visibilityState` `visible` whatever the window does, so without it the row could never see the hide. The two state polls are soft, so the row records the window's and the webview's state apart | Window option to hide on close, plus our own quit path from the tray |
+| W6 | Single instance forwards the second launch's arguments (`SingleInstanceOptions.OnSecondInstanceLaunch`) | Windows CI test: launch twice, the first gets the `--open-url` link | Own lock and pipe in `winos` (per user and data root, §13.3; distinct from the running mutex of §13.4): a `LockFileEx` file lock on `instance.lock` in the data root (owner the user, DACL the user and SYSTEM; a link, a hard link, a folder, a read-only file or a file of another owner there is replaced by a new file, and the launch starts without the lock only when that fails) and the pipe `\\.\pipe\io.isshoni.desktop.v1.<random>`, a new name each run, owned by and open to the user only, whose name the first instance writes into `instance.lock`; a second launch forwards only when the pipe's owner is the user's SID. No name needs to stay unknown (README §3 item 119). **Taken at beta.34 (WA41)**: the pinned Wails takes its single-instance lock inside `application.New`, which is §13.4's step 7, after steps 4–6, so a second instance would read and delete the Pending values and take the running mutex's place in the order; testing Wails' option would also need its message loop, a real window on CI. `winos` serves the fallback (§13.3); the macOS dev build has no single instance (a stub) |
+| W7 | Closing the window can be cancelled and turned into `Hide()` (a `WindowClosing` hook) | CDP e2e + Go hook test. **Holds at beta.34** (PR #53's `windows-desktop` run; README §3 item 92; again in PR #56's green run, README §3 item 113): after `WM_CLOSE` (posted to the main window's HWND, as its close button sends it: the process's one enabled top-level window of Wails' class `WailsWebviewWindow`, since beta.34 also makes a hidden `WS_DISABLED` one of that class, `__wails_hidden_mainthread`, and .NET's `MainWindowHandle`/`CloseMainWindow()`, which PR #53's check used, take the first visible unowned window, the topmost Sharing pill while a share is live) the main HWND still exists (`IsWindow`) and is hidden (`IsWindowVisible` false), the page reports `document.visibilityState` `hidden`, and the process lives. The spec attaches with `chromium.connectOverCDP(…, { noDefaults: true })`: Playwright's default focus emulation keeps `visibilityState` `visible` whatever the window does, so without it the row could never see the hide. The two state polls are soft, so the row records the window's and the webview's state apart | Window option to hide on close, plus our own quit path from the tray |
 | W8 | The notifications service shows toasts with action buttons for an unpackaged app; its toast AppID (the Wails application `Options.Name`, §15), the process AppUserModelID and 06's shortcut property are the same id | Windows CI test reads the HKCU keys of §15 after one toast; manual on the owner's PC (M-DESK-5) for the buttons | Toasts without buttons (a click opens the window on the prompt, §15); if the ids can't be made equal, record the actual toast AppID here for 06 |
 | W9 | WebView2 settings: DevTools off in production builds, default context menu off, zoom control off, browser accelerator keys off, general autofill and password save off, status bar off, swipe navigation off, external drop off | CDP e2e per setting where observable; else manual | The SPA-level mitigations of §5.4 |
 | W10 | The main window's native handle (HWND) is available to Go | Go test on Windows | `FindWindowExW` by the window class Wails registers, on the UI thread |
@@ -123,35 +123,42 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | W20 | License gate (`go-licenses`, GOOS=windows) and `govulncheck` pass for `./cmd/isshoni-desktop` | CI | Replace or drop the offending module before DK1 merges |
 | W21 | The Wails runtime's own objects. At beta.34 the same `/wails/runtime` endpoint serves, besides bound-method `Call`/`CancelCall`: `Clipboard` (`SetText`, `Text`), `Application` (`Quit`, `Hide`, `Show`), `Window` (52 methods, e.g. `Hide`, `SetAlwaysOnTop`, `Reload`, `OpenDevTools`, `Print`), `Dialog`, `ContextMenu`, `Screens`, `System`, `Events.Emit` and `Browser.OpenURL` (whose check refuses only `javascript:`, `data:`, `file:`, `ftp:`, empty schemes, shell metacharacters and backslashes, so `ms-settings:`, `search-ms:` and any registered protocol pass). `Events.On`/`Off` are JS-local. The postMessage IPC (`System.invoke`: `wails:runtime:ready`, drag and resize) is a separate path. The row records, at every pin: each object and method with its wire id, both request forms (the object in the JSON body or in the `?object=` query), the transport's chunking (its header or field names), what the runtime itself calls at load, and the postMessage messages | Go test of `assets.Guard` against requests built as the pinned runtime builds them; CDP e2e (§22.4 B): from the page, `Browser.OpenURL('ms-settings:display')`, `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403 and have no effect (no settings page or search opens, the window stays visible), and a bound method still answers | If the Guard can't see the object (W4 fails, or the body can't be read and restored without breaking the runtime): record it, prefer a pin where it can, and rely on the navigation lock, CSP and no raw HTML (§5.5, §5.8) until then |
 
-**Results at beta.34** (README WA87, group 17; the record the PRs' "Wails checklist" sections and the runs below
-give). A row is complete when each of its checks has a recorded result; "pending" names the run that records it. The
-CDP spec (`web/e2e/cdp/desktop.cdp.ts`) writes one annotation per row ("Wails checklist") in `windows-desktop`'s
-CDP step; the owner's `TestWailsChecklist` (`go test -tags isshoni_hw -run TestWailsChecklist ./cmd/isshoni-desktop`,
-and once more with `-tags "isshoni_hw production"` for W19) prints its rows the same way.
+**Results at beta.34** (README WA87, group 17; WB16 set the CI results from PR #56's green `windows-desktop` run,
+42102224032, and PR #53's green `windows-go` run, README §3 item 115). A row is complete when each of its checks has a
+recorded result; "Still to record" names the run that records the rest. The CDP spec (`web/e2e/cdp/desktop.cdp.ts`)
+writes one annotation per row ("Wails checklist") in `windows-desktop`'s CDP step; the green run passed every case
+(W1/W2, W3, W5, W7, W9, W13, W16, W21, the end-to-end case and W19), but printed none of the annotations (the config's
+`list` reporter doesn't print them, and `cdp-test-results` is uploaded only on failure), so a detail that only an
+annotation holds is "to be read from the next run's summary (WF19)", the slice that prints them: since WF19 each
+annotation is a line of the CDP step's log, a row of the job summary's table and a row of `annotations.md` in
+`cdp-test-results`, which is uploaded on success too (`web/e2e/cdp/annotations.ts`). The same run passed
+`TestAutostartRoundTrip` twice, before and after the updater e2e (§16.1). The owner's `TestWailsChecklist` (`go test
+-tags isshoni_hw -run TestWailsChecklist ./cmd/isshoni-desktop`, and once more with `-tags "isshoni_hw production"` for
+W19) prints its rows the same way.
 
 | # | Result | Recorded by | Still to record |
 |---|---|---|---|
-| W1 | **Holds**: `location.origin` is `http://wails.localhost`; `TestDesktopOrigins` passes (Mac, group 17) | CDP spec since WA48's skeleton (PR #53's `windows-desktop` CDP step, which ran it with W5 and W7) | WA87's end-to-end half: the link case reaches the server's REST API from that origin (02's CORS), on its first `windows-desktop` run; `TestWailsChecklist` |
-| W2 | **Holds**: `isSecureContext` true | CDP spec (as W1) | `TestWailsChecklist` |
-| W3 | **Holds**: an injected inline script doesn't run and reports a `script-src` violation of the header policy | CDP spec (as W1); `desktop-security.spec` in Chrome | `TestWailsChecklist`'s header-only page (`testdata/checklist/w3.html`) |
+| W1 | **Holds**: `location.origin` is `http://wails.localhost`; `TestDesktopOrigins` passes (Mac, group 17); the end-to-end half holds too: the CDP spec's link case reached the server's REST API from that origin (02's CORS) in PR #56's green `windows-desktop` run | CDP spec since WA48's skeleton (PR #53's `windows-desktop` CDP step, which ran it with W5 and W7; passed again in PR #56's green `windows-desktop` run) | `TestWailsChecklist` |
+| W2 | **Holds**: `isSecureContext` true (PR #53; again in PR #56's green `windows-desktop` run) | CDP spec (as W1) | `TestWailsChecklist` |
+| W3 | **Holds**: an injected inline script doesn't run and reports a `script-src` violation of the header policy (again in PR #56's green `windows-desktop` run) | CDP spec (as W1); `desktop-security.spec` in Chrome | `TestWailsChecklist`'s header-only page (`testdata/checklist/w3.html`) |
 | W4 | **Go half holds**: the Guard's tests (`internal/desktop/assets`, `TestGuard*`: foreign and missing `Origin`, the runtime's objects, chunked and oversized bodies, both request forms) pass (Mac, group 17); `desktop-security.spec` gets 403 for a foreign `Origin` through the real Guard in Chrome | Go tests; e2e | The real webview's half (the middleware sees the runtime's requests): `TestWailsChecklist`. The CDP spec can't send a foreign `Origin` to `wails.localhost`: nothing outside the webview reaches that host, and the page's CSP (`frame-src 'none'`) admits no other origin's frame |
-| W5 | **Fails; fallback taken and holds** (above; PR #53, README §3 item 92) | CDP spec | Re-check at every bump |
-| W6 | **Fallback taken (WA41)** (above): `winos`' mutex and pipe; `TestSingleInstanceAndRunningMutex` on `windows-go` | Windows Go test | — |
-| W7 | **Holds** (PR #53): hidden, not destroyed, `visibilityState` `hidden`, process alive; `TestWindowClosing` passes (Mac, group 17) | CDP spec; Go hook test | — |
-| W8 | Registry half: `TestToastRegistryKeys` runs on `windows-go` (made to run there by PR #53's lesson (c): the test process carries its random AppUserModelID, README §3 item 90); its result is pending: the integrator copies `windows-go`'s result from PR #53's run ("Holds (windows-go, PR #53)" if it was green) | Windows Go test | The registry half's result (above); the buttons: M-DESK-5 on the owner's PC |
-| W9 | Zoom control (Ctrl + wheel, Ctrl+=, Ctrl+numpad +) and the browser accelerator keys (F5, Ctrl+R, Ctrl+P, Ctrl+F, Ctrl+U, Ctrl+Shift+I, F12): CDP-observable checks written (WA87): no zoom change, no reload, no `beforeprint`, no new DevTools or view-source target | CDP spec (WA87), pending its first `windows-desktop` run | Manual on the owner's PC with a production build and the real keyboard and mouse: the accelerators again (CDP's key events enter at the renderer's widget, not WebView2's own accelerator path), the default context menu (right-click outside a text field), DevTools (F12, Ctrl+Shift+I), the status bar (hover a link), autofill and password save (the link step's password form), swipe navigation and pinch zoom (touchpad), external drop (drag a file and a link onto the window) |
+| W5 | **Fails; fallback taken and holds** (above; PR #53, README §3 item 92; the fallback passed again in PR #56's green `windows-desktop` run) | CDP spec | Re-check at every bump |
+| W6 | **Fallback taken (WA41)** (above): `winos`' lock and pipe; `TestSingleInstanceAndRunningMutex` passed in PR #53's green `windows-go` run, and the forward held end to end in PR #56's green `windows-desktop` run (`TestAutostartRoundTrip`, twice, §16.1); the mutex/pipe scope mismatch found there is gone since WF19, which made both per user (§13.3, README §3 item 115); the file lock and the random pipe name (README §3 item 119, replacing items 117 and 118) are `winos`' `TestPipeNames`, `TestLockState` and `TestServerCheck` (Mac) and `TestSingleInstanceLock`, `TestSingleInstanceSecurity`, `TestSingleInstanceLockNotOurs`, `TestSingleInstanceOldNamesIgnored`, `TestForwardStaleName` and `TestForwardSquattedName` (`windows-go`, to be read from the next run; the `owner` case of `TestSingleInstanceLockNotOurs` and `TestForwardSquattedName` run only elevated, as on CI, and the `symlink` case only with the right to create one) | Windows Go test | — |
+| W7 | **Holds** (PR #53; again in PR #56's green `windows-desktop` run, with `WM_CLOSE` posted to the main window found by its class, README §3 item 113): hidden, not destroyed, `visibilityState` `hidden`, process alive; `TestWindowClosing` passes (Mac, group 17) | CDP spec; Go hook test | — |
+| W8 | Registry half **holds (windows-go, PR #53)**: `TestToastRegistryKeys` passed in PR #53's green `windows-go` run (made to run there by PR #53's lesson (c): the test process carries its random AppUserModelID, README §3 item 90) | Windows Go test | The buttons: M-DESK-5 on the owner's PC |
+| W9 | Zoom control (Ctrl + wheel, Ctrl+=, Ctrl+numpad +) and the browser accelerator keys (F5, Ctrl+R, Ctrl+P, Ctrl+F, Ctrl+U, Ctrl+Shift+I, F12): **the CDP-observable checks hold** (PR #56's green `windows-desktop` run): no zoom change, no reload, no `beforeprint`, no new DevTools or view-source target. CDP's key and wheel events enter at the renderer, so this says nothing about WebView2's own accelerator path (W16's lesson, README §3 item 113) | CDP spec (WA87) | Manual on the owner's PC with a production build and the real keyboard and mouse: the accelerators again (CDP's key events enter at the renderer's widget, not WebView2's own accelerator path), the default context menu (right-click outside a text field), DevTools (F12, Ctrl+Shift+I), the status bar (hover a link), autofill and password save (the link step's password form), swipe navigation and pinch zoom (touchpad), external drop (drag a file and a link onto the window) |
 | W10 | Pending: `TestWailsChecklist` (owner's PC). The shell uses the main window's HWND for WDA (§11.5) and the pill's owner; W7's check reads the same window: the process's one enabled top-level window of Wails' window class (`WailsWebviewWindow`; beta.34's `initMainLoop` also makes a hidden `WS_DISABLED` top-level window of that class, `__wails_hidden_mainthread`, for its main-thread dispatch, which is left out), not .NET's `MainWindowHandle`, which while a share is live is the topmost pill | `TestWailsChecklist` (`MainWindowHandle()` is a window handle) | `TestWailsChecklist` on the owner's PC; M-DESK-2 (the window is absent from the stream) |
 | W11 | **Holds** without a window (WA48, above) | `TestBindingContextIsTheCalls` (passes, Mac, group 17) | The real webview: `TestWailsChecklist` |
 | W12 | **Holds** without a window (WA48, above) | `TestBindingErrorIsVerbatim` (passes, Mac, group 17) | The real webview: `TestWailsChecklist` |
-| W13 | Written (WA87): a page that no gesture activated (`userActivation.hasBeenActive` false; the check is an init script of a reloaded document, since Playwright's `evaluate` is a gesture) must get `<audio>.play()` resolved for a `blob:` tone; the new `AudioContext`'s state is recorded. The user data folder is the e2e data root's (the fixture refuses a run without it) | CDP spec, pending its first `windows-desktop` run | `TestWailsChecklist` |
-| W14 | **Holds**: `TestShutdownHook` (a quit Wails began stops the share first and closes the audio service) and `TestQuitStopsShareFirst` pass (Mac, group 17) | Go tests | The real app: the CDP spec's end-to-end case (Quit while live: exit 0 within 3 s, the share gone at the viewer), pending its first `windows-desktop` run; M-DESK-4 |
-| W15 | The macOS half holds (above); the ubuntu half is `ci.yml`'s `protocol` job, whose result is pending: the integrator copies it from the group PR's run | CI | The ubuntu half's result |
-| W16 | Written (WA87): `requestFullscreen()` on the page; Wails' `ContainsFullScreenElementChanged` handler makes the window fullscreen (the SPA calls no `Window.SetFullscreen` on its own: beta.34 follows the element's fullscreen itself); the page must fill the screen (`innerWidth`/`innerHeight` equal `screen.width`/`height`), and Esc, a real key press (`SendInput` with the window in the foreground; CDP's key events enter at the renderer, below WebView2's own Esc handling, and the first `windows-desktop` run showed a CDP Escape leaving fullscreen on), must leave it with the window back at its size and visible | CDP spec, pending its first `windows-desktop` run | Manual: F (the stage's fullscreen) on a watched share and Esc, on the owner's PC |
+| W13 | **Holds** (PR #56's green `windows-desktop` run): on a page that no gesture activated (`userActivation.hasBeenActive` false; the check is an init script of a reloaded document, since Playwright's `evaluate` is a gesture) `<audio>.play()` resolved for a `blob:` tone, with the user data folder the e2e data root's (the fixture refuses a run without it). The new `AudioContext`'s state is in the row's annotation, which that run didn't print: to be read from the next run's summary (WF19) | CDP spec | `TestWailsChecklist` |
+| W14 | **Holds**: `TestShutdownHook` (a quit Wails began stops the share first and closes the audio service) and `TestQuitStopsShareFirst` pass (Mac, group 17); the real app's half holds too: the CDP spec's end-to-end case (Quit while live: exit 0 within 3 s, the share gone at the viewer) passed in PR #56's green `windows-desktop` run | Go tests; CDP spec | M-DESK-4 |
+| W15 | **Holds**: the macOS half (WA48, group 5's integration, above) and the ubuntu half, `ci.yml`'s `protocol` job (`task gen:bindings:check`), which PR #56's green run (42102224032) passed: PR #56 changed `cmd/isshoni-desktop/**` (the `desktop_protocol` filter), and `ci-ok` needs `protocol` | CI | — (re-check at every bump) |
+| W16 | **Holds** (PR #56's green `windows-desktop` run): `requestFullscreen()` on the page; Wails' `ContainsFullScreenElementChanged` handler makes the window fullscreen (the SPA calls no `Window.SetFullscreen` on its own: beta.34 follows the element's fullscreen itself); the page fills the screen (`innerWidth`/`innerHeight` equal `screen.width`/`height`), and Esc, a real key press (`SendInput` with the main window brought to the foreground, both asserted; CDP's key events enter at the renderer, below WebView2's own Esc handling, and PR #56's first `windows-desktop` run showed a CDP Escape leaving fullscreen on), leaves it with the window back at its size and visible (README §3 item 113) | CDP spec | Manual: F (the stage's fullscreen) on a watched share and Esc, on the owner's PC |
 | W17 | Fallback built (WF13): the heartbeat watchdog, with the hidden-page gap of §20 | Go tests of the watchdog | M-DESK-11 on the owner's PC (kill a renderer; minimized and covered for 10 minutes) |
 | W18 | **View model holds**: `TestTrayMenu` and `TestTrayIcons` pass (Mac, group 17) | Go tests | M-DESK-4 (the live tray: icon, tooltip, menu, left click) |
-| W19 | Written (WA87): the production build started with the three variables must open no port and no pipe, no process below it may carry them on its command line, and its own environment block must hold no `WEBVIEW2_*` beyond Wails' five placeholders (`WEBVIEW2_X` gone), against a control: the e2e build with the same variables keeps `WEBVIEW2_X`. That block is the proof: the WebView2 loader runs in `isshoni.exe` and reads `WEBVIEW2_*` from it. The WebView2 browser process is read too (a block counts as read only when it holds `SYSTEMROOT` or `PATH`), with a marker that isn't a `WEBVIEW2_*` name (`X_ISSHONI_W19`): the second `windows-desktop` run (PR #56) found the control's browser process without the marker: the WebView2 runtime starts its browser process with an environment of its own, so nothing of `isshoni.exe`'s block reaches it. The production build's browser process must show the same inheritance as the control's and never `WEBVIEW2_X`, and the row records which way the runtime went; `TestScrubEnv` passes (Mac, group 17) | CDP spec (CI: the stage's `isshoni.exe`), pending its first `windows-desktop` run | `TestWailsChecklist` with `-tags "isshoni_hw production"` on the owner's PC; M-DESK-13 (the WebView2 browser process's environment, when the runtime drops `WEBVIEW2_*` there on CI too) |
+| W19 | **Holds for `isshoni.exe`'s block** (PR #56's green `windows-desktop` run): the production build started with the three variables opened no port and no pipe, no process below it carried them on its command line, and its own environment block held no `WEBVIEW2_*` beyond Wails' five placeholders (`WEBVIEW2_X` gone), against a control: the e2e build with the same variables kept `WEBVIEW2_X`. That block is the proof: the WebView2 loader runs in `isshoni.exe` and reads `WEBVIEW2_*` from it. The WebView2 browser process is read too (a block counts as read only when it holds `SYSTEMROOT` or `PATH`), with a marker that isn't a `WEBVIEW2_*` name (`X_ISSHONI_W19`): PR #56's second `windows-desktop` run found the control's browser process without the marker: the WebView2 runtime starts its browser process with an environment of its own, so nothing of `isshoni.exe`'s block reaches it. In the green run the production build's browser process showed the same inheritance as the control's and no `WEBVIEW2_X` (both asserted); which way the runtime went there is in the row's annotation, which that run didn't print: to be read from the next run's summary (WF19). `TestScrubEnv` passes (Mac, group 17) | CDP spec (CI: the stage's `isshoni.exe`) | `TestWailsChecklist` with `-tags "isshoni_hw production"` on the owner's PC; M-DESK-13 (the WebView2 browser process's environment, while the runtime gives it an environment of its own on CI) |
 | W20 | **Holds**: `GOOS=windows govulncheck ./cmd/isshoni-desktop` (no vulnerability the code reaches) and `GOOS=windows go-licenses check ./cmd/isshoni-desktop` pass (Mac, group 17) | CI (`govulncheck`, `licenses`) | — |
-| W21 | **Holds in Chrome** (`desktop-security.spec`, the real Guard, the stub runtime) and in the Guard's tests; the CDP case is written (WA87): the four requests and the query form get 403, no new top-level window of Settings, search or Explorer appears within 3 s, the main window stays visible, `App.Info` answers 200 | e2e; Go tests; CDP spec, pending its first `windows-desktop` run | The full list of objects and wire ids at each pin: `TestWailsChecklist` |
+| W21 | **Holds** in Chrome (`desktop-security.spec`, the real Guard, the stub runtime), in the Guard's tests and in the real webview (PR #56's green `windows-desktop` run): the four requests and the query form get 403, no new top-level window of Settings, search or Explorer appears within 3 s, the main window stays visible, `App.Info` answers 200 | e2e; Go tests; CDP spec | The full list of objects and wire ids at each pin: `TestWailsChecklist` |
 
 ### 3.3 Bumps
 
@@ -860,17 +867,20 @@ included; `services_test`'s `TestEvents` checks the list and `bridge.ts`'s `Brid
 | `deeplink.open` | `PendingLink`, exactly one shape: `{roomId}` for the active server (`""` = the SPA's own last room); `{add: {origin, host, hostUnicode, roomId}}` for an unknown server (`host`/`hostUnicode` from `deeplink.Link`); `{switch: {origin, host, hostUnicode, roomId}, live: {roomId}}` for a known server while a share is live (§13.2's question); `{error: "too_many_servers"}` for a 21st server (WA41) | a deep link, `--server` or `PendingServer` (§13.2) | `App.PendingLink()` |
 | `window.state` | `{visible, focused, fullscreen}` | changes | — |
 | `window.notice` | `WindowNotice {code, text}` (`still-sharing`: "isshoni is still sharing. Stop it from the tray icon (^).") | `App.ShowWindow` opens the window with a notice due (§11.6) | `App.WindowNotice()` |
-| `settings.changed` | `SettingsView` | after any change, from any source (as built: only after `Settings.Update`, WA84; WF18 makes it follow every change) | `Settings.Get()` |
+| `settings.changed` | `SettingsView` | after any change, from any source (as built since group 17: the bridge follows the settings store's `Subscribe`, README §3 item 110) | `Settings.Get()` |
 | `update.state` | `UpdateStatus` | changes | `Updates.Status()` |
 
 As built (WA84 and WF17, group 16; README §3 items 104, 107): **`update.state`** goes out for every status of the
 updater from the app's `Run` on (`bridge.New` subscribes through `app.App.SubscribeUpdates`); without an updater (a
-second instance, the e2e harness) none goes out. **`settings.changed`** goes out only after `Settings.Update`: the
-app's own writes (`tips.firstShareShown` from the share controller, `tips.trayNoticeShown` from
-`App.WindowNoticeShown`, the pill's positions, `autostart` following the Run value at start, §16.1) emit nothing, so
-an open Settings page shows the old value until it pulls `Settings.Get()` again. WF18 (group 17) adds
-`settings.Store.Subscribe(func(Settings)) (cancel func())`, called after every successful save, and the bridge emits
-from it instead (WA84-R6). **`ShareView.lockPrompt`** (WF17) is below.
+second instance, the e2e harness) none goes out. **`settings.changed`** went out only after `Settings.Update` in group
+16, so the app's own writes (`tips.firstShareShown` from the share controller, `tips.trayNoticeShown` from
+`App.WindowNoticeShown`, the pill's positions, `autostart` following the Run value at start, §16.1) emitted nothing. As
+built since group 17 (WF18 and the integration; README §3 item 110; WA84-R6): `settings.Store.Subscribe(func(Settings))
+(cancel func())` reports each real change after a successful save (a clone compared with `reflect.DeepEqual`, so an
+update that changes nothing reports nothing), and `bridge.New` subscribes to it when `Deps.Settings` has it (the
+`settingsSubscriber` interface), emitting `settings.changed` for every change, whatever made it; `Settings.Update` then
+emits no second event, a store without `Subscribe` keeps the old path, and nothing is sent after `Close`
+(`TestSettingsChangedFromStore`). **`ShareView.lockPrompt`** (WF17) is below.
 
 `ShareView` (the bridge's DTO, TS `ShareView`, mapped from 01's `core.ShareSnapshot` plus the controller's own
 fields; named apart from `core.ShareSnapshot` on purpose):
@@ -2260,16 +2270,104 @@ for it), so every later reload sends the page back to the setup page (WA83-R4).
 
 ### 13.3 Single instance
 
-- One instance per Windows user session, through W6's fallback in `winos` (WA41; §3.2 says why Wails' own option
-  can't be used at beta.34): the first instance holds the mutex `Local\io.isshoni.desktop.v1` and serves the pipe
-  `\\.\pipe\io.isshoni.desktop.v1.<user SID>`, whose DACL admits only the current user and no remote client. It
-  creates the next pipe instance before it closes the one it served, so the name is never free while it serves, and
-  serving starts at §13.4 step 3, right after the mutex is taken; the first pipe instance is retried for up to 5 s.
-  Command lines that arrive before `Boot` has run wait in a queue (at most 8), so a second click during a cold
-  WebView2 start isn't lost after the 2 s forward bound; the queue stops at Wails' shutdown, and the mutex and pipe
-  are released right after Wails' `Run` returns (a forward into a dead window would otherwise block the exit). A
-  second launch connects at identification level only (the server can't impersonate it) and forwards nothing to a
-  server that runs as another account. The macOS dev build has no single instance.
+- One instance per Windows user and data root on the PC, across all of the user's sessions, elevated or not, through
+  W6's fallback in `winos` (WA41; §3.2 says why Wails' own option can't be used at beta.34; README §3 item 119). **The
+  lock** is a file lock in the data root (§14.1; `%LOCALAPPDATA%\isshoni`, per user and per PC, or the e2e build's
+  `ISSHONI_E2E_DATA_DIR\isshoni`, §22.4 B, which so has its own lock): a launch opens `instance.lock` there with
+  `CreateFileW(GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_ALWAYS,
+  FILE_FLAG_OPEN_REPARSE_POINT)` (a new file gets the security descriptor
+  `O:<user SID>D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)`, the owner set explicitly since an elevated administrator's files
+  are otherwise owned by `BUILTIN\Administrators`, the DACL protected from inheritance) and takes
+  `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on the one byte at offset 2^40, far past the
+  content, so reading the file is never blocked. Held: the first instance. `ERROR_LOCK_VIOLATION`: another process of
+  this user and data root holds it, in any session, elevated or not, so this launch is a second instance. The lock
+  dies with the handle, so with the process however it ends; there is no stale lock to clean up. Before it locks, the
+  launch checks that `instance.lock` is the user's own plain file: not a reparse point (opened as itself, so a symbolic
+  link or junction is seen, never followed), not a directory, no other hard link, and owned by the user's SID
+  (`GetSecurityInfo(SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION)`). An open that fails with `ERROR_SHARING_VIOLATION`
+  (or `ERROR_LOCK_VIOLATION`: another process, a backup or a scanner, has the file open for a moment without sharing
+  writes) is retried every 25 ms for up to 1 s before it counts as an error.
+- **Repair**: since the data root is the user's own, anything else at `instance.lock` (a file of another owner, a link,
+  a second hard link, a directory, a read-only file or one whose open for writing is denied) came from a copy, a
+  restore or a migration of the data root, not from another account; left there it would make every launch run
+  without the lock, so two instances could share one data root. The launch closes its handle and deletes that name
+  without following it: `DeleteFileW` for a file, a symbolic link or a hard link (a link's target and a file's other
+  names stay), `RemoveDirectoryW` for a junction, a directory symbolic link or a directory, which goes only when empty;
+  a read-only file's `FILE_ATTRIBUTE_READONLY` is cleared first. It then opens the name once more with `CREATE_NEW`
+  and the user-only security descriptor and takes the lock on the new file (when another launch's repair created it
+  first, `ERROR_FILE_EXISTS`, it opens and checks that one as usual), and logs a warning that the lock file was
+  replaced (its base name and the reason only). When the repair fails (another process keeps the file open without
+  delete sharing, a directory that isn't empty), the launch goes on as before: a file it can only read is locked
+  read-only, without a pipe that second launches could find; anything else, or a lock error other than
+  `ERROR_LOCK_VIOLATION`, makes the launch start as the first instance without a lock (step 3's existing rule, with a
+  warning that names no path), never as a second instance, which would exit.
+- **The pipe**: the first instance creates `\\.\pipe\io.isshoni.desktop.v1.<32 hex digits>`, 16 `crypto/rand` bytes
+  new each run, with `FILE_FLAG_FIRST_PIPE_INSTANCE` (a name someone holds is given up for a new one, at most 8
+  times), owned by the user and open to the user only (`O:<user SID>D:P(A;;GA;;;<user SID>)`, no remote client), and
+  only then writes that name into `instance.lock` (from offset 0, truncated and flushed; the lock holder clears the
+  last run's name as soon as it holds the lock, and Close clears its own). A second launch reads the name from
+  `instance.lock`, opens the pipe for `GENERIC_WRITE | READ_CONTROL` at identification level (the server can't
+  impersonate it) and forwards only when the pipe's owner is the user's SID, which works whether or not the first
+  instance runs elevated; comparing the server process's token, which a non-elevated client can't open for an elevated
+  server (`ERROR_ACCESS_DENIED`), is only the fallback when the owner can't be read. No name yet (the first instance
+  still starts), a name with no pipe, a busy pipe and a pipe that isn't the user's are retried until the 2 s bound,
+  then the launch logs the failure and exits 0. A refused pipe is what that failure reports even when later attempts
+  found it busy (a squatter's pipe whose server never disconnects stays busy).
+- **Why no name needs to stay secret** (README §3 items 117–119): every name in `\\.\pipe\` and `\BaseNamedObjects`
+  can be listed by any local account, so WF19's SID-derived names and item 118's per-user secret both leaked to
+  another account the moment the app first ran, and such an account could create them first. Nothing here depends on
+  that any more. The lock lives in the user's data root, which other standard accounts can't open, so they can neither
+  take it nor put a file or a link at its name. The pipe's name is public and new each run; another account that
+  creates a pipe at a name it listed (only a stale one: the live one is the first instance's own, and adding instances
+  to it needs the user's DACL) gets nothing, since its pipe isn't owned by the user. Whoever can open the user's
+  profile (the user's own processes, an administrator, SYSTEM) can already stop the app or read its data. Neither the
+  pipe's name nor the file's content is logged or put in an error, and the CI cleanup prints only a count of leftover
+  pipes: not secret, but nobody's business.
+- **The scope is the user, not the session** (README WF19), because what the app keeps is per user: one data root
+  (06 §2.2, with `settings.json`, `servers.json`, the WebView2 user data folder, logs and updates) and the device
+  credentials in Credential Manager (02). Two instances of one user in two sessions would share all of it:
+  `settings.json`'s writes are atomic (§14.2), so the last writer would silently win; both WebView2 environments would
+  use one user data folder from two sessions; and both would refresh the same device's tokens, each from the credential
+  it read once at start (02's `deviceauth.Manager`), so the later refresh presents a spent token and the server's
+  reuse detection revokes the device (02 §1 decision 6, §6.2). **Accepted cost**: a launch in a second session of the
+  same user (fast user switching, RDP beside the console) is a second instance; it forwards its arguments into the
+  instance of the session that started first and exits 0, so a link clicked there opens in a window the clicking
+  session doesn't show (the user finds it on switching back). An elevated and a non-elevated launch of one user share
+  the lock too (the file's DACL grants the user's SID, which both tokens carry). The running mutex and the installer's
+  mutex stay `Local\` (§13.4, 06 §2.4), accepted, so an installer in one session doesn't wait for the app of another
+  (06 §6.7's `.old` rename loop covers the files that app still maps).
+- **Builds before the lock file** (beta builds of M2: the mutex `Local\io.isshoni.desktop.v1`, WF19's
+  `Global\io.isshoni.desktop.v1.<user SID>` or README §3 item 118's `Global\io.isshoni.desktop.v1.<secret>`, with
+  their pipes) and this one don't see each other; an `instance.secret` that an item-118 build left in the data root is
+  unused (and goes with `--purge-data`). That is harmless across an update: the installer waits until the running mutex
+  `Local\io.isshoni.desktop.running`, which hasn't changed, is gone before it replaces the app (06 §6.7,
+  `installer.nsi`'s `WaitForApp`), every start exits while the installer's mutex exists (§13.4 step 2a), and the
+  installer's own app start comes after; so in the installer's session an old and a new instance never run together.
+  An old instance in another session of the user isn't waited for (the running mutex is `Local\`, the accepted cost
+  above) and runs beside a new one until it exits.
+- **`--purge-data`** (§13.4 step 1): a running instance keeps `instance.lock` open without delete sharing, so while it
+  runs the purge can't delete that file (nor the data root around it): `removeDataRoot` deletes everything else,
+  retries for its 10 s and then logs that the data folder wasn't deleted, never a success, and the mode exits 0 as
+  always. A `/PURGE` uninstall runs it only after waiting for the running mutex (06 §6.8), so in its session no
+  instance runs and the purge is complete; an instance of the same user in another session (the running mutex is
+  `Local\`) keeps `instance.lock` and its folder until it exits, and the uninstaller's own `RMDir /r` leaves them too.
+- The first instance creates the next pipe instance before it closes the one it served, so the name is never free while
+  it serves, and serving starts at §13.4 step 3, right after the lock is taken. Command lines that arrive before `Boot`
+  has run wait in a queue (at most 8), so a second click during a cold WebView2 start isn't lost after the 2 s forward
+  bound; the queue stops at Wails' shutdown, and the lock and pipe are released right after Wails' `Run` returns (a
+  forward into a dead window would otherwise block the exit). The macOS dev build has no single instance.
+- Tests: `winos`' `TestPipeNames` (the name's form, `instance.lock`'s content parsed only as such a name of the same id,
+  the CI cleanup's pattern and that it prints no name), `TestLockState` and `TestServerCheck` (every OS); and
+  `TestRetryOpen` (a refusal outlives later busy attempts) and `TestSingleInstanceLock`, `TestSingleInstanceSecurity`,
+  `TestSingleInstanceLockNotOurs`, `TestSingleInstanceLockNotRepaired`, `TestSingleInstanceSharingViolation`,
+  `TestSingleInstanceOldNamesIgnored`, `TestForwardStaleName`, `TestForwardSquattedName`, `TestForwardChecksTheServer`
+  and `TestSingleInstanceAcrossProcesses` (Windows: one root's second instance forwards, two roots don't see each
+  other, the file's and the pipe's owner and DACL, a file of another owner, a link, a hard link, an empty folder or a
+  read-only file at `instance.lock` is replaced and the new lock serves a second launch, one held open by another
+  process or a folder with a file in it never makes a second instance, a file open for 200 ms without write sharing
+  only delays the lock, a stale name is retried and fails cleanly, a squatted stale name is refused; the `owner` and
+  squatted cases need an elevated process, as on CI); `cmd/isshoni-desktop`'s
+  `TestPurgeWhileRunning` (Windows) checks the purge against a held lock.
 - A second launch forwards `os.Args[1:]` unchanged to the first and exits 0 within 2 s; before forwarding it calls
   `AllowSetForegroundWindow(ASFW_ANY)`, so the first instance may come to the front (Windows' focus rules otherwise
   only flash its taskbar button). The first instance runs `HandleArgs` with them and applies the same `--open-url`
@@ -2431,6 +2529,7 @@ Also part of the contract:
 | `HKCU\Software\isshoni\PendingServer`, `PendingRoom` (REG_SZ) | written by 06's installer (`/SERVER=`) or by 03 before a start-time update; read and deleted by the first instance at start (§13.2) | 06 / 03 |
 | `HKCU\Software\isshoni\UpdateChecks` (DWORD) | written by 06's installer; read once as the initial `updates.check` (§14.2) | 06 |
 | Notification registration, written by Wails' notifications service at runtime (beta.34, `pkg/services/notifications/notifications_windows.go`): `HKCU\Software\Classes\AppUserModelId\<Options.Name>` (value `CustomActivator` = a random GUID), `HKCU\Software\Classes\CLSID\{GUID}\LocalServer32` = `"<exe>" %1`, `HKCU\Software\<Options.Name>\NotificationCategories`; plus the toast icon `%TEMP%\<Options.Name>{GUID}.png` | the app writes them; 06's uninstaller removes them (§15) | this doc |
+| Single-instance lock | `%LOCALAPPDATA%\isshoni\instance.lock` (owner the user, DACL the user and SYSTEM only; the first instance holds `LockFileEx` on one byte at offset 2^40 and writes its pipe's name at offset 0; never logged): single instance (§13.3). `instance.secret`, which an earlier M2 build kept here, is gone (unused if left behind) | this doc |
 | Named mutex `Local\io.isshoni.desktop.running` | held by the first instance (§13.4) | this doc |
 
 Every per-PC file is under `%LOCALAPPDATA%\isshoni\`, which `--purge-data` removes (§13.4); nothing is in the
@@ -2613,6 +2712,19 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   `TestAutostartRoundTrip` (Windows, the e2e build with `web/dist` and a WebView2 runtime: started with `--autostart` it
   shows no window, and a second launch shows one) runs in ci.yml's `windows-desktop` and nightly's `windows-full` with
   `ISSHONI_REQUIRE_AUTOSTART_E2E=1`, which turns its skips into failures (06 §10.1).
+- As run (PR #56; README §3 item 114): the test checks each link of the chain on its own, since its first failure
+  after the updater e2e only said "the window didn't open after a second launch": it refuses to start while anything
+  holds the running mutex, or the single-instance lock of its temp data root (since README §3 item 119 a
+  `LockFileEx` probe of that root's `instance.lock`, `winos.LockHeld`; before it the mutex and pipe names, from the
+  user's SID and then from item 118's secret); it fails when the first instance serves no pipe ("second launches can't
+  reach this one"),
+  when the second launch logs a failed forward or step 2a's installer handover ("couldn't tell whether an installer
+  runs" still forwards), and when the first instance exits while the window is awaited, and its timeout says whether
+  `winos`' `serveLoop` logged the forward as arrived (it logs each delivered command line by its count only, never its
+  arguments). A failure prints both starts' stderr and the first instance's log files. CI runs it twice, before and
+  after the updater e2e (06 §10.1), and PR #56's green run passed both. PR #56's runs had a per-session mutex and a
+  per-user pipe, a scope mismatch that WF19 resolved (README §3 item 115); since item 119 the lock is `instance.lock`
+  in the data root and the pipe's name is new each run (§13.3).
 
 ### 16.2 Updates (the UI; 06 owns the updater)
 
@@ -2821,7 +2933,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | `-Embedding` start without an `open` action | exits within 5 s |
 | `--forget-credentials`, `--purge-data` | revokes ≤ 5 s in all (one budget); `--purge-data`'s locked files retried ≤ 10 s |
 | `--self-check` probe | 20 s |
-| Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s. Checked (README WA87): the CDP spec's end-to-end case sends `App.Quit(true)` while live and asserts exit code 0 within 3 s and the share gone at the viewer, recording the time as "Budget (03 §20)"; pending its first `windows-desktop` run |
+| Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s. Checked (README WA87): the CDP spec's end-to-end case sends `App.Quit(true)` while live and asserts exit code 0 within 3 s and the share gone at the viewer, recording the time as "Budget (03 §20)". **Holds on CI**: the case passed in PR #56's green `windows-desktop` run (42102224032, README §3 item 115), so Quit while live exited 0 within 3 s; the time itself is in the annotation, which that run didn't print: to be read from the next run's summary (WF19) |
 | End of session | share stopped within 2 s |
 | WebView2 watchdog (W17 fallback) | heartbeat every 5 s, reload after 15 s; at most 3 reloads per 5 min, then an error page with "Restart isshoni". As built (WF13, `app.HeartbeatEvery`/`HeartbeatTimeout`; README §3 item 84): the page beats at once at boot, every 5 s, and again at once when it becomes visible; Go's watchdog arms with the first beat, checks every 5 s, watches only a visible window (one just shown gets a fresh 15 s) and waits another 15 s after a reload; when that reload brought no beat back, the next timeout loads the start page (`ReturnHome`, W5's and W17's fallbacks at beta.34). The cap of 3 reloads per 5 min and the error page are not built yet. **Known gap while hidden**: Go asks `Shell.WindowVisible()` (Wails' `IsVisible`, which reads the window's `WS_VISIBLE` style bit (beta.34's `webview_window_windows.go`)), which stays true for a minimized window and one fully covered by a full-screen game, the main case while sharing, while WebView2 marks such a page hidden and, after 5 min hidden, Chromium's intensive throttling runs chained timers about once a minute. The page then beats less often than every 15 s, and the watchdog may reload it every 15–60 s while the user plays (WF13's review, R2; not reproduced on a Mac). A dedicated Worker's timer isn't throttled that way, but §5.3's CSP has `worker-src 'none'`. The fix belongs to the app or the shell, in a later slice: watch only a page that isn't minimized or occluded (`IsIconic`, or the page's own `visibilitychange` sent with the beat), or start WebView2 with `--disable-background-timer-throttling`; M-DESK-11's variant checks it (§22.5) |
 | Settings write debounce | 500 ms |
@@ -2832,9 +2944,9 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | `/wails/runtime` request body read by the Guard | ≤ 64 KiB (413 above); chunked runtime requests refused (§5.6) |
 | `App.OwnConnections` | ≤ 64 ids |
 | Window | min 800 × 560 px, default 1200 × 760 px |
-| Startup to window | ≤ 1.5 s warm, ≤ 3 s cold on the owner's PC, the shell relaunch included (measured in DK13). **Measured** (README WA87, group 17): on the owner's PC not yet (M-DESK-12: Task Manager's startup, cold after a reboot and warm, from a Start menu launch, which includes the shell relaunch; the result goes here). The CDP spec records the CI runner's number at every start as the annotation "Budget (03 §20)": the e2e build's spawn (`--relaunched`, so without the relaunch) to `DOMContentLoaded` at the asset origin (the page's own navigation timing, so the spec's polling and attach aren't counted; the time to Playwright attached is recorded beside it) with a new WebView2 profile, a cold start of the webview on a GPU-less `windows-2025`; it is a trend line, not the budget's measurement |
+| Startup to window | ≤ 1.5 s warm, ≤ 3 s cold on the owner's PC, the shell relaunch included (measured in DK13). **Measured** (README WA87, group 17): on the owner's PC not yet (M-DESK-12: Task Manager's startup, cold after a reboot and warm, from a Start menu launch, which includes the shell relaunch; the result goes here). The CDP spec records the CI runner's number at every start as the annotation "Budget (03 §20)": the e2e build's spawn (`--relaunched`, so without the relaunch) to `DOMContentLoaded` at the asset origin (the page's own navigation timing, so the spec's polling and attach aren't counted; the time to Playwright attached is recorded beside it) with a new WebView2 profile, a cold start of the webview on a GPU-less `windows-2025`; it is a trend line, not the budget's measurement. PR #56's green `windows-desktop` run (42102224032) recorded it but didn't print it: to be read from the next run's summary (WF19) |
 | Pill shown after `live` | ≤ 300 ms |
-| Memory (budget, measured in DK13) | `isshoni.exe` ≤ 120 MB private working set while sharing 1080p60 (engine buffers included, GPU memory excluded); the WebView2 processes ≤ 350 MB together while watching one focused share and 8 thumbnails. **Measured** (README WA87, group 17): on the owner's PC not yet (M-DESK-12, after 30 minutes of sharing 1080p60 while watching one focused share and 8 thumbnails; the result goes here). The CDP spec's end-to-end case records the CI runner's private working sets (`Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`, Task Manager's column) of `isshoni.exe` and of its `msedgewebview2.exe` processes together ("unreadable", with how many processes were read, when the provider had no row for one), while the fake engine shares 640×360 to one Chrome viewer: the annotation "Budget (03 §20)", a trend line on the fake engine, not the budget's case |
+| Memory (budget, measured in DK13) | `isshoni.exe` ≤ 120 MB private working set while sharing 1080p60 (engine buffers included, GPU memory excluded); the WebView2 processes ≤ 350 MB together while watching one focused share and 8 thumbnails. **Measured** (README WA87, group 17): on the owner's PC not yet (M-DESK-12, after 30 minutes of sharing 1080p60 while watching one focused share and 8 thumbnails; the result goes here). The CDP spec's end-to-end case records the CI runner's private working sets (`Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`, Task Manager's column) of `isshoni.exe` and of its `msedgewebview2.exe` processes together ("unreadable", with how many processes were read, when the provider had no row for one), while the fake engine shares 640×360 to one Chrome viewer: the annotation "Budget (03 §20)", a trend line on the fake engine, not the budget's case. PR #56's green `windows-desktop` run (42102224032) recorded it but didn't print it: to be read from the next run's summary (WF19) |
 
 ---
 
@@ -3093,6 +3205,31 @@ WebView2 runtime starts its browser process with an environment of its own. So t
 must match the control's (marker present exactly when the control's is) and hold no `WEBVIEW2_X`, and the browser
 side shows the scrub only where the control's inherits `WEBVIEW2_X`; elsewhere that half is M-DESK-13's (§22.5).
 e2e builds keep the variables.
+
+**PR #56's lessons, as the spec now runs** (README §3 items 113, 115). PR #56's first `windows-desktop` run (of
+group 17's merge) failed `TestAutostartRoundTrip` (§16.1), W16, W19's browser half, the end-to-end close to tray and a
+server's teardown; its green run (42102224032) passed every case:
+- **Esc is a real key press** (W16): `page.keyboard.press` is CDP's `Input.dispatchKeyEvent`, which enters at the
+  renderer, and WebView2's own key handling, which ends element fullscreen on Esc, never sees it (the first run left
+  `fullscreenElement` set). `windows.ts`' `pressEscape` brings the main window to the foreground
+  (`SetForegroundWindow` with `AttachThreadInput`) and sends Esc's down and up through `SendInput`; the spec asserts
+  that the window was in front and that both events went in, and records the page's keydowns (Wails sets
+  `AreBrowserAcceleratorKeysEnabled(false)`, so a failure says whether the key reached the page). The same limit holds
+  for W9's CDP key and wheel events, whose real-keyboard half stays manual.
+- **The main window is found by its class** (W7, W16, W21, the end to end): .NET's
+  `MainWindowHandle`/`CloseMainWindow()` take the first visible unowned window in Z order, which while a share is live
+  is the topmost Sharing pill, and the pill swallows `WM_CLOSE` by design (§11.4), so the product's close path never
+  ran. `mainWindow` takes the process's one top-level window of Wails' class `WailsWebviewWindow` that is not
+  `WS_DISABLED` (`GetWindowLongW(GWL_STYLE)`): beta.34's `initMainLoop` also creates `__wails_hidden_mainthread`, a
+  hidden top-level window of the same class with `WS_DISABLED` alone, for its main-thread dispatch, which `EnumWindows`
+  lists; two enabled windows of the class still fail. `postClose` posts `WM_CLOSE` to that HWND, as the close button
+  does. After the close while live the Sharing pill must show (the fake engine captures borderless).
+- **The runtime's own environment** (W19): the WebView2 runtime starts its browser process with an environment block of
+  its own, so the scrub is asserted on `isshoni.exe`'s block (above) and the browser half is M-DESK-13's.
+- **The server's admin socket on Windows** (`fixtures.ts`): readiness lists the socket's folder (`socketExists`), which
+  the green run confirmed, and teardown removes the socket with `unlink` (`fs.rm` lstats first, and lstat of an
+  AF_UNIX socket's reparse point fails with `EACCES`), with `DeleteFileW` through Windows PowerShell as the fallback; a
+  socket that can't be removed at teardown is reported, not a failure of the test that already ran.
 
 ### 22.5 Manual (owner's PC; recorded in the PR and in the release checklist)
 

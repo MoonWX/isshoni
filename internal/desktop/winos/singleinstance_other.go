@@ -11,8 +11,10 @@ import (
 // twice; M3 adds the macOS lock).
 type SingleInstance struct{}
 
-// NewSingleInstance returns the stub.
-func NewSingleInstance(string, *slog.Logger) (*SingleInstance, error) { return &SingleInstance{}, nil }
+// NewSingleInstance returns the stub; it touches nothing in the data root.
+func NewSingleInstance(string, string, *slog.Logger) (*SingleInstance, error) {
+	return &SingleInstance{}, nil
+}
 
 // Acquire always reports the first instance.
 func (*SingleInstance) Acquire() (bool, error) { return true, nil }
@@ -27,3 +29,6 @@ func (*SingleInstance) Forward([]string) error {
 
 // Close does nothing.
 func (*SingleInstance) Close() error { return nil }
+
+// LockHeld is always false: no lock off Windows.
+func LockHeld(string) (bool, error) { return false, nil }

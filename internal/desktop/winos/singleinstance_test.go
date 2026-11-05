@@ -3,7 +3,11 @@ package winos
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -219,6 +223,187 @@ func receive(t *testing.T, got <-chan []string, want ...string) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("%q wasn't received", want)
+	}
+}
+
+// ciPipePattern is the PowerShell -like pattern by which the windows-desktop jobs' cleanup (ci.yml) and windows-full's
+// (nightly.yml) find the single-instance pipes below \\.\pipe\; TestPipeNames reads it from both files.
+const ciPipePattern = `*io.isshoni.desktop.*`
+
+// ciPipeLike matches the cleanup's pipe filter: GetFiles('\\.\pipe\') piped into Where-Object { $_ -like '<pattern>' }.
+var ciPipeLike = regexp.MustCompile(`GetFiles\('\\\\\.\\pipe\\'\) \| Where-Object \{ \$_ -like '([^']*)' \}`)
+
+// ciPipesUse is every use of the cleanup's $pipes: only its assignment and its count may appear, so the pipes' names
+// are never printed (03 §13.3: neither the pipe's name nor the lock file's content is logged).
+var ciPipesUse = regexp.MustCompile(`\$pipes\b(\s*=\s*@\(|\.Count\b)?`)
+
+// TestPipeNames: the pipe's name is \\.\pipe\<id>.v1.<32 hex digits>, new each run; instance.lock's content gives it
+// back only when it is exactly such a name of the same id (03 §13.3; README §3 item 119). The workflows' cleanup
+// pattern matches it, and the cleanup prints the leftover pipes' count, never their names.
+func TestPipeNames(t *testing.T) {
+	a, err := newPipeName(InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newPipeName(InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Errorf("two runs share a pipe name: %q", a)
+	}
+	if !regexp.MustCompile(`^\\\\\.\\pipe\\io\.isshoni\.desktop\.v1\.[0-9a-f]{32}$`).MatchString(a) {
+		t.Errorf("pipe name %q", a)
+	}
+	for _, data := range []string{a, a + "\r\n", " " + a + "\n"} {
+		if got, ok := pipeFromLock(InstanceID, []byte(data)); !ok || got != a {
+			t.Errorf("pipeFromLock(%q) = %q %v, want %q", data, got, ok, a)
+		}
+	}
+	token := a[len(pipePrefix(InstanceID)):]
+	for _, data := range []string{
+		"",
+		"   ",
+		a[:len(a)-1],       // half written
+		a + "0",            // too long
+		strings.ToUpper(a), // not as written
+		pipePrefix(InstanceID) + strings.Repeat("g", 32),
+		pipePrefix("io.isshoni.test-1") + token, // another id's
+		`\\.\pipe\..\` + token,
+		`C:\Users\x\file.v1.` + token,
+		a + "\n" + a,
+	} {
+		if got, ok := pipeFromLock(InstanceID, []byte(data)); ok {
+			t.Errorf("pipeFromLock(%q) = %q, want none", data, got)
+		}
+	}
+
+	// The cleanup's pattern, as PowerShell's -like applies it to GetFiles' full names (no '/' in them, so path.Match's
+	// '*' is -like's): it must be ciPipePattern in both workflows and match the pipe.
+	for _, wf := range []string{"../../../.github/workflows/ci.yml", "../../../.github/workflows/nightly.yml"} {
+		data, err := os.ReadFile(wf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := ciPipeLike.FindAllStringSubmatch(string(data), -1)
+		if len(m) != 1 {
+			t.Errorf("%s: %d single-instance pipe filters, want 1", wf, len(m))
+			continue
+		}
+		if m[0][1] != ciPipePattern {
+			t.Errorf("%s: the pipe filter is %q, want %q", wf, m[0][1], ciPipePattern)
+		}
+		uses := ciPipesUse.FindAllStringSubmatch(string(data), -1)
+		if len(uses) < 2 {
+			t.Errorf("%s: $pipes is used %d times, want its assignment and its count", wf, len(uses))
+		}
+		for _, u := range uses {
+			if u[1] == "" {
+				t.Errorf("%s: $pipes is used other than by its count (its names would be printed)", wf)
+			}
+		}
+	}
+	for _, p := range []string{a, b} {
+		if ok, err := path.Match(ciPipePattern, p); !ok || err != nil {
+			t.Errorf("%q doesn't match the cleanup's %q: %v", p, ciPipePattern, err)
+		}
+	}
+}
+
+// TestLockState: only a plain instance.lock this user owns is the lock; on it, a held range is a first instance and
+// another handle's range a second one; a link, a file of another owner (or one whose owner can't be read) and any
+// other lock error start the launch without the lock, never as a second instance (03 §13.3).
+func TestLockState(t *testing.T) {
+	errViolation := errors.New("lock violation")
+	errOther := errors.New("something else")
+	for _, c := range []struct {
+		name  string
+		f     lockFacts
+		first bool
+		err   bool
+	}{
+		{"held", lockFacts{ownerIsUser: true}, true, false},
+		{"held elsewhere", lockFacts{ownerIsUser: true, lockErr: errViolation, violation: true}, false, false},
+		{"another lock error", lockFacts{ownerIsUser: true, lockErr: errOther}, false, true},
+		{"a link", lockFacts{reparse: true, ownerIsUser: true}, false, true},
+		{"a link, held elsewhere", lockFacts{reparse: true, ownerIsUser: true, lockErr: errViolation, violation: true},
+			false, true},
+		{"another owner", lockFacts{}, false, true},
+		{"another owner, held elsewhere", lockFacts{lockErr: errViolation, violation: true}, false, true},
+	} {
+		first, err := lockState(c.f)
+		if first != c.first || (err != nil) != c.err {
+			t.Errorf("%s: %v %v, want first %v, error %v", c.name, first, err, c.first, c.err)
+		}
+	}
+	if _, err := lockState(lockFacts{reparse: true}); !errors.Is(err, errLockNotOurs) {
+		t.Errorf("a link: %v isn't errLockNotOurs", err)
+	}
+}
+
+// TestServerCheck: Forward trusts the pipe when its owner is the user's SID, whatever the server's token says (an
+// elevated server's can't be opened from a non-elevated client); it compares the token only when the owner can't be
+// read, and a token that can't be opened then leaves the server unproven (03 §13.3).
+func TestServerCheck(t *testing.T) {
+	const user, other = "S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002"
+	errDenied := errors.New("access denied")
+	errUnread := errors.New("the owner can't be read")
+	token := func(sid string, err error) func() (string, error) {
+		return func() (string, error) { return sid, err }
+	}
+	for _, c := range []struct {
+		name     string
+		owner    string
+		ownerErr error
+		token    func() (string, error)
+		ok       bool
+	}{
+		{"owner is the user, token denied (elevated server)", user, nil, token("", errDenied), true},
+		{"owner is the user, token of the user", user, nil, token(user, nil), true},
+		{"owner is another account", other, nil, token(user, nil), false},
+		{"owner unread, token of the user", "", errUnread, token(user, nil), true},
+		{"owner unread, token of another account", "", errUnread, token(other, nil), false},
+		{"owner unread, token denied", "", errUnread, token("", errDenied), false},
+	} {
+		err := serverCheck(user, c.owner, c.ownerErr, c.token)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %v, want ok %v", c.name, err, c.ok)
+		}
+		if err != nil && !errors.Is(err, errServerNotUser) {
+			t.Errorf("%s: %v isn't errServerNotUser", c.name, err)
+		}
+	}
+}
+
+// TestRetryOpen: Forward's loop returns at the first success; on the timeout a refused server is its error even when
+// later attempts failed otherwise (a refused pipe that stays leaves its instance busy), and without a refusal the
+// last attempt's error is.
+func TestRetryOpen(t *testing.T) {
+	errBusy, errGone := errors.New("busy"), errors.New("gone")
+	const timeout, pause = 100 * time.Millisecond, time.Millisecond
+	seq := func(errs ...error) func() error {
+		n := 0
+		return func() error {
+			err := errs[min(n, len(errs)-1)]
+			n++
+			return err
+		}
+	}
+	refused := fmt.Errorf("%w (its owner: x)", errServerNotUser)
+	if err := retryOpen(timeout, pause, seq(errBusy, refused, nil)); err != nil {
+		t.Errorf("a success after failures: %v", err)
+	}
+	start := time.Now()
+	err := retryOpen(timeout, pause, seq(refused, errBusy))
+	if !errors.Is(err, errServerNotUser) {
+		t.Errorf("refused once, then busy: %v, want errServerNotUser", err)
+	}
+	if d := time.Since(start); d < timeout {
+		t.Errorf("gave up after %v, before the timeout", d)
+	}
+	if err := retryOpen(timeout, pause, seq(errBusy, errGone)); !errors.Is(err, errGone) ||
+		errors.Is(err, errServerNotUser) {
+		t.Errorf("never refused: %v, want the last error", err)
 	}
 }
 

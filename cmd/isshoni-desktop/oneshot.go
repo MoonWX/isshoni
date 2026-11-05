@@ -243,7 +243,9 @@ var dataRootNames = map[string]bool{"isshoni": true, "isshoni-dev": true}
 
 // removeDataRoot deletes root and everything in it, retrying for up to budget, every every, while something is
 // still locked (03 §13.4: WebView2's children may still be exiting). remove is os.RemoveAll. A root that doesn't
-// exist is no error; a root that isn't an absolute path named like a data root is refused.
+// exist is no error; a root that isn't an absolute path named like a data root is refused. A running instance keeps
+// the root's instance.lock open without delete sharing (03 §13.3), so while one runs the file and the root stay and
+// the result is an error after the budget, never a success; everything else in the root is gone by then.
 func removeDataRoot(ctx context.Context, root string, budget, every time.Duration, remove func(string) error) error {
 	if !filepath.IsAbs(root) || !dataRootNames[filepath.Base(root)] || filepath.Dir(root) == root {
 		return fmt.Errorf("refusing to delete %q: not a data root", filepath.Base(root))

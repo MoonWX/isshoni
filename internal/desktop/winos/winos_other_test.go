@@ -38,7 +38,7 @@ func TestStubs(t *testing.T) {
 		t.Errorf("OpenSettingsPage: %v", err)
 	}
 
-	si, err := NewSingleInstance(InstanceID, nil)
+	si, err := NewSingleInstance(InstanceID, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +53,9 @@ func TestStubs(t *testing.T) {
 	}
 	if err := si.Close(); err != nil {
 		t.Error(err)
+	}
+	if held, err := LockHeld(t.TempDir()); held || err != nil {
+		t.Errorf("LockHeld: %v %v", held, err)
 	}
 
 	if err := HoldRunningMutex(RunningMutex); err != nil {

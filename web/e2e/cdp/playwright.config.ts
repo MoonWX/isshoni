@@ -34,7 +34,9 @@ export default defineConfig({
   retries: 0,
   timeout: 120_000,
   expect: { timeout: 15_000 },
-  reporter: [['list']],
+  // annotations.ts prints each "Wails checklist" and "Budget (03 §20)" annotation as one line, and writes them as a
+  // table to annotations.md in outputDir and, when GITHUB_STEP_SUMMARY is set, to the job summary (03 §3.2, §20).
+  reporter: [['list'], ['./annotations.ts']],
   use: {
     channel: 'chrome',
     headless: true,

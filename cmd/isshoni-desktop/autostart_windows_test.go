@@ -5,7 +5,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -35,8 +34,8 @@ import (
 // the test instead of skipping it, so the acceptance can't turn into a silent skip.
 //
 // Every link of the chain is checked on its own, so a failure names the one that broke (the first windows-desktop
-// run of PR #56 only said "the window didn't open"): no other process holds the single-instance mutex or pipe before
-// the start; the first instance's pipe was created; the second launch forwarded (a failed forward still exits 0,
+// run of PR #56 only said "the window didn't open"): no other process holds the data root's single-instance lock
+// before the start; the first instance's pipe was created; the second launch forwarded (a failed forward still exits 0,
 // 03 §13.3); the first instance logged the forward as arrived (winos' serveLoop) or not, when the window doesn't open;
 // the first instance is still running while the window is awaited. A failure prints both starts' stderr (the e2e
 // build mirrors its log there) and the first instance's log files.
@@ -57,29 +56,26 @@ func TestAutostartRoundTrip(t *testing.T) {
 	if running, _ := winos.MutexExists(winos.RunningMutex); running {
 		skip("an isshoni app runs on this PC")
 	}
-	// The build uses the real single-instance names: anything that still holds them (a process an earlier step left
-	// in this session or another one; the pipe's name is per user, not per session) would take the second launch's
-	// forward, or keep the first instance from serving.
-	if held, _ := winos.MutexExists(`Local\` + winos.InstanceID + ".v1"); held {
-		skip("another process holds the single-instance mutex " + winos.InstanceID + ".v1")
+	dir := t.TempDir()
+	data := filepath.Join(dir, "data")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if pipe := singleInstancePipe(t); pipeExists(t, pipe) {
-		skip(`another process serves the single-instance pipe \\.\pipe\` + pipe)
+	// The build uses the real single-instance id with this data root's lock, instance.lock in
+	// ISSHONI_E2E_DATA_DIR\isshoni (dataRoot; 03 §13.3). A process that held it would take the second launch's
+	// forward, or make the --autostart start a second instance.
+	if held, err := winos.LockHeld(filepath.Join(data, "isshoni")); held || err != nil {
+		skip(fmt.Sprintf("this data root's single-instance lock is held (%v)", err))
 	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
 		skip("no go command on PATH")
 	}
-	dir := t.TempDir()
 	exe := filepath.Join(dir, "isshoni.exe")
 	build := exec.CommandContext(t.Context(), goTool, "build", "-buildvcs=false", "-tags", "e2e",
 		"-ldflags=-H=windowsgui", "-o", exe, ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	data := filepath.Join(dir, "data")
-	if err := os.Mkdir(data, 0o700); err != nil {
-		t.Fatal(err)
 	}
 	env := append(os.Environ(), "ISSHONI_E2E_DATA_DIR="+data)
 
@@ -134,7 +130,7 @@ func TestAutostartRoundTrip(t *testing.T) {
 			fail("%d visible windows after an --autostart start", n)
 		}
 	}
-	// serveLoop gave up on the pipe's name after firstPipeWait (5 s), well inside the 8 s above.
+	// serveLoop gives up on the pipe at once when it can't create one under a new name, well inside the 8 s above.
 	if out := firstErr.String() + logFiles(filepath.Join(data, "isshoni", "logs")); strings.Contains(out,
 		"second launches can't reach this one") {
 		fail("the first instance serves no single-instance pipe (another process holds its name?)")
@@ -211,37 +207,6 @@ func logFiles(dir string) string {
 		fmt.Fprintf(&b, "---- %s\n%s\n", e.Name(), data)
 	}
 	return b.String()
-}
-
-// singleInstancePipe is the name, below \\.\pipe\, of the single-instance pipe of this user (winos.NewSingleInstance's).
-func singleInstancePipe(t *testing.T) string {
-	t.Helper()
-	u, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil {
-		t.Fatalf("the user's SID: %v", err)
-	}
-	return winos.InstanceID + ".v1." + u.User.Sid.String()
-}
-
-// pipeExists reports whether a pipe of that name exists, by listing \\.\pipe\ (opening it would take an instance).
-func pipeExists(t *testing.T, name string) bool {
-	t.Helper()
-	pattern, err := windows.UTF16PtrFromString(`\\.\pipe\` + name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fd windows.Win32finddata
-	h, err := windows.FindFirstFile(pattern, &fd)
-	// The pipe file system answers a name it doesn't hold with ERROR_NO_MORE_FILES (the windows-2025 runner, PR #56),
-	// not ERROR_FILE_NOT_FOUND; both mean no such pipe.
-	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_NO_MORE_FILES) {
-		return false
-	}
-	if err != nil {
-		t.Fatalf("listing the pipe %s: %v", name, err)
-	}
-	_ = windows.FindClose(h)
-	return true
 }
 
 // visibleWindows counts the visible top-level windows of the process pid.
