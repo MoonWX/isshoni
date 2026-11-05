@@ -97,7 +97,9 @@ type lumaTap interface {
 	Samples() []lumaSample
 }
 
-// newLumaTap returns a session's luma tap (errLumaTap until the binding delivers it).
+// newLumaTap returns a session's luma tap (errLumaTap until the binding delivers it). -no-luma runs without one: a
+// diagnostic of the Windows half (the flash window's frame statistics, the click process, the PCM tap) that the owner
+// can run before the tap exists; it never reports a pass.
 var newLumaTap = func() (lumaTap, error) { return nil, errLumaTap }
 
 // avsyncOptions are avsync's flags. role, result, stop, ready and clicks are the helper processes'.
@@ -111,10 +113,11 @@ type avsyncOptions struct {
 	ready   string // the flash window creates this file once its first frame is on screen
 	clicks  int    // the click process's bursts
 	life    time.Duration
+	noLuma  bool // the diagnostic without the luma tap
 }
 
 func cmdAVSync(ctx context.Context, g *globals, args []string) int {
-	fs := newFlags(g, "avsync", "[-source pick|mon:<id>] [-seconds 25] [-out DIR]")
+	fs := newFlags(g, "avsync", "[-source pick|mon:<id>] [-seconds 25] [-out DIR] [-no-luma]")
 	o := avsyncOptions{}
 	fs.StringVar(&o.source, "source", "pick", "`pick` (the flash window, WGC; Windows 11) or mon:<id> (DD; Windows 10: the primary monitor, where the flash window opens)")
 	fs.Float64Var(&o.seconds, "seconds", avsyncDefaultSeconds, "how long to capture")
@@ -125,6 +128,8 @@ func cmdAVSync(ctx context.Context, g *globals, args []string) int {
 	fs.StringVar(&o.ready, "ready", "", "the flash window only: created once the first frame is on screen")
 	fs.IntVar(&o.clicks, "clicks", 0, "the click process only: how many clicks")
 	fs.DurationVar(&o.life, "life", avsyncFlashLifetime, "the flash window only: the longest it stays")
+	fs.BoolVar(&o.noLuma, "no-luma", false, "diagnostic: the flash window, the click process and the session without the "+
+		"luma tap; reports P_k, A_k, U_k and U − A, never a pass")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -137,10 +142,14 @@ func cmdAVSync(ctx context.Context, g *globals, args []string) int {
 	case "click":
 		return runClickRole(ctx, g, o)
 	}
-	tap, err := newLumaTap()
-	if err != nil {
-		fmt.Fprintln(g.stderr, "avsync:", err)
-		return envCode(err)
+	var tap lumaTap
+	if !o.noLuma {
+		t, err := newLumaTap()
+		if err != nil {
+			fmt.Fprintln(g.stderr, "avsync:", err, "(-no-luma runs the rest as a diagnostic)")
+			return envCode(err)
+		}
+		tap = t
 	}
 	e, code, err := g.openEngine(false)
 	if err != nil {
@@ -281,7 +290,7 @@ type avsyncEngine interface {
 type avsyncEnv struct {
 	engine  avsyncEngine
 	helpers avsyncHelpers
-	tap     lumaTap
+	tap     lumaTap // nil: -no-luma's diagnostic
 }
 
 // avPair is one flash paired with its click. P, V, A and U are on the engine clock (QPC ns); V and U came from
@@ -298,10 +307,20 @@ type avPair struct {
 	OffsetMS float64 `json:"offsetMs"` // (U − V) − (A − P) = (U − A) − (V − P)
 }
 
+// clickPair is one click of -no-luma's diagnostic: its predicted device-position time A and its onset U in the PCM
+// tap (engine clock, QPC ns).
+type clickPair struct {
+	Click   int     `json:"click"`
+	ANS     int64   `json:"aNs"`
+	UNS     int64   `json:"uNs"`
+	AudioMS float64 `json:"audioMs"` // U − A
+}
+
 // avsyncReport is avsync.json and avsync's -json output. It names no machine, user, window or path.
 type avsyncReport struct {
 	Command      string     `json:"command"`
-	Source       string     `json:"source"` // "pick" or "mon"
+	Diagnostic   string     `json:"diagnostic,omitempty"` // "no-luma": -no-luma's run, which has no verdict
+	Source       string     `json:"source"`               // "pick" or "mon"
 	Seconds      float64    `json:"seconds"`
 	Flashes      int        `json:"flashes"`
 	FlashEst     int        `json:"flashesEstimated"`
@@ -318,6 +337,11 @@ type avsyncReport struct {
 	SpreadMS     [2]float64 `json:"p5p95Ms"`   // the offsets' 5th and 95th percentiles, for the reader
 	Failures     []string   `json:"failures"`
 	Pass         bool       `json:"pass"`
+
+	// -no-luma's diagnostic only.
+	FlashesNS  []int64     `json:"flashesNs,omitempty"`       // P_k
+	ClickPairs []clickPair `json:"clickPairs,omitempty"`      // A_k with U_k
+	AudioMS    []float64   `json:"audioP5P50P95Ms,omitempty"` // U − A: 5th percentile, median, 95th percentile
 }
 
 // runAVSync is the run of 05 §19.3 on env: flash window, source, session with the taps, clicks, capture, analysis.
@@ -358,7 +382,11 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 		}
 		cfg.Source, cfg.Listed = src.ID, false
 	}
-	s, err := env.engine.StartWith(ctx, cfg, env.tap.Options()...)
+	var opts []native.StartOption
+	if env.tap != nil {
+		opts = env.tap.Options()
+	}
+	s, err := env.engine.StartWith(ctx, cfg, opts...)
 	if err != nil {
 		fmt.Fprintln(stderr, "avsync: start:", err)
 		return envCode(err)
@@ -413,7 +441,10 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 	if err != nil {
 		rep.Failures = append(rep.Failures, "the flash window: "+err.Error())
 	}
-	frames := env.tap.Samples()
+	var frames []lumaSample
+	if env.tap != nil {
+		frames = env.tap.Samples()
+	}
 	edges := lumaEdges(frames, avsyncLumaLevel)
 	rep.Flashes, rep.FlashEst, rep.FlashMissing = len(fr.FlashesNS), fr.Estimated, fr.Unresolved
 	rep.RefreshMS = float64(fr.RefreshNS) / 1e6
@@ -421,15 +452,19 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 
 	v := shift(edges, epoch)
 	u := shift(det.onsets, epoch)
-	rep.Pairs, rep.Unpaired = pairAVSync(fr.FlashesNS, v, cr.OnsetsNS, u)
-	offsets := make([]float64, 0, len(rep.Pairs))
-	for _, p := range rep.Pairs {
-		offsets = append(offsets, p.OffsetMS)
+	if env.tap == nil {
+		diagnoseNoLuma(&rep, fr, cr.OnsetsNS, u)
+	} else {
+		rep.Pairs, rep.Unpaired = pairAVSync(fr.FlashesNS, v, cr.OnsetsNS, u)
+		offsets := make([]float64, 0, len(rep.Pairs))
+		for _, p := range rep.Pairs {
+			offsets = append(offsets, p.OffsetMS)
+		}
+		rep.MedianMS = quantile(offsets, 0.5)
+		rep.SpreadMS = [2]float64{quantile(offsets, 0.05), quantile(offsets, 0.95)}
+		rep.Failures = append(rep.Failures, checkAVSync(offsets)...)
+		rep.Pass = len(rep.Failures) == 0
 	}
-	rep.MedianMS = quantile(offsets, 0.5)
-	rep.SpreadMS = [2]float64{quantile(offsets, 0.05), quantile(offsets, 0.95)}
-	rep.Failures = append(rep.Failures, checkAVSync(offsets)...)
-	rep.Pass = len(rep.Failures) == 0
 
 	data, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
@@ -450,12 +485,52 @@ func runAVSync(ctx context.Context, env avsyncEnv, o avsyncOptions, asJSON bool,
 		printAVSync(stdout, rep)
 	}
 	switch {
-	case endErr != nil && len(rep.Pairs) == 0:
+	case endErr != nil && len(rep.Pairs) == 0 && len(rep.ClickPairs) == 0:
 		return envCode(endErr)
-	case !rep.Pass:
+	case len(rep.Failures) > 0:
 		return exitFail
 	}
-	return exitPass
+	return exitPass // -no-luma: the diagnostic ran clean (its report says pass: false)
+}
+
+// diagnoseNoLuma fills -no-luma's report: the flashes P_k, each click A_k with its PCM-tap onset U_k and the U − A
+// distribution. Its failures are the Windows half's: no flash resolved, no click heard. It never passes.
+func diagnoseNoLuma(rep *avsyncReport, fr flashResult, a, u []int64) {
+	rep.Diagnostic = "no-luma"
+	rep.FlashesNS = append([]int64{}, fr.FlashesNS...)
+	rep.ClickPairs, rep.Unpaired = pairClicks(a, u)
+	audio := make([]float64, 0, len(rep.ClickPairs))
+	for _, p := range rep.ClickPairs {
+		audio = append(audio, p.AudioMS)
+	}
+	if len(audio) > 0 {
+		rep.AudioMS = []float64{quantile(audio, 0.05), quantile(audio, 0.5), quantile(audio, 0.95)}
+	}
+	if len(fr.FlashesNS) == 0 {
+		rep.Failures = append(rep.Failures, "the flash window resolved no flash's display time")
+	}
+	if len(rep.ClickPairs) == 0 {
+		rep.Failures = append(rep.Failures, "no click was heard in the PCM tap")
+	}
+	rep.Pass = false
+}
+
+// pairClicks pairs each click A_k with its onset U (the nearest within avsyncMatchWindow, each onset at most once);
+// a click without one is listed in unpaired. Both on one clock.
+func pairClicks(a, u []int64) ([]clickPair, []string) {
+	pairs := []clickPair{}
+	unpaired := []string{}
+	used := map[int]bool{}
+	for k, ak := range a {
+		ui := nearest(u, ak, int64(avsyncMatchWindow), used)
+		if ui < 0 {
+			unpaired = append(unpaired, fmt.Sprintf("click %d: not found in the PCM tap within %v", k, avsyncMatchWindow))
+			continue
+		}
+		used[ui] = true
+		pairs = append(pairs, clickPair{Click: k, ANS: ak, UNS: u[ui], AudioMS: float64(u[ui]-ak) / 1e6})
+	}
+	return pairs, unpaired
 }
 
 // sessionEpoch is the session's epoch_ns on the engine clock: the engine clock (QPC ns) minus Session.Now, read back
@@ -701,6 +776,9 @@ func printAVSync(w io.Writer, r avsyncReport) {
 		r.Source, r.Seconds, r.Flashes, r.FlashEst, r.FlashMissing, r.RefreshMS, r.Clicks)
 	fmt.Fprintf(w, "luma tap: %d pictures, %d flashes seen; PCM tap: %d chunks, %d clicks heard\n", r.Frames, r.Edges,
 		r.PCMChunks, r.Onsets)
+	for _, p := range r.ClickPairs {
+		fmt.Fprintf(w, "click %2d: audio (U − A) %+7.1f ms\n", p.Click, p.AudioMS)
+	}
 	for _, p := range r.Pairs {
 		fmt.Fprintf(w, "flash %2d / click %2d: video %+7.1f ms, audio %+7.1f ms, offset %+7.1f ms\n", p.Flash, p.Click,
 			p.VideoMS, p.AudioMS, p.OffsetMS)
@@ -708,10 +786,18 @@ func printAVSync(w io.Writer, r avsyncReport) {
 	for _, u := range r.Unpaired {
 		fmt.Fprintln(w, "unpaired:", u)
 	}
-	fmt.Fprintf(w, "%d pairs: median offset %+.1f ms (p5 %+.1f, p95 %+.1f)\n", len(r.Pairs), r.MedianMS, r.SpreadMS[0],
-		r.SpreadMS[1])
+	if r.Diagnostic == "" {
+		fmt.Fprintf(w, "%d pairs: median offset %+.1f ms (p5 %+.1f, p95 %+.1f)\n", len(r.Pairs), r.MedianMS,
+			r.SpreadMS[0], r.SpreadMS[1])
+	} else if len(r.AudioMS) == 3 {
+		fmt.Fprintf(w, "%d clicks heard: U − A median %+.1f ms (p5 %+.1f, p95 %+.1f)\n", len(r.ClickPairs), r.AudioMS[1],
+			r.AudioMS[0], r.AudioMS[2])
+	}
 	for _, f := range r.Failures {
 		fmt.Fprintln(w, "FAIL:", f)
+	}
+	if r.Diagnostic != "" && len(r.Failures) == 0 {
+		fmt.Fprintln(w, "DIAGNOSTIC (-no-luma): no verdict without the luma tap")
 	}
 	if r.Pass {
 		fmt.Fprintln(w, "PASS")

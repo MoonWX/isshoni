@@ -274,6 +274,19 @@ func TestOverflowWatch(t *testing.T) {
 	}
 }
 
+// TestOverflowMessageInBinding ties ringOverflowLogBegin to the binding: soak sees RING_OVERFLOW only through the warn
+// message internal/media/native logs, so a change of its wording must fail here rather than silently stop soak from
+// failing on overflows.
+func TestOverflowMessageInBinding(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "internal", "media", "native", "bridge.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `s.log.Warn("` + ringOverflowLogBegin; !strings.Contains(string(src), want) {
+		t.Errorf("internal/media/native/bridge.go no longer logs %q: RING_OVERFLOW's message changed, update ringOverflowLogBegin", want)
+	}
+}
+
 func TestSoakUsage(t *testing.T) {
 	for _, args := range [][]string{
 		{"soak", "-hours", "0"},

@@ -480,6 +480,61 @@ func TestRunAVSyncWithFakes(t *testing.T) {
 	}
 }
 
+func TestPairClicks(t *testing.T) {
+	// Clicks every second; onsets 25 ms later, the third missing and a spurious one between the first two.
+	a := []int64{1_000 * ms, 2_000 * ms, 3_000 * ms, 4_000 * ms}
+	u := []int64{1_025 * ms, 1_600 * ms, 2_025 * ms, 4_025 * ms}
+	pairs, unpaired := pairClicks(a, u)
+	if len(pairs) != 3 || len(unpaired) != 1 || !strings.HasPrefix(unpaired[0], "click 2:") {
+		t.Fatalf("pairs %+v, unpaired %q", pairs, unpaired)
+	}
+	for _, p := range pairs {
+		if p.AudioMS != 25 || p.UNS-p.ANS != 25*ms {
+			t.Errorf("pair %+v: want U − A = 25 ms", p)
+		}
+	}
+	// Each onset at most once: two clicks near one onset take it once.
+	if pairs, _ := pairClicks([]int64{0, 10 * ms}, []int64{5 * ms}); len(pairs) != 1 {
+		t.Errorf("one onset paired %d times", len(pairs))
+	}
+}
+
+func TestRunAVSyncNoLuma(t *testing.T) {
+	run := newAVSyncFakeRun(12*ms, 30*ms)
+	o := avsyncOptions{source: "pick", seconds: 0.2, out: t.TempDir(), noLuma: true}
+	var stdout, stderr bytes.Buffer
+	env := avsyncEnv{engine: run, helpers: avsyncFakeHelpers{run}}
+	code := runAVSync(context.Background(), env, o, true, &stdout, &stderr)
+	var rep avsyncReport
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("exit %d: no report: %v\n%s", code, err, stderr.String())
+	}
+	if code != exitPass || rep.Pass || rep.Diagnostic != "no-luma" || len(rep.Failures) != 0 {
+		t.Fatalf("exit %d, pass %t, diagnostic %q, failures %q: want a clean run without a verdict", code, rep.Pass,
+			rep.Diagnostic, rep.Failures)
+	}
+	if len(rep.FlashesNS) != 18 || len(rep.ClickPairs) != 18 || len(rep.Pairs) != 0 || len(rep.AudioMS) != 3 ||
+		math.Abs(rep.AudioMS[1]-30) > 1 {
+		t.Errorf("flashes %d, clicks %d, pairs %d, U − A %v: want 18, 18, 0 and a 30 ms median", len(rep.FlashesNS),
+			len(rep.ClickPairs), len(rep.Pairs), rep.AudioMS)
+	}
+	var text bytes.Buffer
+	printAVSync(&text, rep)
+	if !strings.Contains(text.String(), "DIAGNOSTIC") || strings.Contains(text.String(), "PASS") {
+		t.Errorf("the text report:\n%s", text.String())
+	}
+
+	// Nothing heard: a failure of the Windows half.
+	silent := newAVSyncFakeRun(12*ms, 30*ms)
+	silent.clicks = nil
+	env = avsyncEnv{engine: silent, helpers: avsyncFakeHelpers{silent}}
+	o.out = t.TempDir()
+	stdout.Reset()
+	if code := runAVSync(context.Background(), env, o, true, &stdout, &stderr); code != exitFail {
+		t.Errorf("no clicks heard: exit %d, want %d", code, exitFail)
+	}
+}
+
 func TestAVSyncUsage(t *testing.T) {
 	for _, args := range [][]string{
 		{"avsync", "-source", "test:pattern"},
@@ -498,6 +553,11 @@ func TestAVSyncUsage(t *testing.T) {
 	code, _, stderr := runArgs(t, "-dll", t.TempDir(), "avsync", "-out", t.TempDir())
 	if code != exitEnv || !strings.Contains(stderr, "luma tap") {
 		t.Errorf("exit %d, want %d with the luma tap named\n%s", code, exitEnv, stderr)
+	}
+	// -no-luma gets past the tap to the engine (which this -dll doesn't have).
+	code, _, stderr = runArgs(t, "-dll", t.TempDir(), "avsync", "-no-luma", "-out", t.TempDir())
+	if code != exitEnv || strings.Contains(stderr, "luma tap") {
+		t.Errorf("-no-luma: exit %d, want %d without the luma tap\n%s", code, exitEnv, stderr)
 	}
 	var me *media.Error
 	if !errors.As(error(errLumaTap), &me) || envCode(errLumaTap) != exitEnv {

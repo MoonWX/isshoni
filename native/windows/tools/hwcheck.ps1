@@ -169,11 +169,13 @@ function Get-HardwareEncoder {
 # A Go time.Duration string (as bench prints it: 850us, 12.5ms, 1.2s, 1m2s) in milliseconds, or $null.
 function ConvertFrom-GoDuration {
     param([string]$Text)
-    if ($Text -notmatch '^([0-9.]+(ns|us|ms|s|m|h|\u00b5s|\u03bcs))+$') { return $null }
-    $unit = @{ 'ns' = 1e-6; 'us' = 1e-3; ([string][char]0x00b5 + 's') = 1e-3; ([string][char]0x03bc + 's') = 1e-3
-        'ms' = 1.0; 's' = 1e3; 'm' = 6e4; 'h' = 3.6e6 }
+    # Go prints microseconds with the micro sign (U+00B5); U+03BC is accepted too. Both become 'u' first: as keys of a
+    # hash literal (case-insensitive) the two can collide ("Duplicate keys") because they share an uppercase form.
+    $Text = $Text.Replace([string][char]0x00b5, 'u').Replace([string][char]0x03bc, 'u')
+    if ($Text -cnotmatch '^([0-9.]+(ns|us|ms|s|m|h))+$') { return $null }
+    $unit = @{ 'ns' = 1e-6; 'us' = 1e-3; 'ms' = 1.0; 's' = 1e3; 'm' = 6e4; 'h' = 3.6e6 }
     $total = 0.0
-    foreach ($m in [regex]::Matches($Text, '([0-9.]+)([a-z\u00b5\u03bc]+)')) {
+    foreach ($m in [regex]::Matches($Text, '([0-9.]+)([a-z]+)')) {
         $total += [double]::Parse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) * $unit[$m.Groups[2].Value]
     }
     return $total
@@ -249,8 +251,12 @@ function Protect-Report {
         $text = [IO.File]::ReadAllText($file.FullName)
         foreach ($p in $patterns) { $text = [regex]::Replace($text, $p[0], $p[1], $opts) }
         [IO.File]::WriteAllText($file.FullName, $text, $utf8)
+        # The check runs on the text without the replacement tokens: a name such as "User" or "host" would otherwise
+        # match the token "<redacted:user>" itself (its ':' and '>' are word boundaries) and stop every run.
+        # A space keeps the word boundary the token was.
+        $check = [regex]::Replace($text, '<redacted:[a-z]+>', ' ')
         foreach ($p in $patterns) {
-            if ([regex]::IsMatch($text, $p[0], $opts)) { $left += $file.FullName.Substring($script:Work.Length + 1) }
+            if ([regex]::IsMatch($check, $p[0], $opts)) { $left += $file.FullName.Substring($script:Work.Length + 1) }
         }
     }
     return @($left | Select-Object -Unique)
