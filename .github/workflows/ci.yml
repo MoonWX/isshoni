@@ -3009,6 +3009,24 @@ jobs:
           if (-not $v) { throw "the WebView2 bootstrapper exited $($p.ExitCode) and no runtime 120.0 or newer is registered" }
           "WebView2 runtime $v (installed)"
 
+      - name: The autostart round trip (TestAutostartRoundTrip, 03 §16.1, README WA84)
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
+        run: |
+          # The e2e build started as the Run value starts it (--autostart) shows no window, and a second launch shows
+          # one. It needs web/dist and a WebView2 runtime, both here; ISSHONI_REQUIRE_AUTOSTART_E2E=1 turns a missing
+          # prerequisite into a failure, and the test must PASS (not skip). It runs without -race (CGO_ENABLED=0). It
+          # builds its own e2e exe, so it runs before the updater e2e: that step starts installed apps, installers and
+          # mutex helpers in this session, and the test needs the single-instance names (the per-user pipe included)
+          # that nothing else holds (PR #56's first run failed there right after it; the test now names a holder).
+          $env:CGO_ENABLED = '0'
+          $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
+          $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart.log'
+          go test -v -count=1 -run '^TestAutostartRoundTrip$' ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ((Get-Content -LiteralPath $log) -match '^--- PASS: TestAutostartRoundTrip\b')) {
+            throw "TestAutostartRoundTrip did not pass (no '--- PASS: TestAutostartRoundTrip' line)"
+          }
+
       - name: The updater e2e (two updatetest builds, relserve, smoke.ps1 -Mode update)
         # M2 06 §8.11, §16, R9 (README WA88). Two updatetest builds of isshoni.exe (TAGS=production,updatetest, 06
         # §5.2; only that tag makes a ci.N version eligible, §8.11), 0.0.1-ci.1 and 0.0.1-ci.2, each packed into an
@@ -3144,11 +3162,26 @@ jobs:
             if (-not $rs.HasExited) { Stop-Process -Id $rs.Id -Force }
             "---- relserve's requests"
             Get-Content -LiteralPath (Join-Path $work 'relserve.err') -ErrorAction SilentlyContinue
-            # A failed case may leave the app running or installed: the later steps (the autostart round trip) need
-            # neither.
+            # A failed case may leave the app running or installed: the later steps (the CDP spec) need neither. Any
+            # isshoni.exe still running, in any folder or session, is named and ended, and the single-instance pipe
+            # (per user, not per session) must be gone with it: a holder would take a later start's forward.
             $exe = Join-Path $installDir 'isshoni.exe'
-            Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'" |
-              Where-Object { $_.ExecutablePath -eq $exe } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'isshoni.exe'")) {
+              if ($p.ExecutablePath -ne $exe) {
+                "::warning::the updater e2e left isshoni.exe $($p.ProcessId) running (session $($p.SessionId)): $($p.ExecutablePath) $($p.CommandLine)"
+              }
+              Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            $deadline = (Get-Date).AddSeconds(15)
+            while ($true) {
+              $pipes = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like '*io.isshoni.desktop.*' })
+              if ($pipes.Count -eq 0) { break }
+              if ((Get-Date) -gt $deadline) {
+                "::warning::the single-instance pipe outlived every isshoni.exe of the updater e2e: $($pipes -join ', ')"
+                break
+              }
+              Start-Sleep -Milliseconds 250
+            }
             $u = Join-Path $installDir 'uninstall.exe'
             if (Test-Path -LiteralPath $u) {
               '::warning::the updater e2e left an install behind; uninstalling it'
@@ -3196,21 +3229,6 @@ jobs:
           $lines = Get-Content -LiteralPath $log
           foreach ($t in $tests) {
             if (-not ($lines -match "^--- PASS: $t\b")) { throw "$t did not pass (no '--- PASS: $t' line)" }
-          }
-
-      - name: The autostart round trip (TestAutostartRoundTrip, 03 §16.1, README WA84)
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.webdist.outcome == 'success' && steps.webview2.outcome == 'success' }}
-        run: |
-          # The e2e build started as the Run value starts it (--autostart) shows no window, and a second launch shows
-          # one. It needs web/dist and a WebView2 runtime, both here; ISSHONI_REQUIRE_AUTOSTART_E2E=1 turns a missing
-          # prerequisite into a failure, and the test must PASS (not skip). It runs without -race (CGO_ENABLED=0).
-          $env:CGO_ENABLED = '0'
-          $env:ISSHONI_REQUIRE_AUTOSTART_E2E = '1'
-          $log = Join-Path $env:RUNNER_TEMP 'go-test-autostart.log'
-          go test -v -count=1 -run '^TestAutostartRoundTrip$' ./cmd/isshoni-desktop/ | Tee-Object -FilePath $log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not ((Get-Content -LiteralPath $log) -match '^--- PASS: TestAutostartRoundTrip\b')) {
-            throw "TestAutostartRoundTrip did not pass (no '--- PASS: TestAutostartRoundTrip' line)"
           }
 
       - name: Set up Node (version from .tool-versions)

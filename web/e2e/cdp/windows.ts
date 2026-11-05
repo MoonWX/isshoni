@@ -34,24 +34,90 @@ function jsonArray<T>(out: string): T[] {
   return Array.isArray(v) ? v : [v];
 }
 
-/**
- * The main window's HWND of a process as a decimal string, "0" while it has none. .NET leaves hidden windows out of
- * MainWindowHandle, so read it while the window shows.
- */
-export async function mainWindow(pid: number): Promise<string> {
-  return ps(`(Get-Process -Id ${String(pid)}).MainWindowHandle.ToInt64()`);
+/** The window class of the app's main window: Wails' default WndClass at beta.34, which the app doesn't change. */
+export const MAIN_WINDOW_CLASS = 'WailsWebviewWindow';
+/** The window class of the Sharing pill (internal/desktop/winos/pill_windows.go, 03 §11.4). */
+export const PILL_WINDOW_CLASS = 'isshoni.pill';
+
+/** A top-level window of a process, shown or not. */
+export interface ProcessWindow {
+  readonly hwnd: string;
+  readonly visible: boolean;
+  /** The window class (GetClassNameW); a class name is the app's own, never a title. */
+  readonly cls: string;
 }
 
-/** Posts WM_CLOSE to the process's main window, as its close button sends it; false when nothing was posted. */
-export async function closeMainWindow(pid: number): Promise<boolean> {
-  return (await ps(`(Get-Process -Id ${String(pid)}).CloseMainWindow()`)) === 'True';
+const PROCESS_WINDOWS_TYPE = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class IsshoniCdpOwn {
+  delegate bool EnumProc(IntPtr h, IntPtr p);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = CharSet.Unicode)]
+  static extern int GetClassNameW(IntPtr h, StringBuilder name, int max);
+  public static string[] Of(int target) {
+    List<string> list = new List<string>();
+    EnumWindows(delegate (IntPtr h, IntPtr p) {
+      uint pid;
+      GetWindowThreadProcessId(h, out pid);
+      if (pid == (uint)target) {
+        StringBuilder cls = new StringBuilder(256);
+        GetClassNameW(h, cls, cls.Capacity);
+        list.Add(h.ToInt64().ToString() + " " + (IsWindowVisible(h) ? "1" : "0") + " " + cls.ToString());
+      }
+      return true;
+    }, IntPtr.Zero);
+    return list.ToArray();
+  }
+}
+'@
+`;
+
+/** Every top-level window of a process (EnumWindows), hidden ones included, with its class. */
+export async function processWindows(pid: number): Promise<ProcessWindow[]> {
+  const out = await ps(`${PROCESS_WINDOWS_TYPE}
+ConvertTo-Json -Compress -InputObject @([IsshoniCdpOwn]::Of(${String(pid)}))`);
+  // "<hwnd> <0|1> <class>": the class is the rest of the line.
+  return jsonArray<string>(out).map((line) => {
+    const [hwnd = '', visible = '', ...cls] = line.split(' ');
+    return { hwnd, visible: visible === '1', cls: cls.join(' ') };
+  });
+}
+
+/**
+ * The main window's HWND of a process as a decimal string, "0" while it has none: its one top-level window of the
+ * Wails class, shown or hidden. Not .NET's MainWindowHandle: that is the first visible unowned window in Z order,
+ * which while a share is live is the topmost Sharing pill (03 §11.4), not the main window.
+ */
+export async function mainWindow(pid: number): Promise<string> {
+  const main = (await processWindows(pid)).filter((w) => w.cls === MAIN_WINDOW_CLASS);
+  if (main.length > 1)
+    throw new Error(`process ${String(pid)} has ${String(main.length)} ${MAIN_WINDOW_CLASS} windows`);
+  return main[0]?.hwnd ?? '0';
 }
 
 const USER32 =
   "Add-Type -Namespace IsshoniCdp -Name U -MemberDefinition '" +
   '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); ' +
-  '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);' +
+  '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); ' +
+  '[DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);' +
   "'; ";
+
+/**
+ * Posts WM_CLOSE to a window (an HWND as a decimal string), as its close button sends it; false when nothing was
+ * posted. What Process.CloseMainWindow does, but to the window named, not to whatever .NET takes for the main one.
+ */
+export async function postClose(hwnd: string): Promise<boolean> {
+  return (
+    (await ps(`${USER32}[IsshoniCdp.U]::PostMessageW([IntPtr]${hwnd}, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)`)) ===
+    'True'
+  );
+}
 
 /** IsWindow and IsWindowVisible of an HWND (decimal), independent of Chromium's own idea of visibility. */
 export async function windowState(hwnd: string): Promise<{ exists: boolean; visible: boolean }> {
@@ -60,6 +126,83 @@ export async function windowState(hwnd: string): Promise<{ exists: boolean; visi
   );
   const [exists, visible] = out.split(' ');
   return { exists: exists === 'True', visible: visible === 'True' };
+}
+
+const KEYS_TYPE = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+public static class IsshoniCdpKeys {
+  [StructLayout(LayoutKind.Sequential)]
+  struct MouseInput { public int Dx; public int Dy; public uint Data; public uint Flags; public uint Time; public IntPtr Extra; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct KeyInput { public ushort Vk; public ushort Scan; public uint Flags; public uint Time; public IntPtr Extra; }
+  // The union is as large as its largest member (MOUSEINPUT), so cbSize is sizeof(INPUT) on either bitness.
+  [StructLayout(LayoutKind.Explicit)]
+  struct InputUnion { [FieldOffset(0)] public MouseInput Mouse; [FieldOffset(0)] public KeyInput Key; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct Input { public uint Type; public InputUnion U; }
+  [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, Input[] inputs, int size);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+  [DllImport("user32.dll", EntryPoint = "MapVirtualKeyW")] static extern uint MapVirtualKeyW(uint code, uint type);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  // Brings h to the foreground: this thread's input is attached to the foreground window's thread and to h's for
+  // the call, which lets SetForegroundWindow through. True once h is the foreground window.
+  public static bool Front(IntPtr h) {
+    uint me = GetCurrentThreadId();
+    for (int i = 0; i < 20; i++) {
+      IntPtr fg = GetForegroundWindow();
+      if (fg == h) { return true; }
+      uint fgThread = GetWindowThreadProcessId(fg, IntPtr.Zero);
+      uint target = GetWindowThreadProcessId(h, IntPtr.Zero);
+      bool toFg = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
+      bool toTarget = target != 0 && target != me && target != fgThread && AttachThreadInput(me, target, true);
+      try {
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+      } finally {
+        if (toTarget) { AttachThreadInput(me, target, false); }
+        if (toFg) { AttachThreadInput(me, fgThread, false); }
+      }
+      Thread.Sleep(100);
+    }
+    return GetForegroundWindow() == h;
+  }
+  // A key press and release of the virtual key vk through SendInput (the keyboard's own path: WM_KEYDOWN and
+  // WM_KEYUP reach the focused window's thread); the number of events Windows took, 2 when both went in.
+  public static uint Press(ushort vk) {
+    Input[] inputs = new Input[2];
+    ushort scan = (ushort)MapVirtualKeyW(vk, 0); // MAPVK_VK_TO_VSC
+    inputs[0].Type = 1; // INPUT_KEYBOARD
+    inputs[0].U.Key.Vk = vk;
+    inputs[0].U.Key.Scan = scan;
+    inputs[1].Type = 1;
+    inputs[1].U.Key.Vk = vk;
+    inputs[1].U.Key.Scan = scan;
+    inputs[1].U.Key.Flags = 2; // KEYEVENTF_KEYUP
+    return SendInput(2, inputs, Marshal.SizeOf(typeof(Input)));
+  }
+}
+'@
+`;
+
+/**
+ * Presses Esc on the real keyboard path (SendInput) with the window hwnd (decimal) in the foreground. Not CDP's
+ * Input.dispatchKeyEvent: that enters at the renderer, below WebView2's own key handling, which is what ends element
+ * fullscreen on Esc (03 §3.2 W16). foreground: the window was the foreground window before the key went in (nothing
+ * is sent otherwise); sent: how many of the key's two events SendInput took.
+ */
+export async function pressEscape(hwnd: string): Promise<{ foreground: boolean; sent: number }> {
+  const out = await ps(`${KEYS_TYPE}
+$h = [IntPtr]${hwnd}
+if ([IsshoniCdpKeys]::Front($h)) { 'True {0}' -f [IsshoniCdpKeys]::Press(0x1B) } else { 'False 0' }`);
+  const [foreground, sent] = out.split(' ');
+  return { foreground: foreground === 'True', sent: Number(sent) };
 }
 
 /** A visible, unowned top-level window of the session: its HWND, its process id and the process's image name. */

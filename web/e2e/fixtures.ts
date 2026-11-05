@@ -486,6 +486,33 @@ function socketExists(p: string): boolean {
   }
 }
 
+/**
+ * Removes the admin socket's file when it is there. On Windows, fs.rm can't: it lstats the path first, and lstat of
+ * an AF_UNIX socket's reparse point fails with EACCES (the CDP spec's first windows-desktop run), which force
+ * doesn't cover. unlink opens the reparse point itself, without a stat; DeleteFileW (.NET's File.Delete under Windows
+ * PowerShell) is the fallback. Throws when the file is still there afterwards.
+ */
+async function removeSocket(p: string): Promise<void> {
+  if (process.platform !== 'win32') {
+    await fsp.rm(p, { force: true });
+    return;
+  }
+  try {
+    await fsp.unlink(p);
+    return;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if (!socketExists(p)) return;
+  }
+  const script = `[IO.File]::Delete('${p.replaceAll("'", "''")}')`;
+  await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { timeout: 60_000 },
+  );
+  if (socketExists(p)) throw new Error(`the admin socket ${p} can't be removed`);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -620,7 +647,7 @@ class Server implements E2EServer {
 
   private async run(ports: Ports): Promise<'ready' | 'exited' | 'timeout'> {
     // A socket file that an earlier run of this server left behind would say "ready" for this one (see below).
-    fs.rmSync(this.socket, { force: true });
+    await removeSocket(this.socket);
     // The process writes to the file itself: nothing is lost when this worker dies, and nothing waits on a pipe.
     const log = fs.openSync(this.logPath, 'a');
     let child: ChildProcess;
@@ -764,7 +791,11 @@ class Server implements E2EServer {
     this.api = null;
     await this.terminate();
     await fsp.rm(this.dataDir, { recursive: true, force: true });
-    await fsp.rm(this.socket, { force: true });
+    // The name is this worker's own (its pid and a counter): one left behind in the temp folder harms no later run,
+    // so a socket that can't be removed is reported, not a failure of the test that already ran.
+    await removeSocket(this.socket).catch((err: unknown) => {
+      console.warn(`e2e: ${String(err)}`);
+    });
   }
 }
 

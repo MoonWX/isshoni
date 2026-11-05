@@ -53,13 +53,17 @@ import { expect, test as e2e } from '../fixtures.ts';
 import { REPO_ROOT } from '../global-setup.ts';
 import { audioOf, readStats, waitForRoom, waitForState, waitForStats, videoOf } from '../stats.ts';
 import {
-  closeMainWindow,
   type ChildProcessInfo,
   descendants,
   environmentNames,
+  MAIN_WINDOW_CLASS,
   mainWindow,
   memory,
   mib,
+  PILL_WINDOW_CLASS,
+  postClose,
+  pressEscape,
+  processWindows,
   ps,
   topWindows,
   webviewProcesses,
@@ -517,11 +521,11 @@ test('W5: navigation and new windows stay on the asset origin', async ({ app }) 
 test('W7: closing the window hides it; the app keeps running', async ({ app }) => {
   test.skip(app.process?.pid === undefined, 'needs the app this spec started (its pid)');
   const pid = app.process?.pid ?? 0;
-  // The main window's HWND, read before the close: .NET leaves hidden windows out of MainWindowHandle.
+  // The main window's HWND (its Wails window class; windows.ts says why not .NET's MainWindowHandle).
   const hwnd = await mainWindow(pid);
   expect(hwnd).toMatch(/^[1-9]\d*$/);
   // WM_CLOSE to the main window, as its close button sends it. False would mean it wasn't posted.
-  expect(await closeMainWindow(pid)).toBe(true);
+  expect(await postClose(hwnd)).toBe(true);
   // The window itself, independent of Chromium: it still exists (not destroyed) and is hidden (Hide(), 03 §3.2 W7).
   // Read first, and both polls soft, so the row below always records the window's state and the webview's
   // separately: a WebView2 visibility quirk then reads apart from a broken close path.
@@ -721,7 +725,18 @@ test('W16: element fullscreen fills the screen and Esc brings the window back', 
     )
     .toBe(true);
   const full = await size();
-  await page.keyboard.press('Escape');
+  // Whether the page itself sees the Esc keydown is recorded, not asserted: WebView2 may handle the key before it.
+  await page.evaluate(() => {
+    const w = window as { __cdpKeys?: string[] };
+    w.__cdpKeys = [];
+    window.addEventListener('keydown', (e) => w.__cdpKeys?.push(e.key), { capture: true });
+  });
+  // A real Esc (SendInput, the window in the foreground): WebView2's own key handling ends element fullscreen, and
+  // CDP's key events never reach it (they enter at the renderer; the first windows-desktop run showed a CDP Escape
+  // leaving fullscreenElement set). The window must be in front for the key to reach it.
+  const esc = await pressEscape(hwnd);
+  expect(esc.foreground, 'the main window is the foreground window for the real Esc').toBe(true);
+  expect(esc.sent, "SendInput took the Esc key's down and up").toBe(2);
   await expect.poll(async () => (await size()).fs, { timeout: 10_000, message: 'Esc leaves fullscreen' }).toBe(false);
   await expect
     .poll(
@@ -733,11 +748,13 @@ test('W16: element fullscreen fills the screen and Esc brings the window back', 
     )
     .toEqual([before.w, before.h]);
   const win = await windowState(hwnd);
+  const keys = await page.evaluate(() => (window as { __cdpKeys?: string[] }).__cdpKeys ?? []);
   row(
     'W16',
     `before ${String(before.w)}×${String(before.h)} on a ${String(before.sw)}×${String(before.sh)} screen; ` +
-      `fullscreen ${String(full.w)}×${String(full.h)} (fullscreenElement set); after Esc (CDP input) ` +
-      `fullscreenElement null and the window back at ${String(before.w)}×${String(before.h)}, visible = ${String(win.visible)}`,
+      `fullscreen ${String(full.w)}×${String(full.h)} (fullscreenElement set); after Esc (SendInput, the window ` +
+      `in the foreground) fullscreenElement null and the window back at ${String(before.w)}×${String(before.h)}, ` +
+      `visible = ${String(win.visible)}; the page's keydowns: ${keys.length === 0 ? 'none' : keys.join(', ')}`,
   );
   expect(win).toEqual({ exists: true, visible: true });
 });
@@ -899,11 +916,15 @@ test('the app end to end: a device-flow link, a fake share watched in Chrome, cl
       } (the budget's own case, watching one focused share and 8 thumbnails, is M-DESK-12's)`,
   );
 
-  // Close the window while live (03 §11.6): it hides to the tray, the process lives and the share goes on.
+  // Close the window while live (03 §11.6): it hides to the tray, the process lives and the share goes on. The main
+  // window by its class: while live the topmost Sharing pill is the process's first visible window, which .NET's
+  // MainWindowHandle would pick, and the pill swallows WM_CLOSE (03 §11.4).
   const hwnd = await mainWindow(pid);
   expect(hwnd).toMatch(/^[1-9]\d*$/);
-  expect(await closeMainWindow(pid)).toBe(true);
+  expect(await postClose(hwnd)).toBe(true);
   await expect.poll(async () => (await windowState(hwnd)).visible, { timeout: 10_000 }).toBe(false);
+  // Recorded: the pill shows while the window is hidden and the share is live (a borderless capture, 03 §11.4).
+  const pillShown = (await processWindows(pid)).some((w) => w.cls === PILL_WINDOW_CLASS && w.visible);
   expect((await windowState(hwnd)).exists).toBe(true);
   expect(app.process?.exitCode).toBeNull();
   expect((await boundJSON<{ state: string } | null>(page, 'Share', 'Current'))?.state).toBe('live');
@@ -934,7 +955,8 @@ test('the app end to end: a device-flow link, a fake share watched in Chrome, cl
   const goneMs = Date.now() - sent;
   row(
     'close-to-tray and Quit (03 §11.6, §22.4 B)',
-    `closed while live (closeToTray off): hidden, process alive, Share.Current live, the friend got 30 more frames; ` +
+    `closed while live (closeToTray off; WM_CLOSE to the ${MAIN_WINDOW_CLASS} window): hidden, process alive, ` +
+      `Share.Current live, the friend got 30 more frames, Sharing pill visible = ${String(pillShown)}; ` +
       `Quit: exit code ${String(exit?.code)} after ${String(quitMs)} ms, the share gone at the friend within ` +
       `${String(goneMs)} ms; the friend heard ${energy > 0 ? 'the tone' : 'no tone (no audio device on the runner)'}`,
   );
@@ -986,16 +1008,26 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
   test.setTimeout(240_000);
   const port = await freePort();
   const pipe = `isshoni-test-${randomBytes(6).toString('hex')}`;
+  // MARKER is no WEBVIEW2_* name, so no scrub touches it: where a WebView2 browser process has it, that process got
+  // the app's environment, whatever became of WEBVIEW2_X there.
+  const MARKER = 'X_ISSHONI_W19';
   const vars = {
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${String(port)}`,
     WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER: pipe,
     WEBVIEW2_X: '1',
+    [MARKER]: '1',
   };
   const upperNames = (names: readonly string[]): string[] => names.map((n) => n.toUpperCase());
+  const has = (names: readonly string[], name: string): boolean => upperNames(names).includes(name);
 
   // The control: the e2e build, which keeps WEBVIEW2_*, started with the same variables, still has WEBVIEW2_X in its
   // environment block, so the reader below sees what a parent passed (a scrub-less production build would look so).
-  // Its WebView2 browser process (no --type=) is read too, so the reader is proven on the webview side as well.
+  // That block is the one that matters: the WebView2 loader runs inside isshoni.exe and reads WEBVIEW2_* from it
+  // when it creates the environment. Its WebView2 browser process (no --type=) is read too, and what it shows decides
+  // what the production build's browser process can prove: the first windows-desktop run found WEBVIEW2_X missing
+  // from the control's browser block although isshoni.exe's had it, so the WebView2 runtime doesn't hand WEBVIEW2_*
+  // on to it (or doesn't hand on the environment at all, which MARKER tells apart). "No WEBVIEW2_X in the production
+  // build's browser process" is evidence of the scrub only when the control's browser process kept it.
   const browserOf = (tree: readonly ChildProcessInfo[]): ChildProcessInfo[] =>
     webviewProcesses(tree).filter((p) => !p.commandLine.includes('--type='));
   const control = await launchApp({ env: vars });
@@ -1007,14 +1039,22 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
   await control.stop();
   expect(controlNames, "the e2e build's environment can be read").not.toBeNull();
   expect(upperNames(controlNames ?? [])).toContain('WEBVIEW2_X');
+  expect(upperNames(controlNames ?? [])).toContain(MARKER);
   const controlBrowserRead = controlBrowserEnvs.filter((e): e is string[] => e !== null);
   expect(controlBrowserRead.length, "the e2e build's WebView2 browser process environment can be read").toBeGreaterThan(
     0,
   );
-  expect(
-    controlBrowserRead.some((e) => upperNames(e).includes('WEBVIEW2_X')),
-    "the e2e build's WebView2 browser process has WEBVIEW2_X",
-  ).toBe(true);
+  // What the runtime hands its browser process (names only; the annotation is public).
+  const controlBrowserX = controlBrowserRead.some((e) => has(e, 'WEBVIEW2_X'));
+  const controlBrowserMarker = controlBrowserRead.some((e) => has(e, MARKER));
+  const controlBrowserPort = controlBrowserRead.some((e) => has(e, PORT_ENV));
+  const inheritance = controlBrowserX
+    ? "the e2e build's WebView2 browser process kept WEBVIEW2_X"
+    : controlBrowserMarker
+      ? `the WebView2 runtime drops WEBVIEW2_* from its browser process (the e2e build's has ${MARKER} but not ` +
+        'WEBVIEW2_X), so the production browser process shows nothing about the scrub'
+      : `the WebView2 runtime doesn't hand the app's environment to its browser process (the e2e build's has neither ` +
+        `${MARKER} nor WEBVIEW2_X), so the production browser process shows nothing about the scrub`;
 
   // The production build. It has no e2e data folder: remember whether %LOCALAPPDATA%\isshoni was there before.
   const localAppData = process.env['LOCALAPPDATA'] ?? '';
@@ -1032,7 +1072,8 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
         );
       }
       if (child.exitCode !== null) throw new Error(`the production build exited (${String(child.exitCode)})`);
-      if (webviewProcesses(await descendants(pid)).length > 0 && (await mainWindow(pid)) !== '0') break;
+      const shown = (await processWindows(pid)).some((w) => w.cls === MAIN_WINDOW_CLASS && w.visible);
+      if (shown && webviewProcesses(await descendants(pid)).length > 0) break;
       if (Date.now() > deadline) throw new Error('the production build showed no window with a WebView2 within 60 s');
       await sleep(500);
     }
@@ -1053,7 +1094,9 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
     // WebView2's browser process (no --type=): its environment too, where it can be read.
     const browserProcs = browserOf(tree);
     const browserEnvs = await Promise.all(browserProcs.map((p) => environmentNames(p.pid)));
-    const browserX = browserEnvs.filter((e) => e !== null && upperNames(e).includes('WEBVIEW2_X')).length;
+    const browserRead = browserEnvs.filter((e): e is string[] => e !== null);
+    const browserX = browserRead.filter((e) => has(e, 'WEBVIEW2_X')).length;
+    const browserMarker = browserRead.some((e) => has(e, MARKER));
     row(
       'W19',
       [
@@ -1062,8 +1105,11 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
         `port open = ${String(open)}, pipe exists = ${String(piped)}`,
         `${String(webviews.length)} WebView2 processes, command lines naming the port, the pipe or WEBVIEW2_: ${String(leaking.length)}`,
         `isshoni.exe's environment: WEBVIEW2_* beyond Wails' five placeholders: ${left.length === 0 ? 'none' : left.join(', ')}`,
-        `WebView2 browser processes read: ${String(browserEnvs.filter((e) => e !== null).length)}/${String(browserProcs.length)}, with WEBVIEW2_X: ${String(browserX)}`,
-        `control: the e2e build kept WEBVIEW2_X (its own block and ${String(controlBrowserRead.length)} WebView2 browser process read)`,
+        `WebView2 browser processes read: ${String(browserRead.length)}/${String(browserProcs.length)}, with WEBVIEW2_X: ` +
+          `${String(browserX)}, with ${MARKER}: ${String(browserMarker)}`,
+        `control: the e2e build kept WEBVIEW2_X in its own block; ${String(controlBrowserRead.length)} WebView2 ` +
+          `browser process read, with WEBVIEW2_X = ${String(controlBrowserX)}, ${MARKER} = ` +
+          `${String(controlBrowserMarker)}, ${PORT_ENV} = ${String(controlBrowserPort)}: ${inheritance}`,
       ].join('; '),
     );
     expect(open, 'the debugging port is open').toBe(false);
@@ -1072,11 +1118,16 @@ test("W19: a production build opens no debugging port or pipe, and scrubs the pa
     expect(names, "the production build's environment can be read").not.toBeNull();
     expect(left).toEqual([]);
     // Not vacuous: at least one browser process's environment was read (it is the user's own, unsandboxed process).
-    expect(
-      browserEnvs.filter((e) => e !== null).length,
-      "a WebView2 browser process's environment can be read",
-    ).toBeGreaterThan(0);
-    expect(browserX).toBe(0);
+    expect(browserRead.length, "a WebView2 browser process's environment can be read").toBeGreaterThan(0);
+    // The browser side proves the scrub only as far as the control showed that it can (see above): where the
+    // control's browser process got the app's environment, the production build's must have got it too (so the read
+    // is of the right process), and where the control's kept WEBVIEW2_X, the production build's must not have it.
+    if (controlBrowserMarker) {
+      expect(browserMarker, `the production build's WebView2 browser process has ${MARKER}, as the control's`).toBe(
+        true,
+      );
+    }
+    if (controlBrowserX) expect(browserX, "the production build's WebView2 browser process has WEBVIEW2_X").toBe(0);
   } finally {
     await kill(child, exited);
     if (!hadData) await fsp.rm(dataRoot, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
