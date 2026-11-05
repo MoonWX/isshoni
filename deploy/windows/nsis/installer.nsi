@@ -3,6 +3,8 @@
 ; Build it with tools/desktoppkg nsis (makensis -WX): it passes VERSION, WINVER (06 section 5.3), STAGE (the tree that
 ; desktoppkg stage wrote, 06 section 2.2), OUTFILE, WEBVIEW2_SETUP and, in CI, PREBUILT_UNINSTALLER (06 section 6.9). Without
 ; PREBUILT_UNINSTALLER (the Mac, Homebrew's makensis) the uninstaller is written with WriteUninstaller.
+; Source paths in File join ${STAGE} with "\": makensis on Windows splits a File path into folder and pattern only at
+; "\" (a "/" there makes "stage/install-files.txt" a file name, so "no files found"), and the Mac's turns "\" into "/".
 ;
 ; Command line (06 section 6.4): /S, /UPDATE, /RELAUNCH, /LAUNCH, /SERVER=<url>, /DESKTOPSHORTCUT=0|1, /NOUPDATECHECKS,
 ; /ALLOWDOWNGRADE, /D=<dir> (last, fresh installs only). Exit codes: 0 installed, 1 cancelled, 2 other error,
@@ -835,7 +837,7 @@ Section "-isshoni"
     CopyFiles /SILENT "$INSTDIR\${FILE_LIST}" "$PLUGINSDIR\old-files.txt"
   ${EndIf}
   SetOutPath "$PLUGINSDIR"
-  File "/oname=$PLUGINSDIR\new-files.txt" "${STAGE}/${FILE_LIST}"
+  File "/oname=$PLUGINSDIR\new-files.txt" "${STAGE}\${FILE_LIST}"
   Call MoveAsideImages
 
   ; The staged tree (06 section 2.2) without its list, which is written last. "try" sets the error flag on a file that
@@ -843,7 +845,7 @@ Section "-isshoni"
   SetOutPath "$INSTDIR"
   SetOverwrite try
   ClearErrors
-  File /r /x "${FILE_LIST}" "${STAGE}/*"
+  File /r /x "${FILE_LIST}" "${STAGE}\*"
   ${If} ${Errors}
     StrCpy $R9 ${EXIT_WRITE}
     StrCpy $R8 "$(WriteFailed)"
@@ -853,7 +855,7 @@ Section "-isshoni"
   StrCpy $MovedAside 0
   Call RemoveStale
   ClearErrors
-  File "${STAGE}/${FILE_LIST}"
+  File "${STAGE}\${FILE_LIST}"
   !ifdef PREBUILT_UNINSTALLER
     File "/oname=uninstall.exe" "${PREBUILT_UNINSTALLER}"
   !else
