@@ -1179,11 +1179,13 @@ tasks:
   native:dist:
     desc: >-
       Zip the Windows test tools for the owner's PC into dist-desktop/isshoni-native-tools.zip (OUT=<file>), flat -
-      GOOS=windows isshoni-enginetest.exe (once cmd/isshoni-enginetest exists), the release isshoni-media.dll
-      (DLL=<file>; default native/build/win-x64-release/) and the two FFmpeg DLLs of native/ffmpeg/lock.json, checked
-      against its SHA-256s (FFMPEG_ROOT=<dir>; default the ffmpeg:fetch output) (docs/m2/06 §5.1, §17)
-    # CI's windows-native uploads the zip as isshoni-native-tools (06 §5.1). README WA76 adds g2g.exe and
-    # native/windows/tools/hwcheck.ps1. The FFmpeg DLLs sit next to isshoni-media.dll because the engine loads them
+      GOOS=windows isshoni-enginetest.exe (once cmd/isshoni-enginetest exists), g2g.exe (tools/g2g), hwcheck.ps1
+      (native/windows/tools), the release isshoni-media.dll (DLL=<file>; default native/build/win-x64-release/) and
+      the two FFmpeg DLLs of native/ffmpeg/lock.json, checked against its SHA-256s (FFMPEG_ROOT=<dir>; default the
+      ffmpeg:fetch output) (docs/m2/06 §5.1, §17)
+    # CI's windows-native uploads the zip as isshoni-native-tools (06 §5.1). README WA76 added g2g.exe (01 §12.2's
+    # glass-to-glass tool, from the tools module) and native/windows/tools/hwcheck.ps1 (04 §14, §18.4), which runs the
+    # tool next to it. The FFmpeg DLLs sit next to isshoni-media.dll because the engine loads them
     # from its own folder (04 §9.2). Relative paths are relative to the repository root. On Windows the task runs in
     # Windows PowerShell 5.1 (Compress-Archive: Windows has no zip), elsewhere in Task's shell with zip, so a zip for
     # the owner's PC can also be made on the Mac from a downloaded windows-native artifact
@@ -1259,6 +1261,16 @@ tasks:
         } else {
           Write-Host 'native:dist: note: cmd/isshoni-enginetest does not exist yet (README WA44 adds it), so the zip has no isshoni-enginetest.exe'
         }
+        # g2g (tools module, 01 section 12.2) and the hardware run script (04 section 14).
+        $saved = @($env:GOOS, $env:GOARCH, $env:CGO_ENABLED)
+        $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
+        try {
+          Invoke-Native 'go build ./g2g' 'go' @('-C', 'tools', 'build', '-trimpath', '-ldflags',
+            "-s -w -X main.version=$env:NATIVE_DIST_VERSION", '-o', (Join-Path $stage 'g2g.exe'), './g2g')
+        } finally {
+          $env:GOOS, $env:GOARCH, $env:CGO_ENABLED = $saved
+        }
+        Copy-Item -LiteralPath (Join-Path $root 'native\windows\tools\hwcheck.ps1') -Destination $stage
 
         $out = Get-RepoPath $env:NATIVE_DIST_OUT
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
@@ -1324,6 +1336,10 @@ tasks:
           else
             echo 'native:dist: note: cmd/isshoni-enginetest does not exist yet (README WA44 adds it), so the zip has no isshoni-enginetest.exe'
           fi
+          # g2g (tools module, 01 §12.2) and the hardware run script (04 §14).
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go -C tools build -trimpath \
+            -ldflags "-s -w -X main.version=$NATIVE_DIST_VERSION" -o "$(abs "$stage")/g2g.exe" ./g2g
+          cp native/windows/tools/hwcheck.ps1 "$stage/"
 
           out=$(abs "$NATIVE_DIST_OUT")
           mkdir -p "$(dirname "$out")"
