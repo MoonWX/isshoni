@@ -92,6 +92,17 @@ std::optional<StoredCaps> StoredProbe() {
   return out;
 }
 
+uint32_t PrimaryAdapterIndex() noexcept {
+  Cache &c = TheCache();
+  std::lock_guard<std::mutex> lock(c.mu);
+  if (!c.caps || c.caps->adapter_count == 0) {
+    return encpolicy::kNoAdapter;
+  }
+  // DXGI lists the adapter of the primary output first; one without outputs (a render-only GPU, a hybrid laptop's
+  // dGPU listed first by a driver) holds no monitor, so no adapter is the capture adapter then.
+  return (c.caps->adapters[0].flags & IM_ADAPTER_HAS_OUTPUTS) != 0 ? 0u : encpolicy::kNoAdapter;
+}
+
 std::vector<session::EncoderEntry> CatalogEntries() {
   std::optional<im_caps> caps;
   {

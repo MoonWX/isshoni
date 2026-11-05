@@ -27,7 +27,11 @@
 //   what the pacer asks for, runs the normalizer (§9.4) and pushes into the rings; re-inits through the re-init
 //   planner (§9.5); recovers a failed encoder with the next candidate (ENCODER_CHANGED first, §9.8); ends the session
 //   when a device is removed (IM_ERR_ENCODER_LOST, or any failure while the device reports itself removed, §8.1) or no
-//   candidate is left. It never waits on the consumer.
+//   candidate is left. It never waits on the consumer. Once the session ended (for any reason) it closes its encoders
+//   (README WA61), so an ended session holds no NVENC session and no dead FFmpeg context while the host has yet to call
+//   im_stop. im_set_profile moves the session only when every layer's encoder can encode the profile (§9.6: one
+//   profile per session); the candidates' order puts the capture adapter first (encode::PrimaryAdapterIndex, §9.1),
+//   and an encoder on another adapter than the session's device is skipped (open_failed).
 // - supervisor: the test pattern's frame timer (frames on a grid anchored at epoch_ns, pattern_grid.h, so the
 //   pattern's flash instants are the test tone's beeps; each frame drawn into a slot by the GPU, or only its time
 //   without a device), and the real-time flags into events: LIMIT_CHANGED (every edge of the pacer's overload rule),
@@ -305,6 +309,8 @@ private:
   // failure on the GPU path asks it (04 §8.1): a TDR may first show up as an encoder's or a pool's ordinary error, or
   // as re-opens that fail, and still ends the session as device_removed (§9.8). Any session thread.
   bool DeviceLost() const noexcept;
+  // The video thread, once the session ended: closes its encoders (§9.8) without waiting for im_stop.
+  void ReleaseEncoders() noexcept;
   // Releases the GPU path once no session thread can use it any more (the encoders first: they hold the device).
   void ReleaseVideo() noexcept;
   im_status Push(const Command &c);

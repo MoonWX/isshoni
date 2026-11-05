@@ -10,6 +10,8 @@
 //   (session::MarkProbeCacheStale, 04 §9.8); CatalogEntries then probes the encoders again before the next start
 //   relies on them, and clears the mark. With no full probe yet it runs one as well (lazily, 04 §9.8), so a start
 //   never needs im_probe first.
+// - The capture adapter (README WA61): PrimaryAdapterIndex, step 1 of 04 §9.1's order when the source's monitor isn't
+//   known.
 // - The session's encoder catalog (session/encoder.h's EncoderCatalog) lists these after the test hooks' entries
 //   (session/encoder_catalog.cpp, wired by README WF10); the probe's IM_ENC_FAKE entry (test-hooks builds) is left
 //   out here, since the catalog adds the fake itself.
@@ -50,6 +52,15 @@ void ForgetProbe() noexcept;
 // The encoders a session may choose from, in the probe's order (see above). Probes first when nothing is stored or
 // the cache is stale.
 std::vector<session::EncoderEntry> CatalogEntries();
+
+// The capture adapter of 04 §9.1's order (step 1: the vendor encoder, then MF hardware, on it) when the source's
+// monitor isn't known (README WA61): the adapter of the primary monitor, which DXGI lists first (EnumAdapters1(0), the
+// probe's EnumAdapterByGpuPreference(UNSPECIFIED) order), as an index into the stored probe's adapters[] (the space of
+// im_encoder_info.adapter_index). encpolicy::kNoAdapter without a stored probe, or when the first adapter has no
+// outputs (every hardware encoder then counts as "another adapter"). A session asks it right after CatalogEntries,
+// which stored the probe. DD's output adapter and WGC's "monitor that holds most of the source" come from the capture
+// area (README WA60) once it reports them.
+uint32_t PrimaryAdapterIndex() noexcept;
 
 // OpenH264 (openh264_encoder.cpp, README WA51): its probe entry and its open function. The entry is IM_ERR_DEPENDENCY
 // while it is off or its file doesn't load (disabled, missing, version, blocked_by_policy); a full probe test-encodes

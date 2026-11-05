@@ -139,7 +139,9 @@ std::vector<EncoderEntry> EncoderCatalog();
 // Test hooks (session_gpu_test, session_fake_test): entries EncoderCatalog lists before the test hooks' fake
 // encoders, for sessions started from now on; an empty list removes them (testhooks::Reset doesn't: the test that
 // sets them clears them). An entry with FrameInput::kNv12 on a WARP device runs a session's GPU path without FFmpeg.
-void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries);
+// only (README WA61): the catalog lists these entries and the test hooks' fakes but not the probe's encoders (and runs
+// no probe), so a test's candidates stay its own also on a PC whose real encoders would open; an empty list ends it.
+void SetCatalogPrefixForTest(std::vector<EncoderEntry> entries, bool only = false);
 #endif
 
 } // namespace im::session

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -99,6 +100,10 @@ bool GpuPathOf(im_session s);
 // loss), as a WARP device can't be removed. Only failures look at it: a session whose calls succeed runs on. Any
 // thread; testhooks::Reset doesn't clear it (the test that sets it does).
 void SetDeviceRemovedForTest(bool removed) noexcept;
+// session_fake_test (README WA61): the capture adapter 04 §9.1's order puts first (an im_encoder_info.adapter_index,
+// encpolicy::kNoAdapter for none) for sessions started from now on, in place of encode::PrimaryAdapterIndex; nullopt
+// gives the engine's choice back. Any thread; testhooks::Reset doesn't clear it (the test that sets it does).
+void SetCaptureAdapterForTest(std::optional<uint32_t> adapter_index) noexcept;
 #endif
 
 } // namespace im::session
