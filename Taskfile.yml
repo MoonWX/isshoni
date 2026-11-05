@@ -1646,10 +1646,26 @@ tasks:
       KEEP_IMAGES: '{{.KEEP_IMAGES | default "false"}}'
     env:
       ISSHONI_SNAPSHOT_VERSION: '{{.SNAPSHOT_VERSION}}'
+      # The release notes' desktop lines (.goreleaser.yaml's release.header, docs/m2/06 §11.7), as release.yml's
+      # build job exports them. Read with sed, not jq, so that a snapshot needs no jq; the first step says which one
+      # is missing. pins.json keeps each pin on one line: "ffmpeg": {"version": "<v>", ...}.
+      ISSHONI_DESKTOP_MIN_VERSION:
+        sh: (tr -d '\r' < deploy/desktop/min-version) 2>/dev/null | sed -n '1s/^[[:space:]]*//; 1s/[[:space:]]*$//; 1p'
+      ISSHONI_FFMPEG_VERSION:
+        sh: >-
+          sed -n 's/^[[:space:]]*"ffmpeg"[[:space:]]*:[[:space:]]*{.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+          native/ffmpeg/pins.json 2>/dev/null || true
     cmds:
       - cmd: "echo 'release:snapshot: skipped, .goreleaser.yaml does not exist yet'"
         silent: true
         if: '[ ! -f .goreleaser.yaml ]'
+      - cmd: |
+          if [ -z "$ISSHONI_DESKTOP_MIN_VERSION" ] || [ -z "$ISSHONI_FFMPEG_VERSION" ]; then
+            echo "release:snapshot: deploy/desktop/min-version ('$ISSHONI_DESKTOP_MIN_VERSION') or native/ffmpeg/pins.json's ffmpeg version ('$ISSHONI_FFMPEG_VERSION') is missing; .goreleaser.yaml's release notes need both" >&2
+            exit 1
+          fi
+        silent: true
+        if: '[ -f .goreleaser.yaml ]'
       - task: release:goreleaser
         if: '[ -f .goreleaser.yaml ]'
       - task: build:web
@@ -1671,6 +1687,10 @@ tasks:
             fi
           done
         silent: true
+      # Stubs for the desktop files that a snapshot without a Windows build lacks (release:desktop-stubs).
+      - task: release:desktop-stubs
+        vars: {VERSION: '{{.SNAPSHOT_VERSION}}'}
+        if: '[ -f .goreleaser.yaml ]'
       # The before hook runs `task release:prepare`: with .bin/ first in PATH, it finds the pinned Task there too.
       - cmd: PATH="$PWD/.bin:$PATH" .bin/goreleaser{{exeExt}} release --snapshot --clean --skip=sign,sbom {{.CLI_ARGS}}
         if: '[ -f .goreleaser.yaml ]'
@@ -1694,17 +1714,71 @@ tasks:
         silent: true
         if: '[ -f .goreleaser.yaml ] && command -v docker >/dev/null 2>&1'
 
+  release:desktop-stubs:
+    desc: >-
+      Write ISSHONI-DESKTOP-STUB stand-ins for the desktop files into dist-desktop/ (VERSION=<v>), for a goreleaser
+      snapshot without a Windows build; release:snapshot runs it, and nightly.yml's goreleaser-full until it has real
+      desktop files (README WA81, WA86)
+    requires:
+      vars: [VERSION]
+    cmds:
+      # .goreleaser.yaml uploads the desktop files from dist-desktop/ (docs/m2/06 §2.1, §11.2), and goreleaser fails
+      # on an extra_files glob that matches nothing. A snapshot without a Windows build gets stubs for them, files
+      # that say ISSHONI-DESKTOP-STUB (06 §10.1): goreleaser checks the config's globs by name, release:assets checks
+      # the names, and its FULL=true refuses a stub. Earlier stubs go first (they carry another snapshot's
+      # version); a real file of this version is kept. install-desktop.ps1 comes from the before hook.
+      - cmd: |
+          set -eu
+          v='{{.VERSION}}'
+          mkdir -p dist-desktop
+          for f in dist-desktop/isshoni-desktop*; do
+            [ -f "$f" ] || continue
+            if [ "$(head -c 20 "$f")" = ISSHONI-DESKTOP-STUB ]; then rm -f "$f"; fi
+          done
+          if [ -f "dist-desktop/isshoni-desktop_${v}_windows_amd64_setup.exe" ]; then
+            echo "release:desktop-stubs: dist-desktop/ has the desktop files of $v, so no stubs"
+            exit 0
+          fi
+          for name in "isshoni-desktop_${v}_windows_amd64_setup.exe" "isshoni-desktop_${v}_windows_amd64_symbols.zip" \
+            "isshoni-desktop_${v}_windows_amd64.sbom.json" "isshoni-desktop_${v}_ffmpeg-source.tar" \
+            isshoni-desktop-update.json; do
+            printf 'ISSHONI-DESKTOP-STUB: a stand-in for %s in a snapshot without a Windows build (docs/m2/06 §10.1)\n' \
+              "$name" >"dist-desktop/$name"
+          done
+          echo "release:desktop-stubs: wrote stub desktop files for $v into dist-desktop/"
+        silent: true
+
   release:assets:
     desc: >-
-      Check dist/ after a goreleaser run against the release assets of docs/m1/06-deploy-and-ci.md §3 (VERSION=<v>;
-      FULL=true for a real release, which also has SBOMs and the cosign bundle)
+      Check dist/ and dist-desktop/ after a goreleaser run against the release assets of docs/m1/06-deploy-and-ci.md §3
+      and docs/m2/06 §2.1 (VERSION=<v>; FULL=true for a real release, which also has SBOMs and the cosign bundle and no
+      desktop stubs unless DESKTOP_STUBS=true; DESKTOP=true checks the desktop files themselves, PKG_PS1=<file> the
+      packaging job's script)
+    # The desktop assets (docs/m2/06 §2.1, §11.2) are in dist-desktop/: release.yml's build job downloads the
+    # desktop-pkg job's files there, and `task release:snapshot` writes stubs (ISSHONI-DESKTOP-STUB) when there are
+    # none, so that .goreleaser.yaml's desktop globs match. goreleaser lists them in checksums.txt either way, so
+    # this task always checks their names and checksums; FULL=true refuses a stub, unless DESKTOP_STUBS=true:
+    # nightly.yml's goreleaser-full runs FULL=true over release:desktop-stubs' stubs until it builds real desktop
+    # files (README WA81 hands that to WA86). DESKTOP=true always refuses a stub, and (release.yml) also checks: the
+    # update manifest's version, channel, minVersion (deploy/desktop/min-version) and artifacts[0] against the
+    # installer and the tag; the FFmpeg source tar's SHA-256 against native/ffmpeg/lock.json; install-desktop.ps1
+    # as deploy/install-desktop.ps1 stamped with <v>, with the production key block (and equal to PKG_PS1, the copy
+    # the packaging job stamped, when given); the symbols zip's and the SBOM's contents; and the installer's file
+    # list (7z l, which reads NSIS archives) against the stage's install-files.txt (dist-desktop/stage/). It needs jq,
+    # unzip and 7z then.
     vars:
       FULL: '{{.FULL | default "false"}}'
+      DESKTOP: '{{.DESKTOP | default "false"}}'
+      DESKTOP_STUBS: '{{.DESKTOP_STUBS | default "false"}}'
+      PKG_PS1: '{{.PKG_PS1 | default ""}}'
     cmds:
       - cmd: |
           set -eu
           v='{{.VERSION}}'
           full='{{.FULL}}'
+          desktop='{{.DESKTOP}}'
+          desktop_stubs='{{.DESKTOP_STUBS}}'
+          pkg_ps1='{{.PKG_PS1}}'
           # The packages' own version puts "~" before a prerelease, so that it sorts before the release: 0.1.0-rc.1
           # is the deb and rpm version 0.1.0~rc.1. Their file names have "-" there (.goreleaser.yaml): GitHub
           # renames an asset with a "~" in its name.
@@ -1740,7 +1814,17 @@ tasks:
             echo 'release:assets: there is no dist/: run task release:snapshot' >&2
             exit 1
           fi
-          echo "release:assets: checking dist/ for isshoni $v (full release: $full)"
+          echo "release:assets: checking dist/ and dist-desktop/ for isshoni $v (full release: $full, desktop files: $desktop)"
+          # The desktop assets of docs/m2/06 §2.1 that goreleaser uploads from dist-desktop/ (.goreleaser.yaml's
+          # extra_files); isshoni-desktop-update.json.sig comes from release.yml's sign job, like checksums.txt.sig.
+          setup=isshoni-desktop_${v}_windows_amd64_setup.exe
+          symbols=isshoni-desktop_${v}_windows_amd64_symbols.zip
+          desktop_sbom=isshoni-desktop_${v}_windows_amd64.sbom.json
+          source_tar=isshoni-desktop_${v}_ffmpeg-source.tar
+          manifest=isshoni-desktop-update.json
+          printf '%s\n' "$setup" "$symbols" "$desktop_sbom" "$source_tar" "$manifest" >"$tmp/desktop.stubbable"
+          cat "$tmp/desktop.stubbable" >"$tmp/desktop"
+          echo install-desktop.ps1 >>"$tmp/desktop"
 
           # The assets of 06 §3. install.sh and the compose files are uploaded from where they are
           # (dist-extra/install.sh, deploy/), so dist/ has the others.
@@ -1754,8 +1838,9 @@ tasks:
           printf '%s\n' "isshoni_${v}_amd64.deb" "isshoni_${v}_arm64.deb" \
             "isshoni-$v-1.x86_64.rpm" "isshoni-$v-1.aarch64.rpm" >"$tmp/packages"
           sed 's/$/.sbom.json/' "$tmp/archives" >"$tmp/sboms"
-          # checksums.txt: every archive, package, install.sh and compose file, and in a full release the SBOMs.
-          cat "$tmp/archives" "$tmp/packages" >"$tmp/summed"
+          # checksums.txt: every archive, package, install.sh and compose file, the desktop files, and in a full
+          # release the SBOMs.
+          cat "$tmp/archives" "$tmp/packages" "$tmp/desktop" >"$tmp/summed"
           printf '%s\n' install.sh compose.yaml compose.host.yaml >>"$tmp/summed"
           cat "$tmp/archives" "$tmp/packages" >"$tmp/dist.want"
           echo checksums.txt >>"$tmp/dist.want"
@@ -1781,6 +1866,27 @@ tasks:
           if ! grep -qx "ISSHONI_INSTALLER_VERSION=\"$v\"" dist-extra/install.sh 2>/dev/null; then
             problem "dist-extra/install.sh is not stamped with $v"
           fi
+          while read -r name; do
+            [ -f "dist-desktop/$name" ] || problem "dist-desktop/$name is missing (a release uploads it, docs/m2/06 §2.1)"
+          done <"$tmp/desktop"
+          # release:prepare (goreleaser's before hook) stamps it (docs/m2/06 §7.1, §11.2).
+          if ! grep -Fqx "\$IsshoniVersion = '$v'" dist-desktop/install-desktop.ps1 2>/dev/null; then
+            problem "dist-desktop/install-desktop.ps1 is not stamped with $v"
+          fi
+          # Stubs (release:snapshot's, docs/m2/06 §10.1) only stand in for the files of a Windows build.
+          stubs=0
+          while read -r name; do
+            [ -f "dist-desktop/$name" ] || continue
+            if [ "$(head -c 20 "dist-desktop/$name")" = ISSHONI-DESKTOP-STUB ]; then
+              stubs=$((stubs + 1))
+              if [ "$desktop" = true ] || { [ "$full" = true ] && [ "$desktop_stubs" != true ]; }; then
+                problem "dist-desktop/$name is a stub (ISSHONI-DESKTOP-STUB): a release needs the file from release.yml's desktop-pkg job"
+              fi
+            fi
+          done <"$tmp/desktop.stubbable"
+          if [ "$stubs" != 0 ] && [ "$desktop" != true ] && { [ "$full" != true ] || [ "$desktop_stubs" = true ]; }; then
+            echo "release:assets: note: $stubs of the desktop files in dist-desktop/ are stubs, so only their names and checksums were checked"
+          fi
 
           # checksums.txt: "<sha256>  <name>" for exactly those files, each with the hash the file has.
           if [ -f dist/checksums.txt ]; then
@@ -1795,6 +1901,7 @@ tasks:
               case $name in
               install.sh) file=dist-extra/install.sh ;;
               compose.yaml | compose.host.yaml) file=deploy/$name ;;
+              install-desktop.ps1 | isshoni-desktop*) file=dist-desktop/$name ;;
               *) file=dist/$name ;;
               esac
               [ -f "$file" ] || continue
@@ -1901,8 +2008,130 @@ tasks:
             echo "release:assets: note: rpm is not installed here, so the rpm packages' Requires and version were not checked"
           fi
 
+          # The desktop files themselves (docs/m2/06 §11.2), in release.yml's build job.
+          missing=''
+          if [ "$desktop" = true ]; then
+            for tool in jq unzip; do
+              command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+            done
+            sevenzip=''
+            for tool in 7z 7zz; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                sevenzip=$tool
+                break
+              fi
+            done
+            [ -n "$sevenzip" ] || missing="$missing 7z"
+            if [ -n "$missing" ]; then
+              problem "DESKTOP=true needs$missing, which is not installed here"
+            fi
+          fi
+          if [ "$desktop" = true ] && [ -z "$missing" ]; then
+            dd=dist-desktop
+
+            # The update manifest (docs/m2/06 §8.2) against the installer and the tag. The channel is
+            # tools/desktoppkg's: stable for X.Y.Z, beta for X.Y.Z-rc.N, ci for any other prerelease (the dry run's).
+            if printf '%s\n' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+              channel=stable
+            elif printf '%s\n' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+-rc\.(0|[1-9][0-9]*)'; then
+              channel=beta
+            else
+              channel=ci
+            fi
+            min=$(tr -d '\r' <deploy/desktop/min-version | sed -n '1s/^[[:space:]]*//; 1s/[[:space:]]*$//; 1p')
+            if [ -f "$dd/$manifest" ] && [ -f "$dd/$setup" ]; then
+              size=$(wc -c <"$dd/$setup" | tr -d ' ')
+              url=https://github.com/MoonWX/isshoni/releases/download/v$v/$setup
+              # One "<field> <value>" line each, the field names as the errors show them.
+              if jq -r '
+                ["schema", .schema], ["product", .product], ["version", .version], ["channel", .channel],
+                ["minVersion", .minVersion], ["artifacts.length", (.artifacts | length)],
+                ["artifacts[0].os", .artifacts[0].os], ["artifacts[0].arch", .artifacts[0].arch],
+                ["artifacts[0].kind", .artifacts[0].kind], ["artifacts[0].name", .artifacts[0].name],
+                ["artifacts[0].url", .artifacts[0].url], ["artifacts[0].size", .artifacts[0].size],
+                ["artifacts[0].sha256", .artifacts[0].sha256] | "\(.[0]) \(.[1])"' "$dd/$manifest" \
+                >"$tmp/manifest.got" 2>"$tmp/manifest.err"; then
+                printf '%s\n' 'schema 1' 'product isshoni-desktop' "version $v" "channel $channel" "minVersion $min" \
+                  'artifacts.length 1' 'artifacts[0].os windows' 'artifacts[0].arch amd64' 'artifacts[0].kind nsis' \
+                  "artifacts[0].name $setup" "artifacts[0].url $url" "artifacts[0].size $size" \
+                  "artifacts[0].sha256 $(sha256 "$dd/$setup")" >"$tmp/manifest.want"
+                while read -r field want; do
+                  got=$(awk -v f="$field" '$1 == f { sub(/^[^ ]* /, ""); print; exit }' "$tmp/manifest.got")
+                  [ "$got" = "$want" ] || problem "$manifest: $field is '$got', not '$want'"
+                done <"$tmp/manifest.want"
+              else
+                problem "$dd/$manifest is not JSON: $(cat "$tmp/manifest.err")"
+              fi
+            fi
+
+            # The FFmpeg source tar is byte for byte the deps release's (docs/m2/06 §4.5).
+            want=$(jq -r '.assets | to_entries[] | select(.key | endswith("-source.tar")) | .value' native/ffmpeg/lock.json)
+            if [ -f "$dd/$source_tar" ] && [ "$(sha256 "$dd/$source_tar")" != "$want" ]; then
+              problem "$source_tar is not the source tar that native/ffmpeg/lock.json pins ($want)"
+            fi
+
+            # install-desktop.ps1: deploy/install-desktop.ps1 with $IsshoniVersion stamped and nothing else changed,
+            # so its key block is the committed one, and the copy that the packaging job stamped is the same file.
+            awk -v v="$v" -v q="'" '
+              $0 == "$IsshoniVersion = " q "@VERSION@" q { print "$IsshoniVersion = " q v q; next }
+              { print }' deploy/install-desktop.ps1 >"$tmp/install-desktop.ps1"
+            if [ -f "$dd/install-desktop.ps1" ] && ! cmp -s "$tmp/install-desktop.ps1" "$dd/install-desktop.ps1"; then
+              problem "$dd/install-desktop.ps1 is not deploy/install-desktop.ps1 stamped with $v"
+            fi
+            if [ -n "$pkg_ps1" ] && ! cmp -s "$tmp/install-desktop.ps1" "$pkg_ps1"; then
+              problem "the packaging job's install-desktop.ps1 ($pkg_ps1) is not deploy/install-desktop.ps1 stamped with $v"
+            fi
+            # The production key block: every key of deploy/keys/allowed_signers (`task lint:keys` keeps the two
+            # equal; a dry run of a repository without release keys has none, and the dry run uses its own key).
+            if [ -s deploy/keys/allowed_signers ]; then
+              tr -d '\r' <deploy/keys/allowed_signers | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' >"$tmp/keys" || :
+              [ -s "$tmp/keys" ] || problem 'deploy/keys/allowed_signers has no key line'
+              while IFS= read -r line; do
+                grep -Fqx -- "$line" "$tmp/install-desktop.ps1" || problem "install-desktop.ps1's key block lacks the key line '$line'"
+              done <"$tmp/keys"
+            else
+              echo 'release:assets: note: deploy/keys/allowed_signers is missing or empty, so install-desktop.ps1 carries no release key (the dry run puts its own key in)'
+            fi
+
+            # The symbols zip (docs/m2/06 §2.1) and the SBOM.
+            if [ -f "$dd/$symbols" ]; then
+              unzip -Z1 "$dd/$symbols" >"$tmp/symbols.got" 2>/dev/null || problem "$symbols is not a zip"
+              for want in isshoni-media.pdb native-manifest.json; do
+                grep -qx "$want" "$tmp/symbols.got" || problem "$symbols has no $want"
+              done
+              for lib in avcodec avutil; do
+                major=$(jq -r ".${lib}Major" native/ffmpeg/lock.json)
+                grep -qx "$lib-$major.pdb" "$tmp/symbols.got" || problem "$symbols has no $lib-$major.pdb"
+              done
+            fi
+            if [ -f "$dd/$desktop_sbom" ] && ! jq -e '.spdxVersion and (.packages | length > 0)' "$dd/$desktop_sbom" >/dev/null 2>&1; then
+              problem "$desktop_sbom is not an SPDX JSON SBOM with packages"
+            fi
+
+            # The installer packs exactly the stage (docs/m2/06 §6): 7z lists an NSIS installer's files, those
+            # installed under $INSTDIR with or without that prefix, NSIS's own ($PLUGINSDIR\..., the [NSIS].nsi
+            # script) with theirs. Left out of the comparison: the list itself and the prebuilt uninstall.exe.
+            if [ -n "$sevenzip" ] && [ -f "$dd/$setup" ]; then
+              if [ ! -f "$dd/stage/install-files.txt" ]; then
+                problem "$dd/stage/install-files.txt is missing (release.yml's build job downloads the desktop-stage artifact there)"
+              elif ! "$sevenzip" l -slt -ba "$dd/$setup" >"$tmp/7z.out" 2>"$tmp/7z.err"; then
+                problem "$sevenzip can't list $setup: $(cat "$tmp/7z.err")"
+              else
+                awk '
+                  { sub(/\r$/, "") }
+                  /^Path = / { if (p != "" && !dir) print p; p = substr($0, 8); dir = 0; next }
+                  /^Folder = \+/ || /^Attributes = D/ { dir = 1 }
+                  END { if (p != "" && !dir) print p }' "$tmp/7z.out" |
+                  tr '\\' '/' | sed 's|^\$INSTDIR/||' |
+                  grep -v -e '^\$' -e '^\[NSIS\]' -e '^install-files\.txt$' -e '^uninstall\.exe$' >"$tmp/installer.got" || :
+                tr -d '\r' <"$dd/stage/install-files.txt" | tr '\\' '/' | grep -v '^$' >"$tmp/installer.want" || :
+                same_set "$setup (7z l, against $dd/stage/install-files.txt)" "$tmp/installer.want" "$tmp/installer.got"
+              fi
+            fi
+          fi
+
           if [ "$status" = 0 ]; then
-            echo "release:assets: dist/ has the release assets of isshoni $v"
+            echo "release:assets: dist/ and dist-desktop/ have the release assets of isshoni $v"
           fi
           exit "$status"
         silent: true
