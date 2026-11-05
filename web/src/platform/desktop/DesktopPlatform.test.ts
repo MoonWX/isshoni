@@ -138,6 +138,25 @@ describe('the heartbeat (docs/m2/03 §3.2 W17, §20)', () => {
     expect(fake.callsOf('app.heartbeat')).toHaveLength(6);
   });
 
+  it('beats at once when the page becomes visible again, and not when it is hidden', () => {
+    vi.useFakeTimers();
+    const { p, fake } = make({ cfg: config({ server: null, serverIds: [] }), active: '' });
+    let state: DocumentVisibilityState = 'hidden';
+    const spy = vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => state);
+    try {
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(fake.callsOf('app.heartbeat')).toHaveLength(1);
+      state = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(fake.callsOf('app.heartbeat')).toHaveLength(2);
+      p.dispose();
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(fake.callsOf('app.heartbeat')).toHaveLength(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('is fire-and-forget: a failing beat neither throws nor stops the next one', () => {
     vi.useFakeTimers();
     const fake = createFakeBridge({ active: ORIGIN });

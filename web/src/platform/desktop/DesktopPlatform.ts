@@ -51,7 +51,12 @@ export interface DesktopPlatformOptions {
 /**
  * W17's watchdog (docs/m2/03 §3.2, §20): the page calls App.Heartbeat this often, and Go reloads a visible window
  * whose page sent none for 15 s (app.HeartbeatEvery and HeartbeatTimeout). The watchdog arms with the first beat,
- * which goes out at once.
+ * which goes out at once, and the page beats again at once when it becomes visible.
+ *
+ * Known gap: Go counts a minimized or fully covered window as visible (IsWindowVisible), while Chromium marks its
+ * page hidden and, after 5 min, throttles chained timers to about one run a minute; such a page would beat too
+ * seldom. A dedicated Worker's timer isn't throttled that way, but 03 §5's CSP has worker-src 'none', so the fix is
+ * the app's or the shell's (watch only a page that is visible, or --disable-background-timer-throttling).
  */
 export const HeartbeatEveryMs = 5000;
 
@@ -87,6 +92,7 @@ export class DesktopPlatform implements Platform {
   private readonly log = createLogger('desktop');
   private readonly disposeLinks: () => void;
   private readonly heartbeat: ReturnType<typeof setInterval>;
+  private readonly onVisible: () => void;
   /** The URL openExternal opened in this task (see there). */
   private lastExternal: string | null = null;
 
@@ -130,6 +136,10 @@ export class DesktopPlatform implements Platform {
     };
     beat();
     this.heartbeat = setInterval(beat, HeartbeatEveryMs);
+    this.onVisible = () => {
+      if (document.visibilityState === 'visible') beat();
+    };
+    document.addEventListener('visibilitychange', this.onVisible);
     this.sharing = opts.sharing
       ? opts.sharing(bridge)
       : lazySharing(bridge, (err) => {
@@ -151,6 +161,7 @@ export class DesktopPlatform implements Platform {
    */
   dispose(): void {
     clearInterval(this.heartbeat);
+    document.removeEventListener('visibilitychange', this.onVisible);
     this.disposeLinks();
     this.tokens.dispose();
   }

@@ -3,8 +3,6 @@
 package winos
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"runtime"
@@ -101,8 +99,10 @@ func mustGUID(s string) windows.GUID {
 	return g
 }
 
-// toastMu serializes this package's changes to Action Center: a removal that clears an app's toasts and delivers the
-// others again must not lose a toast that ShowToast delivers meanwhile.
+// toastMu serializes this package's own calls into Action Center (ShowToast, DeliveredToasts, RemoveDeliveredToasts).
+// It does not cover toasts shown any other way: the shell's toasts go out through Wails' notifications service
+// (go-toast), which never takes it. A Wails toast delivered while RemoveDeliveredToasts clears the app's toasts can
+// still be lost; RemoveToasts' doc (toasts.go) puts the ordering on its callers.
 var toastMu sync.Mutex
 
 // errNoWinRT is a Windows without WinRT's combase exports.
@@ -298,12 +298,6 @@ func (c *actionCenter) close() {
 	release(c.history)
 	release(c.manager)
 	c.app.free()
-}
-
-// deliveredItem is one toast in Action Center with its XML.
-type deliveredItem struct {
-	DeliveredToast
-	xml string
 }
 
 // list is the app's toasts in Action Center (GetHistoryWithId).
@@ -536,62 +530,16 @@ func notificationSetting(appID string) (int32, error) {
 	return s, err
 }
 
-// RemoveDeliveredToasts removes appID's toasts that match from Action Center and reports how many went: a tagged one
-// by its tag and group; when an untagged one is among them, every toast of appID is cleared and the ones that don't
-// match are delivered again with their own XML, without a banner, each with a tag of its own (keepTag) so that the
-// next removal of one is a single one (toasts.go).
+// RemoveDeliveredToasts removes appID's toasts that match from Action Center and reports how many went
+// (removeDelivered, toasts.go, has the rules and the contract for callers).
 func RemoveDeliveredToasts(appID string, match func(DeliveredToast) bool) (int, error) {
 	removed := 0
 	err := withActionCenter(appID, func(c *actionCenter) error {
-		items, err := c.list()
-		if err != nil {
-			return err
-		}
-		var keep []deliveredItem
-		untagged := false
-		for _, it := range items {
-			switch {
-			case !match(it.DeliveredToast):
-				keep = append(keep, it)
-			case it.Tag == "":
-				untagged = true
-				removed++
-			default:
-				if err := c.remove(it.Tag, it.Group); err != nil {
-					return err
-				}
-				removed++
-			}
-		}
-		if !untagged {
-			return nil
-		}
-		if err := c.clear(); err != nil {
-			return err
-		}
-		var errs []error
-		for _, it := range keep {
-			tag := it.Tag
-			if tag == "" {
-				tag = keepTag(it.xml)
-			}
-			if err := c.show(Toast{XML: it.xml, Tag: tag, Group: it.Group, SuppressPopup: true}); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if len(errs) > 0 {
-			return fmt.Errorf("winos: %d toasts not delivered again: %w", len(errs), errors.Join(errs...))
-		}
-		return nil
+		var err error
+		removed, err = removeDelivered(c, match)
+		return err
 	})
 	return removed, err
-}
-
-// keepTag is the tag a toast delivered again gets: 16 hex characters of its XML's SHA-256 (16 is the tag's limit
-// before Windows 10 1703).
-func keepTag(doc string) string {
-	sum := sha256.Sum256([]byte(doc))
-	return hex.EncodeToString(sum[:8])
 }
 
 // removeToasts is RemoveDeliveredToasts for the Hooks.
