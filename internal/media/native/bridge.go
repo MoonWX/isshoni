@@ -618,10 +618,27 @@ func (e *Engine) cancelPicks(locked <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-// ProtectWindow is im_protect_window (04 §11): enginetest's protect-check only (the app's WDA is 03's winos). Not
-// implemented yet (README WA70).
+// ProtectWindow is im_protect_window(hwnd, 0) (04 §11): WDA_EXCLUDEFROMCAPTURE on a top-level window of this process,
+// which the engine verifies with GetWindowDisplayAffinity. Its only caller in M2 is enginetest's protect-check (the
+// app's own windows get their affinity from 03's winos, which never imports this package). There is no Go call for
+// IM_PROTECT_OFF: protect-check undoes the affinity with SetWindowDisplayAffinity(WDA_NONE) itself, and the C++ tests
+// cover the flag. Errors: *media.Error with Op "protect_window": invalid for hwnd 0 (no DLL call), a handle that is no
+// window, a child window or a window of another process; unsupported_os (os_too_old) below build 19041; internal
+// when Windows refused the affinity or didn't keep it.
 func (e *Engine) ProtectWindow(hwnd uintptr) error {
-	return notImplemented("protect_window")
+	const op = "protect_window"
+	if hwnd == 0 {
+		return codeError(media.CodeInvalid, op, "", "no window")
+	}
+	if err := e.begin(op); err != nil {
+		return err
+	}
+	defer e.end()
+	r, lastErr := e.c.call(procProtectWindow, hwnd, 0)
+	if st := int32(r); st != imOK {
+		return e.failed(statusError(op, procProtectWindow.String(), st, lastErr))
+	}
+	return nil
 }
 
 // The log drain (04 §5.6, §12.3).
@@ -1426,7 +1443,8 @@ type session struct {
 	c       caller
 	log     *slog.Logger
 	h       uint64
-	epochNS int64 // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+	epochNS int64  // im_session_info.epoch_ns: the origin of Now and of every CaptureNS
+	capture string // im_session_info.capture_path at start: the path that runs ("wgc", "dd", "test"; CapturePath)
 
 	rids          []string // layer index → rid
 	hasAudio      bool
@@ -1447,6 +1465,17 @@ type session struct {
 
 	smu   sync.Mutex
 	freed bool // im_stop ran: the handle never reaches the DLL again
+}
+
+// CapturePath is the capture path a session of this package started on, from im_session_info.capture_path: "wgc",
+// "dd" or "test". It can differ from the source's planned media.Source.Capture: on Windows 11 a WGC start that fails
+// falls back to Desktop Duplication on the same output (04 §7.1, §7.5). It is "" for any other media.Session. Only
+// isshoni-enginetest's protect-check uses it.
+func CapturePath(s media.Session) string {
+	if ns, ok := s.(*session); ok {
+		return ns.capture
+	}
+	return ""
 }
 
 // The session's limits (04 §12.3): the pull timeout, and each packet kind's largest size (the f arena; one Opus
@@ -1485,6 +1514,7 @@ func newSession(e *Engine, h uint64, info *imSessionInfo, cfg media.Config, sc *
 		log:           e.log,
 		h:             h,
 		epochNS:       info.epochNS,
+		capture:       captureToken(info.capturePath),
 		rids:          make([]string, n),
 		hasAudio:      cfg.Audio != nil,
 		noOSIndicator: info.flags&imSessNoOSIndicator != 0,

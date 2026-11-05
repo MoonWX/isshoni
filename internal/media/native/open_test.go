@@ -661,22 +661,10 @@ func TestRelease(t *testing.T) {
 	}
 }
 
-// TestNotImplementedYet: the parts later slices fill answer internal/not_implemented, with the Go method as Op.
-// (README WA23 implemented Probe, Sources, Pick, Start, StartExtra, SourceDetail and the session: bridge_test.go;
-// README WA35 the audio calls and the test hooks: audio_test.go; README WA51 the OpenH264 helpers: openh264_test.go.)
-func TestNotImplementedYet(t *testing.T) {
-	f := newFakeCaller(t)
-	e := openFake(t, f, Options{})
-	calls := f.total()
-	for op, err := range map[string]error{
-		"protect_window": e.ProtectWindow(0),
-	} {
-		wantError(t, err, media.CodeInternal, reasonNotImplemented, op)
-	}
-	if f.total() != calls {
-		t.Errorf("the stubs made %d DLL calls", f.total()-calls)
-	}
-}
+// The binding has no part left that a later slice fills: README WA23 implemented Probe, Sources, Pick, Start,
+// StartExtra, SourceDetail and the session (bridge_test.go), README WA35 the audio calls and the test hooks
+// (audio_test.go), README WA51 the OpenH264 helpers (openh264_test.go) and README WA70 ProtectWindow
+// (protect_test.go).
 
 func second[T any](_ T, err error) error { return err }
 
