@@ -1,13 +1,10 @@
-// The watcher's portable parts (docs/m2/05-windows-audio.md §12; README WA35): the report writer against the golden
-// reports that Go's media.ParseAudioReport reads (internal/media/testdata/audio, 05 §13.1), byte for byte, and the
-// level store's lock-free sample (05 §12.2). Pure C++: no audio device needed. The writer is interim (report.h): its
-// golden tests go with it when README WA45 switches to audiomix's writer.
+// The watcher's portable parts (docs/m2/05-windows-audio.md §12; README WA35, WA45): the planner's vocabulary in the
+// report's (report.h; the report's one writer is im_audiomix's, checked against the goldens by mix_report_test, README
+// §3 item 36), what the report's seq covers, and the level store's lock-free sample (05 §12.2). Pure C++: no audio
+// device needed.
 #include <atomic>
 #include <cmath>
 #include <cstring>
-#include <fstream>
-#include <iterator>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,197 +19,102 @@ namespace {
 
 using audiopolicy::AppRow;
 using audiopolicy::Engine;
-using audiopolicy::Flow;
 using audiopolicy::Reason;
-using audiopolicy::SessionState;
 using audiopolicy::Verdict;
 
-std::string Golden(const char *name) {
-  const std::string path = std::string(IM_NATIVE_DIR) + "/../internal/media/testdata/audio/" + name;
-  std::ifstream f(path, std::ios::binary);
-  EXPECT_TRUE(f.good()) << "cannot read " << name;
-  return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+TEST(AudioReport, ThePlannersVocabularyInTheReports) {
+  EXPECT_STREQ(audiomix::ReportName(ToReport(Engine::kIncludeSet)), "include-set");
+  EXPECT_STREQ(audiomix::ReportName(ToReport(Engine::kExcludeSelf)), "exclude-self");
+  EXPECT_STREQ(audiomix::ReportName(ToReport(Engine::kEndpoint)), "endpoint");
+  EXPECT_STREQ(audiomix::ReportName(ToReport(Engine::kNone)), "none");
+  for (const Verdict v : {Verdict::kHeard, Verdict::kKeptOut, Verdict::kNotCaptured, Verdict::kPending}) {
+    EXPECT_EQ(std::string(audiomix::ReportName(ToReport(v))), audiopolicy::VerdictName(v));
+  }
+  for (const Reason r :
+       {Reason::kNone, Reason::kBuiltin, Reason::kUser, Reason::kMic, Reason::kViewer, Reason::kIsshoni,
+        Reason::kLauncher, Reason::kTree, Reason::kPidReuse, Reason::kLimit, Reason::kCaptureFailed}) {
+    EXPECT_EQ(std::string(audiomix::ReportName(ToReport(r))), audiopolicy::ReasonName(r));
+  }
+  for (const audiopolicy::Note n :
+       {audiopolicy::Note::kNone, audiopolicy::Note::kCovered, audiopolicy::Note::kNoHandle}) {
+    EXPECT_EQ(std::string(audiomix::ReportName(ToReport(n))), audiopolicy::NoteName(n));
+  }
+  for (const audiopolicy::Flow f : {audiopolicy::Flow::kRender, audiopolicy::Flow::kCapture}) {
+    EXPECT_EQ(std::string(audiomix::ReportName(ToReport(f))), audiopolicy::FlowName(f));
+  }
+  EXPECT_STREQ(audiomix::ReportName(ToReport(audiopolicy::SessionState::kActive)), "active");
+  EXPECT_STREQ(audiomix::ReportName(ToReport(audiopolicy::SessionState::kInactive)), "inactive");
+
+  // A row's warning bits by name, lowest bit first, as the planner names them.
+  const uint32_t all = audiopolicy::kWarnSharedAppUsesMic | audiopolicy::kWarnSharedAppKeptOut |
+                       audiopolicy::kWarnIncludedUsesMic | audiopolicy::kWarnMultiProcessSession;
+  const std::vector<audiomix::AppWarning> w = WarningsOf(all);
+  ASSERT_EQ(w.size(), 4u);
+  for (uint32_t bit = 1, i = 0; i < 4; bit <<= 1, ++i) {
+    EXPECT_EQ(std::string(audiomix::ReportName(w[i])), audiopolicy::WarningName(bit));
+  }
+  EXPECT_TRUE(WarningsOf(0).empty());
+
+  // Report-level warnings, the instance rule's included (05 §5.3).
+  audiomix::ReportWarning rw;
+  ASSERT_TRUE(ToReport(audiopolicy::PlanWarning{"instance_gone", "isshoni"}, &rw));
+  EXPECT_EQ(rw.code, audiomix::AppWarning::kInstanceGone);
+  EXPECT_EQ(rw.app, "isshoni");
+  ASSERT_TRUE(ToReport(audiopolicy::PlanWarning{"multi_process_session", "exe:a.exe"}, &rw));
+  EXPECT_EQ(rw.code, audiomix::AppWarning::kMultiProcessSession);
+  EXPECT_FALSE(ToReport(audiopolicy::PlanWarning{"something_new", ""}, &rw));
 }
 
-AppRow Row(const char *id, const char *name, const char *exe, Verdict v, Reason r, bool playing, bool mic,
-           uint32_t pids, uint32_t sessions, uint32_t streams) {
+TEST(AudioReport, ARowThroughTheWriter) {
   AppRow a;
-  a.id = id;
-  a.name = name;
-  a.exe = exe;
-  a.verdict = v;
-  a.reason = r;
-  a.playing = playing;
-  a.uses_mic = mic;
-  a.pids = pids;
-  a.sessions = sessions;
-  a.streams = streams;
-  return a;
-}
-
-ReportSession Sess(uint32_t pid, uint64_t created, const char *exe, const char *app, SessionState st, Verdict v,
-                   Reason r, const char *stream) {
-  ReportSession s;
-  s.pid = pid;
-  s.created = created;
-  s.exe = exe;
-  s.app_id = app;
-  s.flow = Flow::kRender;
-  s.state = st;
-  s.verdict = v;
-  s.reason = r;
-  s.stream = stream;
-  s.format = "float32";
-  return s;
-}
-
-Report LiveBase(uint32_t seq, int64_t qpc) {
+  a.id = "exe:launcherx.exe";
+  a.name = "LauncherX";
+  a.exe = "launcherx.exe";
+  a.verdict = Verdict::kNotCaptured;
+  a.reason = Reason::kTree;
+  a.detail = "Discord";
+  a.pids = 1;
+  a.sessions = 1;
+  a.warnings = audiopolicy::kWarnSharedAppUsesMic;
   Report r;
-  r.seq = seq;
-  r.qpc_ns = qpc;
-  r.engine = Engine::kIncludeSet;
-  r.state = "ok";
-  r.live = true;
-  r.probe = ReportProbe{"ok", 26100, "float32", -60.1, 231};
-  r.device = ReportDevice{true, 2, 1};
-  return r;
+  r.apps.push_back(ToReport(a));
+  const std::string doc = audiomix::WriteReportJson(r);
+  EXPECT_NE(doc.find("{\"id\":\"exe:launcherx.exe\",\"name\":\"LauncherX\",\"exe\":\"launcherx.exe\","
+                     "\"verdict\":\"not_captured\",\"reason\":\"tree\",\"playing\":false,\"usesMic\":false,"
+                     "\"browser\":false,\"shared\":false,\"pids\":1,\"sessions\":1,\"streams\":0,"
+                     "\"detail\":\"Discord\",\"warnings\":[\"shared_app_uses_mic\"]}"),
+            std::string::npos)
+      << doc;
 }
 
-TEST(AudioReport, NoDeviceGolden) {
-  Report r;
-  r.seq = 3;
-  r.qpc_ns = 412000000000;
-  r.engine = Engine::kNone;
-  r.state = "no-device";
-  r.probe = ReportProbe{"skipped", 26100, "", -120, 0};
-  r.device = ReportDevice{false, 0, 0};
-  r.apps.push_back(
-      Row("discord", "Discord", "discord.exe", Verdict::kKeptOut, Reason::kBuiltin, false, false, 6, 0, 0));
-  r.counters.device_changes = 1;
-  r.events.push_back(ReportEvent{322000000000, "device_removed", "", ""});
-  r.events.push_back(ReportEvent{322000000000, "no_device", "", ""});
-  EXPECT_EQ(WriteReportJson(r), Golden("report-no-device.json"));
-}
-
-TEST(AudioReport, NormalGolden) {
-  Report r = LiveBase(118, 81234567890123);
-  r.apps.push_back(
-      Row("exe:spotify.exe", "Spotify", "spotify.exe", Verdict::kHeard, Reason::kNone, true, false, 4, 1, 1));
-  r.apps.push_back(Row("discord", "Discord", "discord.exe", Verdict::kKeptOut, Reason::kBuiltin, true, true, 6, 2, 0));
-  r.apps.push_back(Row("exe:steam.exe", "Steam", "steam.exe", Verdict::kKeptOut, Reason::kMic, false, true, 3, 1, 0));
-  AppRow l = Row("exe:launcherx.exe", "LauncherX", "launcherx.exe", Verdict::kNotCaptured, Reason::kTree, false, false,
-                 1, 1, 0);
-  l.detail = "Discord";
-  r.apps.push_back(l);
-  r.sessions.push_back(Sess(4120, 133725183450041234ull, "spotify.exe", "exe:spotify.exe", SessionState::kActive,
-                            Verdict::kHeard, Reason::kNone, "running"));
-  r.sessions.push_back(Sess(6604, 133725183457351234ull, "discord.exe", "discord", SessionState::kActive,
-                            Verdict::kKeptOut, Reason::kBuiltin, "none"));
-  r.sessions.push_back(Sess(6612, 133725183464661234ull, "discord.exe", "discord", SessionState::kInactive,
-                            Verdict::kKeptOut, Reason::kBuiltin, "none"));
-  r.sessions.push_back(Sess(2280, 133725183471971234ull, "steam.exe", "exe:steam.exe", SessionState::kInactive,
-                            Verdict::kKeptOut, Reason::kMic, "none"));
-  r.sessions.push_back(Sess(7316, 133725183479281234ull, "launcherx.exe", "exe:launcherx.exe", SessionState::kInactive,
-                            Verdict::kNotCaptured, Reason::kTree, "none"));
-  r.counters.streams = 1;
-  r.counters.activations = 1;
-  r.counters.max_resample_ppm = 41;
-  r.counters.audio_cpu_ms_per_s = 6.2;
-  r.events.push_back(ReportEvent{81174567890123, "session_created", "exe:spotify.exe", ""});
-  r.events.push_back(ReportEvent{81174567890123, "session_created", "discord", ""});
-  r.events.push_back(ReportEvent{81174567890123, "session_created", "exe:steam.exe", ""});
-  r.events.push_back(ReportEvent{81175567890123, "session_created", "exe:launcherx.exe", ""});
-  r.events.push_back(ReportEvent{81204567890123, "stream_opened", "exe:spotify.exe", ""});
-  r.events.push_back(ReportEvent{81204607890123, "stream_running", "exe:spotify.exe", ""});
-  EXPECT_EQ(WriteReportJson(r), Golden("report-normal.json"));
-}
-
-TEST(AudioReport, SharedMicGolden) {
-  Report r = LiveBase(57, 1830000000000);
-  AppRow v = Row("exe:valorant.exe", "VALORANT", "valorant.exe", Verdict::kHeard, Reason::kNone, true, true, 3, 2, 1);
-  v.shared = true;
-  v.warnings = audiopolicy::kWarnSharedAppUsesMic | audiopolicy::kWarnMultiProcessSession;
-  r.apps.push_back(v);
-  r.apps.push_back(
-      Row("exe:spotify.exe", "Spotify", "spotify.exe", Verdict::kHeard, Reason::kNone, true, false, 4, 1, 1));
-  r.apps.push_back(Row("discord", "Discord", "discord.exe", Verdict::kKeptOut, Reason::kBuiltin, true, true, 6, 2, 0));
-  AppRow k = Row("exe:kook.exe", "KOOK", "kook.exe", Verdict::kHeard, Reason::kNone, true, true, 2, 1, 1);
-  k.warnings = audiopolicy::kWarnIncludedUsesMic;
-  r.apps.push_back(k);
-  ReportSession s1 = Sess(8812, 133725184509991234ull, "valorant.exe", "exe:valorant.exe", SessionState::kActive,
-                          Verdict::kHeard, Reason::kNone, "running");
-  s1.multi_process = true;
-  r.sessions.push_back(s1);
-  ReportSession s2 = s1;
-  s2.created = 133725184517301234ull;
-  r.sessions.push_back(s2);
-  r.sessions.push_back(Sess(4120, 133725184524611234ull, "spotify.exe", "exe:spotify.exe", SessionState::kActive,
-                            Verdict::kHeard, Reason::kNone, "running"));
-  r.sessions.push_back(Sess(6604, 133725184531921234ull, "discord.exe", "discord", SessionState::kActive,
-                            Verdict::kKeptOut, Reason::kBuiltin, "none"));
-  r.sessions.push_back(Sess(6612, 133725184539231234ull, "discord.exe", "discord", SessionState::kInactive,
-                            Verdict::kKeptOut, Reason::kBuiltin, "none"));
-  r.sessions.push_back(Sess(5520, 133725184546541234ull, "kook.exe", "exe:kook.exe", SessionState::kActive,
-                            Verdict::kHeard, Reason::kNone, "running"));
-  r.warnings.push_back(ReportWarning{"multi_process_session", "exe:valorant.exe"});
-  r.counters.streams = 3;
-  r.counters.activations = 3;
-  r.counters.max_resample_ppm = 33;
-  r.counters.audio_cpu_ms_per_s = 7.9;
-  r.events.push_back(ReportEvent{1530000000000, "stream_running", "exe:valorant.exe", ""});
-  r.events.push_back(ReportEvent{1530000000000, "stream_running", "exe:spotify.exe", ""});
-  r.events.push_back(ReportEvent{1590000000000, "rules_changed", "", ""});
-  r.events.push_back(ReportEvent{1590050000000, "stream_running", "exe:kook.exe", ""});
-  EXPECT_EQ(WriteReportJson(r), Golden("report-shared-mic.json"));
-}
-
-// The caps of 05 §12.1: 128 apps, 256 sessions, the last 300 events, strings of at most 260 bytes cut on a UTF-8
-// boundary; and what seq covers.
-TEST(AudioReport, CapsAndVisibleState) {
-  Report r;
-  const std::string long_name = std::string(259, 'a') + "\xC3\xA9" + "QQQQ"; // 'é' straddles byte 260
-  for (int i = 0; i < 200; ++i) {
-    r.apps.push_back(
-        Row("exe:a.exe", long_name.c_str(), "a.exe", Verdict::kHeard, Reason::kNone, false, false, 1, 0, 0));
-  }
-  for (int i = 0; i < 300; ++i) {
-    r.sessions.push_back(Sess(static_cast<uint32_t>(i + 1), 1, "a.exe", "exe:a.exe", SessionState::kInactive,
-                              Verdict::kHeard, Reason::kNone, "none"));
-  }
-  for (int i = 0; i < 400; ++i) {
-    r.events.push_back(ReportEvent{i, "session_created", "", ""});
-  }
-  const std::string doc = WriteReportJson(r);
-  auto count = [&](const std::string &needle) {
-    std::size_t n = 0;
-    for (std::size_t at = doc.find(needle); at != std::string::npos; at = doc.find(needle, at + 1)) {
-      ++n;
-    }
-    return n;
-  };
-  EXPECT_EQ(count("\"verdict\":\"heard\",\"reason\":\"\",\"playing\""), kReportMaxApps);
-  EXPECT_EQ(count("\"multiProcess\""), kReportMaxSessions);
-  EXPECT_EQ(count("\"code\":\"session_created\""), kReportMaxEvents);
-  EXPECT_NE(doc.find("{\"tNs\":100,"), std::string::npos) << "the last 300 events are kept";
-  EXPECT_EQ(doc.find("{\"tNs\":99,"), std::string::npos);
-  EXPECT_NE(doc.find("\"name\":\"" + std::string(259, 'a') + "\""), std::string::npos) << "cut before the 'é'";
-  EXPECT_EQ(doc.find("QQQQ"), std::string::npos);
-
-  // seq covers apps, sessions, warnings and the state, not qpcNs, counters or events.
-  Report a, b;
-  a.apps.push_back(
-      Row("discord", "Discord", "discord.exe", Verdict::kKeptOut, Reason::kBuiltin, false, false, 1, 0, 0));
-  b = a;
+// seq covers apps, sessions, warnings and the state, not qpcNs, counters or events.
+TEST(AudioReport, VisibleState) {
+  Report a;
+  audiomix::ReportApp app;
+  app.id = "discord";
+  app.verdict = audiomix::AppVerdict::kKeptOut;
+  a.apps.push_back(app);
+  Report b = a;
   b.qpc_ns = 99;
   b.seq = 7;
   b.counters.device_changes = 3;
-  b.events.push_back(ReportEvent{1, "device_added", "", ""});
+  b.events.push_back(ReportEntry{1, audiomix::ReportEventCode::kDeviceAdded, "", ""});
   EXPECT_EQ(VisibleState(a), VisibleState(b));
   b.apps[0].playing = true;
   EXPECT_NE(VisibleState(a), VisibleState(b));
   b = a;
-  b.state = "no-device";
+  b.state = audiomix::ReportState::kNoDevice;
   EXPECT_NE(VisibleState(a), VisibleState(b));
+  b = a;
+  b.muted = true;
+  EXPECT_NE(VisibleState(a), VisibleState(b));
+  b = a;
+  b.sessions.push_back(audiomix::ReportSession{});
+  EXPECT_NE(VisibleState(a), VisibleState(b));
+  b.sessions[0].stream = audiomix::SessionStream::kRunning;
+  Report c = a;
+  c.sessions.push_back(audiomix::ReportSession{});
+  EXPECT_NE(VisibleState(c), VisibleState(b)) << "a stream's state is visible";
 }
 
 TEST(AudioLevels, PeakToDb) {
@@ -238,7 +140,7 @@ TEST(AudioLevels, MakeLevels) {
   apps.push_back(AppActivity{"discord", -24.0f, 5000, false});
   apps.push_back(AppActivity{"discord", -12.0f, 4000, false}); // a second session of the same app: the loudest wins
   apps.push_back(AppActivity{"", -1.0f, 9999, false});         // no app id yet (pending): left out
-  apps.push_back(AppActivity{"exe:spotify.exe", -500.0f, 6000, true});
+  apps.push_back(AppActivity{"exe:spotify.exe", -500.0f, 6000, true, -700.0f});
   const im_audio_levels l = MakeLevels(42, 123456789, kSilenceDb, kSilenceDb, apps);
   EXPECT_EQ(l.struct_size, sizeof(im_audio_levels));
   EXPECT_EQ(l.report_seq, 42u);
@@ -248,12 +150,26 @@ TEST(AudioLevels, MakeLevels) {
   EXPECT_STREQ(l.apps[0].app_id, "exe:spotify.exe");
   EXPECT_EQ(l.apps[0].source, 0u);
   EXPECT_FLOAT_EQ(l.apps[0].peak_db, kSilenceDb) << "floored at -120";
+  EXPECT_FLOAT_EQ(l.apps[0].rms_db, kSilenceDb) << "a captured entry's own RMS, floored";
   EXPECT_STREQ(l.apps[1].app_id, "discord");
   EXPECT_FLOAT_EQ(l.apps[1].peak_db, -12.0f);
   EXPECT_FLOAT_EQ(l.apps[1].rms_db, -12.0f);
   EXPECT_EQ(l.apps[1].source, 1u);
   EXPECT_STREQ(l.apps[2].app_id, "exe:app69.exe");
   EXPECT_STREQ(l.apps[63].app_id, "exe:app8.exe") << "the 8 least recently active apps are cut";
+}
+
+// While live, an app's captured level (source 0, its own RMS) replaces its sessions' activity (05 §12.2).
+TEST(AudioLevels, CapturedReplacesActivity) {
+  std::vector<AppActivity> apps = {{"exe:game.exe", -3.0f, 100, false},
+                                   {"exe:game.exe", -9.0f, 50, true, -12.0f},
+                                   {"exe:game.exe", -1.0f, 70, false}};
+  const im_audio_levels l = MakeLevels(1, 2, -9.0f, -12.0f, apps);
+  ASSERT_EQ(l.count, 1u);
+  EXPECT_EQ(l.apps[0].source, 0u);
+  EXPECT_FLOAT_EQ(l.apps[0].peak_db, -9.0f);
+  EXPECT_FLOAT_EQ(l.apps[0].rms_db, -12.0f);
+  EXPECT_FLOAT_EQ(l.mix_rms_db, -12.0f);
 }
 
 TEST(AudioLevels, StoreRoundTrip) {

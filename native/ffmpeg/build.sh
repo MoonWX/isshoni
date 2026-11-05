@@ -10,14 +10,15 @@
 #
 #   powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe native/ffmpeg/build.sh
 #
-# MSYS2 needs `pacman -S --needed make pkgconf diffutils zip` once; this script installs nothing and changes nothing
-# outside WORKDIR (default .deps/ffmpeg-build in the repository). The same command rebuilds the DLLs from an unpacked
-# source archive (below), whose src/ folder then supplies the upstream tarballs (06 §9.1, the relink check).
+# MSYS2 needs `pacman -S --needed make pkgconf diffutils zip patch` once; this script installs nothing and changes
+# nothing outside WORKDIR (default .deps/ffmpeg-build in the repository). The same command rebuilds the DLLs from an
+# unpacked source archive (below), whose src/ folder then supplies the upstream tarballs (06 §9.1, the relink check).
 #
 # Steps (06 §4.3):
 #   1. the four upstream tarballs of native/ffmpeg/pins.json into WORKDIR/src, each checked against its SHA-256
 #      (downloaded with three retries, unless already there or in the source archive's src/);
-#   2. libvpl's dispatcher as a static library with the static CRT (CMake and Ninja from the VS instance);
+#   2. libvpl's dispatcher with the patches of libvpl_patches (below) as a static library with the static CRT (CMake
+#      and Ninja from the VS instance);
 #   3. nv-codec-headers and the AMF headers into WORKDIR/prefix;
 #   4. FFmpeg: configure (06 §4.2, configure_args below), make, make install;
 #   5. the checks of 06 §4.4: config.h, ffcheck (license, configuration, exactly four encoders), the DLLs' imports,
@@ -40,8 +41,8 @@
 # 14.44.35229.0). Visual Studio's servicing updates the compiler and linker in place under the same folder name, so
 # the folder alone does not say which compiler built the DLLs.
 #
-# Changing this file, pins.json or ffcheck.c changes inputsSha256 (06 §4.1): the FFmpeg workflow must then publish a
-# new revision and lock.json be updated, or every consumer fails as stale.
+# Changing this file, pins.json, ffcheck.c or a patch under patches/ changes inputsSha256 (06 §4.1): the FFmpeg
+# workflow must then publish a new revision and lock.json be updated, or every consumer fails as stale.
 #
 # Environment: SOURCE_DATE_EPOCH and BUILD_COMMIT override the commit time and hash read from git (outside a git
 # checkout they default to 1980-01-01 and "none"). GITHUB_ACTIONS=true folds the log into groups.
@@ -66,6 +67,14 @@ system_dlls=(kernel32.dll user32.dll gdi32.dll advapi32.dll ole32.dll oleaut32.d
 
 # The encoders FFmpeg is built with (06 D6); ffcheck.c checks the same list.
 encoders='h264_nvenc,h264_amf,h264_qsv,h264_mf'
+
+# The patches applied to the unpacked libvpl source, in this order, each with `patch -p1 --fuzz=0` (06 §4.3 step 3);
+# each file's header says why. Every one is an input of inputsSha256, and tools/desktoppkg's inputFiles lists the same
+# files in the same order.
+libvpl_patches=(patches/libvpl-no-exe-dir-or-path.patch)
+
+# The files inputsSha256 hashes (06 §4.1), relative to native/ffmpeg, in order.
+input_files=(pins.json build.sh ffcheck.c "${libvpl_patches[@]}")
 
 log() { printf '%s: %s\n' "$prog" "$*"; }
 die() {
@@ -123,11 +132,12 @@ json_escape() {
   printf '%s' "$s"
 }
 
-# inputs_sha256 prints lock.json's inputsSha256: the SHA-256 of the lines "<sha256>  <path>" for pins.json, build.sh
-# and ffcheck.c (06 §4.1; `go -C tools run ./desktoppkg ffmpeg-inputs` prints the same).
+# inputs_sha256 prints lock.json's inputsSha256: the SHA-256 of the lines "<sha256>  <path>" for input_files, that is
+# pins.json, build.sh, ffcheck.c and the libvpl patches (06 §4.1; `go -C tools run ./desktoppkg ffmpeg-inputs` prints
+# the same).
 inputs_sha256() {
   local f
-  for f in pins.json build.sh ffcheck.c; do
+  for f in "${input_files[@]}"; do
     printf '%s  native/ffmpeg/%s\n' "$(sha256 "$here/$f")" "$f"
   done | sha256sum | cut -c1-64
 }
@@ -261,8 +271,31 @@ check_imports() {
   log "$(basename "$dll") imports: $(printf '%s\n' "$list" | awk '{printf "%s%s (%s)", sep, $2, $1; sep = ", "}')"
 }
 
-# fetch NAME URL SHA256 puts the tarball NAME into $src_dir: from the source archive's src/, a previous run, or a
-# download (three retries), and fails unless its SHA-256 matches.
+# from_published NAME DST copies the tarball NAME out of the source archive of lock.json's release (the same upstream
+# bytes, published by an earlier run) into DST: the fallback when its upstream host is down. pins.json's SHA-256 is
+# still what decides. Fails quietly (status 1) when there is no lock.json or the copy can't be had.
+from_published() {
+  local name=$1 dst=$2 tag base tar
+  [ -f "$lock_file" ] || return 1
+  tag=$(json_string "$lock_file" tag)
+  [ -n "$tag" ] || return 1
+  base=${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-MoonWX/isshoni}/releases/download
+  tar=$work/published-${tag#deps-}-source.tar
+  if [ ! -f "$tar" ]; then
+    curl -fsSL --proto '=https' --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 900 \
+      -o "$tar.part" "$base/$tag/${tag#deps-}-source.tar" || {
+      rm -f "$tar.part"
+      return 1
+    }
+    mv "$tar.part" "$tar"
+  fi
+  tar -xOf "$tar" "${tag#deps-}-source/src/$name" >"$dst" 2>/dev/null || return 1
+  log "$name: from $tag's source archive (the upstream download failed)"
+}
+
+# fetch NAME URL SHA256 puts the tarball NAME into $src_dir: from the source archive's src/, a previous run, a
+# download (three retries), or, when the download fails, lock.json's published source archive; it fails unless its
+# SHA-256 matches.
 fetch() {
   local name=$1 url=$2 want=$3 dst=$src_dir/$1
   if [ -f "$dst" ] && [ "$(sha256 "$dst")" = "$want" ]; then
@@ -275,8 +308,8 @@ fetch() {
     log "$name: from src/"
   else
     curl -fsSL --proto '=https' --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 900 \
-      -o "$dst.part" "$url" || die "$name: download of $url failed"
-    log "$name: downloaded from $url"
+      -o "$dst.part" "$url" && log "$name: downloaded from $url" ||
+      from_published "$name" "$dst.part" || die "$name: download of $url failed"
   fi
   local got
   got=$(sha256 "$dst.part")
@@ -292,6 +325,21 @@ unpack() {
   rm -rf "$2"
   mkdir -p "$2"
   tar -xf "$1" -C "$2" --strip-components=1 --no-same-owner
+}
+
+# apply_patch DIR PATCH applies PATCH (relative to native/ffmpeg) to the source in DIR, and fails the build unless every
+# hunk applies exactly: a dry run first, so a patch that doesn't fit leaves the source as unpacked; no fuzz, no
+# reversed or already-applied patch, no reject or backup files.
+apply_patch() {
+  local dir=$1 file=$here/$2 out
+  [ -f "$file" ] || die "native/ffmpeg/$2 does not exist"
+  out=$(patch -d "$dir" -p1 --dry-run --batch --forward --fuzz=0 -i "$file" 2>&1) || {
+    printf '%s\n' "$out" >&2
+    die "native/ffmpeg/$2 does not apply to $(basename "$dir") (patch --dry-run failed, its output is above)"
+  }
+  patch -d "$dir" -p1 --batch --forward --fuzz=0 --no-backup-if-mismatch -r - -i "$file" ||
+    die "native/ffmpeg/$2 did not apply to $(basename "$dir")"
+  log "applied native/ffmpeg/$2"
 }
 
 main() {
@@ -336,8 +384,8 @@ main() {
     [ -x "$msvc_bin/$tool" ] || die "no $tool in $msvc_bin"
   done
   export PATH="$msvc_bin:/usr/bin:$PATH"
-  for tool in make pkg-config cmp diff tar xz gzip curl sha256sum zip cygpath dumpbin.exe lib.exe; do
-    command -v "$tool" >/dev/null || die "$tool not found (MSYS2: pacman -S --needed make pkgconf diffutils zip)"
+  for tool in make pkg-config cmp diff tar xz gzip curl sha256sum zip patch cygpath dumpbin.exe lib.exe; do
+    command -v "$tool" >/dev/null || die "$tool not found (MSYS2: pacman -S --needed make pkgconf diffutils zip patch)"
   done
   # The toolset build: the folder (VCToolsVersion) and the compiler and linker builds in it (see the header).
   local compiler linker
@@ -385,8 +433,12 @@ main() {
   local ff_tar=ffmpeg-$ff_version.tar.xz nv_tar=nv-codec-headers-$nv_tag.tar.gz amf_tar=AMF-headers-$amf_tag.tar.gz
   local vpl_tar=libvpl-$vpl_tag.tar.gz
   local name=ffmpeg-$ff_version-r$revision tag=deps-ffmpeg-$ff_version-r$revision
-  local inputs
+  local inputs p vpl_patches=''
   inputs=$(inputs_sha256)
+  # "<patch>": "<sha256>" for build-manifest.json's libvpl entry.
+  for p in "${libvpl_patches[@]}"; do
+    vpl_patches+="${vpl_patches:+, }\"$p\": \"$(sha256 "$here/$p")\""
+  done
 
   local commit epoch
   commit=${BUILD_COMMIT:-$(git -C "$(cygpath -m "$repo")" rev-parse HEAD 2>/dev/null || echo none)}
@@ -415,6 +467,9 @@ main() {
   unpack "$src_dir/$nv_tar" "$deps/nv-codec-headers"
   unpack "$src_dir/$amf_tar" "$deps/amf"
   unpack "$src_dir/$vpl_tar" "$deps/libvpl"
+  for p in "${libvpl_patches[@]}"; do
+    apply_patch "$deps/libvpl" "$p"
+  done
   endgroup
 
   group "libvpl $vpl_tag (static, /MT)"
@@ -563,7 +618,7 @@ main() {
         "$(json_string "$lock_file" msvcLinker); this build: toolset $toolset, cl.exe $compiler, link.exe $linker)"
     fi
   else
-    log 'lock.json does not describe these inputs (absent, or pins.json, build.sh or ffcheck.c changed): names checked against ffcheck only'
+    log 'lock.json does not describe these inputs (absent, or pins.json, build.sh, ffcheck.c or a patch changed): names checked against ffcheck only'
   fi
   endgroup
 
@@ -594,7 +649,7 @@ main() {
   # package) is left out rather than failing the build here, after the checks.
   local msys_pkgs=''
   if command -v pacman >/dev/null; then
-    msys_pkgs=$({ pacman -Q make pkgconf diffutils zip tar 2>/dev/null || true; } |
+    msys_pkgs=$({ pacman -Q make pkgconf diffutils zip patch tar 2>/dev/null || true; } |
       awk '{printf "%s\"%s\": \"%s\"", sep, $1, $2; sep = ", "}')
   fi
   local cmake_version
@@ -611,7 +666,7 @@ main() {
     "ffmpeg": {"version": "$ff_version", "file": "$ff_tar", "sha256": "$ff_sha"},
     "nvCodecHeaders": {"tag": "$nv_tag", "file": "$nv_tar", "sha256": "$nv_sha"},
     "amfHeaders": {"tag": "$amf_tag", "file": "$amf_tar", "sha256": "$amf_sha"},
-    "libvpl": {"tag": "$vpl_tag", "file": "$vpl_tar", "sha256": "$vpl_sha"}
+    "libvpl": {"tag": "$vpl_tag", "file": "$vpl_tar", "sha256": "$vpl_sha", "patches": {$vpl_patches}}
   },
   "msvcToolset": "$(json_escape "$toolset")",
   "msvcCompiler": "$(json_escape "$compiler")",
@@ -634,9 +689,12 @@ EOF
   (cd "$out" && find "$name-win-x64" -type f | sort | zip -X -D -q -9 -@ "$name-win-x64.zip")
 
   local srcpkg=$out/$name-source
-  mkdir -p "$srcpkg/src" "$srcpkg/native/ffmpeg" "$srcpkg/deploy/windows"
+  mkdir -p "$srcpkg/src" "$srcpkg/native/ffmpeg/patches" "$srcpkg/deploy/windows"
   cp "$src_dir/$ff_tar" "$src_dir/$nv_tar" "$src_dir/$amf_tar" "$src_dir/$vpl_tar" "$srcpkg/src/"
   cp "$here/pins.json" "$here/build.sh" "$here/ffcheck.c" "$here/README-LGPL.txt" "$srcpkg/native/ffmpeg/"
+  for p in "${libvpl_patches[@]}"; do
+    cp "$here/$p" "$srcpkg/native/ffmpeg/$p"
+  done
   # The MSVC environment step, so the archive alone rebuilds the DLLs (06 §9.1's relink check).
   local f
   for f in msvc-env.ps1 tools.json; do

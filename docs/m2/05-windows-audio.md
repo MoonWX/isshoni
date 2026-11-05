@@ -11,7 +11,8 @@ Written in parallel with `01-client-core.md`, `02-device-auth.md`, `03-desktop-a
 Tags: **M2** = build now. **later (Mx)** = leave room now, build in milestone x.
 
 This doc is the M2 exit criterion "Discord is excluded (the audiotest passes on Win10 and Win11)". §18 is the exact
-gate.
+gate. Windows 10 22H2 takes the plan's gate (README §3 item 52, the owner's decision of 2026-11-03): builds below
+22000 use endpoint loopback with the banner, and the Win10 half of the gate is §18.10's reduced form.
 
 ## 1. Scope
 
@@ -54,7 +55,7 @@ the Discord Web separate-window launcher (Later).
 | PID reuse | Hold a `SYNCHRONIZE` handle on every include target while its stream lives (snapshot checks when the handle can't be opened, §5.7); creation-time checks on parent links; a lineage cache for orphans; loose (PID-only) ancestry for the safety invariant, reported as its own reason `pid_reuse` | A held handle makes reuse of that PID impossible; the loose check covers whatever Windows itself uses for "tree" until the INFO case `pid-reuse-tree` measures it |
 | Mic users | Kept out by default, sticky for the life of the app's root process, one-tap prompt remembered per app (by exe name) | Push-to-talk apps toggle their capture stream; a 10 s timeout (S1) would let incoming voices leak between presses |
 | Mixer clock | 10 ms ticks on QPC, 48 kHz stereo float; per-stream PI-controlled adaptive resampling (speexdsp); silence is corrected by dropping or padding zeros | S1 limitation: QPC vs device clock drift caused rare trims; at 100 ppm that is a dip every ~6 minutes |
-| Click safety | S1's fades (preroll 40 ms, 10 ms fades) with a shaped 64-frame backstop tail instead of S1's linear ramp (§9.4, WA36), plus the onset fade (5 ms ramp after ≥ 50 ms of digital silence, on the stream's input before the resampler, §9.5; a new channel counts as silent, as in S1's code) | S1 runs 1–2: the only artifact was the stream-attach click; the onset fade is the diagnosed fix |
+| Click safety | S1's fades (preroll 40 ms, 10 ms fades) with a shaped 64-frame backstop tail instead of S1's linear ramp (§9.4, WA36), plus the onset fade (5 ms ramp after ≥ 50 ms of digital silence, on the stream's input before the resampler, §9.5; a new channel counts as silent, as in S1's code) and the tail fade (the last 5 ms before ≥ 5 ms of digital silence ramped out, from audio already buffered, so 0 ms of added latency, §9.5; README §3 item 53) | S1 runs 1–2: the only artifact was the stream-attach click; the onset fade is the diagnosed fix. WA09's CI runs (2026-11-03): the onset fade verified, and a stop click where Windows' per-app tap cuts an app's end on a 10 ms packet boundary; the tail fade is its diagnosed fix, verified in the second run |
 | Opus (04's stage, 05's requirements) | 48 kHz stereo, 20 ms frames, `OPUS_APPLICATION_AUDIO`, signal music, constrained VBR, complexity 10, bitrate from `ShareParams.AudioBitrate` (128 k, Movie 256 k), in-band FEC off, DTX off (§10.1) | FEC only works in SILK/hybrid, which these bitrates never use (plan); continuous frames keep jitter buffers and A/V sync steady |
 | Timestamps | The mixer hands 04's stage chunks stamped on an exact 10 ms grid in the QPC domain: `tick_k − L`, `L` = the fixed estimate of the delay from the audio engine's mix (the loopback QPC position) to the mixer's pop, so a chunk is stamped with the time Windows mixed it, without the sharer's output-device latency (§10.3); `L0` = 50 ms until a silence re-anchor measures it; 04's stage subtracts the encoder lookahead, so packets sit on an exact 20 ms grid | Video stamps DWM's composition time (WGC `SystemRelativeTime`, DD `LastPresentTime`), not the display's; friends never go through the sharer's speakers. Go derives RTP timestamps from capture times (M1 publisher); any jitter would break the 960-sample RTP step |
 | Startup probe | A 200 ms, −60 dBFS, 997 Hz tone in a private session, captured by an INCLUDE stream on isshoni itself. Failure → endpoint loopback + banner | Plan. Process loopback is digital and pre-volume (S1: muted 19% volume still gave −12 dB), so a nearly inaudible tone suffices |
@@ -63,7 +64,7 @@ the Discord Web separate-window launcher (Later).
 | Reports | JSON report (`im_list_audio_apps`, changes rarely, has `seq`) + fixed-size level struct polled at 10 Hz | No callbacks into Go (pull-based ABI); meters need no JSON parsing |
 | Privacy | App names, exe names, rules and levels never leave the device and are never logged, at any level; logs carry codes and counts | Plan "Privacy and trust model"; 01 §11.12 |
 | Harness | One Go binary that copies itself as fixtures (S1's proven approach), drives the shipping DLL, analyzes a PCM tap with Goertzel (over the whole window and over sliding 50 ms windows, so a leak of a few milliseconds fails) and click detection, and writes a redacted JSON report | The S1 self-test design, extended to the plan's cases; S1's single whole-window level can't see a 30 ms leak; the PCM tap avoids needing an Opus decoder in Go |
-| Gate location | The owner's physical PC, Win11 and Win10 22H2 (dual boot). GitHub-hosted Windows runners have no audio endpoint; they build, unit-test and run `selfcheck` | Process loopback needs a real render endpoint and an interactive session |
+| Gate location | The owner's physical PC, Win11 and Win10 22H2 (dual boot; Win10 in §18.10's reduced form, README §3 item 52). GitHub-hosted Windows runners have no audio endpoint; they build, unit-test and run `selfcheck` | Process loopback needs a real render endpoint and an interactive session. WA09 gave a windows-2025 runner one with a virtual cable (VB-CABLE, `.github/workflows/s1-audio.yml`, README §3 item 51): S1's process-loopback scenarios ran there, but plain endpoint loopback of the cable stayed digital silence, so a hosted runner can't check the endpoint engine and isn't a gate |
 
 ## 3. From spike S1 to M2
 
@@ -74,14 +75,15 @@ the Discord Web separate-window launcher (Later).
 | Process loopback accepted plain float32 48 kHz on the first try | Same format attempts in the same order (§8.2) |
 | Loopback level unaffected by master volume and mute | Documented for users: muting the PC doesn't mute the stream; Pause or **Share sound** off does (03) |
 | Steam holds a microphone session, so it was auto-excluded as a mic user (its own UI sounds; games are separate apps) | Kept: launchers stop the app walk, so Steam games stay heard (§5.4); audiotest case `steam-game` |
-| late-start clicks: Windows drops the first milliseconds of an app that starts playing after the loopback attaches; the stream then starts at full level | Onset fade (§9.5). **Not yet re-verified on Windows** (pending owner run); slice A0 and cases `late-app`, `late-helper` |
+| late-start clicks: Windows drops the first milliseconds of an app that starts playing after the loopback attaches; the stream then starts at full level | Onset fade (§9.5). Re-verified by A0 (README WA09) on a GitHub windows-2025 runner (Server 2025, build 26100, VB-CABLE; 2026-11-03): no onset click. Cases `late-app`, `late-helper` check it on the owner's PC |
+| late-start's stop click (at 6.13–6.14 s in A0's first CI run and at 6.11 s in the Win11 PC's run 1, where game2 stops): Windows' per-app tap ends an app's sound early, on a 10 ms packet boundary, through the app's own 20 ms fade-out, then delivers digital silence; the stream stays running, so no stream fade covers it. Plain endpoint loopback on the PC heard the fade-out whole | Tail fade (§9.5; README §3 item 53). A0's second CI run: late-start passes in the full run and the `-only` re-run, no clicks, one tail fade each, game2 heard to its end. Case `late-app` checks it on the owner's PC |
 | Poll every 500 ms; first sound of a new app lost | Session notifications plus a 1 s poll; new apps heard ≤ 500 ms after their session appears, usually ≈ 100 ms (§7) |
 | Mixer on QPC without drift correction | Adaptive resampling (§9.3) |
 | Endpoint mode didn't follow default-device changes | `IMMNotificationClient`; the endpoint stream reopens on the new default (§7.5) |
 | One capture thread per stream | One MMCSS capture thread multiplexing ≤ 63 stream events (§8.4) |
 | Activation on the poller thread, 5 s timeout | Two activator threads, 3 s timeout, re-validation at commit (§8.1) |
 | `im_audio_*` draft ABI, PCM out | Audio part of ABI v1 (§4); the mixer feeds 04's `PcmSink` (Opus stage), whose packets reach `im_next_packet` through 04's audio ring (04 §6.2, §10.3) |
-| Win10 22H2: not run | **Gate A0** before any M2 audio code merges (§23). If the include set fails on Win10, the plan's gate applies: Win10 gets endpoint loopback only, and the owner is told |
+| Win10 22H2: not run | **Gate A0** before any M2 audio code merges (§23). If the include set fails on Win10, the plan's gate applies: Win10 gets endpoint loopback only, and the owner is told. As run (README WA09, §3 items 51–52): A0 ran on a GitHub windows-2025 runner instead of the owner's PC, and Windows 10 was not run: the owner decided on 2026-11-03 to apply the gate without a Windows 10 run, so builds below 22000 use endpoint loopback with the banner (§6.1, §15) and the Win10 gate is §18.10's reduced form |
 | Mic stickiness 10 s | Life of the app root process (§5.6) |
 | Test tones 1031/453/571/683/907 Hz between musical notes | The plan's 1 kHz game and 440 Hz voice, plus distinct extra tones; background music is caught by a silence pre-check instead (§18.4) |
 
@@ -543,6 +545,12 @@ kind and its targets.
 While the probe runs (≤ 600 ms after start, §11.2), the engine starts as if the probe passed: the include set never
 leaks, and a failed probe switches to `endpoint`.
 
+**Windows 10 takes the plan's gate** (README §3 item 52; the owner's decision of 2026-11-03, with no Windows 10 run of
+A0): on a build below 22000 (`kMinIncludeSetBuild`, `im_caps.os_build`), `IM_AUDIO_MODE_EXCLUDE_APPS` plans
+`endpoint` whatever the probe says, with the banner `exclusion-unavailable` (§14.7, §15). The include set and the fast
+path run on builds 22000 and later only. WA53 builds this with the endpoint engine; a later Windows 10 run of A0 that
+passes can lift the gate by lowering the constant, as an owner's decision.
+
 ### 6.2 Include set (S1 `PlanIncludeSet`, extended)
 
 1. Classify every process in the snapshot, not just the ones with sessions (an excluded process that isn't playing
@@ -865,7 +873,7 @@ As built in WA36 (`native/common/audiomix`, `controller.h`, `mix_engine.h`):
   switch back that are still prerolling). A stream reopened inside the running engine (a device change, §7.5) is not
   marked and fades in on its own.
 
-### 9.5 Onset fade (the S1 click fix)
+### 9.5 Onset and tail fades (the S1 click fixes)
 
 When a stream's input turns non-silent after at least **50 ms** of digital silence (|x| < 1e-6 on both channels), its
 next **5 ms** (240 frames) are ramped in linearly. Windows drops the first milliseconds of an app that starts playing
@@ -879,11 +887,44 @@ the resampler consumed.
 The silence counter of a **new channel**, and of a channel re-entering `Running` from `Preroll`, starts **saturated**
 (≥ 50 ms, as S1's `size_t silent_frames = kOnsetSilenceFrames;`), so its first non-silent sample always ramps. S1's
 diagnosed click was exactly that case: a stream silent for only 30 ms after "running", then the tone at full level; a
-counter starting at 0 would meet the 50 ms rule and still click.
+counter starting at 0 would meet the 50 ms rule and still click. A0's CI runs (README WA09, 2026-11-03) verified it:
+late-start had no onset click.
+
+**Tail fade** (README §3 item 53; the onset fade's mirror image). When an app stops playing, Windows' process-loopback
+tap cuts its audio at a 10 ms packet boundary and then delivers digital silence, so the app's own fade-out arrives only
+in part or not at all, and the stream, still `Running`, passes the step to friends. Evidence: A0's first CI run
+(README WA09, a GitHub windows-2025 runner with VB-CABLE) clicked in `late-start` at 6.13–6.14 s, where game2 stops,
+and the Win11 PC's run 1 at 6.11 s; in the WAVs game2 plays at full level, or partway into its own 20 ms fade-out,
+then drops to exact zero on a 10 ms boundary, while plain endpoint loopback on the PC heard the fade-out whole; the
+spike's own stream fade came 0.1–0.45 s later, on silence. The rule, as the spike's `MixChannel` builds it
+(`spikes/s1-win-audio/native/engine.cpp`, `kOffsetRampFrames`):
+- A **stop** is a first silent frame `t` (|x| < 1e-6 on both channels, the onset fade's test) after a non-silent one,
+  followed by at least **5 ms** (240 frames) of digital silence. A shorter gap is not a stop and changes nothing.
+- The **5 ms** (240 frames) before `t` are ramped out linearly: frame `i` in `[t − 240, t)` is multiplied by
+  `(t − i) / 240`, taking the smaller factor where two ramps overlap. A sound that really ends in a hard cut loses
+  5 ms of level at its very end, which is inaudible.
+- The frames after the ones this tick consumes are **read without consuming them** (S1's `Peek` of the ring): a
+  `Running` stream holds at least 20 ms (the low-water mark, §9.2), so at least 5 ms past the consumed frames are
+  always buffered, and the fade adds **0 ms of latency**. A ramp that straddles two ticks is found in both and applied
+  to each tick's part; it is counted once.
+- Applied where the onset fade is: on the stream's **input, before the resampler** and before the channel gain, for
+  the same reason (after the resampler the cut is a band-limited step that rings on either side of it). A stream that
+  runs dry instead keeps §9.2's low-water fade and §9.4's backstop tail.
+- Counted per channel and in total (`tail_fades`, S1's counter); S1 also logged an event "sound stopped: tail fade"
+  at most once per second per channel, so apps that gate their sound to digital zero often can't push the other
+  events out of the list. In the report (§12.1) these are an additive counter `tailFades` and an event code
+  `tail_fade` (at most one per channel per second); the Go goldens and `AudioCounters` (§12.1, §13.1) take them in the
+  same change as the C++ writer, through the integrator where the mixer's slice doesn't touch them.
+
+A0's second CI run, with the tail fade: `late-start` passed in the full run and in the `-only late-start,
+late-start-endpoint` re-run, with no clicks, one tail fade each, and game2 heard to its end. WA45 builds it into the
+mixer (`native/common/audiomix`, beside the onset fade, which WA36 put there) with unit tests on synthetic input
+(§19.1).
 
 ### 9.6 Mix bus
 
-- Sum of the channels' resampled chunks × their gain (the onset ramp is already in each stream's input, §9.5).
+- Sum of the channels' resampled chunks × their gain (the onset and tail ramps are already in each stream's input,
+  §9.5).
 - Soft clip above −1 dBFS: for |x| > t (t = 0.891), `y = sign(x)·(t + (1 − t)·tanh((|x| − t)/(1 − t)))`; continuous
   slope at t. Replaces S1's hard clamp.
 - **Silence flags** (§4.3): `paused` (`Mixer::SetPaused`, from 04's `im_set_paused`), `muted` (`im_audio_set_muted`,
@@ -1178,7 +1219,7 @@ banner `viewer-muted` explains it.
   ],
   "warnings": [{"code": "multi_process_session", "app": "exe:foo.exe"}],
   "counters": {"streams": 7, "activations": 9, "activationFailures": 0, "underruns": 0, "trims": 0,
-    "overflows": 0, "discontinuities": 0, "mixerResyncs": 0, "fastpathExits": 0,
+    "tailFades": 0, "overflows": 0, "discontinuities": 0, "mixerResyncs": 0, "fastpathExits": 0,
     "fastpathLateCuts": 0, "silentReopens": 0, "deviceChanges": 0, "pidReuseBlocks": 0, "maxResamplePpm": 41,
     "audioCpuMsPerS": 6.2},
   "events": [{"tNs": 81234560000000, "code": "stream_running", "app": "exe:spotify.exe", "detail": ""}]
@@ -1200,12 +1241,13 @@ banner `viewer-muted` explains it.
 | `sessions[].created` | FILETIME as a decimal string (JSON numbers lose precision above 2^53) |
 | `sessions[].stream` | `none`, `activating`, `preroll`, `running`, `fading` |
 | `sessions[].note` | `""`; `covered` (captured by an ancestor's stream, §6.2 step 3); `no_handle` (an include target running without a held process handle, §5.7) |
-| `events[].code` | `session_created`, `session_expired`, `stream_opened`, `stream_running`, `stream_removed`, `stream_failed`, `activation_failed`, `fastpath_enter`, `fastpath_exit`, `fastpath_late_cut`, `default_device_changed`, `device_added`, `device_removed`, `no_device`, `audiosrv_restart`, `probe_ok`, `probe_failed`, `mixer_resync`, `underrun`, `trim`, `silent_reopen`, `rules_changed`, `muted`, `unmuted`, `mode_changed`, `reanchor` |
+| `events[].code` | `session_created`, `session_expired`, `stream_opened`, `stream_running`, `stream_removed`, `stream_failed`, `activation_failed`, `fastpath_enter`, `fastpath_exit`, `fastpath_late_cut`, `default_device_changed`, `device_added`, `device_removed`, `no_device`, `audiosrv_restart`, `probe_ok`, `probe_failed`, `mixer_resync`, `underrun`, `trim`, `tail_fade` (at most one per channel per second, §9.5), `silent_reopen`, `rules_changed`, `muted`, `unmuted`, `mode_changed`, `reanchor` |
 
-`counters` are the mixer's; packets dropped after the mixer are 04's (`im_get_stats` `audio.drops`). Caps: `apps` ≤ 128
-rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary), and the first 128
-top-level `warnings`, so the report stays within §17's 256 KiB (WA36's writer caps `warnings`; WA35's interim writer
-doesn't, see "The writer" below). Rows: apps with a session,
+`counters` are the mixer's; packets dropped after the mixer are 04's (`im_get_stats` `audio.drops`). The tail fade
+(§9.5, README §3 item 53) adds the counter `tailFades` and the event code `tail_fade`, additive like any later field.
+Caps: `apps` ≤ 128 rows, `sessions` ≤ 256, `events` = the last 300, strings ≤ 260 bytes (cut on a UTF-8 boundary),
+and the first 128 top-level `warnings`, so the report stays within §17's 256 KiB (WA36's writer caps `warnings`;
+WA35's interim writer doesn't, see "The writer" below). Rows: apps with a session,
 plus running processes matched by a built-in rule (so "Discord · kept out" shows while Discord is silent), plus the
 shared app. `seq` increases whenever anything except levels, counters, `qpcNs` and `events` changes. Unknown fields are
 ignored by Go (additive changes only).
@@ -1894,7 +1936,7 @@ settings" runs `control.exe mmsys.cpl,,3` (the Communications tab).
 | Process loopback works | include set / exclude-self | everything except kept-out apps and isshoni | none | normal |
 | Probe failed (silent loopback, broken driver or APO, policy) | endpoint | everything on the default output, voice apps and isshoni included | `exclusion-unavailable`, `viewer-muted` | re-probed after a default-device change |
 | Windows older than 19041 | endpoint | as above | `windows-too-old` | defensive only: below 19045 the app doesn't share (04 `IM_OS_SUPPORTED`); tools must not crash |
-| Win10 fails the gate (A0/§18) | endpoint on Win10 by build check (`kMinIncludeSetBuild = 22000`) | as above | `exclusion-unavailable` | only if the gate fails; the plan's fallback |
+| Windows 10 (builds below 22000) | endpoint on Win10 by build check (`kMinIncludeSetBuild = 22000`, §6.1) | as above | `exclusion-unavailable` | the plan's fallback, in force: the owner decided on 2026-11-03 to apply it without a Windows 10 run of A0 (README §3 item 52) |
 | No output device | any | nothing (silent frames) | `no-output-device` | |
 | Device changing (> 1 s) | any | gap, then normal | `reconnecting-sound` | |
 | An app can't be captured | include set | everything else | `capture-trouble` while it plays | row in `notCaptured` |
@@ -2066,7 +2108,7 @@ configuration has the fast path on (§18.10), INFO otherwise. S is the isshoni-s
 | 5 | `fast-path-late-voice` | as 4 (without S); at t = 3 s discord.exe starts and plays 440 at once (its `firstRenderNs` logged, §18.3) | 440 absent over [1.5, end], whose short-window rule covers every 50 ms window from Discord's `firstRenderNs` to the end (the leak this case exists for); 1000 present; `fastpath_exit` ≤ 15 ms after Discord's `session_created`; `fastpathLateCuts` = 0; **session lag** = `session_created` time − `firstRenderNs`, recorded, FAIL above 20 ms (the cut margin of §6.4) | yes (fast path) |
 | 6 | `helper-tree` | discord.exe (spawn) → voicehelper.exe (spawn) → audiohelper.exe plays 440 (a grandchild whose own name matches no rule: the ancestor walk must catch it); ms-teams.exe (spawn) → WebView2Runtime\msedgewebview2.exe plays 571 (another folder: the shared-runtime rule must catch it); game 1000 | 440, 571 absent; 1000 present | yes |
 | 7 | `late-helper` | discord.exe from the start (`spawn -at 4`, i.e. t = 3 s after the 1 s settle) → audiohelper.exe playing 440 at once (`firstRenderNs` logged) | 440 absent over [1.5, end], short windows included (in particular from the helper's `firstRenderNs`: the include set must never have captured it); 1000 present; no clicks | yes |
-| 8 | `late-app` | discord.exe idle (forces the include set); at t = 3 s game2 starts playing 683 for 3 s | 683 present in [3.5, 5.8]; measured onset (§18.6) ≤ 500 ms after its `session_created` (value recorded); no clicks in [1.5, end] (verifies the onset fade) | yes |
+| 8 | `late-app` | discord.exe idle (forces the include set); at t = 3 s game2 starts playing 683 for 3 s | 683 present in [3.5, 5.8]; measured onset (§18.6) ≤ 500 ms after its `session_created` (value recorded); no clicks in [1.5, end] (verifies the onset fade at game2's start and the tail fade at its stop, §9.5) | yes |
 | 9 | `steam-game` | mic flag on; `Steam\steam.exe` (`spawn -mic`) → `steamapps\common\TestGame\game.exe` 1000 (a subfolder of Steam's: only the launcher stop separates them) | 1000 present; Steam row `kept_out`/`mic`; game row heard | yes (mic) |
 | 10 | `isshoni-self` | harness plays 797 itself; harness's child `SelfWebView\msedgewebview2.exe` → its child `msedgewebview2.exe` plays S (1700); game 1000 | 797, S absent; 1000 present; rows `isshoni` | yes |
 | 11 | `viewer-browser` | `Service.SetViewerBrowser("c_test1", "edge", "windows", true)` as 03 calls it; `Microsoft\Edge\Application\msedge.exe` (spawn) → msedge.exe (`spawn -tone 440`, the "isshoni tab") → msedge.exe playing 797 ("other tab"); game 1000 | 440 and 797 absent (whole browser out, reason `viewer`); 1000 present | yes |
@@ -2221,8 +2263,14 @@ The total leaves INFO cases out, and ` · N INFO` follows when there are any (WA
 | CI windows-2025 (GitHub-hosted) | MSVC build of the DLL (`win-x64-ci`); all native unit tests incl. Windows-only ones that need no endpoint (process table against spawned children, report writer); `isshoni-audiotest selfcheck` | required check |
 | CI windows, experimental job | tries `Start-Service audiosrv` and `isshoni-audiotest run -gate`; expected result on hosted runners: exit 3 (no render endpoint) | never required |
 | Owner's PC, Win11 (≥ 24H2; now 25H2) | `isshoni-audiotest run -gate` + manual R1–R5 | **M2 gate**, every release |
-| Owner's PC, Win10 22H2 (dual boot) | the same | **M2 gate**, minor releases |
+| Owner's PC, Win10 22H2 (dual boot) | the same, judged in §18.10's reduced form (README §3 item 52) | **M2 gate**, minor releases |
 | Optional self-hosted runner on the owner's PC | the same, triggered by `workflow_dispatch` | see below |
+
+A0 (README WA09) ran S1's self-test on a GitHub windows-2025 runner with a virtual cable
+(`.github/workflows/s1-audio.yml`: VB-CABLE Driver Pack 45, donationware, downloaded at run time from the vendor with a
+pinned SHA-256, never committed or shipped; README §3 item 51). Process loopback worked there, but plain endpoint
+loopback of the cable gave only zeros, so case 1 (`baseline-endpoint`) would fail there, which makes every later case
+INCONCLUSIVE: the gate stays on the owner's PC.
 
 Exact manual run (≈ 10 minutes per OS):
 1. Download the `isshoni-exit-tools` artifact of the release candidate's `release.yml` run (06 §11.1; for a commit
@@ -2280,10 +2328,14 @@ that release), they still run, with the fast path forced on, as INFO and never c
 
 If the Win10 include set fails (A0 or the gate), the plan's gate applies: Win10 builds below 22000 use endpoint
 loopback with the banner, and the Win10 gate becomes "cases 1 and 19 pass and the banner shows", once the owner has been
-told.
+told. **This applies now** (README §3 item 52): A0 ran on a CI runner and Windows 10 was not tested, and the owner
+decided on 2026-11-03 to take the gate. So on Win10 22H2, items 1 and 2 above become "cases 1 and 19 pass and the
+banner shows": the checks that need exclusion (the include-set and fast-path cases, R1, R2, R4 and R5's "Discord
+stays absent") don't apply to the endpoint engine. R2's "at least one" is then Win11, and R3 runs on Win11 only.
+Items 3 and 4 stand on both.
 
 **Release tiers** (plan "Verification"; 06 runs the checklist): every release: `run -gate` and R1 on Win11, report
-attached to the GitHub Release as `audiotest-win11.json`. Minor releases: the full gate on Win11 and Win10, R1–R6
+attached to the GitHub Release as `audiotest-win11.json`. Minor releases: the full gate on Win11 and, in the reduced form above, on Win10, R1–R6
 (R7 for an app whose row changed), `soak`, both reports attached.
 
 ## 19. Test plan
@@ -2311,7 +2363,11 @@ Native tests use GoogleTest through 04's vcpkg `tests` feature and run with `tas
 - **`audiomix`**: ring wraparound and QPC side ring; preroll/low/high water; fade lengths; tail ramp; onset fade (ramp
   after exactly 50 ms of silence, not after 49 ms; **a new stream with 30 ms of zeros, then a −6 dBFS tone, is
   ramped** because its counter starts saturated, and the click detector finds nothing; the same after a
-  `Preroll` → `Running` re-entry); a stream leaving the silent bypass gets `speex_resampler_reset_mem` (a stream fed
+  `Preroll` → `Running` re-entry); tail fade (§9.5, WA45, on synthetic input: a −6 dBFS tone cut to exact zero on a
+  10 ms boundary gives no sample step above S1's click threshold, nor does a tone that ends inside a chunk or a ramp
+  that straddles two ticks, which counts once; a gap of digital silence shorter than 5 ms and a stream that stays
+  loud are left unchanged, sample for sample; no added latency: the output's frames are the input's, at the same
+  positions); a stream leaving the silent bypass gets `speex_resampler_reset_mem` (a stream fed
   a tone, then 200 ms of zeros, then the tone again shows no pre-silence samples at the onset); soft clip continuity;
   crossfade; PI controller in simulation (drift −500…+500 ppm, 10 ms bursts with ±3 ms jitter, 2 simulated hours:
   fill 40 ± 15 ms after 60 s, zero underruns/trims, ratio std dev ≤ 30 ppm; the 2-hour runs are
@@ -2573,27 +2629,28 @@ Each slice is independently testable. "Mac" means `task test` on the developer's
 
 | # | Slice | Scope | Acceptance | Verified | Needs | Days |
 |---|---|---|---|---|---|---|
-| A0 | Win10 gate and onset-fade re-run (owner action) | Run the existing S1 bundle: `s1.exe selftest` on Win10 22H2; `s1.exe selftest -only late-start,late-start-endpoint` on Win11 | Results recorded in `spikes/s1-win-audio/README.md`. Pass: include-set scenarios pass on Win10 and late-start has no click on Win11. A Win10 failure triggers the plan's gate (endpoint-only on Win10, owner told) before A6 merges | PC | — | 0.5 |
+| A0 | Win10 gate and onset-fade re-run (owner action) | Run the existing S1 bundle: `s1.exe selftest` on Win10 22H2; `s1.exe selftest -only late-start,late-start-endpoint` on Win11 | Results recorded in `spikes/s1-win-audio/README.md`. Pass: include-set scenarios pass on Win10 and late-start has no click on Win11. A Win10 failure triggers the plan's gate (endpoint-only on Win10, owner told) before A6 merges. As run (README WA09, PR #48, 2026-11-03; README §3 items 51–53): on a GitHub windows-2025 runner (Server 2025, build 26100) with VB-CABLE instead of the owner's PC, by the owner's decision: the full `selftest` and the `-only` re-run, twice. The include-set scenarios pass (excluded tones at −133 to −145 dB); the onset fade holds; the first run found the stop click and the tail fade fixed it (late-start passes in both runs of the second); `endpoint-baseline` fails there because the cable's plain loopback is silent. Windows 10 was not run, and the owner took the gate | CI windows (PC replaced) | — | 0.5 |
 | A1 | `audiorules` | Go data of §5.4 + tests | lower case, unique, families complete; `go test` green | Mac, CI | — | 0.5 |
 | A2 | Go audio types and fake | `internal/media/audio.go` (§13.1), goldens, `fake/audio_ctl.go` (`EngineConfig.AudioScenario`, the scenarios of §13.3, the call-log fields) | goldens parse; fake scenarios scripted under synctest; the fake's `AudioController` works before `Start`; `GOOS=windows/darwin/linux` and the gomobile package builds pass | Mac, CI | 01's C01 (media package) | 1.5 |
 | A3 | `audiopolicy` core | portable C++20 of §5–6 as CMake target `im_audiopolicy` in `native/common/audiopolicy/` (added by 04's `native/common/CMakeLists.txt`): snapshot, rules, classifier, lineage, mic state, planner, invariants, the WebView2 path rule | ≈ 60 GoogleTest table cases and the 10 000-seed property test pass under `task native:test` in `host-debug` and `host-tsan` (macOS clang, ubuntu-24.04) and `win-x64-ci` (windows-2025, MSVC) | Mac, CI | 04's E1 | 3 |
 | A4 | `audiomix` core | target `im_audiomix` in `native/common/audiomix/`: rings with QPC side ring, PI resampler (speexdsp from `native/vcpkg.json`, `init_frac` creation, the 62 500 denominator, \|ppm\| ≥ 16, `reset_mem` on leaving the bypass), silence drop/pad, channel states, fades, onset fade (saturated counter for new channels), soft clip, levels, silence flags, chunk timestamps (mix time, L0 = 50 ms, re-anchor only in silence) and the `OnGap` rules (§10.3, §10.4); report writer producing the goldens | §19.1 `audiomix` and report-writer tests pass, including the 30 ms-silence onset, ppm never 0, no mixer-thread allocation (Linux `host-debug`) and sound from t = 0; the drift simulation meets §17 | Mac, CI | A2 (goldens), 04's E1 | 3 |
 | A5 | Windows watcher (no capture) | process table, endpoints, session notifications, meters, mic detection, device notifications, `AudioEngine::Init/Shutdown/Watch/Unwatch/SetRules/ListAppsJson/LevelsGet/ProbeFlags`, `im_caps.audio_flags`; Go `internal/media/native` (`audio.go`; an `audio_windows.go` only if WA35 needs Windows-only helpers, §13.2) | caller-fake tests on the Mac and CI ubuntu; hosted CI windows: process-table tests, 100 start/stop cycles without leaks, `no-device` state, `IM_INIT_NO_AUDIO` returns. PC (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR): `isshoni-audiotest apps` lists playing apps with correct verdicts for Discord, a browser and a Steam game | Mac, CI, PC | A3, 04's E2 (DLL skeleton and loader) | 2.5 |
-| A6 | Windows capture and mixer | activators, held handles (and the no-handle path, §5.7), commit check, loopback streams, capture thread, include set (`pid_reuse` verdicts, `covered` notes), fast path with retroactive cut, endpoint engine, probe, mode/mute/pause flags, sound check, health checks, `Mixer` of §10.5 calling 04's `PcmSink` (packets reach `im_next_packet` through 04's bridge), test exports (`im_test_render_bursts` predicting from `IAudioClock`, §13.2), `AudioTestHooks` | hosted CI builds and `selfcheck` passes. PC: cases 1–4, 10, 15, 19–21 pass (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR), and 04's E13 acceptance: `enginetest capture -audio mix` gives a playable `audio.ogg` | CI windows, PC | A0, A4, A5, 04's E13 | 4 |
+| A6 | Windows capture and mixer | activators, held handles (and the no-handle path, §5.7), commit check, loopback streams, capture thread, include set (`pid_reuse` verdicts, `covered` notes), fast path with retroactive cut, endpoint engine, probe, mode/mute/pause flags, sound check, health checks, `Mixer` of §10.5 calling 04's `PcmSink` (packets reach `im_next_packet` through 04's bridge), test exports (`im_test_render_bursts` predicting from `IAudioClock`, §13.2), `AudioTestHooks` | hosted CI builds and `selfcheck` passes. PC: cases 1–4, 10, 15, 19–21 pass (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR), and 04's E13 acceptance: `enginetest capture -audio mix` gives a playable `audio.ogg`. As run (README WA45, group 10): the mixer also applies the tail fade beside the onset fade (§9.5, README §3 item 53), in `native/common/audiomix`, with §19.1's unit tests on synthetic input on the Mac and in CI; builds below 22000 plan `endpoint` (§6.1) with WA53's endpoint engine | CI windows, PC | A0, A4, A5, 04's E13 | 4 |
 | A7 | Audiotest harness | §18 complete: analyzer (S1's as base, plus the 50 ms short-window rule and measured cut/onset of §18.6), runner, the `SetExclusions` recorder, fixtures (`firstRenderNs`, `reuse-pid`), all cases (24–27 included), gate configuration, report, redaction, summary, `record`, `merge`, README with the "unverified" column for R7 | Mac: analyzer and verdict tests, including the 20 ms burst that must FAIL absent and a faded 1000 Hz tone, with its onsets and cuts, that must not trip a short-window check at the isshoni-self tone S, 1700 Hz (§18.3, §19.1, README §3 item 40). PC: all required cases run; any failure is a real engine bug, fixed in A6's code by a `WF` fix slice that lists `native/windows/src/audio/`, never in a harness PR (README §3 item 13; a case 25 or 26 failure switches on its fallback, §6.2, §6.4). As built (WA62a): cases 20, 21 and 27 drive real capture that no Mac run has exercised, so a first failure in one of them is judged (harness or engine) before a `WF` slice is opened (README WA62a's row); the same holds for WA62b's endpoint reads, cases 13, 14 and 22 and the soak (README WA62b's row) | Mac, CI, PC | A6 (runs), A2, A8 (the harness drives the service) | 3 |
 | A8 | Desktop policy service | `internal/desktop/audio`: settings, rules builder, prompts, viewer browser (connIDs, override), banners/tips (`ducking_windows.go`/`ducking_other.go`), `FriendsHear` (with `alert`), `AppRules`, errors, `AudioConfig`, `SetSharedPID`, `SetShareSound`, `SetPaused`, `WatchLevels` polling, events (`audio.alert` included), `RunSoundCheckHelper` (`helper_windows.go`/`helper_other.go`) | §19.1 Go tests and the lifecycle integration test with the fake pass with goleak, on the Mac and CI ubuntu, macos, windows | Mac, CI | A1, A2 | 2.5 |
 | A9 | App integration (audio part) | with 03: `bridge.Audio` wrapping and events, the `--sound-check-helper` dispatch, viewer mute in endpoint mode, `SetViewerBrowser` from `EventPlaybackState`, `SetSharedPID` after the pick, `OnShare*`/`SetPaused`/`SetShareSound` from the share controller, `core.Options.AudioConfig`. As built: `OnShare*`/`SetPaused`/`SetShareSound` come from 03's share controller since README WA58 (through `share.AudioPolicy`, and `AudioConfig` through C2, both found on `app.Deps.Audio`, 03 §6.1, §10.1); `SetSharedPID` and passing the service to the app are WA77's | Mac: share sheet driven by every fake scenario (`ISSHONI_FAKE_AUDIO`). PC: share with Discord in a call shows Discord kept out; Share sound off, pause, resume stays silent; R4 passes | Mac, PC | A8, 03's shell, 04's picker | 1.5 |
 | A10 | Gate | §18.10 on Win11 and Win10, R1–R5, R7 (Win11), `soak`, `enginetest avsync` (§19.3, 04's tool); results committed | `run -gate` exit 0 on both in the gate configuration; manual checks pass; avsync \|median\| ≤ 20 ms on both; reports in `cmd/isshoni-audiotest/results/` | PC | A7, A9, 04's `avsync`, release candidate (06) | 1 |
 
 A1–A4 touch disjoint paths and can be built in parallel; A8 can run beside A5–A6. Critical path: A3 → A5 → A6 → A7
-→ A10 (A0 must be done before A6 merges). About 23 working days of the milestone's ≈ 50.
+→ A10 (A0 must be done before A6 merges; it was, on 2026-11-03, README WA09). About 23 working days of the
+milestone's ≈ 50.
 
 ## 24. Risks
 
 | Risk | Mitigation |
 |---|---|
-| The include set fails on Win10 22H2 (never run there) | A0 first; the plan's gate (endpoint-only on Win10 with the banner); the probe also catches silent loopback per machine |
-| The onset fade doesn't remove the stream-attach click on real hardware | Cases `late-app`, `late-helper` with click checks; the fade length (5 ms) and silence threshold (50 ms) are constants to tune in A6 |
+| The include set fails on Win10 22H2 (never run there) | A0 first; the plan's gate (endpoint-only on Win10 with the banner); the probe also catches silent loopback per machine. As run: Win10 stayed untested and the gate applies (README §3 item 52), so Win10 users get endpoint loopback with the banner |
+| The onset fade doesn't remove the stream-attach click on real hardware | Cases `late-app`, `late-helper` with click checks; the fade length (5 ms) and silence threshold (50 ms) are constants to tune in A6. A0's CI runs verified the onset fade and added the tail fade for the stop click (§9.5) on Server 2025 with a virtual cable; `late-app` on the owner's PC is the first check on Win11 client hardware |
 | The fast path leaks the first milliseconds of a voice app that starts mid-share | Retroactive cut at C − 20 ms; case 5 with the 50 ms short-window rule from the fixture's own first-render time (a few milliseconds of leak fail), the measured session-notification lag (FAIL above the 20 ms cut margin) and `fastpathLateCuts = 0`; case 26 for late isshoni children; `audio.fastPath` kill switch, with the gate following the shipped default (§18.10). Deferring the fast path altogether is the owner's call (§25 question 4) |
 | Windows fixes an INCLUDE stream's tree when the stream is activated, so a later child of a heard app is silently lost | Required case 25 (`late-child-heard`); if it fails, §6.2 step 3's fallback gives later children their own stream |
 | A dead parent's PID is reused inside a heard app's tree (Discord's `Update.exe` exits at once), blocking the main content through a loose link | Reason `pid_reuse` with its own text and counter instead of a false "Started Discord"; INFO case 27 measures whether Windows follows reused PIDs, and §5.2 drops the loose union if it doesn't |

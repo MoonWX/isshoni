@@ -162,6 +162,7 @@ jobs:
             # windows-native run on it; windows-desktop joins when it lands (README WA72).
             desktop:
               - 'cmd/isshoni-desktop/**'
+              - 'cmd/isshoni-enginetest/**'
               - 'internal/client/**'
               - 'internal/media/**'
               - 'internal/update/**'
@@ -1707,8 +1708,8 @@ jobs:
     # imports, VERSIONINFO); the WebView2 bootstrapper's signature; and the Go tests that need
     # the engine DLL (ISSHONI_TEST_ENGINE_DLL), here until windows-desktop takes them over
     # (README WA72). FFmpeg (README WA24, 06 §4.1, §5.1): the job fails first when
-    # native/ffmpeg/lock.json is stale (a pins.json, build.sh or ffcheck.c change without a new
-    # publish), then fetches the locked zip from its deps release (SHA-256 against the lock,
+    # native/ffmpeg/lock.json is stale (a pins.json, build.sh, ffcheck.c or patches/ change
+    # without a new publish), then fetches the locked zip from its deps release (SHA-256 against the lock,
     # unpacked and checked by tools/desktoppkg ffmpeg-fetch) as both presets' IM_FFMPEG_ROOT, and
     # dll-check -ffmpeg checks its DLLs against the lock's names and SHA-256s. Uploads
     # windows-native, kept 1 day: release\ (the shipped DLL and PDB, the FFmpeg DLLs and PDBs
@@ -1761,8 +1762,8 @@ jobs:
           version: ${{ needs.changes.outputs.task-version }}
 
       - name: The FFmpeg lock is current
-        # M2 06 §4.1: inputsSha256 over pins.json, build.sh and ffcheck.c must equal lock.json's,
-        # so a pin or build change can't merge without its published build.
+        # M2 06 §4.1: inputsSha256 over pins.json, build.sh, ffcheck.c and the libvpl patches must
+        # equal lock.json's, so a pin or build change can't merge without its published build.
         run: |
           go -C tools run ./desktoppkg ffmpeg-inputs -check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1844,6 +1845,10 @@ jobs:
           CTEST: ${{ steps.tools.outputs.ctest }}
           NINJA: ${{ steps.tools.outputs.ninja }}
           FFMPEG_ROOT: ${{ steps.ffmpeg.outputs.root }}
+          # README WA44: ffmpeg_load_test and mf_sw_test load the locked FFmpeg DLLs from here
+          # (im_init_params.ffmpeg_dir); in CI they fail rather than skip without it. The test
+          # executables' own folder holds no FFmpeg, so every other test runs as without it.
+          ISSHONI_TEST_FFMPEG_DIR: ${{ steps.ffmpeg.outputs.bin }}
         run: |
           & $env:CMAKE --preset win-x64-ci "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_FFMPEG_ROOT=$env:FFMPEG_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -2055,16 +2060,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
 
-      - name: go test -race ./internal/media/... with the engine DLL (win-x64-ci)
+      - name: go test -race ./internal/media/... ./cmd/isshoni-enginetest/... with the engine DLL (win-x64-ci)
         # The DLL-dependent Go tests (04 §18.2); they skip without ISSHONI_TEST_ENGINE_DLL, so they
         # run here and nowhere else until windows-desktop exists (README WA72). They use the
         # artifact's ci\ folder (06 §5.1): the win-x64-ci DLL with the lock-checked FFmpeg DLLs
-        # next to it, since the engine loads them from its own folder (04 §9.2).
+        # next to it, since the engine loads them from its own folder (04 §9.2). README WA44 adds
+        # isshoni-enginetest: its startup's process default (04 §13.3 layer 2, with the marker DLL
+        # built by this job's gcc) and its probe against that DLL.
         env:
           CGO_ENABLED: '1'
           ISSHONI_TEST_ENGINE_DLL: ${{ runner.temp }}\windows-native\ci\isshoni-media.dll
         run: |
-          go test -race -count=1 -timeout 10m ./internal/media/...
+          go test -race -count=1 -timeout 10m ./internal/media/... ./cmd/isshoni-enginetest/...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: task native:dist (isshoni-native-tools)

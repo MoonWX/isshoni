@@ -1883,7 +1883,9 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
   `desktop` connection that is online, or `GET /api/v1/me/devices` lists a device with `clientKind: desktop` and the
   same `os` as this browser's `client.os`. It opens `appLinkFor(serverOrigin, roomId)` (02's
   `web/src/lib/appLink.ts`, which builds `isshoni://<host>/r/<roomId>`) through `platform.openExternal`; 3 s later a
-  quiet line says "Nothing happened? [Get the desktop app]". The app then joins the room and sends `playback.stop`
+  quiet line says "Nothing happened? [Get the desktop app]". When `appLinkFor` returns `""` (an `http://` server, or
+  one of the rare host names its stricter rules refuse although Go's `Parse` would take them, 02 §10.2's as-built note
+  from WA74), there is no link and the line isn't shown (WA83). The app then joins the room and sends `playback.stop`
   (§12.2).
 
 ---

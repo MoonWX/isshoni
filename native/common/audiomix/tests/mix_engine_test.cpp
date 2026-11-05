@@ -407,6 +407,153 @@ TEST(MixEngine, ReentryFromPrerollRampsTheOnsetToo) {
   EXPECT_TRUE(ClickFrames(r.sink.audio).empty());
 }
 
+// ------------------------------------------------------------------------------------------------- tail fade
+
+// The last output frame that isn't digital silence at or after frame `from`, and before frame `to`.
+std::size_t LastSound(const Rig &r, std::size_t from, std::size_t to) {
+  std::size_t last = 0;
+  for (std::size_t f = from; f < to && 2 * f + 1 < r.sink.audio.size(); ++f) {
+    if (!IsSilentFrame(r.sink.audio[2 * f], r.sink.audio[2 * f + 1])) {
+      last = f;
+    }
+  }
+  return last;
+}
+
+// README WA09: Windows' per-app tap cuts an app's tail on a 10 ms packet boundary and then delivers digital silence.
+// A -6 dBFS tone cut to exact zero there, at several phases, clicks raw; through the mixer (real speexdsp) S1's
+// detector finds no step above its threshold, and each stop is one tail fade.
+TEST(MixEngine, ATailCutToZeroOnATenMsBoundaryIsFadedWithoutAClick) {
+  int raw_clicks = 0;
+  for (const uint64_t cut : {48000ull + 4800 + 480 * 3, 48000ull + 4800 + 480 * 7, 48000ull + 4800 + 480 * 12}) {
+    for (const uint32_t hz : {997u, 440u, 1700u}) {
+      Rig r(true);
+      test::Segments sig;
+      sig.Add(0, cut, hz, 0.5f);
+      std::vector<float> raw(2 * 960);
+      sig.Fill(cut - 480, 960, raw.data());
+      bool step = false; // the raw cut is a click unless it falls on a zero crossing
+      for (const uint64_t c : ClickFrames(raw)) {
+        step = step || (c >= 470 && c <= 490);
+      }
+      raw_clicks += step;
+      Channel *ch = r.Add(&sig, Plain(), /*speex=*/true);
+      r.Begin(0);
+      r.RunTo(2000 * kMs);
+      ASSERT_EQ(ch->state(), StreamState::kRunning);
+      const std::vector<float> out = AudioFrom(r, 20); // past the fade-in
+      EXPECT_TRUE(ClickFrames(out).empty()) << hz << " Hz, cut at " << cut << (step ? " (raw clicks)" : "");
+      EXPECT_EQ(ch->tail_fades(), 1u) << hz << " Hz, cut at " << cut;
+      EXPECT_EQ(r.engine.counters().tail_fades, 1u);
+      auto ev = Events(r.engine);
+      EXPECT_EQ(CountEvents(ev, MixEventCode::kTailFade), 1);
+      // The tone is still at its level up to 10 ms before the stop.
+      const std::size_t last = LastSound(r, 20 * kChunkFrames, r.sink.audio.size() / 2);
+      ASSERT_GT(last, 20 * kChunkFrames + 960u);
+      EXPECT_NEAR(ToneDb(r.sink.audio, last - 960, 480, hz), -6.02, 0.5) << hz << " Hz, cut at " << cut;
+    }
+  }
+  EXPECT_GE(raw_clicks, 6); // most of these cuts click without the fade
+}
+
+// A sound that ends inside a chunk (not on a packet boundary): its last 5 ms are ramped linearly to exactly zero, the
+// frames before them untouched (the model resampler: the output is the input).
+TEST(MixEngine, ATailEndingInsideAChunkIsRampedOverItsLastFiveMs) {
+  for (const uint64_t cut : {48000ull + 237, 48000ull + 479, 48000ull + 481, 48000ull + 200}) {
+    Rig r;
+    r.controller = Frozen();
+    test::Segments sig;
+    sig.Add(0, cut, 0, 0.5f);
+    Channel *ch = r.Add(&sig, Plain());
+    r.Begin(0);
+    r.RunTo(2000 * kMs);
+    const std::size_t last = LastSound(r, 0, r.sink.audio.size() / 2);
+    ASSERT_GT(last, 1000u);
+    for (uint32_t k = 0; k < kOffsetRampFrames; ++k) {
+      const float want = 0.5f * static_cast<float>(k + 1) / static_cast<float>(kOffsetRampFrames);
+      ASSERT_NEAR(r.sink.audio[2 * (last - k)], want, 1e-6f) << "cut " << cut << ", frame -" << k;
+      ASSERT_EQ(r.sink.audio[2 * (last - k) + 1], r.sink.audio[2 * (last - k)]);
+    }
+    for (std::size_t f = 20 * kChunkFrames; f <= last - kOffsetRampFrames; ++f) {
+      ASSERT_EQ(r.sink.audio[2 * f], 0.5f) << "cut " << cut << ", frame " << f;
+    }
+    for (std::size_t f = last + 1; f < r.sink.audio.size() / 2; ++f) {
+      ASSERT_EQ(r.sink.audio[2 * f], 0.0f);
+    }
+    EXPECT_EQ(ch->tail_fades(), 1u);
+    EXPECT_EQ(ch->state(), StreamState::kRunning); // the stream itself goes on (silent)
+  }
+}
+
+// A stream that stays loud is never touched: a continuous tone, and one with gaps of digital silence shorter than 5 ms
+// (not a stop), come out exactly as they went in, with no tail fade counted.
+TEST(MixEngine, AStreamThatStaysLoudIsUnchanged) {
+  for (const bool gaps : {false, true}) {
+    Rig r;
+    r.controller = Frozen();
+    test::Segments sig;
+    if (gaps) {
+      // 0.5 with gaps of 1, 100 and 239 frames (the longest just short of 5 ms).
+      sig.Add(0, 30000, 0, 0.5f);
+      sig.Add(30001, 40000, 0, 0.5f);
+      sig.Add(40100, 50000, 0, 0.5f);
+      sig.Add(50239, 10'000'000, 0, 0.5f);
+    } else {
+      sig.Add(0, 10'000'000, 0, 0.5f);
+    }
+    Channel *ch = r.Add(&sig, Plain());
+    r.Begin(0);
+    r.RunTo(2000 * kMs);
+    ASSERT_EQ(ch->state(), StreamState::kRunning);
+    EXPECT_EQ(ch->tail_fades(), 0u);
+    EXPECT_EQ(r.engine.counters().tail_fades, 0u);
+    EXPECT_EQ(CountEvents(Events(r.engine), MixEventCode::kTailFade), 0);
+    std::size_t zeros = 0;
+    for (std::size_t f = 20 * kChunkFrames; f < r.sink.audio.size() / 2; ++f) {
+      const float v = r.sink.audio[2 * f];
+      ASSERT_TRUE(v == 0.5f || v == 0.0f) << (gaps ? "gaps" : "continuous") << ", frame " << f << ": " << v;
+      zeros += v == 0.0f;
+    }
+    EXPECT_EQ(zeros, gaps ? 1u + 100u + 239u : 0u);
+  }
+  // The same with real speexdsp on a tone: no tail fade, no click.
+  Rig r(true);
+  test::Tone tone(1000, 0.5f);
+  Channel *ch = r.Add(&tone, Plain(), /*speex=*/true);
+  r.Begin(0);
+  r.RunTo(2000 * kMs);
+  EXPECT_EQ(ch->tail_fades(), 0u);
+  EXPECT_TRUE(ClickFrames(AudioFrom(r, 20)).empty());
+}
+
+// Every stop counts; the event comes at most once per second per channel.
+TEST(MixEngine, TailFadeEventsAtMostOncePerSecondPerChannel) {
+  Rig r;
+  r.controller = Frozen();
+  test::Segments sig;
+  // Bursts of 0.5 for 100 ms every 300 ms from 0.5 s: stops at 0.6, 0.9, 1.2, 1.5, 1.8 s, then one at 3.1 s.
+  for (uint64_t k = 0; k < 5; ++k) {
+    sig.Add(24000 + k * 14400, 24000 + k * 14400 + 4800, 0, 0.5f);
+  }
+  sig.Add(144000, 148800, 0, 0.5f);
+  Channel *ch = r.Add(&sig, Plain());
+  r.Begin(0);
+  r.RunTo(4000 * kMs);
+  EXPECT_EQ(ch->tail_fades(), 6u);
+  EXPECT_EQ(r.engine.counters().tail_fades, 6u);
+  const auto ev = Events(r.engine);
+  std::vector<int64_t> at;
+  for (const auto &e : ev) {
+    if (e.code == MixEventCode::kTailFade) {
+      EXPECT_EQ(e.tag, ch->tag());
+      at.push_back(e.t_ns);
+    }
+  }
+  ASSERT_EQ(at.size(), 3u); // 0.6 s, then 1.8 s (the first stop a second later), then 3.1 s
+  EXPECT_GE(at[1] - at[0], kNsPerSecond);
+  EXPECT_GE(at[2] - at[1], kNsPerSecond);
+}
+
 // ----------------------------------------------------------------------------------------------- silent bypass
 
 // 100 ms of digital silence: the stream skips the resampler; when sound comes back the filter starts clean, so
@@ -1021,6 +1168,7 @@ TEST(MixEngine, EventNamesAreTheReportsCodes) {
   EXPECT_STREQ(MixEventName(MixEventCode::kMixerResync), "mixer_resync");
   EXPECT_STREQ(MixEventName(MixEventCode::kReanchor), "reanchor");
   EXPECT_STREQ(MixEventName(MixEventCode::kFastpathLateCut), "fastpath_late_cut");
+  EXPECT_STREQ(MixEventName(MixEventCode::kTailFade), "tail_fade"); // logged, not a report event (05 §12.1)
 }
 
 TEST(MixEngine, AFullEventQueueDropsAndCounts) {

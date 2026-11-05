@@ -38,6 +38,28 @@ constexpr uint32_t ApplyLiveBitrateCheck(uint32_t flags, bool idr_after_change) 
   return idr_after_change ? (flags & ~IM_ENCF_LIVE_BITRATE) : flags;
 }
 
+// §9.10's test encode for a kind: the IDR, then at most max_delay_frames more frames until the first AU comes out.
+// Every kind gets the same frame budget. Two things differ for MF software only, because of how libavcodec's h264_mf
+// drives Microsoft's synchronous H.264 MFT: it calls IMFTransform::ProcessOutput once per avcodec_send_frame, right
+// after ProcessInput, and an avcodec_receive_packet with no new frame returns EAGAIN without asking the MFT, so a
+// frame the MFT is still encoding on its own worker threads (Microsoft's "slice encoding" mode, its default) shows up
+// only at a later send. paced: the frames after the IDR go in one frame interval apart, as a session sends them, not
+// back to back. drain: diagnosis only. When the budget gives no AU, an end of stream (MFT_MESSAGE_COMMAND_DRAIN) shows
+// in the log what the MFT still held from those frames (no extra frame is sent), and the probe fails all the same: a
+// session never drains, so an encoder whose first AU comes out only that way would hold back more frames than the
+// budget allows.
+struct TestEncodePlan {
+  int max_delay_frames = 3; // some MF and QSV configurations hold one
+  bool paced = false;
+  bool drain = false;
+};
+constexpr TestEncodePlan TestEncodePlanFor(uint32_t kind) noexcept {
+  if (kind == IM_ENC_MF_SW) {
+    return TestEncodePlan{3, true, true};
+  }
+  return TestEncodePlan{};
+}
+
 // How a bitrate change reaches an encoder with these probe flags (§9.5).
 enum class BitrateMode : uint8_t {
   kLive,   // set before the next frame, no IDR

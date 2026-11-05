@@ -78,6 +78,7 @@ im_audio_levels MakeLevels(uint32_t report_seq, int64_t qpc_ns, float mix_peak_d
     float peak_db;
     int64_t last;
     bool captured;
+    float rms_db;
   };
   std::vector<Merged> merged;
   merged.reserve(apps.size());
@@ -87,11 +88,15 @@ im_audio_levels MakeLevels(uint32_t report_seq, int64_t qpc_ns, float mix_peak_d
     }
     auto it = std::find_if(merged.begin(), merged.end(), [&](const Merged &m) { return m.id == a.app_id; });
     if (it == merged.end()) {
-      merged.push_back(Merged{a.app_id, a.peak_db, a.last_active_ns, a.captured});
-    } else {
+      merged.push_back(Merged{a.app_id, a.peak_db, a.last_active_ns, a.captured, a.rms_db});
+    } else if (a.captured && !it->captured) {
+      *it = Merged{a.app_id, a.peak_db, std::max(it->last, a.last_active_ns), true, a.rms_db};
+    } else if (a.captured == it->captured) {
       it->peak_db = std::max(it->peak_db, a.peak_db);
+      it->rms_db = std::max(it->rms_db, a.rms_db);
       it->last = std::max(it->last, a.last_active_ns);
-      it->captured = it->captured || a.captured;
+    } else {
+      it->last = std::max(it->last, a.last_active_ns); // an activity entry beside the captured one
     }
   }
   std::stable_sort(merged.begin(), merged.end(), [](const Merged &a, const Merged &b) { return a.last > b.last; });
@@ -100,7 +105,7 @@ im_audio_levels MakeLevels(uint32_t report_seq, int64_t qpc_ns, float mix_peak_d
     im_audio_level &l = out.apps[i];
     abi::CopyFixed(l.app_id, sizeof l.app_id, merged[i].id);
     l.peak_db = std::max(merged[i].peak_db, kSilenceDb);
-    l.rms_db = l.peak_db; // activity: = peak_db (05 §4.1); captured RMS comes with the mixer (README WA45)
+    l.rms_db = merged[i].captured ? std::max(merged[i].rms_db, kSilenceDb) : l.peak_db; // activity: = peak (05 §4.1)
     l.source = merged[i].captured ? 0u : 1u;
   }
   out.count = static_cast<uint32_t>(n);

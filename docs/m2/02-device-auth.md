@@ -1172,6 +1172,19 @@ become:
   dotted as `netip` writes it; it returns `''` for a trailing dot, numeric hosts the URL parser would rewrite,
   unspecified and multicast addresses, ports with leading zeros and an empty `?` or `#`. The bidi rule is left to
   `Parse` (WA63-R3); WA74, its first caller, makes it refuse what Go refuses if its page needs that.
+- As built (WA74, group 8; WA63-R3 closed): `appLinkFor` never builds a link that `deeplink.Parse` refuses. On top of
+  the rules above it applies RFC 5893's bidi rule to a name with a right-to-left label, refuses a label that starts
+  with a combining mark, requires an `xn--` label to be in NFC and to be the URL parser's own spelling of its Unicode
+  form, and accepts the not-equal sign (also written as `=` plus U+0338), which Go 1.27's tables keep. Where it can't
+  tell what Go decides without Unicode tables, it refuses: a label with a zero-width joiner or non-joiner (Go allows
+  one in a few contexts, by joining type), and a symbol, punctuation or a modifier letter in a name with a
+  right-to-left label. So for a few rare host names it returns `""` although `Parse` would take a link; every caller
+  treats `""` as "no link" (the `/download` page hides "Open isshoni", 06 §7.5; 03 §12.3's "Open in the isshoni app"
+  likewise, README WA83). WA74's check against `deeplink.Build` (a temporary test, 177,356 random hosts mixing Hebrew
+  and Arabic letters, Arabic-Indic digits, combining marks, ZWJ/ZWNJ, `≠` and `xn--` pieces) found no host where the
+  two differ other than these refusals (773 of them). The `≠` agreement depends on the toolchain `go.mod` pins
+  (go1.27, `x/net/idna`'s Unicode 17 tables): a go1.26 build uses Unicode 15's tables, which refuse `≠`, so the
+  browser would build a link that app's `Parse` rejects; the pin keeps them equal.
 
 ---
 

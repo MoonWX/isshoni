@@ -1,0 +1,3 @@
+# Byte-exact fixtures: never convert line endings (Windows checkouts are CRLF otherwise).
+*.h264 binary
+*.norm binary

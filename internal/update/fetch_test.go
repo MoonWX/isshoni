@@ -130,7 +130,9 @@ func TestFetchTimeouts(t *testing.T) {
 						case <-r.Context().Done():
 						case <-h.gh.quit:
 						}
-						return true
+						// Never answer: an empty 200 sent as the client gives up could still be read as the
+						// asset, and the check would end as bad_signature instead of a network error.
+						panic(http.ErrAbortHandler)
 					}
 					return false
 				})

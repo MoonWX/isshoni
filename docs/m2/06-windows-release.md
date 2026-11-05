@@ -255,7 +255,7 @@ by hand against FFmpeg's release key):
 
 ```json
 {
-  "revision": 1,
+  "revision": 2,
   "ffmpeg":          {"version": "9.0.2", "url": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz", "sha256": "<pin>"},
   "nvCodecHeaders":  {"tag": "n12.1.14.1", "url": "https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n12.1.14.1.tar.gz", "sha256": "<pin>"},
   "amfHeaders":      {"tag": "v1.5.3", "url": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.3/AMF-headers-v1.5.3.tar.gz", "sha256": "<pin>"},
@@ -263,9 +263,10 @@ by hand against FFmpeg's release key):
 }
 ```
 
-- `revision` starts at 1 and goes up whenever the build changes without a version change (a flag, the script), once
-  that revision has been published: `deps-ffmpeg-9.0.2-r1` had not been published when WF1 changed `build.sh`, so
-  `revision` stayed 1 (`inputsSha256` moved with the script, and the first publish writes the lock for it).
+- `revision` starts at 1 and goes up whenever the build changes without a version change (a flag, the script, a
+  patch), once that revision has been published: `deps-ffmpeg-9.0.2-r1` had not been published when WF1 changed
+  `build.sh`, so `revision` stayed 1 (`inputsSha256` moved with the script, and the first publish writes the lock for
+  it). r1 was published on 2026-11-03, so the libvpl patch below is revision 2 (`deps-ffmpeg-9.0.2-r2`).
 - Each entry stays on one line, as above: `build.sh` reads `pins.json` line by line (no JSON parser in MSYS2's bash),
   and `tools/desktoppkg`'s check of `pins.json` enforces it. `native/ffmpeg/.gitattributes` (`eol=lf`) and
   `tools/desktoppkg/testdata/.gitattributes` (`-text`) keep the bytes that `inputsSha256` hashes the same in every
@@ -274,10 +275,25 @@ by hand against FFmpeg's release key):
   newer); n13.x would raise the floor to the 570 series. 04 decides the floor; n12.1.14.1 is the default here. The
   exact driver numbers are checked against NVIDIA's SDK notes when the pin is set.
 - AMF headers and libvpl are MIT; nv-codec-headers are MIT (headers only, the driver library is loaded at run time).
-- **libvpl's dispatcher and the DLL search** (04 §13.3 layer 4, §17): if 04's marker test (`dll_search_test`'s
-  vendor-runtime and libvpl part, slice E7, README WA44) shows the dispatcher loading a runtime from the current
-  directory or `PATH`, this pin moves to a libvpl version or build option whose dispatcher doesn't, in a tool PR
-  (a new `revision`) before WA44 merges.
+- **libvpl's dispatcher and the DLL search** (04 §13.3 layer 4, §17): 04's marker test (`dll_search_test`'s
+  vendor-runtime and libvpl part in `ffmpeg_load_test`, slice E7, README WA44) showed r1's dispatcher (libvpl v2.17.0
+  unchanged) loading `libmfx64-gen.dll` and `libmfxhw64.dll` planted in a `PATH` entry. libvpl v2.17.0 has no build
+  option for its Windows search: `MFXLoad` takes runtimes from `ONEVPL_PRIORITY_PATH`,
+  the driver store, the executable's folder, every `PATH` entry, `ONEVPL_SEARCH_PATH`, the legacy driver store, the
+  dispatcher's registry keys and `%windir%\system32`/`syswow64`, and loads each one by full path, past the process's
+  DLL search settings. So the owner decided (2026-11-04) to patch it:
+  `native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch` removes the executable's folder, `PATH`,
+  `ONEVPL_SEARCH_PATH` and `ONEVPL_PRIORITY_PATH` from that list on Windows and keeps the places Intel's drivers
+  install the runtimes (both driver stores, the registry keys, System32 and SysWOW64). The two variables go as well,
+  although the engine clears them (04 §13.3 layer 4): without them the dispatcher's search doesn't depend on the host
+  process (ffcheck, `isshoni-enginetest`, the test binaries) or on when it clears them. It guards against planted
+  files only: the kept search still reads `%windir%` and the HKCU dispatcher key. The patch's header gives the
+  details; `build.sh` applies it (§4.3 step 3). The libvpl pin stays v2.17.0: a pin bump has to carry the patch
+  forward (it must apply with no fuzz, or the build fails).
+- **Patches** are files under `native/ffmpeg/patches/`, unified diffs with a header saying why, applied to an
+  unpacked upstream source by `build.sh` (its `libvpl_patches`, in order; for now only libvpl has one). Each is an
+  input of `inputsSha256` and goes into the source archive (§4.5), and `tools/desktoppkg`'s tests fail when a file
+  there is not one of the inputs.
 
 `native/ffmpeg/lock.json` (outputs; written by the owner after a publishing run, §4.5):
 
@@ -285,7 +301,7 @@ by hand against FFmpeg's release key):
 {
   "revision": 1,
   "tag": "deps-ffmpeg-9.0.2-r1",
-  "inputsSha256": "<sha256 over pins.json, build.sh, ffcheck.c (§4.4)>",
+  "inputsSha256": "<sha256 over pins.json, build.sh, ffcheck.c and the patches (below)>",
   "assets": {
     "ffmpeg-9.0.2-r1-win-x64.zip": "<sha256>",
     "ffmpeg-9.0.2-r1-source.tar": "<sha256>"
@@ -300,14 +316,20 @@ by hand against FFmpeg's release key):
 }
 ```
 
-`msvcToolset` is the `VCToolsVersion` folder; `msvcCompiler` and `msvcLinker` are the toolset build of §3 (WF1).
+`msvcToolset` is the `VCToolsVersion` folder; `msvcCompiler` and `msvcLinker` are the toolset build of §3 (WF1). The
+committed lock is `deps-ffmpeg-9.0.2-r1`'s, from the owner's publishing run of 2026-11-03 (§4.6, README §3 item 50).
+With the libvpl patch the inputs are revision 2's, so that lock is stale, and every consumer (`windows-native`'s
+"The FFmpeg lock is current" step first) fails by design until the owner publishes `deps-ffmpeg-9.0.2-r2` and commits
+the lock it prints.
 
 `avcodecMajor` and `avutilMajor` (integers; the numbers above are placeholders) are written by the publish run from
 `ffcheck`'s `avcodec_version() >> 16` and `avutil_version() >> 16` in `ffmpeg-config.json` (§4.4). 04's CMake reads
 them to compile in the runtime DLL names and the load-time version check (04 §9.2).
 
-`inputsSha256` is `sha256` of the three lines `"<sha256>  <path>\n"` for `native/ffmpeg/pins.json`,
-`native/ffmpeg/build.sh` and `native/ffmpeg/ffcheck.c`, in that order (`tools/desktoppkg ffmpeg-inputs` prints it).
+`inputsSha256` is `sha256` of the lines `"<sha256>  <path>\n"` for `native/ffmpeg/pins.json`,
+`native/ffmpeg/build.sh`, `native/ffmpeg/ffcheck.c` and then each patch in `build.sh`'s order (now
+`native/ffmpeg/patches/libvpl-no-exe-dir-or-path.patch`), in that order (`tools/desktoppkg ffmpeg-inputs` prints it;
+its `inputFiles` and `build.sh`'s `input_files` list the same files).
 Every consumer fails with "native/ffmpeg/lock.json is stale: run the FFmpeg workflow with publish and update the lock"
 when it differs from the current files, so a pin change can't merge without its build.
 
@@ -355,8 +377,8 @@ runners) inside the MSVC environment of §3, which `deploy/windows/msvc-env.ps1`
 workflow's step, on a PC `powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe
 native/ffmpeg/build.sh` from the repository root. `WORKDIR` defaults to the git-ignored `.deps/ffmpeg-build`. The
 script installs nothing and changes nothing outside `WORKDIR`: MSYS2's packages come from the workflow's
-`pacman -Sy --noconfirm --needed make pkgconf diffutils zip` (once by hand on a PC; their versions go into the build
-manifest). No third-party action. The same command rebuilds the DLLs from an unpacked source archive (§4.5).
+`pacman -Sy --noconfirm --needed make pkgconf diffutils zip patch` (once by hand on a PC; their versions go into the
+build manifest). No third-party action. The same command rebuilds the DLLs from an unpacked source archive (§4.5).
 
 1. **Preflight**: MSYS2's bash and the MSVC variables (`VCToolsInstallDir`, `VCToolsVersion`, `WindowsSDKVersion`)
    are required. MSVC's `Hostx64/x64` folder goes first on `PATH`, before `/usr/bin`, so MSYS2's coreutils `link.exe`
@@ -366,8 +388,12 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
    tools for Windows"), else from `PATH`. When the built DLLs differ from `lock.json`'s, the log line names the
    lock's and this build's toolset, compiler and linker.
 2. **Sources**: each `pins.json` tarball into `WORKDIR/src/`, downloaded with MSYS2's `curl` (3 retries) unless
-   already there or in the source archive's `src/`, and checked against its SHA-256 either way.
-3. **libvpl**: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+   already there or in the source archive's `src/`, and checked against its SHA-256 either way. When a download
+   fails (ffmpeg.org was down on 2026-11-04), the tarball comes out of the source archive of `lock.json`'s release
+   (`src/<name>`, the same upstream bytes an earlier run published); `pins.json`'s SHA-256 still decides.
+3. **libvpl**: the patches of §4.1 (`libvpl-no-exe-dir-or-path.patch`), each with `patch -p1 --fuzz=0` after a
+   `--dry-run`; a patch that doesn't apply exactly (a hunk off, fuzz needed, already applied) fails the build. Then
+   `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DUSE_MSVC_STATIC_RUNTIME=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
    -DINSTALL_EXAMPLES=OFF`, build, install into `WORKDIR/prefix` (gives `vpl.lib` and `vpl.pc`). libvpl sets CMP0091
    inside `if(MSVC)` before `project()` defines `MSVC`, so without the policy default CMake ignores the runtime
@@ -382,9 +408,10 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
 6. **Checks** of §4.4, then the layout `ffmpeg-<ver>-r<rev>-win-x64/`: `bin/` (the two DLLs), `pdb/`, `lib/`
    (`avcodec.lib`, `avutil.lib` import libraries), `include/`, `licenses/{ffmpeg/COPYING.LGPLv2.1,ffmpeg/LICENSE.md,
    ffmpeg/README-LGPL.txt,libvpl/LICENSE,nv-codec-headers/LICENSE,amf/LICENSE.txt}`, `ffmpeg-config.json` (§4.4) and
-   `build-manifest.json` (every input's SHA-256, the toolset folder and the compiler and linker builds of §3, SDK and
-   MSYS2 package versions, the commit; `README-LGPL.txt` names the compiler build too). Neither
-   the AMF headers nor nv-codec-headers ship a license file, so `build.sh` writes `amf/LICENSE.txt` and
+   `build-manifest.json` (every input's SHA-256, the libvpl patches' under `inputs.libvpl.patches`, the toolset
+   folder and the compiler and linker builds of §3, SDK and MSYS2 package versions, the commit; `README-LGPL.txt`
+   names the compiler build too and says that libvpl's dispatcher is patched). Neither the AMF headers nor
+   nv-codec-headers ship a license file, so `build.sh` writes `amf/LICENSE.txt` and
    `nv-codec-headers/LICENSE` from the headers' own MIT notices: each distinct notice once, after the files that
    carry it.
 7. **Archives** in `WORKDIR/out/`: `ffmpeg-<ver>-r<rev>-win-x64.zip` (the layout folder at its top; names sorted, no
@@ -449,11 +476,12 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   prerelease) and the updater (§8.4) never see it. A ruleset makes `deps-*` tags undeletable and immutable (§14).
 - **The source archive** `ffmpeg-<ver>-r<rev>-source.tar` holds one top-level folder, `ffmpeg-<ver>-r<rev>-source/`,
   with: the four upstream tarballs exactly as downloaded (`src/`), `native/ffmpeg/{pins.json,build.sh,ffcheck.c,
-  README-LGPL.txt}`, `deploy/windows/{msvc-env.ps1,tools.json}` (so the archive alone rebuilds the DLLs, the relink
-  check of §9.1), `CONFIGURE.txt` (the configuration string `ffcheck` printed, the toolset folder with the compiler and
-  linker builds, the SDK, and how to build),
-  and `SHA256SUMS` of the tarballs. The zip likewise has one top-level folder, `ffmpeg-<ver>-r<rev>-win-x64/`. Every
-  isshoni release copies the source archive as `isshoni-desktop_<v>_ffmpeg-source.tar` (§11.1).
+  README-LGPL.txt}` and `native/ffmpeg/patches/` (the patches `build.sh` applies),
+  `deploy/windows/{msvc-env.ps1,tools.json}` (so the archive alone rebuilds the DLLs, the relink check of §9.1),
+  `CONFIGURE.txt` (the configuration string `ffcheck` printed, the toolset folder with the compiler and linker builds,
+  the SDK, and how to build), and `SHA256SUMS` of the tarballs. The zip likewise has one top-level folder,
+  `ffmpeg-<ver>-r<rev>-win-x64/`. Every isshoni release copies the source archive as
+  `isshoni-desktop_<v>_ffmpeg-source.tar` (§11.1).
 - **Consumers** (the `windows-native` job of both ci.yml and release.yml, `task ffmpeg:fetch`) download
   `https://github.com/MoonWX/isshoni/releases/download/<tag>/<asset>` and fail unless the SHA-256 matches
   `lock.json`; release.yml also runs `gh attestation verify <zip> --repo MoonWX/isshoni --signer-workflow
@@ -506,6 +534,15 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   hashes were unchanged from the first run (`avcodec-63.dll` `954840c9…`, `avutil-61.dll` `4e8d2abe…`). These are the
   values a publishing run on that image writes as `msvcToolset`, `msvcCompiler` and `msvcLinker` (§4.1). The publish
   itself is the owner's (README §8), now that WF1 has merged.
+- **The publishing run** (README §3 item 50): dispatched on 2026-11-03 at the owner's request, `workflow_dispatch`
+  with `publish` from `main` at `7e3f7bb`. It created the prerelease `deps-ffmpeg-9.0.2-r1`, and its printed
+  `lock.json` is committed on `m2/windows-app` (`0fc561f`, before group 9): `inputsSha256` `0e3ec921…`, equal to
+  `desktoppkg ffmpeg-inputs` for the current `pins.json`, `build.sh` and `ffcheck.c`; `avcodecMajor` 63 and
+  `avutilMajor` 61;
+  `avcodec-63.dll` `21d8c2af…` and `avutil-61.dll` `a5969e2e…` (not the PR runs' hashes above: the lock's are the
+  shipped bytes, and every later comparison is against them); `msvcToolset` 14.44.35207, `msvcCompiler` 19.44.35229,
+  `msvcLinker` 14.44.35229.0; `commit` `7e3f7bb`. `ffmpeg-fetch -source` verified the release's zip, DLLs and source
+  archive against it before the commit, and group 9's integration fetched the zip with `task ffmpeg:fetch` on the Mac.
 
 ### 4.7 Security updates
 
@@ -534,7 +571,10 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   `release.yml` uses no cache (M1 06 §9.3); libopus builds in about a minute.
 - FFmpeg: the locked zip is unpacked to `$RUNNER_TEMP\ffmpeg` and passed as `-DIM_FFMPEG_ROOT=…`. 04's CMake uses only
   `include/` from the zip (FFmpeg is loaded at run time, never import-linked, 04 §9.2); `lib/` stays informational.
-  Until slice R3b, `IM_FFMPEG_ROOT` is optional (04's skeleton DLL builds without it).
+  Until slice R3b, `IM_FFMPEG_ROOT` is optional (04's skeleton DLL builds without it). As built (README WA24): the
+  job first runs `desktoppkg ffmpeg-inputs -check` (a stale lock fails it), then `desktoppkg ffmpeg-fetch -out
+  $RUNNER_TEMP\ffmpeg`, which downloads the locked zip, checks its SHA-256 and the DLLs and LGPL config, and prints the
+  unpacked folder that both presets get as `IM_FFMPEG_ROOT`; `dll-check -ffmpeg <its bin\>` checks the two DLLs.
 - Build, with 04's presets (04 §13.1):
   1. **`win-x64-ci`** (CI only): `cmake --preset win-x64-ci -DIM_FFMPEG_ROOT=<unpacked locked zip>`,
      `cmake --build --preset win-x64-ci`, `ctest --preset win-x64-ci --output-on-failure` (04 §18.2's Windows tests;
@@ -587,8 +627,10 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
 - **WebView2 bootstrapper**: downloaded from the `tools.json` URL; `Get-AuthenticodeSignature` must say `Valid` with
   exactly the pinned signer subject; its SHA-256 is recorded.
 - Artifact `windows-native`, two folders:
-  - `release\`: the `win-x64-release` `isshoni-media.dll` and `isshoni-media.pdb`, the FFmpeg `bin/` and `pdb/`,
-    FFmpeg's `licenses/`, the vcpkg copyright files **from the `win-x64-release` build tree only** (its
+  - `release\`: the `win-x64-release` `isshoni-media.dll` and `isshoni-media.pdb`, the FFmpeg `bin/` and `pdb/`
+    (as built, README WA24: the two DLLs that `lock.json` names, hash-checked again, and their PDBs, flat next to
+    `isshoni-media.dll`, the installed layout of §2.2), FFmpeg's `licenses/` (its subfolders under
+    `release\licenses\`), the vcpkg copyright files **from the `win-x64-release` build tree only** (its
     `vcpkg_installed/x64-windows-static/share/*/copyright`, built without 04's vcpkg feature `tests`, so no gtest) as
     `licenses/vcpkg/<port>/copyright`, `native/windows/third_party/openh264/LICENSE` as `licenses/openh264/LICENSE`,
     the C++/WinRT MIT license (committed by 04 as `native/windows/third_party/cppwinrt/LICENSE`) as
@@ -596,12 +638,15 @@ Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most o
   - `ci\` (ci.yml only): the `win-x64-ci` `isshoni-media.dll` with the FFmpeg DLLs next to it (the engine loads FFmpeg
     from its own folder), for `ISSHONI_TEST_ENGINE_DLL` (§10.1). It has 04's test hooks (fake encoder, fault
     injection, luma tap) and is never staged: staging and `smoke.ps1` require `testHooks: false` from `--self-check`
-    (§2.4, §6.2).
+    (§2.4, §6.2). As built (README WA24): the job assembles and uploads `windows-native` before its Go DLL tests,
+    which run in `windows-native` until `windows-desktop` takes them (README WA72) with `ISSHONI_TEST_ENGINE_DLL` =
+    this `ci\isshoni-media.dll`, so the engine finds FFmpeg next to it (04 §9.2).
 - CI's `windows-native` also uploads `isshoni-native-tools` (kept 7 days): the `native:dist` zip of §17, for the owner's
   PC and the `hwcheck` run (§10.4), plus a `ci\` folder with the `win-x64-ci` `isshoni-media.dll` and the FFmpeg DLLs
   for the checks that need 04's luma tap (`isshoni-enginetest avsync -dll ci`, 04 §14, 05 §19.3). Never staged.
 
-`native-manifest.json` (`"ffmpeg": null` until README WA24 wires the locked FFmpeg build into the job; the vcpkg
+`native-manifest.json` (`"ffmpeg": null` until README WA24 wires the locked FFmpeg build into the job; as built, its
+`ffmpeg` is the lock's `tag` and the two DLLs' SHA-256s, checked against the lock as they are copied; the vcpkg
 ports and their versions come from the release tree's `vcpkg_installed/vcpkg/status`):
 
 ```json
@@ -1021,6 +1066,28 @@ shell) doesn't warn about an unknown env var; a name that is neither a key nor r
 names with a grep of the repository and adds them with a test that lists them; until it merges, the server warns about
 them. The list in M1 04 §4.2 (outside `docs/m2`) follows with the integrator.
 
+As built (WF7, merged in group 8): `reservedEnv` continues after the names above with 22 exact names, never prefixes,
+so any other `ISSHONI_*` name that is not a key still warns:
+- the dev build's Vite origin `ISSHONI_DESKTOP_DEV_URL` (03 §5.3) and the fake engine's audio scenario
+  `ISSHONI_FAKE_AUDIO` (05 §13.3);
+- the e2e build's CDP port and data folder `ISSHONI_E2E_CDP_PORT`, `ISSHONI_E2E_DATA_DIR`, and the CDP spec's app and
+  endpoint `ISSHONI_DESKTOP_EXE`, `ISSHONI_CDP_ENDPOINT` (03 §22.4);
+- what `native:build` and `ffmpeg:build` pass to Windows PowerShell: `ISSHONI_NATIVE_PRESETS`, `ISSHONI_NATIVE_TEST`,
+  `ISSHONI_NATIVE_BUILD_PS1`, `ISSHONI_FFMPEG_BUILD_PS1` (§4.3, §5.1);
+- the Wails checklist test's `ISSHONI_CHECKLIST_OUT`, `ISSHONI_CHECKLIST_W19_PORT`, `ISSHONI_CHECKLIST_W19_PIPE`
+  (03 §3.2);
+- the switches test binaries set for the child processes they start: `ISSHONI_DESKTOP_TEST_CHILD`,
+  `ISSHONI_DESKTOP_TEST_ID`, `ISSHONI_DESKTOP_TEST_RUNNING`, `ISSHONI_DESKTOP_TEST_OUT`, `ISSHONI_WINOS_TEST_CHILD`,
+  `ISSHONI_WINOS_TEST_ID`, `ISSHONI_WINOS_TEST_OUT`, `ISSHONI_APPLOG_CRASH_CHILD`, `ISSHONI_MEDIATEST_MUTANT`.
+
+`keys_test.go`'s `devEnvNames` lists them with their readers, and `TestRepoEnvNamesReserved` scans every tracked file
+outside `docs/` and `spikes/` (skipped outside a checkout of the repository; about 12 s) and fails on an `ISSHONI_*`
+name that is neither a key, reserved nor env-only. So **a slice that starts reading a new `ISSHONI_*` name adds it to
+`reservedEnv` and `devEnvNames` in the same PR** (or to this section, for a name users set), which puts
+`internal/server/config/keys.go` in its Touches through the integrator (README §5, shared files); a name that lives
+only inside one task's own processes takes another prefix instead, as `native:dist`'s `NATIVE_DIST_*` and
+`ffmpeg:fetch`'s `FFMPEG_FETCH_*` do (§17; README WA24).
+
 ### 7.4 Server: `GET /install-desktop.ps1`
 
 M1 reserved the path (M1 04 §9.2). M2 adds:
@@ -1133,7 +1200,10 @@ The exact installer URL is
 `https://github.com/MoonWX/isshoni/releases/download/v<version>/isshoni-desktop_<version>_windows_amd64_setup.exe`.
 
 `ps1Command` is one of two exact strings, chosen once by slice R10's measurement on a clean Windows 10 22H2
-(§11.8 item 7(b) describes it) and asserted exactly by `links.test.ts`:
+(§11.8 item 7(b) describes it) and asserted exactly by `links.test.ts` (as built, WA74: `PS1_NEEDS_TLS12_PREFIX` in
+`links.ts` chooses it, `false` = the bare form R10 recorded, and `links.node.test.ts` checks that line 1 of
+`deploy/install-desktop.ps1` shows the same form, so a WF that adds the prefix changes the script's line 1, its Pester
+test 'starts with the usage line and the docs link' and that constant together, README §8):
 - TLS 1.2 in a fresh `powershell.exe`'s default `[Net.ServicePointManager]::SecurityProtocol`:
   `irm https://watch.example.com/install-desktop.ps1 | iex`;
 - otherwise: `[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor 3072; irm
@@ -1152,7 +1222,9 @@ Page content:
 - **Windows** (first when the browser reports Windows): three numbered steps that stay visible the whole time, so a
   friend who comes back from the installer knows what's next: **1 Download** ("Download for Windows", the installer
   URL), **2 Run it** (the warning lines below), **3 Open isshoni** (the "Open isshoni" button, disabled with "after
-  the install" until the download was clicked, hidden when `openAppUrl` is `""`). Then the requirements
+  the install" until the download was clicked, hidden when `openAppUrl` is `""`; as built, WA74-R2: a middle click
+  (`auxclick` with button 1) or the link's context menu ("Save link as…") counts as the download too, since both
+  download the installer without a `click`). Then the requirements
   "Windows 10 22H2 or later, 64-bit", "a current GPU driver (NVIDIA 531.61 or newer for NVIDIA encoding)" and "Windows
   N editions: install the Media Feature Pack" linking `/troubleshooting#desktop-gpu-driver` and
   `#desktop-media-feature-pack` on the project site (04 §19); three warning lines, in the order the friend meets
@@ -1171,6 +1243,10 @@ Page content:
 - The page renders only in browsers: in the desktop app, 03 §7.5 (D7) wraps `/download` in `RequireBrowser`, which
   opens it in the system browser, so there is no desktop variant.
 - Texts are `account.download.*` in the lazy `account` namespace, as in M1.
+- As built (WA74): `openAppUrl` uses `appLinkFor` with the stricter host rules WA74 gave it (02 §10.2's as-built note,
+  WA63-R3), so for a few rare host names that Go's `deeplink.Parse` would accept the page has no link and hides step
+  3's button. M1's `e2e/a11y.spec.ts` doesn't cover `/download`; `download.spec` runs axe itself (WCAG 2.0 A and AA,
+  2.1 AA, no serious or critical violation) in the light and the dark colour scheme.
 
 ### 7.6 How a server knows the matching desktop version
 
@@ -1685,7 +1761,8 @@ New `changes` filters:
   `deploy/notices/native-windows.json`, `tools/desktoppkg/**`, `tools/wails3/**`, `tools/notices/**`, `go.mod`,
   `go.sum`, `web/**` (the SPA is bundled), `.github/workflows/ci.yml`.
 - `native`: `native/**`, `.github/workflows/ci.yml`, `Taskfile.yml` (`native-host` runs `task native:test` and
-  `task lint:native`, so the Taskfile is one of its inputs, as M1 counts each job's own inputs), and
+  `task lint:native`, and `windows-native` `task native:dist`, so the Taskfile is one of their inputs, as M1 counts
+  each job's own inputs; README §3 item 54), and
   `internal/media/testdata/audio/**` (group 4's integration: `mix_report_test` checks the C++ report writer against
   those goldens byte for byte, so a goldens-only PR runs it too).
 - `update`: `internal/update/**`, `deploy/windows/nsis/**`, `tools/desktoppkg/**` (runs the updater e2e).
@@ -1714,7 +1791,7 @@ New `changes` filters:
 | `desktop-macos` | desktop | macos-15 | `go test -race` of `./internal/client/... ./internal/media/... ./internal/update/...` and the app's packages; `go build ./cmd/isshoni-desktop` (darwin, cgo, fake engine until M3); `go-licenses check ./cmd/isshoni-desktop` | 20 | yes |
 | `native-host` | native | ubuntu-24.04, macos-15 (matrix) | `task native:test PRESET=host-debug` and `PRESET=host-tsan` with `VCPKG_DIR=$RUNNER_TEMP/vcpkg` (the task clones vcpkg at `native/vcpkg.json`'s baseline, bootstraps it with metrics off, then runs `cmake --preset`, `cmake --build --preset` and `ctest --preset`; 04 §18.1: `native/common` tests, the libopus host build of 04 E3/E4), with vcpkg's `files` binary cache keyed by OS, image and manifest (no restore keys); on ubuntu `vm.mmap_rnd_bits=28` before `host-tsan` (TSan's fixed shadow layout fails with Ubuntu 24.04's 32-bit mmap randomization), and `task lint:native CLANG_FORMAT=clang-format-18` (`clang-format --dry-run --Werror` over the tracked `native/**/*.{h,c,cpp}` with `native/.clang-format`). The clang-format version is the ubuntu image's `clang-format-18` (installed with apt if the image lacks it), not pinned in a repository file | 20 | yes |
 | `windows-go` | desktop | windows-2025 | no `needs`, no DLL: `go test -race ./internal/client/... ./internal/update/... ./internal/media/...` with the image's MinGW gcc (as M1's nightly), the fake engine (04's DLL tests skip without `ISSHONI_TEST_ENGINE_DLL`), then `CGO_ENABLED=0 go test ./internal/client/... ./internal/update/...` (the shipped build mode; this is the Windows job 02 §16.1 expects, on `windows-2025` rather than `windows-latest`, which moves). Runs 02's credstore and deviceauth tests (DA9, DA10) and this document's R7/R8 on Windows from R1 on | 15 | yes |
-| `windows-native` | desktop | windows-2025 | §5.1 with the vcpkg cache: FFmpeg from the lock (and its staleness check, §4.1), the MSVC environment, `win-x64-ci` build and `ctest` (outbound network for 04's `openh264_test`), `win-x64-release` build, the DLL checks on the release output; uploads `windows-native` (`release\` and `ci\`, kept 1 day) and `isshoni-native-tools` (§17 `native:dist`, kept 7 days) | 30 | yes |
+| `windows-native` | desktop, native (as built, README WA24: the `native` filter adds only `Taskfile.yml` to `desktop`'s paths, and the job runs `task native:dist`; README §3 item 54) | windows-2025 | §5.1 with the vcpkg cache: FFmpeg from the lock (and its staleness check, §4.1), the MSVC environment, `win-x64-ci` build and `ctest` (outbound network for 04's `openh264_test`), `win-x64-release` build, the DLL checks on the release output; uploads `windows-native` (`release\` and `ci\`, kept 1 day) and `isshoni-native-tools` (§17 `native:dist`, kept 7 days). As built (README WA24): the `windows-native` artifact is assembled before the Go DLL tests, which run here against its `ci\` folder until `windows-desktop` exists (README WA72); `isshoni-native-tools` is the `native:dist` zip plus that `ci\` folder | 30 | yes |
 | `windows-desktop` | desktop | windows-2025 | needs `windows-native` and `web`: only the DLL-dependent Go tests, `go test -race ./internal/media/...` with `ISSHONI_TEST_ENGINE_DLL=<artifact>\ci\isshoni-media.dll` (04 §18.2, `TestNativeIntoPublisher`; everything else is in `windows-go`); `task desktop:exe:windows`; NSIS (pinned zip); desktop notices and the native gate (§9.3); `stage -release`, prebuilt uninstaller, installer; `deploy/test/windows/smoke.ps1` (§16); Pester under Windows PowerShell 5.1 (`ps` filter); the updater e2e (`update` filter, §8.11, §16); the server-rendered ps1 test (§16); then, before the CDP spec, a step that reads the WebView2 `pv` from §6.5's keys and, when it is missing or below 120.0, runs the checked `MicrosoftEdgeWebview2Setup.exe /silent /install` from the `windows-native` artifact (so the CDP spec doesn't depend on `smoke.ps1`'s install having run first); **03's CDP spec** (03 §22.4 B): `task desktop:exe:windows TAGS=e2e`, `go build ./cmd/isshoni`, `npm ci` in `web/`, then the CDP Playwright config (`connectOverCDP`, no browser download); uploads `isshoni-desktop-windows-pr` (installer and symbols, kept 7 days, for manual tests on the owner's PC) | 50 | yes |
 | `lint-deploy` (changed) | deploy, readme, repocheck, ps, pins | ubuntu-24.04 | M1's tasks plus `lint:ps` (PSScriptAnalyzer at Warning and Error and the ASCII check over `deploy/install-desktop.ps1`, `deploy/test/windows/*.ps1`, `deploy/windows/msvc-env.ps1` and `native/windows/tools/*.ps1`; the PowerShell 5.1 grammar check is in `windows-desktop`) and `test:ps` (Pester under `pwsh`). As built (WA49): `lint:ps` also ASCII-checks `deploy/test/install-desktop.Tests.ps1`, fails on CRLF in `deploy/install-desktop.ps1` and enables `PSUseCompatibleSyntax` for 5.1; both tasks take `PWSH=<binary>` (like `lint:native`'s `CLANG_FORMAT`) and fetch their module at `tools.json`'s version into `.deps/psmodules/` (§3), which the job caches by `tools.json`'s hash; `lint:keys` now also checks the ps1 key block, `internal/update/signers.go` and the update keys' README rows; `lint:pins` (§3) | 10 | yes |
 | `goreleaser-check` (changed) | as M1 | ubuntu-24.04 | `task release:snapshot` creates stub desktop files (`ISSHONI-DESKTOP-STUB`) when `dist-desktop/` has none, so the goreleaser config's desktop `extra_files` are checked by name; `release:assets` checks the names; `FULL=true` refuses stubs | 20 | yes |
@@ -1826,6 +1903,14 @@ pattern would otherwise propose runtime bumps alone). A Wails bump is a hand-mad
 Windows smoke, and 03's origin test against `protocol.DesktopOrigins()` with the previous release's list). vcpkg's
 baseline (`native/vcpkg.json` and `native/vcpkg-configuration.json`), NSIS, the FFmpeg pins and the PowerShell modules
 are bumped by hand with M1's monthly tool PR.
+
+As run (README WF8, group 9): the three open alerts on the tools modules were fixed by the smallest bumps to the
+first fixed versions: `github.com/go-jose/go-jose/v4` v4.1.4 → v4.1.6 in `tools/go.mod` and `tools/goreleaser/go.mod`,
+and `github.com/klauspost/compress` v1.18.3 → v1.18.7 in `tools/wails3/go.mod`. `govulncheck` (the repository's
+pinned one, as `task` runs it) passes on the root module and on `tools/`; for the root module it reports only
+vulnerabilities in required modules that the code doesn't call: `golang.org/x/net` v0.61.0 (GO-2026-6866 and
+GO-2026-6860, fixed in v0.62.0) and `golang.org/x/crypto` v0.58.0 (GO-2026-5932). They may come back as Dependabot
+alerts; a bump of the root module goes through M1's rule for `go.mod` (README §5, shared files).
 
 ## 11. Release
 
@@ -2148,7 +2233,8 @@ Before the first rc with the app:
    the private `isshoni-update-1` in the `release` environment; the backup into the password manager and on paper;
    delete local private copies. `deploy/keys/README.md` gets these steps.
 2. **FFmpeg**: Actions → FFmpeg → Run workflow with `publish` on (from the branch of the pins PR); commit the printed
-   `lock.json` into that PR.
+   `lock.json` into that PR. Done for `deps-ffmpeg-9.0.2-r1` (README §3 item 50): dispatched on 2026-11-03 at the
+   owner's request from `main` at `7e3f7bb`, and the printed `lock.json` committed (§4.6).
 3. **Rulesets**: a tag ruleset for `deps-*` (block update and deletion; creation by repository writers, which is only
    the owner).
 4. **Actions setting**: "Require approval for all external contributors".
@@ -2190,7 +2276,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Unit | `tools/desktoppkg` | the winver table; stage list and mtimes; NSIS defines; manifest golden; `check` rules (unknown binary, literal strings in NSIS, size budget: warn above 40 MB, fail above 100 MB); `ffmpeg-inputs` hash; `dll-check` against synthetic PE images that a test builder writes (`pebuild_test.go`; dll-check reads PE files, not dumpbin text, §5.1): an extra or missing export, an ordinal-only or forwarded export, another export name, a `VCRUNTIME140.dll`, UCRT, `opus.dll`, unlisted or `avcodec-*`/`avutil-*` import fail; `mfplat.dll` and `avrt.dll` pass only as delay imports; a 32-bit image, an executable, no Control Flow Guard, a wrong `ProductVersion`, `FileVersion`, `OriginalFilename` or binary `FILEVERSION` and a missing VERSIONINFO fail; the load-config cases (with `-load-config`, 0x800 passes and a zero flag or no load config fails; without it the line is printed, never a failure, §5.1); an FFmpeg DLL importing `mfplat.dll` fails; DLL names unequal to `lock.json`'s majors fail; `stage -release` refuses a `windows_amd64-test` exe and a DLL whose `--self-check` reports `testHooks: true` (fixture) | CI ubuntu; Mac |
 | Unit | `tools/notices` desktop golden | the native section; LGPL accepted only dynamic and with the bundle; a GPL native entry fails; an unlisted vcpkg port fails; a `LicenseRef` without an exception fails | CI ubuntu |
 | Unit | `internal/server/httpapi` `desktopscripts_test.go` | `RenderInstallPS1`: `'` doubled, a non-ASCII origin or an `http://` non-loopback origin gives an empty server, a dev/CI/e2e version gives an empty version, rc kept, missing or doubled markers error; the route: 200, content type with charset, `Cache-Control`, `ETag`, `HEAD` without body; `/install-desktop.sh` is 404 text, never the SPA; the template itself (`deploy.InstallDesktopPS1`) renders. With them (group 7's integration), `internal/server`'s `desktopscripts_test.go`: `TestCheckDesktopScripts` (the embedded script passes; one without a prefill block is refused with `NeedsOperator`, naming `isshoni-prefill`, with a `fix:` line) and `TestRouterOptionsDesktop` (the router gets the embedded script, the site's origin and `version.Version()`, §7.4) | CI ubuntu; Mac |
-| Unit | `web/src/download/links.test.ts`, `DownloadPage.test.tsx` | release vs non-release links, the exact installer URL, the ps1 command, `openAppUrl` exactly `isshoni://watch.example.com/` for `https://watch.example.com` (via `appLinkFor`) and `""` for an `http://localhost` origin, the "Open isshoni" button hidden then, the requirement lines, the three warning lines (browser download, SmartScreen, Smart App Control) with their project-site anchors, OS ordering | CI ubuntu; Mac |
+| Unit | `web/src/download/links.test.ts`, `DownloadPage.test.tsx` (as built, WA74: with `links.node.test.ts`, which checks the command's form against line 1 of `deploy/install-desktop.ps1`, §7.5) | release vs non-release links, the exact installer URL, the ps1 command, `openAppUrl` exactly `isshoni://watch.example.com/` for `https://watch.example.com` (via `appLinkFor`) and `""` for an `http://localhost` origin, the "Open isshoni" button hidden then, the requirement lines, the three warning lines (browser download, SmartScreen, Smart App Control) with their project-site anchors, OS ordering | CI ubuntu; Mac |
 | Unit | `deploy/test/install-desktop.Tests.ps1` (Pester) | the checksum-line lookup (exact name, both forms, duplicates refused), version regex, the quoting helper with spaces, `ssh-keygen` discovery (mocked), the exit-code messages (8 included), no `exit` anywhere in the script; the Smart App Control read (mocked `Get-ItemProperty`): `1` → the `isshoni:` Smart App Control line, "Nothing was installed." and no `Invoke-WebRequest` call; `2`, `0` and a missing key → the download proceeds; a mocked `Start-Process` that throws → "isshoni: Windows blocked the installer (" with the exception's message, no error record escapes the script block | `pwsh` on CI ubuntu; Windows PowerShell 5.1 on CI windows |
 | Unit | `check-draft-test.sh` new cases (§11.3); `repocheck` tests for `update_signers` (exactly one `isshoni-update-backup-<n>` line and at least one other; every name `isshoni-update-<n>` or `isshoni-update-backup-<n>`; `ssh-ed25519` only; no key also in `allowed_signers`; `Backup` set in `signers.go` exactly for it), `signers.go` block (`repocheck update-keys` writes it; `TestCommittedUpdateKeys` checks the real tree), ps1 block, the 8.1-option rule (`valid-before` fails, `cert-authority` passes, an unknown option fails; M1's rotation test now adds a key and later deletes the old line) | | CI ubuntu; Mac |
 | Static | PSScriptAnalyzer, ASCII-only, PowerShell 5.1 parse (`[System.Management.Automation.Language.Parser]::ParseFile` under `powershell.exe`), `makensis -WX`, actionlint, the DLL export/import/version checks, FFmpeg's license checks | | CI ubuntu and windows |
@@ -2204,7 +2290,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Static | generated-code drift (`protocol` job) | `gen:check` incl. `web/src/platform/desktop/codes.gen.ts`; `GOOS=windows wails3 generate bindings` gives no diff in `web/src/platform/desktop/bindings/` | CI ubuntu; Mac |
 | E2E | 03's desktop specs and CDP spec (03's content, run by 06's jobs) | `e2e` with `DESKTOP_E2E_BIN` (03 §22.4 A); `windows-desktop` with the `TAGS=e2e` exe over CDP (03 §22.4 B) | CI ubuntu, windows; Mac |
 | E2E | release dry run | build → sign-dry → verify (Linux) and verify-windows (ps1 install, smoke, uninstall) | GitHub |
-| E2E | Playwright `download.spec` | on the e2e server (non-release version): the latest-release link and the ps1 command with the server's origin; with `/api/v1/info` routed to `0.2.0`: the exact installer URL; `GET /install-desktop.ps1` is pre-filled | CI ubuntu; Mac |
+| E2E | Playwright `download.spec` | on the e2e server (non-release version): the latest-release link and the ps1 command with the server's origin; with `/api/v1/info` routed to `0.2.0`: the exact installer URL; `GET /install-desktop.ps1` is pre-filled; axe in the light and the dark colour scheme (as built, WA74: M1's `a11y.spec` doesn't cover `/download`) | CI ubuntu; Mac |
 | E2E | nightly `compat-servers` | against servers with `deviceFlow`: the client core joins, publishes with the fake engine and receives media, and 02's test links and refreshes; against a 0.1.x server: only the `compat.FromInfo` verdict `update_server`/`no_device_flow` | GitHub |
 | Manual | `audiotest.yml` on Win11 and Win10 22H2; Discord real-app check | the exit criterion (audio) | owner's PC |
 | Manual | `audiotest.yml` suite `hwcheck` (04's `hwcheck.ps1`) | 04 §18.4's automated set; the result bundle attached | owner's PC (self-hosted runner) |
@@ -2263,7 +2349,16 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
     `ffmpeg:fetch` output in `.deps/ffmpeg/`;
   - `task native:dist`: a flat zip of `GOOS=windows` `isshoni-enginetest.exe`, `g2g.exe` (01's `tools/g2g`),
     `native/windows/tools/hwcheck.ps1`, the release `isshoni-media.dll` and the FFmpeg DLLs (CI uploads it as
-    `isshoni-native-tools`, §5.1);
+    `isshoni-native-tools`, §5.1). As built (README WA24): `DLL=<file>` (default
+    `native/build/win-x64-release/windows/isshoni-media.dll`), `OUT=<file>` (default
+    `dist-desktop/isshoni-native-tools.zip`) and `FFMPEG_ROOT=<dir>` (default the `ffmpeg:fetch` output); it fails on
+    a stale lock and checks both FFmpeg DLLs against `lock.json`'s SHA-256s; `isshoni-enginetest.exe` joins once
+    `cmd/isshoni-enginetest` exists (WA44), `g2g.exe` and `hwcheck.ps1` with WA76. On Windows it runs in Windows
+    PowerShell 5.1 (`Compress-Archive`), elsewhere in Task's shell with `zip`, so a zip for the owner's PC can also be
+    made on the Mac from a downloaded `windows-native` artifact. The values reach its scripts through env names of its
+    own, `NATIVE_DIST_*` (and `ffmpeg:fetch`'s `FFMPEG_FETCH_*`), never as template text inside the scripts' quotes:
+    they exist only in the task's processes, so they take no `ISSHONI_` prefix and aren't on the server's reserved list
+    (§7.3);
 
   the MSVC environment step `deploy/windows/msvc-env.ps1` (VS `[17.0,19.0)` with the C++ tools component, toolset
   `14.44`, SDK `10.0.26100.0`, from `tools.json` `msvc`; `task native:build` runs it, §3);
@@ -2402,9 +2497,9 @@ In order; each is testable on its own. Days are rough, for one developer (about 
 | # | Slice | Scope | Acceptance | Depends on | Verified |
 |---|---|---|---|---|---|
 | R1 | Cross-OS desktop CI (1 d) | `lint-go`'s Windows steps, `desktop-macos` job, the DLL-free `windows-go` job (windows-2025, `desktop` filter, no needs, 15 min, in `ci-ok`), the `native-host` job and `task native:test`, `tools/wails3` + `task release:wails3` + the extended `lint:pins` (Wails library, CLI and `@wailsio/runtime` in `web/package.json` and `web/package-lock.json`), the Dependabot ignores (gomod and npm), `changes` filters (`desktop`, `native`) | a PR touching the app: ubuntu cross-builds `isshoni.exe` (`CGO_ENABLED=0`), macOS builds the darwin app with the fake engine, client-core tests pass on both and on `windows-go` (02's DA9/DA10 and this document's R7/R8 get Windows CI from here on); `native-host` is green on 04 E1's host tests on ubuntu and macOS; `lint:pins` fails when `tools/wails3` and `go.mod` name different Wails versions, and when `@wailsio/runtime` is a range or differs from the version 03's DK1 recorded | 03's app skeleton with the build constraints; 04 E1 for `native-host` | CI ubuntu, macos, windows; Mac |
-| R2 | FFmpeg LGPL build (2 d) | `native/ffmpeg/{pins.json,build.sh,ffcheck.c,README-LGPL.txt}`, `ffmpeg.yml` (build, publish, weekly), `tools/desktoppkg ffmpeg-inputs/ffmpeg-fetch`, `lock.json`; the MSVC environment step `deploy/windows/msvc-env.ps1` and the `msvc` entry of `deploy/windows/tools.json` (§3; R3a adds the other entries) | the PR build is green on `windows-2025` (VS 2026 image) with toolset 14.44, and the log and summary name the VS instance, the toolset build and the SDK; with `toolset` set to a version the image lacks, the step fails naming the toolsets it found; the zip holds the two DLLs, import libs, headers, PDBs and licenses; `ffcheck` shows LGPL 2.1+, exactly the four encoders, no gpl/nonfree/version3; dependents are system DLLs only; a second build is byte-identical (or the slice records that MSVC isn't and the check becomes a warning, §4.6); the owner's dispatch creates `deps-ffmpeg-9.0.2-r1` as a non-latest prerelease with attestations; `lock.json` merged | — | CI windows; owner dispatch |
+| R2 | FFmpeg LGPL build (2 d) | `native/ffmpeg/{pins.json,build.sh,ffcheck.c,README-LGPL.txt}`, `ffmpeg.yml` (build, publish, weekly), `tools/desktoppkg ffmpeg-inputs/ffmpeg-fetch`, `lock.json`; the MSVC environment step `deploy/windows/msvc-env.ps1` and the `msvc` entry of `deploy/windows/tools.json` (§3; R3a adds the other entries) | the PR build is green on `windows-2025` (VS 2026 image) with toolset 14.44, and the log and summary name the VS instance, the toolset build and the SDK; with `toolset` set to a version the image lacks, the step fails naming the toolsets it found; the zip holds the two DLLs, import libs, headers, PDBs and licenses; `ffcheck` shows LGPL 2.1+, exactly the four encoders, no gpl/nonfree/version3; dependents are system DLLs only; a second build is byte-identical (or the slice records that MSVC isn't and the check becomes a warning, §4.6); the owner's dispatch creates `deps-ffmpeg-9.0.2-r1` as a non-latest prerelease with attestations; `lock.json` merged (done: dispatched on 2026-11-03 from `main` at `7e3f7bb`, §4.6, README §3 item 50) | — | CI windows; owner dispatch |
 | R3a | `windows-native` job, no FFmpeg yet (0.75 d) | lands **in the same PR as 04 E2**: vcpkg clone at `native/vcpkg.json`'s baseline + cache, the MSVC environment, presets `win-x64-ci` (build, ctest) and `win-x64-release` (build), `tools/desktoppkg dll-check` (exports, `static:`/`delay:` imports, version resource), `deploy/windows/dll-imports.txt` and the rest of `tools.json` (NSIS, WebView2, Pester, PSScriptAnalyzer; R2's `msvc-env.ps1` reused), the WebView2 bootstrapper check, the `release\`/`ci\` artifact, `task native:build`; `IM_FFMPEG_ROOT` optional until R3b; the Go load test (`ISSHONI_TEST_ENGINE_DLL`) in this job until R5 exists | green on 04's skeleton DLL (E2's acceptance: both presets with `/W4 /WX`, exports equal the `.def`, Go loads the DLL); an extra export, a `VCRUNTIME140.dll` or `avcodec-62.dll` import, a static `mfplat.dll` import or a wrong `ProductVersion` each fail the job | R1, 04 E2 (same PR) | CI windows |
-| R3b | FFmpeg in `windows-native` (0.5 d) | the locked zip from the deps release as `IM_FFMPEG_ROOT`, the lock staleness check (§4.1), the FFmpeg DLL hash check, `task native:dist` and the `isshoni-native-tools` artifact | a changed `pins.json` without a new lock fails the job; the `ci\` folder carries the FFmpeg DLLs next to the DLL; the tools zip unpacks on the owner's PC (its `isshoni-enginetest probe -quick` check is 04 E7's, README WA44, since the tool comes with E7); lands **before 04 E7** | R2, R3a | CI windows; owner's PC |
+| R3b | FFmpeg in `windows-native` (0.5 d) | the locked zip from the deps release as `IM_FFMPEG_ROOT`, the lock staleness check (§4.1), the FFmpeg DLL hash check, `task native:dist` and the `isshoni-native-tools` artifact | a changed `pins.json` without a new lock fails the job; the `ci\` folder carries the FFmpeg DLLs next to the DLL; the tools zip unpacks on the owner's PC (its `isshoni-enginetest probe -quick` check is 04 E7's, README WA44, since the tool comes with E7); lands **before 04 E7**. As built (README WA24, group 9): the job also runs on `Taskfile.yml`-only changes (§10.1); `release\` gets the FFmpeg DLLs and PDBs flat next to `isshoni-media.dll` (§5.1); `native:dist` passes its values through `NATIVE_DIST_*` (§17); the Go DLL tests use the `ci\` folder, assembled before them | R2, R3a | CI windows; owner's PC |
 | R4 | Installer (2.5 d) | `deploy/windows/nsis/*` (incl. the `.old` rename loop for every overwritten PE file, the WebView2 120.0 minimum, the toast-key cleanup, `--forget-credentials` on every uninstall, the installing mutex with exit 8 and the `/UPDATE` banner), `tools/desktoppkg {winver,stage,nsis,check}`, `task desktop:exe:windows [TAGS]`, `task desktop:package:windows`, `deploy/test/windows/smoke.ps1` | on the Mac: an installer builds with Homebrew makensis; on Windows CI: every `smoke.ps1 -Mode ci` case of §16 passes (credentials and toast keys gone in both uninstall modes, the data root only on purge; a second setup exits 8 and an app start exits 0 with the Pending values written while the installing mutex is held); `makensis -WX` clean; the strings rule holds (`Banner::show` included); on the owner's PC, `setup.exe /S /UPDATE /RELAUNCH` over an installed copy shows the "Updating isshoni to {v}…" window until the relaunch (or the slice records the §6.4 fallback) | R3b, 03's flag parsing (`--open-url`, `--forget-credentials`, `--purge-data`, `--self-check`), the running mutex and step 2a (the installing-mutex probe, 03 §13.4), 02 DA10 (`ForgetAll`) | CI windows; Mac; owner's PC (pages, interactive prompts, the banner) |
 | R5 | `windows-desktop` job (0.75 d) | the job of §10.1: the DLL-dependent Go tests (`go test -race ./internal/media/...` with the `ci\` DLL), the installer and smoke, 03's CDP spec with the `TAGS=e2e` build, the PR artifact, `ci-ok` wiring; plus `protocol`'s bindings and `codes.gen.ts` drift checks and `build`/`e2e`'s `DESKTOP_E2E_BIN` | a PR changing the app runs it; 04's `TestNativeIntoPublisher` runs (not skipped) on the runner; the CDP spec passes; a hand-edited binding fails `protocol`; the artifact installs on the owner's PC | R4, 03's `e2ehost` and CDP config | CI ubuntu, windows; owner's PC |
 | R6 | Desktop notices and native gate (1 d) | `tools/notices` `-native`, `deploy/notices/native-windows.json`, `deploy/notices/licenses/webview2-bootstrapper.txt`, the LGPL files in the stage, `go-licenses` on macOS | the installed `THIRD_PARTY_NOTICES.txt` lists Wails' modules, the npm packages and the native section; the §16 negative cases fail | R5 | CI ubuntu, windows, macos |
@@ -2413,7 +2508,7 @@ In order; each is testable on its own. Days are rough, for one developer (about 
 | R9 | Updater e2e on Windows (1 d) | the e2e of §16 in `windows-desktop` and the nightly (`smoke.ps1 -Mode update`) | ci.1 → ci.2 via `--update-now`, the failure and downgrade cases; a start while the installing mutex is held leaves `attempts` at 0 and starts no installer, and the following start applies the pending ci.2 and hands the link over through `PendingServer`/`PendingRoom` | R5, R8, 03's `--update-now` and the start-time apply | CI windows |
 | R10 | `install-desktop.ps1` (1.5 d) | the script (incl. the Smart App Control check and the `try`/`catch` around `Start-Process`, §7.1), Pester tests, PSScriptAnalyzer, `lint:ps`/`test:ps`, `task release:keys` and `lint:keys` for its block, `release:prepare` stamping; the TLS measurement on a clean Windows 10 22H2 (§7.1 step 2, §11.8 item 7(b)) recorded in the PR, which fixes the `ps1Command` form for R12 | Pester passes under `pwsh` and Windows PowerShell 5.1 (Smart App Control `1` → message and no download; a throwing `Start-Process` → the `isshoni:` line); on Windows CI against relserve it installs a CI build and refuses tampered files and wrong keys; the PR states the measured default `SecurityProtocol` and the chosen `ps1Command` form | R5 | CI ubuntu, windows; owner's PC (Win10 22H2 inbox OpenSSH, clean install for the TLS check) |
 | R11 | Server route (0.5 d) | `deploy/embed.go`, `internal/server/httpapi/desktopscripts.go`, router and wiring lines (as built: the wiring line in `http.go`'s `routerOptions`, §7.4), the reserved env names of §7.3 in `reservedEnv` (M1 04 §4.2; `ISSHONI_TEST_ENGINE_DLL`, not `ISSHONI_TEST_MEDIA_DIR`), M1 04 §2's import-table row (not written yet: outside `docs/m2`, §7.4) | §16's httpapi tests; `task dev` serves a pre-filled script for `http://localhost:5173`; `/install-desktop.sh` is 404; the server logs no unknown-env warning for any §7.3 name | R10 (the template) | CI ubuntu; Mac |
-| R12 | `/download` page (1 d) | `web/src/download/*` (browser-only, `openAppUrl` via `appLinkFor`), `account.download.*` texts, `download.spec` | Vitest and Playwright as in §16 (the three numbered Windows steps; `?room=` valid and invalid; the three warning lines with their anchors; `ps1Command` exactly the form R10 recorded); axe passes (M1's a11y spec covers the page) | R11, R10 (the `ps1Command` form), 02 DA7 (`appLinkFor`) | CI ubuntu; Mac |
+| R12 | `/download` page (1 d) | `web/src/download/*` (browser-only, `openAppUrl` via `appLinkFor`), `account.download.*` texts, `download.spec` | Vitest and Playwright as in §16 (the three numbered Windows steps; `?room=` valid and invalid; the three warning lines with their anchors; `ps1Command` exactly the form R10 recorded); axe passes (M1's a11y spec covers the page; as built, WA74: it doesn't, so `download.spec` runs axe itself in both colour schemes, §16) | R11, R10 (the `ps1Command` form), 02 DA7 (`appLinkFor`) | CI ubuntu; Mac |
 | R13 | Release pipeline (2.5 d) | `release.yml` jobs of §11.1, `.goreleaser.yaml`, `release:assets DESKTOP=true` and the stubs, `check-draft.sh` + test, `verify-windows`, the server-rendered ps1 integration test in `windows-desktop` | the dry run is green end to end with ephemeral keys, `verify-windows` included; `check-draft-test.sh` new cases pass; `goreleaser-check` passes with stubs; the server-rendered ps1 test's cases of §16 pass, including the non-executable installer ending with the `isshoni: Windows blocked the installer (` line and no unhandled error; the dry run uploads `isshoni-exit-tools` whose `isshoni-media.dll` SHA-256 equals `native-manifest.json`'s and whose `isshoni-audiotest.exe selfcheck` passes on `verify-windows`' runner; an `audiotest.yml` dispatch with `release_run_id` = the dry run's run skips `build` and its `fetch` job succeeds (its `run` job may be cancelled when no runner is online); `check-draft-test.sh` fails a manifest with a non-empty `revokedKeys` signed by the active key and passes it signed by the backup (§11.3) | R6, R7, R10 | GitHub dry run; Mac (`test:sh`) |
 | R14 | Site and docs (1 d) | §13's pages (R14 owns `/privacy#desktop` incl. 02 §9's "On the PC" facts; the troubleshooting anchors incl. `#desktop-linking` for 02's section), `site.yml` and `release.json`, `TestDocsAnchors` additions, README keys table, `deploy/keys/README.md` and `deploy/windows/runner/README.md` | the `site` job and the anchor test pass with every §17 anchor; nothing is loaded from another origin | R13 | CI ubuntu |
 | R15 | Audiotest workflow (0.5 d) | `audiotest.yml` with the suites `release`, `full` and `hwcheck`, the `release_run_id` input and the `fetch` job | a dispatch on the owner's PC under Win11 and under Win10 produces a report artifact and a summary; the `fetch` job and `release_run_id` exist (exercised end to end by R13's dry run); `suite: hwcheck` uploads `hwcheck.ps1`'s bundle; the workflow has no PR trigger (a test in `repocheck` reads the file) | 05's audiotest, R3b (`isshoni-native-tools`) | owner's PC |

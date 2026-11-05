@@ -1,11 +1,15 @@
 // The C++ boundary between the engine (04) and Windows audio (05) inside isshoni-media.dll:
 // docs/m2/04-windows-engine.md §10.2 in the form of docs/m2/05-windows-audio.md §10.5, which 05 implements in this
 // folder. 04 calls it from src/api/exports.cpp (the audio exports, after their argument checks), src/engine/ (Init and
-// Shutdown on the worker) and src/audio_bridge/ (a session's Mixer, wired to its Opus stage as the PcmSink).
+// Shutdown on the worker) and src/session/session_object.cpp (a session creates its Mixer through NewMixer, wires it
+// to its Opus stage as the PcmSink, starts, pauses and stops it and reads State); src/audio_bridge/ only says which
+// AudioEngine that is (audio_bridge::Engine(), with a test override).
 //
 // README WA11 declared this boundary with a stub engine; 05's engine is audio_engine.cpp: README WA35 the watcher half
 // (watcher.h: the process table, endpoints, session and device notifications, meters, mic detection, the report, the
-// levels and the probe flags), WA45 and WA53 the capture, the mixer and the sound check.
+// levels and the probe flags), README WA45 the include set's capture and the share's mixer (include_set.h, live_mix.h:
+// im_audiomix's mixer thread on the Windows clock, through a PcmSink adapter), README WA53 the fast path, the endpoint
+// engine, the startup probe and the sound check.
 //
 // Rules for the implementation (05 §4.3, §10.5): every audio call may come from any thread; COM work happens only on
 // 05's own MTA threads; rules and strings are copied during the call; audio never fails a share and never makes

@@ -71,8 +71,8 @@ ReportSession Session(uint32_t pid, uint64_t created, const char *exe, const cha
   return s;
 }
 
-ReportEvent Event(int64_t t, ReportEventCode code, const char *app = "") {
-  ReportEvent e;
+ReportEntry Event(int64_t t, ReportEventCode code, const char *app = "") {
+  ReportEntry e;
   e.t_ns = t;
   e.code = code;
   e.app = app;
@@ -438,6 +438,7 @@ TEST(ReportWriter, EverySpelling) {
   EXPECT_STREQ(ReportName(AppReason::kPidReuse), "pid_reuse");
   EXPECT_STREQ(ReportName(AppReason::kCaptureFailed), "capture_failed");
   EXPECT_STREQ(ReportName(AppWarning::kSharedAppKeptOut), "shared_app_kept_out");
+  EXPECT_STREQ(ReportName(AppWarning::kInstanceGone), "instance_gone");
   EXPECT_STREQ(ReportName(SessionFlow::kCapture), "capture");
   EXPECT_STREQ(ReportName(SessionStream::kActivating), "activating");
   EXPECT_STREQ(ReportName(SessionStream::kPreroll), "preroll");

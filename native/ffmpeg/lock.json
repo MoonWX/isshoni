@@ -1,19 +1,19 @@
 {
-  "revision": 1,
-  "tag": "deps-ffmpeg-9.0.2-r1",
-  "inputsSha256": "0e3ec921c8ad3c01e652ade4cf8df27763582f5ffe07efaf47581835844a1093",
+  "revision": 2,
+  "tag": "deps-ffmpeg-9.0.2-r2",
+  "inputsSha256": "27c3b458f76c338b66d8f387189918c4b1d695756053989b12affbe255943311",
   "assets": {
-    "ffmpeg-9.0.2-r1-win-x64.zip": "9c21557c4006db3cb10356044bf9c4365cb7530fa0b58805cb2552b8fff02eec",
-    "ffmpeg-9.0.2-r1-source.tar": "9adbadca79c5c1bb359f7ed1c7cf1772ed9254de51092b7fb67258b2eff2127c"
+    "ffmpeg-9.0.2-r2-win-x64.zip": "0b403065af54ed217e5801244838d0a896ae0f9abccd83768a5130407c720a66",
+    "ffmpeg-9.0.2-r2-source.tar": "972443c691b15e672ab663d19f8628bbb680502fbbee28832d64e176846ba271"
   },
   "avcodecMajor": 63,
   "avutilMajor": 61,
   "dlls": {
-    "avcodec-63.dll": "21d8c2af17ed4b2d35c40bcb5eeed92173385543e4869f3e5e02b059f9c17518",
-    "avutil-61.dll": "a5969e2e7b021182e054a8a70e3d80ce7390dd71f81c5bda99977b91b0b49d39"
+    "avcodec-63.dll": "a739c6ff930a14c46c044fad8832c1614e9ed4fa25230d9538ce7bec25d70938",
+    "avutil-61.dll": "e8bfdef34f0009dc99f606ba44bcc55b0abd70e5a2f837ab73fcfd4490c996d6"
   },
   "msvcToolset": "14.44.35207",
   "msvcCompiler": "19.44.35229",
   "msvcLinker": "14.44.35229.0",
-  "commit": "7e3f7bb334f47569e5430b053b53fdc162fa41f3"
+  "commit": "957cce64408fafc3ac0a65a127926a1e6f6075f5"
 }

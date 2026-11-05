@@ -23,7 +23,7 @@
 #   msvcLinker, from their banners): Visual Studio's servicing updates those in place under the same folder name, so
 #   the same toolset build means all three are equal. The DLLs are compared with lock.json's whenever its inputsSha256
 #   is the one build hashed (in the weekly run, too, while a pins bump waits for its publishing run). lock.json absent
-#   or stale (a pins.json, build.sh or ffcheck.c change) is a note: publishing after the merge fixes it.
+#   or stale (a pins.json, build.sh, ffcheck.c or patches/ change) is a note: publishing after the merge fixes it.
 # - publish (ubuntu-24.04, contents: write, id-token: write, attestations: write; runs no build code): only a manual
 #   run with publish on, from any ref. It refuses when the tag exists (raise "revision" in pins.json instead), checks
 #   the artifact against build's SHA-256s, attests both files, creates deps-ffmpeg-<ver>-r<rev> as a prerelease that
@@ -163,8 +163,8 @@ jobs:
           CHERE_INVOKING: '1' # stay in the workspace
           MSYSTEM: MSYS
         run: |
-          pacman -Sy --noconfirm --needed make pkgconf diffutils zip
-          pacman -Q make pkgconf diffutils zip tar
+          pacman -Sy --noconfirm --needed make pkgconf diffutils zip patch
+          pacman -Q make pkgconf diffutils zip patch tar
 
       - name: Build FFmpeg
         shell: C:\msys64\usr\bin\bash.exe --login -eo pipefail {0}
@@ -374,7 +374,7 @@ jobs:
             ;;
           stale)
             echo "::notice::native/ffmpeg/lock.json does not describe these inputs: after the merge, run this workflow with publish and commit the lock it prints"
-            summary '- lock.json does not describe these inputs (pins.json, build.sh or ffcheck.c changed): after the merge, run this workflow with publish and commit the lock it prints.'
+            summary '- lock.json does not describe these inputs (pins.json, build.sh, ffcheck.c or a patch under native/ffmpeg/patches changed): after the merge, run this workflow with publish and commit the lock it prints.'
             ;;
           absent)
             echo "::notice::native/ffmpeg/lock.json does not exist yet: run this workflow with publish and commit the lock it prints"

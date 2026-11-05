@@ -16,6 +16,16 @@ inline constexpr uint32_t kTailRampFrames = 64;                // a chunk that e
 // the stream's input, before the resampler (mix_engine.cpp says why), where §9.5 puts it after.
 inline constexpr uint32_t kOnsetSilenceFrames = 50 * kFramesPerMs;
 inline constexpr uint32_t kOnsetRampFrames = 5 * kFramesPerMs;
+// The tail fade, the onset fade's mirror image (the S1 spike's offset fade, README WA09's run on Server 2025): when an
+// app stops playing, Windows' process-loopback tap cuts its audio on a 10 ms packet boundary and then delivers digital
+// silence, so the app's own fade-out arrives only in part or not at all, and the waveform stops mid-cycle (a click).
+// Sound followed by at least kOffsetSilenceFrames (5 ms) of digital silence has its last kOffsetRampFrames (5 ms)
+// ramped linearly to zero. The frames after the stop are already in the ring (a running stream holds 40 ms), so the
+// ramp adds no latency; a sound that really ends in a hard cut loses 5 ms of level at its very end, which is
+// inaudible. MixEngine applies it to the stream's input before the resampler, like the onset fade, and counts it
+// (MixCounters::tail_fades, event kTailFade at most once per second per channel).
+inline constexpr uint32_t kOffsetSilenceFrames = 5 * kFramesPerMs;
+inline constexpr uint32_t kOffsetRampFrames = 5 * kFramesPerMs;
 
 // Soft clip above -1 dBFS (§9.6): for |x| > t (t = 0.891), y = sign(x) * (t + (1 - t) * tanh((|x| - t) / (1 - t))).
 // Continuous with slope 1 at t; |y| <= 1 for every x; NaN becomes 0.
