@@ -40,6 +40,16 @@ type instance interface {
 type starter struct {
 	log    *slog.Logger
 	stdout func() io.Writer // --version's output
+	// soundCheckHelper is step 0: 05's audio.RunSoundCheckHelper, whose result is the exit code. main runs it
+	// itself right after its first action, before any logging; start runs it for a start that got this far with
+	// --sound-check-helper first. nil: this build has none (exit 2).
+	soundCheckHelper func() int
+	// runningExists is step 2's probe of the running mutex (winos.MutexExists): while it exists this start only
+	// forwards, so it isn't relaunched. shellRelaunch is step 2 itself (winos.RelaunchUnderShell): true when a new
+	// process was started under the user's shell and this one exits 0; an error is logged and the start goes on in
+	// place. nil skips step 2 (the tests that don't look at it, and OSes without a shell relaunch).
+	runningExists func() (bool, error)
+	shellRelaunch func(args []string) (bool, error)
 	// installerRunning is step 2a's probe of installingMutex (OpenMutexW): true while an installer runs, false
 	// when the name doesn't exist (ERROR_FILE_NOT_FOUND), an error otherwise.
 	installerRunning func() (bool, error)
@@ -74,11 +84,14 @@ type starter struct {
 func (s *starter) start(args []string) int {
 	p := app.ParseArgs(args)
 
-	// Step 0: --sound-check-helper as os.Args[1] runs 05's helper before any other step (README WA77 dispatches it
-	// to audio.RunSoundCheckHelper; until then this build has none).
+	// Step 0: --sound-check-helper as os.Args[1] runs 05's helper before any other step (main has already run it
+	// right after its first action; this is the same step for a start that reached here).
 	if p.SoundCheckHelper {
-		s.log.Error("desktop: --sound-check-helper is not in this build yet")
-		return exitUnavailable
+		if s.soundCheckHelper == nil {
+			s.log.Error("desktop: this build has no --sound-check-helper")
+			return exitUnavailable
+		}
+		return s.soundCheckHelper()
 	}
 
 	// Step 1: the one-shot modes, never with --open-url (ParseArgs leaves OneShot empty then). No window, no single
@@ -98,7 +111,11 @@ func (s *starter) start(args []string) int {
 		return s.oneShot(p)
 	}
 
-	// Step 2, the shell relaunch (README WA77), goes here.
+	// Step 2: the shell relaunch (03 D16): a start whose parent isn't Explorer or a launcher starts again under the
+	// user's shell and exits.
+	if s.relaunchUnderShell(p, args) {
+		return exitOK
+	}
 
 	// Step 2a: an installer runs right now. A link start leaves its link to the installer's own app start, and
 	// every start exits: no single instance, running mutex, updater or Apply (06 §2.4, §8.7).
@@ -152,6 +169,34 @@ func (s *starter) start(args []string) int {
 
 	// Step 7: the app.
 	return s.runApp(p, args, pending, fwd, inst)
+}
+
+// relaunchUnderShell is 03 §13.4 step 2. It reports whether the start must exit 0 now: a new process was started
+// under the user's shell. It is skipped with --relaunched and while the running mutex exists (this start will only
+// forward); a probe or relaunch that fails is logged and the start goes on in place.
+func (s *starter) relaunchUnderShell(p app.Args, args []string) bool {
+	if s.shellRelaunch == nil || p.Relaunched {
+		return false
+	}
+	if s.runningExists != nil {
+		running, err := s.runningExists()
+		if err != nil {
+			s.log.Warn("desktop: couldn't tell whether isshoni runs; not relaunching", "err", err)
+			return false
+		}
+		if running {
+			return false
+		}
+	}
+	relaunched, err := s.shellRelaunch(args)
+	if err != nil {
+		s.log.Warn("desktop: not relaunched under the shell; starting here", "err", err)
+		return false
+	}
+	if relaunched {
+		s.log.Info("desktop: started again under the shell")
+	}
+	return relaunched
 }
 
 // startFresh starts the exe again without arguments and doesn't wait for it.

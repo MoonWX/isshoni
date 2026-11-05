@@ -302,9 +302,14 @@ func (c coreClient) StartShare(ctx context.Context, r core.ShareRequest) (Share,
 	return s, nil
 }
 
-// AudioPolicy is what the controller calls of 05's *audio.Service (05 §14.2): the share's life, the pause's extra
-// mute and the Share sound switch. 05's SetSharedPID at pick time is README WA77's hand-off.
+// AudioPolicy is what the controller calls of 05's *audio.Service (05 §14.2): the shared app's process while a pick
+// is held, the share's life, the pause's extra mute and the Share sound switch.
 type AudioPolicy interface {
+	// SetSharedPID names the process of the picked window while the pick is held and no share runs (0 for a monitor,
+	// and once the pick is released, expired or given up), so the first-share sheet shows the shared app first, with
+	// its warnings, before the share starts (05 §5.8, §22; README WA77). From OnShareStarted to OnShareStopped 05
+	// keeps it itself.
+	SetSharedPID(pid uint32)
 	// OnShareStarted is called before StartShare; sharedPID is the shared window's process, 0 for a monitor.
 	OnShareStarted(sharedPID uint32, withAudio bool)
 	// OnShareStopped is called after every share end, and after a StartShare that failed.

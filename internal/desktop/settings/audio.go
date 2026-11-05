@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"maps"
@@ -27,11 +28,16 @@ func NewAudioStore[T any](s *Store, defaults func() T) *AudioStore[T] {
 	return &AudioStore[T]{s: s, defaults: defaults}
 }
 
-// AudioSettings returns the saved section as T: the defaults, overwritten by what the section has. A section that
-// doesn't decode into T gives the defaults for what failed (one WARN).
+// AudioSettings returns the saved section as T: the defaults, overwritten by what the section has. A settings.json
+// without an audio section (a new install, a file of an older build) gives the defaults as they are, without a log
+// line (README WA77); a section that doesn't decode into T gives the defaults for what failed (one WARN).
 func (a *AudioStore[T]) AudioSettings() T {
 	v := a.defaults()
-	if err := json.Unmarshal(a.s.AudioSection(), &v); err != nil {
+	section := a.s.AudioSection()
+	if len(bytes.TrimSpace(section)) == 0 {
+		return v
+	}
+	if err := json.Unmarshal(section, &v); err != nil {
 		a.s.log.Warn("settings: the audio section doesn't fit; using 05's defaults for what failed", slog.Any("err", err))
 	}
 	return v

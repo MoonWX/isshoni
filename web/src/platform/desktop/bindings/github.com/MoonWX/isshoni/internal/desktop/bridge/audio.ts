@@ -7,7 +7,8 @@
  * and Settings → Audio call Watch on mount and unmount; level meters call WatchLevels). There is no sound-mode
  * method: M2 has no "All sound" mode (README §3 item 15), and sound is switched per share by Share.SetAudioEnabled.
  * 
- * main hands it 05's service with README WA77; until then every method is not_implemented (the counts still work).
+ * main and the e2e harness hand it 05's service (Deps.Audio); without one every method is not_implemented (the counts
+ * still work).
  * @module
  */
 

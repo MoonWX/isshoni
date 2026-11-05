@@ -1,6 +1,8 @@
-// /desktop/setup (docs/m2/03 §8.2): the first-run wizard's server, add, confirm and link steps. The sound and voice
-// steps of the first install (§8.4, DesktopFeatures.wizardSteps()) come with README WA77; until then the wizard ends at
-// the link step's "Linked", and goes to the room.
+// /desktop/setup (docs/m2/03 §8.2): the first-run wizard's server, add, confirm, link, sound and voice steps. The
+// sound and voice steps (§8.4, DesktopFeatures.wizardSteps()) come once per install, after the link of a server
+// that was just added: while App.Info's wizardDone is false; the voice step's Done sets it (Settings.Update
+// {wizardDone: true}). A server added later, and linking the same server again (the relink page), end at the link
+// step's "Linked" and go to the room.
 //
 // - server: no server came with a link, --server or PendingServer: "Installed from your isshoni page? Go back to it
 //   and click Open isshoni", and the address field as the fallback. Enter probes (Auth.Probe); an invite or setup link
@@ -13,6 +15,8 @@
 //   address first (Shell.Reload reloads the window's address), so the reloaded page, with the new server's bridge.js,
 //   drops ?link=1 and calls Auth.Link() once (LinkStep). After addServer this page makes no other bridge call.
 // - link: LinkStep, for the active server.
+// - sound (first install): the sound check (SoundCheck.tsx, Audio.SoundCheck), which never blocks: Continue.
+// - voice (first install): what friends never hear and the mic toggle (AudioSettings.tsx's VoiceStep), Done.
 // Cancel on the first server leaves an empty "Link isshoni to your server" page with [Start].
 import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
@@ -26,15 +30,17 @@ import { Actions, Prose } from '../auth/AuthForm';
 import { Notice } from '../auth/Notice';
 import { DOCS_URL } from '../conntest/links';
 import type { DesktopFeatures } from '../platform/types';
-import type { PendingLink, ServerProbe } from '../platform/desktop/bridge';
+import type { PendingLink, ServerProbe, SettingsPatch } from '../platform/desktop/bridge';
 import { queryKeys } from '../protocol/queryKeys';
 import { Button } from '../ui/Button';
 import { TextField } from '../ui/Field';
 import { Spinner } from '../ui/Spinner';
 import { hostOf, inviteLink } from './address';
 import { failureOf, failureText, type BridgeFailure } from './authText';
+import { VoiceStep } from './AudioSettings';
 import { LinkStep } from './LinkStep';
 import { hostLabel, TrustLine } from './parts';
+import { SoundCheck } from './SoundCheck';
 import styles from './wizard.module.css';
 
 /** The site's section on a server that opens in the browser but not in the app (03 §8.1, 02 DA12). */
@@ -55,7 +61,9 @@ type Step =
   | { kind: 'add'; target: AddTarget }
   | { kind: 'confirm'; probe: ServerProbe; shown: string; add: AddTarget | null }
   | { kind: 'switching' }
-  | { kind: 'link'; autoLink: boolean };
+  | { kind: 'link'; autoLink: boolean }
+  | { kind: 'sound' }
+  | { kind: 'voice' };
 
 /** Every shape Go's PendingLink can have (03 §6.3); bridge.ts names the two the router needs. */
 type AnyPendingLink = PendingLink & { error?: string; switch?: AddTarget };
@@ -177,7 +185,8 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
     else setStep({ kind: 'start' });
   };
 
-  const done = useCallback((): void => {
+  /** The wizard is over: the room of the link that started it, else the home page (03 §8.2). */
+  const finish = useCallback((): void => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.me, exact: true });
     void bridge.app.pendingLink().then(
       (p: AnyPendingLink | null | undefined) => {
@@ -194,6 +203,41 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
       },
     );
   }, [bridge, navigate, queryClient]);
+
+  // The first install's audio steps come after the first link, once (wizardDone, 03 §8.2).
+  const audioSteps = desktop.wizardSteps().filter((s): s is 'sound' | 'voice' => s === 'sound' || s === 'voice');
+  const firstAudioStep = audioSteps[0] ?? null;
+  /**
+   * The link step of a server just added (the page Go reloaded at ?link=1 after Auth.AddServer) is done: the audio
+   * steps of a first install, else the end. Relinking the same server (the relink page's Link again, a sign-in again)
+   * is no install step and ends at once (`finish`).
+   */
+  const done = useCallback((): void => {
+    if (firstAudioStep === null) {
+      finish();
+      return;
+    }
+    bridge.app.info().then(
+      (info: { wizardDone?: boolean } | null | undefined) => {
+        // No answer is no first install to finish: the audio steps are for a wizardDone that is false.
+        if (info?.wizardDone !== false) finish();
+        else setStep({ kind: firstAudioStep });
+      },
+      () => {
+        finish();
+      },
+    );
+  }, [bridge, finish, firstAudioStep]);
+  /** The voice step's Done: the steps were seen (wizardDone), then the end. */
+  const audioDone = (): void => {
+    // SettingsPatch's wizardDone (Go's bridge.SettingsPatch has it; bridge.ts's type gets it with a later change of
+    // platform/desktop, so it goes through as a plain object here).
+    const patch: Record<string, unknown> = { wizardDone: true };
+    bridge.settings
+      .update(patch as SettingsPatch)
+      .catch(() => undefined)
+      .finally(finish);
+  };
 
   let heading = t('desktop.setup.title');
   let body;
@@ -309,7 +353,7 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
           origin={origin}
           appVersion={appVersion}
           autoLink={step.autoLink}
-          onDone={done}
+          onDone={step.autoLink ? done : finish}
           openExternal={(url) => {
             platform.openExternal(url);
           }}
@@ -319,6 +363,26 @@ function Wizard({ desktop, origin }: { desktop: DesktopFeatures; origin: string 
           onTitle={setTitle}
         />
       );
+      break;
+    case 'sound':
+      heading = t('desktop.setup.sound.title');
+      body = (
+        <div className={styles.stack}>
+          <p>{t('desktop.setup.sound.intro')}</p>
+          <SoundCheck
+            bridge={bridge}
+            auto
+            onContinue={() => {
+              if (audioSteps.includes('voice')) setStep({ kind: 'voice' });
+              else audioDone();
+            }}
+          />
+        </div>
+      );
+      break;
+    case 'voice':
+      heading = t('desktop.setup.voice.title');
+      body = <VoiceStep bridge={bridge} onDone={audioDone} />;
       break;
   }
 

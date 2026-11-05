@@ -3,8 +3,9 @@
 // SPA in Chrome at http://wails.localhost, against real e2e servers:
 // - an address → the confirm step → Link: AddServer, the window reloads (the harness counts Shell.Reload, and the
 //   spec reloads Chrome's page, as the shell would), the link step shows the code, its QR code and the short URL, and
-//   the app opened the browser at /link?code=…; a second browser context, signed in, approves there → linked, and
-//   the wizard goes to the room;
+//   the app opened the browser at /link?code=…; a second browser context, signed in, approves there → linked, then
+//   the first install's sound and voice steps on 05's fake engine (README WA77: the sound check's result, the
+//   scenario's voice apps and the mic toggle; Done sets wizardDone), and the wizard goes to the room;
 // - a code declined in the browser: "Linking was declined in the browser", and Try again gets a new code;
 // - an unknown server from the command line (--server, as a link or PendingServer would bring it): "Add server
 //   {host}?" with no connection to that server before Add (a counting TCP proxy stands in front of it); its /info
@@ -74,9 +75,49 @@ async function answer(page: Page, url: string, approve: boolean): Promise<void> 
   await expect(page.getByRole('heading', { level: 1, name: 'Linked' })).toBeVisible();
 }
 
-/** The app is linked to origin, and the wizard went on to a room. */
+/** The sound step's heading (03 §8.4). */
+const SOUND_STEP = "Check your PC's sound";
+
+/**
+ * The first install's sound and voice steps (03 §8.2, §8.4; README WA77), run for real on 05's fake engine (its
+ * `normal` scenario): the sound check plays and captures the chime over process loopback, the voice step lists the
+ * scenario's built-in voice apps with Discord running, and Done sets wizardDone.
+ */
+async function throughAudioSteps(desktop: DesktopApp): Promise<void> {
+  const { page } = desktop;
+  await expect(page.getByRole('heading', { level: 1, name: SOUND_STEP })).toBeVisible();
+  await expect(page.getByText("✓ isshoni can capture your PC's sound, without your voice apps")).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText(/^Measured level: -?\d+ dB$/)).toBeVisible();
+  await page.getByRole('button', { name: 'Continue', exact: true }).click();
+
+  await expect(page.getByRole('heading', { level: 1, name: "What friends won't hear" })).toBeVisible();
+  await expect(page.getByText('Discord (running)')).toBeVisible();
+  await expect(page.getByText('TeamSpeak', { exact: true })).toBeVisible();
+  await expect(page.getByText("Apps that use your microphone (you'll be asked)")).toBeVisible();
+  await expect(page.getByRole('switch', { name: 'Keep out apps that use my microphone' })).toBeChecked();
+  expect((await desktop.call<{ wizardDone: boolean }>('App', 'Info')).wizardDone).toBe(false);
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
+  await expect.poll(async () => (await desktop.call<{ wizardDone: boolean }>('App', 'Info')).wizardDone).toBe(true);
+}
+
+/**
+ * The app is linked to origin, and the wizard went on to a room: through the sound and voice steps when this is the
+ * install's first wizard (wizardDone false), straight on otherwise.
+ */
 async function expectLinked(desktop: DesktopApp, origin: string): Promise<void> {
-  await expect(desktop.page).toHaveURL(/\/r\/[^/]+$/, { timeout: LINKED_TIMEOUT_MS });
+  const { page } = desktop;
+  const room = /\/r\/[^/]+$/;
+  const sound = page.getByRole('heading', { level: 1, name: SOUND_STEP });
+  await expect
+    .poll(async () => room.test(page.url()) || (await sound.isVisible()), {
+      message: 'the wizard goes on after the link',
+      timeout: LINKED_TIMEOUT_MS,
+    })
+    .toBe(true);
+  if (!room.test(page.url())) await throughAudioSteps(desktop);
+  await expect(desktop.page).toHaveURL(room, { timeout: LINKED_TIMEOUT_MS });
   const st = await desktop.call<{ origin: string; status: string }>('Auth', 'State');
   expect(st).toMatchObject({ origin, status: 'linked' });
 }
@@ -115,9 +156,12 @@ test('address → confirm → code, QR code and short URL → approved in a seco
   await expect.poll(async () => (await desktop.state()).openedUrls).toEqual([complete, complete]);
 
   await answer(friend.page, complete, true);
+  // The first install: the sound and voice steps come before the room (README WA77).
+  await expect(page.getByRole('heading', { level: 1, name: SOUND_STEP })).toBeVisible({ timeout: LINKED_TIMEOUT_MS });
   await expectLinked(desktop, server.url);
   const st = await desktop.call<{ user: { username: string } | null }>('Auth', 'State');
   expect(st.user?.username).toBe(friend.account.username);
+  expect((await desktop.call<{ wizardDone: boolean }>('App', 'Info')).wizardDone).toBe(true);
 });
 
 test('a code declined in the browser: the notice, and Try again gets a new code', async ({

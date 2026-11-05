@@ -654,8 +654,8 @@ describe('M2: boot in the desktop app (docs/m2/03 §7.2)', () => {
 
   it('the default routes and preload are the desktop table’s: /desktop/settings has its page', async () => {
     const { started: app } = mountDesktop({ path: '/desktop/settings', routes: 'app' });
-    // desktop/'s stub (WA42) until WA82 fills it.
-    expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
+    // desktop/'s page: its Audio section (WA77) until WA82 adds the others.
+    expect(await screen.findByRole('heading', { level: 1, name: 'Settings' })).toBeInTheDocument();
     expect(app.services?.platform.kind).toBe('desktop');
     expect(preloadSpy).toHaveBeenCalledExactlyOnceWith('/desktop/settings');
     expect(preloadTargets).toEqual(['desktop']);

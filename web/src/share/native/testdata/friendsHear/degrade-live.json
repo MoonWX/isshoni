@@ -1,0 +1,117 @@
+{
+  "seq": 3,
+  "live": false,
+  "mode": "exclude-apps",
+  "engine": "include-set",
+  "muted": false,
+  "paused": false,
+  "keepOutMicUsers": true,
+  "heard": [
+    {
+      "id": "exe:spotify.exe",
+      "name": "Spotify",
+      "reason": "",
+      "playing": true,
+      "usesMic": false,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    }
+  ],
+  "keptOut": [
+    {
+      "id": "discord",
+      "name": "Discord",
+      "reason": "builtin",
+      "playing": true,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "locked",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:chrome.exe",
+      "name": "Google Chrome",
+      "reason": "mic",
+      "playing": true,
+      "usesMic": true,
+      "browser": true,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    },
+    {
+      "id": "exe:steam.exe",
+      "name": "Steam",
+      "reason": "mic",
+      "playing": false,
+      "usesMic": true,
+      "browser": false,
+      "shared": false,
+      "control": "toggle",
+      "decision": "auto"
+    }
+  ],
+  "notCaptured": [],
+  "prompts": [
+    {
+      "id": "p1",
+      "appId": "exe:steam.exe",
+      "name": "Steam",
+      "kind": "mic",
+      "since": 946684800000
+    },
+    {
+      "id": "p2",
+      "appId": "exe:chrome.exe",
+      "name": "Google Chrome",
+      "kind": "browser-mic",
+      "since": 946684805000
+    }
+  ],
+  "banners": [],
+  "tips": [],
+  "voiceApps": [
+    {
+      "id": "discord",
+      "name": "Discord",
+      "running": true
+    },
+    {
+      "id": "vesktop",
+      "name": "Vesktop",
+      "running": false
+    },
+    {
+      "id": "teamspeak",
+      "name": "TeamSpeak",
+      "running": false
+    },
+    {
+      "id": "mumble",
+      "name": "Mumble",
+      "running": false
+    },
+    {
+      "id": "zoom",
+      "name": "Zoom",
+      "running": false
+    },
+    {
+      "id": "teams",
+      "name": "Microsoft Teams",
+      "running": false
+    },
+    {
+      "id": "slack",
+      "name": "Slack",
+      "running": false
+    }
+  ],
+  "alert": {
+    "voiceAppsHeard": false,
+    "questions": 2
+  }
+}

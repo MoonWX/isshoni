@@ -13,6 +13,8 @@
 //   the tiles write (useVisibility.ts).
 // - A share this page publishes is never subscribed (05 §12.2). The desktop app's own share, which its C2 publishes
 //   and the page has no preview of, is subscribed at the low layer at most and never with audio (docs/m2/03 §10.4).
+// - While the desktop app shares with 05's `endpoint` engine, nothing is heard (viewerStore.audioMutedForShare,
+//   docs/m2/03 §12.1).
 import type { SubscriptionWant } from '../protocol/types.gen';
 import { desiredSubscriptions, PAGE_HIDDEN_OFF_MS, type LayerInputs } from './layerPolicy';
 import type { ViewerServices } from './services';
@@ -38,6 +40,7 @@ export function layerInputs(s: ViewerData, now: number): LayerInputs {
     pageHiddenForMs: s.pageHiddenSince === null ? 0 : Math.max(0, now - s.pageHiddenSince),
     fullscreen: s.fullscreen,
     pip: s.pipShareId,
+    audioMuted: s.audioMutedForShare,
   };
 }
 
@@ -79,7 +82,8 @@ export function attachSubscriptions(
       s.visible !== prev.visible ||
       s.pageHiddenSince !== prev.pageHiddenSince ||
       s.fullscreen !== prev.fullscreen ||
-      s.pipShareId !== prev.pipShareId
+      s.pipShareId !== prev.pipShareId ||
+      s.audioMutedForShare !== prev.audioMutedForShare
     ) {
       apply();
     }

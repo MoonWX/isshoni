@@ -1,6 +1,6 @@
 // Test helpers for share/native/'s components: a desktop-like platform whose sharing provider is a real DesktopSharing
 // on a fake NativeBridge (platform/desktop/testing/fakeBridge.ts), with the page's share store of the test.
-import type { Picked, ShareView } from '../../platform/desktop/bridge';
+import type { AppRow, FriendsHear, Picked, ShareView } from '../../platform/desktop/bridge';
 import { DesktopSharing } from '../../platform/desktop/DesktopSharing';
 import { createFakeBridge, type FakeBridge } from '../../platform/desktop/testing/fakeBridge';
 import type { DesktopFeatures, Platform } from '../../platform/types';
@@ -45,4 +45,47 @@ export async function nativeSetup(init: { current?: ShareView | null; picked?: P
     },
   });
   return { fake, sharing, store, platform, opened };
+}
+
+/** One app row of 05's FriendsHear (05 §14.5): a heard, playing app by default. */
+export function appRow(over: Partial<AppRow> & Pick<AppRow, 'id' | 'name'>): AppRow {
+  return {
+    reason: '',
+    playing: true,
+    usesMic: false,
+    browser: false,
+    shared: false,
+    control: 'toggle',
+    decision: 'auto',
+    ...over,
+  };
+}
+
+/**
+ * 05's FriendsHear (05 §14.5) of a live share with sound: Spotify heard, Discord kept out (built-in), nothing else; the
+ * built-in voice apps with Discord running.
+ */
+export function friendsHear(over: Partial<FriendsHear> = {}): FriendsHear {
+  return {
+    seq: 1,
+    live: true,
+    mode: 'exclude-apps',
+    engine: 'include-set',
+    muted: false,
+    paused: false,
+    keepOutMicUsers: true,
+    heard: [appRow({ id: 'exe:spotify.exe', name: 'Spotify' })],
+    keptOut: [appRow({ id: 'discord', name: 'Discord', reason: 'builtin', control: 'locked', usesMic: true })],
+    notCaptured: [],
+    prompts: [],
+    banners: [],
+    tips: [],
+    voiceApps: [
+      { id: 'discord', name: 'Discord', running: true },
+      { id: 'teamspeak', name: 'TeamSpeak', running: false },
+      { id: 'mumble', name: 'Mumble', running: false },
+    ],
+    alert: { voiceAppsHeard: false, questions: 0 },
+    ...over,
+  };
 }

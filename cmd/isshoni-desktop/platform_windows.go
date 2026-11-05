@@ -57,7 +57,7 @@ func profileDir() string {
 }
 
 // webviewDataDir is WebView2's user data folder, %LOCALAPPDATA%\isshoni\WebView2, absolute and without a trailing
-// separator (03 §5.4; the same string becomes audio.SelfInfo.WebViewDataDir in README WA77's wiring).
+// separator (03 §5.4; the same string is audio.SelfInfo.WebViewDataDir, main.go's newAudioService).
 func webviewDataDir() (string, error) {
 	root, err := dataRoot()
 	if err != nil {

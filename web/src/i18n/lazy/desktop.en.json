@@ -72,7 +72,8 @@
         "browserMic": "Your browser is using the mic (Discord Web?). Keep the whole browser out; friends won't hear any of its tabs. Tip: the Discord app works best.",
         "keepOut": "Keep out",
         "keepBrowserOut": "Keep browser out",
-        "include": "Include"
+        "include": "Include",
+        "dismiss": "Dismiss"
       },
       "warning": {
         "sharedUsesMic": "{{app}} is the app you're sharing and it uses your microphone. Friends will hear its voice chat.",
@@ -94,15 +95,38 @@
       },
       "sheet": {
         "voiceApps": "Friends won't hear: {{apps}}. Apps that use your microphone are kept out too; you'll be asked.",
-        "volumeNote": "Muting your PC doesn't mute your stream. Use Pause or turn Share sound off."
+        "volumeNote": "Muting your PC doesn't mute your stream. Use Pause or turn Share sound off.",
+        "everything": "Friends will hear everything on this PC",
+        "hear_one": "Friends will hear 1 app",
+        "hear_other": "Friends will hear {{count}} apps",
+        "keptOut": "{{app}} kept out",
+        "keptOutMore_one": "{{app}} and {{count}} more kept out",
+        "keptOutMore_other": "{{app}} and {{count}} more kept out",
+        "details": "Details"
       },
       "tip": {
-        "ducking": "Windows turns other sounds down during calls, and friends hear that too. To stop it: Sound settings → More sound settings → Communications → Do nothing."
+        "ducking": "Windows turns other sounds down during calls, and friends hear that too. To stop it: Sound settings → More sound settings → Communications → Do nothing.",
+        "dismiss": "Don't show again"
       },
       "soundCheck": {
         "failed": "We couldn't capture the test sound, so friends would hear nothing from this PC.",
         "deviceBusy": "Another app is using your speakers on its own (exclusive mode). Close it, or turn off \"Allow applications to take exclusive control of this device\" in the device's Sound properties, then Try again."
-      }
+      },
+      "title": "What friends hear",
+      "group": {
+        "heard": "Friends will hear:",
+        "keptOut": "Friends won't hear:",
+        "notCaptured": "Not captured:"
+      },
+      "row": {
+        "keepOut": "Keep out",
+        "include": "Include",
+        "level": "{{app}}: sound level"
+      },
+      "nothingPlaying": "Nothing is playing right now",
+      "mixLevel": "Sound level of your stream",
+      "keepOutMic": "Keep out apps that use my microphone",
+      "openSoundSettings": "Open sound settings"
     },
     "share": {
       "sheet": {
@@ -267,6 +291,25 @@
       "version": {
         "updateApp": "This server needs a newer isshoni app. You have {{app}}; the server runs {{server}}.",
         "updateServer": "This server runs isshoni {{server}}, which is too old for this app. Ask your admin to update it."
+      },
+      "done": "Done",
+      "sound": {
+        "title": "Check your PC's sound",
+        "intro": "isshoni plays a short test sound and checks that it can capture it.",
+        "playing": "Playing a test sound…",
+        "ok": "✓ isshoni can capture your PC's sound, without your voice apps",
+        "level": "Measured level: {{level}} dB",
+        "endpoint": "isshoni can capture your PC's sound, but it can't keep voice apps out on this PC. Set your voice app to a different output device.",
+        "learnMore": "Learn more",
+        "withoutSound": "Friends will see your screen without sound."
+      },
+      "voice": {
+        "title": "What friends won't hear",
+        "lead": "Friends won't hear:",
+        "running": "{{app}} (running)",
+        "micApps": "Apps that use your microphone (you'll be asked)",
+        "isshoni": "isshoni itself",
+        "note": "Change this anytime in Settings → Audio."
       }
     },
     "relink": {
@@ -293,6 +336,21 @@
       "signOutAction": "Sign out",
       "signOutUnconfirmed": "Remove {{device}} on your Devices page to finish.",
       "add": "Add a server"
+    },
+    "settings": {
+      "title": "Settings",
+      "audio": {
+        "title": "Audio",
+        "alwaysKeptOut": "Always kept out: {{apps}}",
+        "rules": "Your choices for apps",
+        "noRules": "You haven't made a choice for an app yet. Apps you keep out or include are listed here.",
+        "change": "Choice for {{app}}",
+        "keptOut": "Kept out",
+        "included": "Included",
+        "forget": "Decide for me",
+        "locked": "Always kept out (voice app)",
+        "soundCheck": "Run the sound check again"
+      }
     }
   }
 }

@@ -61,6 +61,7 @@ import { Sheet } from '../ui/Sheet';
 import { CodecBanner } from './CodecBanner';
 import { ViewerContext } from './context';
 import { DebugOverlay, debugInUrl } from './DebugOverlay';
+import { useEndpointMute } from './endpointMute';
 import { FocusFromUrl } from './FocusFromUrl';
 import { IosHint } from './IosHint';
 import { attachShortcuts, moveTileFocus, TILE_LIST, TILE_MAIN, type ShortcutAction } from './keyboard';
@@ -198,6 +199,8 @@ export function ViewerLayout({
   }, [fullscreen]);
   const pip = usePip(viewer, root, caps?.pip === true);
   useWakeLock(viewer, platform, caps?.wakeLock === true);
+  // The desktop app's endpoint share mutes every share here (docs/m2/03 §12.1).
+  useEndpointMute(viewer.store, platform);
   useMediaSession(viewer, roomName);
 
   const focused = shares.find((s) => s.id === focusedId) ?? null;

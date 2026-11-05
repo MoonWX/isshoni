@@ -181,6 +181,7 @@ export function NativeShareButton({
         <FirstShareSheet
           open
           label={picked?.label ?? ''}
+          withAudio={picked?.audioScope !== 'none'}
           preset={preset}
           onPreset={(p) => {
             store.getState().setPreset(p);
