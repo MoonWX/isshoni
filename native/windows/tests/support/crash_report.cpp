@@ -2,9 +2,10 @@
 // bodies on the main thread only: a crash on the engine worker or any other thread ends the process with nothing but
 // ctest's "Exception: SegFault". This installs a last-chance exception filter that prints the exception code, the
 // faulting address as module+offset ("no loaded module" when the code was in a DLL that has been unloaded), an access
-// violation's target and a symbolized stack (DbgHelp, with the PDBs of /DEBUG:FULL) to stderr, then lets the crash
-// proceed: the test still fails and ctest still reports the exception. It also makes stdout unbuffered, so a test's
-// own printf reaches ctest's log before a crash.
+// violation's target and a symbolized stack (DbgHelp, with the PDBs of /DEBUG:FULL) to stderr, then hands the
+// exception on to the filter installed before it (the CRT's), so the crash proceeds as it would have: the test still
+// fails and ctest still reports the exception. It also makes stdout unbuffered, so a test's own printf reaches ctest's
+// log before a crash.
 // Under win-x64-asan, ASan's own handler reports a crash, and this file is empty (an unused static function would be
 // C4505 there).
 #if !defined(__SANITIZE_ADDRESS__)
@@ -18,6 +19,12 @@
 #pragma comment(lib, "dbghelp.lib")
 
 namespace {
+
+// The filter that was installed before ours (the CRT's, which sends an unhandled C++ exception to std::terminate):
+// LastChance hands every exception on to it after reporting.
+LPTOP_LEVEL_EXCEPTION_FILTER g_prev = nullptr;
+
+LONG Chain(EXCEPTION_POINTERS *ep) noexcept { return g_prev != nullptr ? g_prev(ep) : EXCEPTION_CONTINUE_SEARCH; }
 
 void Write(const char *s) noexcept {
   DWORD written = 0;
@@ -59,7 +66,7 @@ void Describe(HANDLE process, const char *label, DWORD64 addr) noexcept {
 LONG WINAPI LastChance(EXCEPTION_POINTERS *ep) {
   static volatile LONG once = 0;
   if (::InterlockedExchange(&once, 1) != 0) {
-    return EXCEPTION_CONTINUE_SEARCH;
+    return Chain(ep);
   }
   const EXCEPTION_RECORD &r = *ep->ExceptionRecord;
   char line[256];
@@ -108,12 +115,12 @@ LONG WINAPI LastChance(EXCEPTION_POINTERS *ep) {
 #else
   Describe(process, "at", reinterpret_cast<DWORD64>(r.ExceptionAddress));
 #endif
-  return EXCEPTION_CONTINUE_SEARCH;
+  return Chain(ep);
 }
 
 [[maybe_unused]] const bool kInstalled = [] {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  ::SetUnhandledExceptionFilter(LastChance);
+  g_prev = ::SetUnhandledExceptionFilter(LastChance);
   return true;
 }();
 

@@ -15,7 +15,8 @@
 #   third_party/                     headers compiled in (OpenH264's, 04 §9.9), on the include path
 #   tests/*_test.cpp                 one GoogleTest executable per file (IM_BUILD_TESTS), linked with im_engine and
 #                                    registered with ctest under the file's name; each file belongs to one slice
-#   tests/support/                   the marker and probe DLLs of dll_search_test, built with the tests, never shipped
+#   tests/support/                   the marker and probe DLLs of dll_search_test, and crash_report.cpp (linked into
+#                                    every test executable), built with the tests, never shipped
 #
 # System libraries: the ones 04 §13.1 names are linked below. An area that needs another one names it in its source
 # with #pragma comment(lib, "<name>.lib"), and its DLL goes onto deploy/windows/dll-imports.txt in the same change
