@@ -2007,8 +2007,8 @@ Each has a default that the specs implement until it is answered.
   needed (the runtime gave its browser process an environment of its own on CI again). New, and not on CI (UAC off,
   one session; 03 §13.3): with UAC on, an elevated and a non-elevated launch of one user, in both orders, give one
   instance (the second forwards into the first and exits 0); and two sessions of one user (fast user switching, or RDP
-  beside the console) give one instance, the second session's launch forwarding into the first's. The results go into
-  03 §3.2's W6 row through the next write-back slice. §7 question 11 is still open; WA90's exit run records
+  beside the console) give one instance, the second session's launch forwarding into the first's (03 §22.5 M-DESK-14
+  and M-DESK-15). The results go into 03 §3.2's W6 row through the next write-back slice. §7 question 11 is still open; WA90's exit run records
   `protect-check` under its default until it is answered.
 - M0's spikes: S1's Windows runs are the first item above (Windows 10 audio untested, §3 item 52); S4's Firefox viewer
   passed on a Windows VM (`spikes/s4-sfu/README.md`), whose manual Firefox and Safari viewer check on the Mac is still
