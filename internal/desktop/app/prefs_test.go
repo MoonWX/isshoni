@@ -6,8 +6,11 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
+	"github.com/MoonWX/isshoni/internal/desktop/tray"
+	"github.com/MoonWX/isshoni/internal/update"
 )
 
 // WA84: autostart and the side effects of a saved settings change (03 §11.2, §11.5, §14.2, §16.1).
@@ -154,5 +157,85 @@ func TestTestHotkey(t *testing.T) {
 		"+pause Ctrl+Alt+Shift+F9", "+stop Ctrl+Alt+Shift+F10")
 	if st, err := s.app.TestHotkey("Ctrl+Alt+Shift+F10"); err != nil || st.State != HotkeyRegistered {
 		t.Fatalf("the share's own: %+v, %v", st, err)
+	}
+}
+
+// TestSettingsChangedUpdates (03 §16.2): updates.check off publishes StateOff at once (the ready offer and the
+// tray's item go, Settings → Updates says "Turned off") without a request; on again, or another channel, checks now.
+// A change of anything else checks nothing.
+func TestSettingsChangedUpdates(t *testing.T) {
+	s, u := newUpdateEnv(t)
+	st := s.app.d.Settings
+	u.mu.Lock()
+	u.enabled = func() bool { return st.Updates().Check }
+	u.mu.Unlock()
+	change := func(fn func(*settings.Settings)) {
+		t.Helper()
+		prev := st.Get()
+		if err := st.Update(fn); err != nil {
+			t.Fatal(err)
+		}
+		s.app.SettingsChanged(prev)
+	}
+	u.set(readyStatus("0.3.0"))
+	s.waitTray(t, func(v tray.View) bool {
+		return slices.ContainsFunc(v.Menu, func(m tray.MenuItem) bool { return m.Action == tray.ActionRestart })
+	}, "the tray offers the ready update")
+
+	change(func(st *settings.Settings) { st.Updates.Check = false })
+	waitUntil(t, func() bool { return u.Status().State == update.StateOff }, "StateOff after the switch went off")
+	s.waitTray(t, func(v tray.View) bool {
+		return !slices.ContainsFunc(v.Menu, func(m tray.MenuItem) bool { return m.Action == tray.ActionRestart })
+	}, "the tray's offer goes once updates are off")
+	if got := u.checked(); got != 1 {
+		t.Fatalf("%d checks after off", got)
+	}
+
+	change(func(st *settings.Settings) { st.Updates.Check = true })
+	waitUntil(t, func() bool { return u.checked() == 2 }, "a check after the switch went on")
+	change(func(st *settings.Settings) { st.Updates.Channel = settings.ChannelBeta })
+	waitUntil(t, func() bool { return u.checked() == 3 }, "a check after the channel changed")
+	change(func(st *settings.Settings) { st.CloseToTray = !st.CloseToTray })
+	time.Sleep(20 * time.Millisecond)
+	if got := u.checked(); got != 3 {
+		t.Fatalf("%d checks after a change of something else", got)
+	}
+}
+
+// statusOS reports a Run value (Autostart) and records SetAutostart.
+type statusOS struct {
+	*autostartOS
+	on  bool
+	err error
+}
+
+func (o *statusOS) Autostart() (bool, error) { return o.on, o.err }
+
+// TestSyncAutostart (03 §16.1): at Run's start settings.json's autostart follows the Run value (gone after a
+// keep-data reinstall, say), without writing the Run value; an OS without autostart changes nothing.
+func TestSyncAutostart(t *testing.T) {
+	s := newSafetyEnv(t)
+	o := &statusOS{autostartOS: &autostartOS{safetyOS: s.sos}}
+	s.app.d.OS = o
+	st := s.app.d.Settings
+	if err := st.Update(func(st *settings.Settings) { st.Autostart = true }); err != nil {
+		t.Fatal(err)
+	}
+	s.app.syncAutostart()
+	if st.Get().Autostart {
+		t.Fatal("settings say autostart while the Run value is gone")
+	}
+	o.on = true
+	s.app.syncAutostart()
+	if !st.Get().Autostart {
+		t.Fatal("settings don't follow a Run value that is there")
+	}
+	o.on, o.err = false, ErrNotSupported
+	s.app.syncAutostart()
+	if !st.Get().Autostart {
+		t.Fatal("an OS without autostart changed the setting")
+	}
+	if len(o.calls) != 0 {
+		t.Fatalf("the Run value was written: %q", o.calls)
 	}
 }

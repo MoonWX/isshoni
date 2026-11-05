@@ -23,6 +23,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/desktop/servers"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/update"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -137,7 +138,16 @@ func newStarter(r *startRun) *starter {
 			return r.inst, nil
 		},
 		holdRunning: func() error { r.rec = append(r.rec, "running-mutex"); return nil },
-		takePending: func() (app.Pending, error) { r.rec = append(r.rec, "take-pending"); return r.pending, nil },
+		// Step 6 reads and deletes the Pending values: those a step wrote (registry), else r.pending.
+		takePending: func() (app.Pending, error) {
+			r.rec = append(r.rec, "take-pending")
+			if len(r.registry) == 0 {
+				return r.pending, nil
+			}
+			p := app.Pending{Server: r.registry["PendingServer"], Room: r.registry["PendingRoom"]}
+			clear(r.registry)
+			return p, nil
+		},
 		runApp: func(p app.Args, _ []string, pending app.Pending, _ *forwarded, _ instance) int {
 			r.rec = append(r.rec, "app")
 			r.gotArgs, r.gotPend = p, pending
@@ -513,7 +523,10 @@ func TestInstallerHandover(t *testing.T) {
 	} {
 		name := strings.Join(tc.args, " ")
 		r := &startRun{installer: true, registry: maps.Clone(old), root: filepath.Join(t.TempDir(), "isshoni")}
-		if code := newStarter(r).start(tc.args); code != exitOK {
+		// A pending update waits: with the installer's mutex present no start builds the updater or applies it
+		// (03 §22.1's start order), so neither open-updater nor apply may appear among the steps.
+		s := withUpdater(r, &fakeStartUpdater{pending: &update.Pending{Version: "0.3.0"}})
+		if code := s.start(tc.args); code != exitOK {
 			t.Errorf("%q: exit %d", name, code)
 		}
 		want := []string{"installer-probe"}
@@ -533,13 +546,14 @@ func TestInstallerHandover(t *testing.T) {
 		}
 	}
 
-	// Absent, or the probe failed: the normal order, nothing written.
+	// Absent, or the probe failed: the normal order (step 5 builds the updater; nothing pending), nothing written.
 	for _, r := range []*startRun{{}, {installerErr: errors.New("access denied")}} {
 		args := []string{"--open-url", "isshoni://watch.example.com/r/lounge"}
-		if code := newStarter(r).start(args); code != exitOK {
+		if code := withUpdater(r, &fakeStartUpdater{}).start(args); code != exitOK {
 			t.Errorf("exit %d", code)
 		}
-		want := []string{"installer-probe", "single-instance", "acquire", "serve", "running-mutex", "take-pending", "app"}
+		want := []string{"installer-probe", "single-instance", "acquire", "serve", "running-mutex", "open-updater",
+			"pending-at-startup", "take-pending", "app"}
 		if !slices.Equal(r.rec, want) || r.registry != nil {
 			t.Errorf("steps %v (want %v), registry %v", r.rec, want, r.registry)
 		}

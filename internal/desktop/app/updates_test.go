@@ -30,6 +30,9 @@ type fakeUpdater struct {
 	applyErr error
 	checkErr error
 	subs     []chan update.Status
+	checks   int         // CheckNow calls
+	enabled  func() bool // 06's Enabled; nil: on
+	onApply  func()      // runs as Apply begins (while it would wait for the installer's mutex)
 }
 
 func newFakeUpdater(st update.Status) *fakeUpdater { return &fakeUpdater{st: st} }
@@ -73,10 +76,25 @@ func (f *fakeUpdater) set(st update.Status) {
 	}
 }
 
+// CheckNow counts the checks; with enabled false it publishes StateOff and makes no request, as 06's does.
 func (f *fakeUpdater) CheckNow(context.Context) (update.Status, error) {
+	f.mu.Lock()
+	f.checks++
+	off := f.enabled != nil && !f.enabled()
+	f.mu.Unlock()
+	if off {
+		f.set(update.Status{State: update.StateOff})
+		return f.Status(), nil
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.st, f.checkErr
+}
+
+func (f *fakeUpdater) checked() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checks
 }
 
 func (f *fakeUpdater) Ready() *update.Pending {
@@ -90,6 +108,9 @@ func (f *fakeUpdater) Ready() *update.Pending {
 }
 
 func (f *fakeUpdater) Apply(ctx context.Context, p *update.Pending, relaunch bool) error {
+	if f.onApply != nil {
+		f.onApply()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if ctx.Err() != nil {
@@ -282,5 +303,41 @@ func waitUntil(t *testing.T, ok func() bool, what string) {
 		if time.Now().After(deadline) {
 			t.Fatal(what)
 		}
+	}
+}
+
+// TestInstallUpdateGate (03 §16.2: the update never interrupts a live share): a share the SPA starts while "Restart
+// and update" waits in Apply (06 waits up to 10 s for the installer's mutex) is refused with busy, so the Quit that
+// follows stops nothing; after a failed Apply shares start again.
+func TestInstallUpdateGate(t *testing.T) {
+	s, u := newUpdateEnv(t)
+	u.set(readyStatus("0.3.0"))
+	p, err := s.app.Shares().Pick(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startErr error
+	u.onApply = func() {
+		_, startErr = s.app.Shares().Start(context.Background(), share.StartRequest{PickID: p.PickID, RoomID: "lounge"})
+	}
+	u.applyErr = update.ErrNotInstalled
+	if err := s.app.InstallUpdate(context.Background()); !errors.Is(err, update.ErrNotInstalled) {
+		t.Fatalf("InstallUpdate: %v", err)
+	}
+	if !errors.Is(startErr, ErrBusy) {
+		t.Fatalf("a start during Apply: %v", startErr)
+	}
+	u.onApply = nil
+	if _, err := s.app.Shares().Start(context.Background(),
+		share.StartRequest{PickID: p.PickID, RoomID: "lounge"}); err != nil {
+		t.Fatalf("a start after a failed Apply: %v", err)
+	}
+	s.waitState(t, share.StateLive)
+	u.applyErr = nil
+	if err := s.app.InstallUpdate(context.Background()); !errors.Is(err, ErrBusy) {
+		t.Fatalf("InstallUpdate while live: %v", err)
+	}
+	if got := u.applied(); len(got) != 1 {
+		t.Fatalf("applies %v", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
 	"github.com/MoonWX/isshoni/internal/update"
 )
@@ -116,8 +117,8 @@ func TestStartTimeUpdateForwardedLink(t *testing.T) {
 }
 
 // TestStartTimeUpdateNotApplied: at an --autostart start nothing is applied (the update stays ready for the tray);
-// without a pending update, or when Apply fails, the start goes on with the Pending values (those just written
-// included) and the app.
+// without a pending update, or when Apply fails, the start goes on with the app. A failed Apply takes back the
+// Pending values it wrote, so the link reaches the app once: from its own command line, not again from step 6.
 func TestStartTimeUpdateNotApplied(t *testing.T) {
 	r := &startRun{}
 	u := &fakeStartUpdater{pending: &update.Pending{Version: "0.3.0"}}
@@ -145,9 +146,13 @@ func TestStartTimeUpdateNotApplied(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 	want := []string{"installer-probe", "single-instance", "acquire", "serve", "running-mutex", "open-updater",
-		"pending-at-startup", "write-pending", "apply 0.3.0 relaunch", "take-pending", "app"}
+		"pending-at-startup", "write-pending", "apply 0.3.0 relaunch", "take-pending", "take-pending", "app"}
 	if !slices.Equal(r.rec, want) {
 		t.Fatalf("a failed apply: steps %v, want %v", r.rec, want)
+	}
+	if len(r.registry) != 0 || r.gotPend != (app.Pending{}) ||
+		r.gotArgs.Link != "isshoni://watch.example.com/r/lounge" {
+		t.Fatalf("a failed apply: the link reaches the app %+v and %+v; registry %v", r.gotArgs, r.gotPend, r.registry)
 	}
 
 	r = &startRun{}

@@ -31,7 +31,7 @@ func TestStubs(t *testing.T) {
 	if err := h.SetAutostart(true, "x"); !errors.Is(err, app.ErrNotSupported) {
 		t.Errorf("SetAutostart: %v", err)
 	}
-	if on, err := h.Autostart(); on || err != nil {
+	if on, err := h.Autostart(); on || !errors.Is(err, app.ErrNotSupported) {
 		t.Errorf("Autostart: %v %v", on, err)
 	}
 	if err := h.OpenSettingsPage(app.PageSound); !errors.Is(err, app.ErrNotSupported) {

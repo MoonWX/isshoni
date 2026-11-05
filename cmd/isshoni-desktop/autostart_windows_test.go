@@ -25,22 +25,29 @@ import (
 // TestAutostartRunValue. It needs the built SPA in web/dist (task build:web: otherwise the app stops at its asset
 // handler) and a WebView2 runtime, and skips under -race (the CGO_ENABLED=0 pass runs it) and while an isshoni runs:
 // the build uses the real single-instance id and running mutex.
+//
+// With ISSHONI_REQUIRE_AUTOSTART_E2E=1 (CI's windows-desktop job, which has web/dist) a missing prerequisite fails
+// the test instead of skipping it, so the acceptance can't turn into a silent skip.
 func TestAutostartRoundTrip(t *testing.T) {
+	skip := t.Skip
+	if os.Getenv("ISSHONI_REQUIRE_AUTOSTART_E2E") == "1" {
+		skip = t.Fatal
+	}
 	switch {
 	case testing.Short():
-		t.Skip("builds and runs the app")
+		skip("builds and runs the app")
 	case raceEnabled:
-		t.Skip("the race pass would build every package again; the CGO_ENABLED=0 pass runs this")
+		skip("the race pass would build every package again; the CGO_ENABLED=0 pass runs this")
 	}
 	if _, err := fs.Stat(web.Dist(), "index.html"); err != nil {
-		t.Skip("the SPA isn't built (task build:web)")
+		skip("the SPA isn't built (task build:web)")
 	}
 	if running, _ := winos.MutexExists(winos.RunningMutex); running {
-		t.Skip("an isshoni app runs on this PC")
+		skip("an isshoni app runs on this PC")
 	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
-		t.Skip("no go command on PATH")
+		skip("no go command on PATH")
 	}
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "isshoni.exe")

@@ -1,21 +1,25 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"time"
 
 	"github.com/MoonWX/isshoni/internal/desktop/hotkey"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
+	"github.com/MoonWX/isshoni/internal/update"
 )
 
 // The settings' side effects (03 §14.2, §14.4, §16.1; README WA84): the bound Settings.Update saves a patch to
 // settings.json and the app makes what changed take effect. Autostart goes to the OS first (SetAutostart: the Run
 // value), so a value Windows refused is never saved; the rest follows the saved settings (SettingsChanged): the main
-// window's capture exclusion, the registered hotkeys of a running share, the pill's mode and the log level. The
-// notifications switch and the update settings are read where they are used (the toasts; 06's Enabled and Channel
-// before every request).
+// window's capture exclusion, the registered hotkeys of a running share, the pill's mode, the log level, and a change
+// of updates.check or updates.channel: 06's Enabled and Channel are read before every request, but the status the
+// UI and the tray show only changes with a check, so the app runs one at once (off: StateOff, no request). The
+// notifications switch is read where it is used (the toasts).
 
 // HotkeyTest is the id TestHotkey registers a combination under for the moment of its check (03 §11.2).
 const HotkeyTest HotkeyID = "test"
@@ -43,6 +47,29 @@ func (a *App) SetAutostart(on bool) error {
 	}
 }
 
+// syncAutostart makes settings.json's autostart say what the OS does (Run's start): the Run value can go without the
+// app (06's uninstaller deletes it and a keep-data reinstall keeps settings.json; another tool may remove it), and
+// Settings → App would then show the switch on while Windows doesn't start the app, and turning it on would change
+// nothing. The OS is the truth; the app never writes the Run value behind the user's back. Where the OS has no
+// autostart (Autostart's error) nothing changes.
+func (a *App) syncAutostart() {
+	on, err := a.d.OS.Autostart()
+	if err != nil {
+		if !errors.Is(err, ErrNotSupported) {
+			a.log.Info("app: the autostart value couldn't be read", "err", err)
+		}
+		return
+	}
+	if on == a.d.Settings.Get().Autostart {
+		return
+	}
+	if err := a.d.Settings.Update(func(s *settings.Settings) { s.Autostart = on }); err != nil {
+		a.log.Warn("app: settings.json's autostart wasn't brought in line with the OS", "on", on, "err", err)
+		return
+	}
+	a.log.Info("app: settings.json's autostart follows the OS's Run value", "on", on)
+}
+
 // SettingsChanged makes a saved change of settings.json take effect; prev is what the settings were before it. It
 // is safe to call for any change, also one that changed nothing the app follows.
 func (a *App) SettingsChanged(prev settings.Settings) {
@@ -59,6 +86,28 @@ func (a *App) SettingsChanged(prev settings.Settings) {
 	if next.Log.Level != prev.Log.Level && a.d.SetLogDebug != nil {
 		a.d.SetLogDebug(next.Log.Level == settings.LogDebug)
 	}
+	if next.Updates.Check != prev.Updates.Check || next.Updates.Channel != prev.Updates.Channel {
+		a.recheckUpdates()
+	}
+}
+
+// updatesRecheckTimeout bounds the check a change of the update settings runs (a download included).
+const updatesRecheckTimeout = 45 * time.Second
+
+// recheckUpdates runs 06's CheckNow in the background after a change of the update settings: turned off, it
+// publishes StateOff (the ready offer and the tray's item go); on, or another channel, it checks now.
+func (a *App) recheckUpdates() {
+	u := a.d.Updater
+	if u == nil || a.ctx.Err() != nil {
+		return
+	}
+	a.wg.Go(func() {
+		ctx, cancel := context.WithTimeout(a.ctx, updatesRecheckTimeout)
+		defer cancel()
+		if _, err := u.CheckNow(ctx); err != nil && a.ctx.Err() == nil {
+			a.log.Info("app: the check after a change of the update settings failed", "code", update.CodeOf(err))
+		}
+	})
 }
 
 // reregisterHotkeys registers the hotkeys again with settings.json's combinations while a share has them registered

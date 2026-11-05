@@ -36,8 +36,8 @@ type ShareController interface {
 
 var _ ShareController = (*share.Controller)(nil)
 
-// Shares returns the share controller.
-func (a *App) Shares() ShareController { return a.shares }
+// Shares returns the share controller, whose Start answers ErrBusy while "Restart and update" runs (updates.go).
+func (a *App) Shares() ShareController { return gatedShares{Controller: a.shares, a: a} }
 
 // publisher is what the app uses of C2 beyond Run: *session.Session. A Deps.Session without it gets no C2 for the
 // share controller (Start answers publisher_offline).

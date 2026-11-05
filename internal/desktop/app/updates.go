@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/desktop/share"
 	"github.com/MoonWX/isshoni/internal/update"
 )
 
@@ -34,6 +35,14 @@ type updateFollow struct {
 	toasted string // the version the ready toast was shown for; "" while none is ready
 	next    int
 	subs    map[int]func(update.Status)
+
+	// The gate between "Restart and update" and a share's start (03 §16.2: never while a share is live). Apply waits
+	// up to 10 s for the installer's mutex, so a share the SPA starts meanwhile would be ended by the Quit that
+	// follows: while installing is set, Shares().Start answers ErrBusy, and while a start runs (starting > 0),
+	// InstallUpdate does.
+	gate       sync.Mutex
+	installing bool
+	starting   int
 }
 
 // startUpdates follows the updater's status until the app ends (Run). Without an updater it does nothing.
@@ -151,7 +160,8 @@ func (a *App) CheckUpdate(ctx context.Context) (update.Status, error) {
 }
 
 // InstallUpdate is "Restart and update" (Settings → Updates, the required banner, the tray, the toast; 03 §16.2):
-// ErrBusy while a share is live (03 enforces it; the updater isn't told), ErrUpdateNotReady when no verified installer
+// ErrBusy while a share is live or starting, or another "Restart and update" runs (03 enforces it; the updater isn't
+// told; a share the SPA starts meanwhile is refused with ErrBusy, beginInstall), ErrUpdateNotReady when no verified installer
 // waits, else 06's Apply with relaunch, and once the installer runs, Quit. Apply's errors are returned as they are
 // (update.ErrNotInstalled, *update.Error), and the app keeps running.
 func (a *App) InstallUpdate(ctx context.Context) error {
@@ -159,11 +169,12 @@ func (a *App) InstallUpdate(ctx context.Context) error {
 	if u == nil {
 		return ErrNotImplemented
 	}
-	if _, live := a.sharing(); live {
+	if !a.beginInstall() {
 		return ErrBusy
 	}
 	p := u.Ready()
 	if p == nil {
+		a.endInstall()
 		return ErrUpdateNotReady
 	}
 	if ctx == nil {
@@ -172,12 +183,73 @@ func (a *App) InstallUpdate(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), installTimeout)
 	defer cancel()
 	if err := u.Apply(ctx, p, true); err != nil {
+		a.endInstall()
 		a.log.Warn("app: the update wasn't applied", "version", p.Version, "code", update.CodeOf(err))
 		return err
+	}
+	if _, live := a.sharing(); live { // the gate rules it out; were it to happen, the end isn't the user's
+		a.log.Warn("app: a share went live while the update's installer started; stopping it", "version", p.Version)
+		a.quit(true, share.CauseSystem, true)
+		return nil
 	}
 	a.log.Info("app: the update's installer runs; quitting", "version", p.Version)
 	a.Quit(true)
 	return nil
+}
+
+// beginInstall closes the gate for "Restart and update": false (busy) while a share is live or starting. The gate
+// stays closed once the installer runs (the app quits); endInstall opens it again after a refusal or a failure.
+func (a *App) beginInstall() bool {
+	g := &a.upd
+	g.gate.Lock()
+	defer g.gate.Unlock()
+	if g.installing || g.starting > 0 {
+		return false
+	}
+	if _, live := a.sharing(); live {
+		return false
+	}
+	g.installing = true
+	return true
+}
+
+func (a *App) endInstall() {
+	a.upd.gate.Lock()
+	a.upd.installing = false
+	a.upd.gate.Unlock()
+}
+
+// beginShareStart is the other side of the gate: false (busy) while "Restart and update" runs; else done must be
+// called once the start returned.
+func (a *App) beginShareStart() (done func(), ok bool) {
+	g := &a.upd
+	g.gate.Lock()
+	defer g.gate.Unlock()
+	if g.installing {
+		return nil, false
+	}
+	g.starting++
+	return func() {
+		g.gate.Lock()
+		g.starting--
+		g.gate.Unlock()
+	}, true
+}
+
+// gatedShares is the share controller as Shares() hands it out: Start answers ErrBusy while "Restart and update"
+// runs (beginShareStart).
+type gatedShares struct {
+	*share.Controller
+	a *App
+}
+
+func (g gatedShares) Start(ctx context.Context, r share.StartRequest) (share.View, error) {
+	done, ok := g.a.beginShareStart()
+	if !ok {
+		return share.View{}, ErrBusy
+	}
+	defer done()
+	return g.Controller.Start(ctx, r)
 }
 
 // restartForUpdate is the tray's "Restart and update to X" and the toast's Restart now: InstallUpdate, and on a

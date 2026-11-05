@@ -45,7 +45,8 @@ const startApplyTimeout = 30 * time.Second
 // update's installer runs (Apply returned once it holds the installing mutex). The link this start came with
 // (--open-url), or the newest one a second launch forwarded meanwhile, goes to PendingServer and PendingRoom first,
 // so the relaunched app opens it. Nothing is applied at an --autostart start (06's PendingAtStartup answers nil), and
-// an Apply that fails is logged and the start goes on: step 6 then reads the values just written.
+// an Apply that fails is logged, the values just written are taken back (the link reaches the app once, from where
+// it came), and the start goes on.
 func (s *starter) startTimeUpdate(p app.Args, fwd *forwarded) bool {
 	if s.openUpdater == nil {
 		return false
@@ -62,12 +63,15 @@ func (s *starter) startTimeUpdate(p app.Args, fwd *forwarded) bool {
 	if pend == nil {
 		return false
 	}
+	wrote := false
 	if link := newestLink(p.Link, fwd.queued()); link != "" {
 		// Never log the link: its path names a room.
 		if pv, err := pendingFromLink(link); err != nil {
 			s.log.Info("desktop: this start's link isn't valid; not kept for the update's relaunch", "err", err)
 		} else if err := s.writePending(pv); err != nil {
 			s.log.Warn("desktop: this start's link wasn't kept for the update's relaunch", "err", err)
+		} else {
+			wrote = true
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startApplyTimeout)
@@ -75,6 +79,13 @@ func (s *starter) startTimeUpdate(p app.Args, fwd *forwarded) bool {
 	if err := u.Apply(ctx, pend, true); err != nil {
 		s.log.Warn("desktop: the pending update wasn't applied; starting this version", "version", pend.Version,
 			"code", update.CodeOf(err), "not_installed", errors.Is(err, update.ErrNotInstalled))
+		if wrote {
+			// The link reaches this start's app from where it came (its own --open-url, or fwd's queue), so the
+			// Pending values just written are taken back: step 6 would hand the same link to the app again.
+			if _, err := s.takePending(); err != nil {
+				s.log.Warn("desktop: the link kept for the update's relaunch wasn't taken back", "err", err)
+			}
+		}
 		return false
 	}
 	s.log.Info("desktop: the pending update's installer runs; it starts the app when it is done",

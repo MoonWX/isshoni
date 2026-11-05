@@ -224,6 +224,7 @@ func (a *App) Run(ctx context.Context) error {
 	defer stop()
 	defer a.cancel()
 
+	a.syncAutostart()
 	a.startActive()
 	a.startAudio()
 	a.startUpdates()
