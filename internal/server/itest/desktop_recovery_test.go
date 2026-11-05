@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -59,9 +58,9 @@ type timedStatus struct {
 // its sockets recorded and their redials gated (redialGate). It waits until the connection is online; the app is
 // closed and checked when the test ends.
 //
-// Its authentication is desktop()'s (desktop_helpers_test.go), the member's session cookie in Options.Header. README
-// WA73's switch of that file to a linked device's bearer token has to switch this function too, so that D3 runs on
-// bearer auth as WA73's acceptance asks.
+// Its authentication is desktop()'s (desktop_helpers_test.go, README WA73): a device linked for m through the real
+// deviceauth.Manager (linkApp), whose bearer access token the core sends in each hello; the manager's own requests
+// go on the harness's transport, outside the recorded and gated sockets.
 func (w *world) recoveringDesktop(m *member, engine fake.EngineConfig, settings *webrtc.SettingEngine) *recoveryApp {
 	w.t.Helper()
 	return w.recoveringDesktopOn(m, engine, settings, nil)
@@ -74,17 +73,7 @@ func (w *world) recoveringDesktopOn(m *member, engine fake.EngineConfig, setting
 	wrap func(*fake.Engine) media.Engine) *recoveryApp {
 	w.t.Helper()
 	t := w.t
-	site, err := url.Parse(w.srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cookies []string
-	for _, ck := range m.http.Jar.Cookies(site) {
-		cookies = append(cookies, ck.Name+"="+ck.Value)
-	}
-	if len(cookies) == 0 {
-		t.Fatalf("%s has no session cookie", m.name)
-	}
+	auth := w.linkApp(m)
 	if settings == nil {
 		se := sfutest.LoopbackSettings()
 		settings = &se
@@ -110,7 +99,7 @@ func (w *world) recoveringDesktopOn(m *member, engine fake.EngineConfig, setting
 	t.Cleanup(a.gate.release) // registered before the core's close, so it runs after it: nothing waits by then
 	c, err := core.New(core.Options{
 		ServerURL:  w.srv.URL,
-		Header:     http.Header{"Cookie": {strings.Join(cookies, "; ")}},
+		Auth:       auth,
 		Engine:     coreEngine,
 		Settings:   settings,
 		HTTPClient: &http.Client{Transport: tr},
@@ -120,7 +109,7 @@ func (w *world) recoveringDesktopOn(m *member, engine fake.EngineConfig, setting
 		t.Fatal(err)
 	}
 	a.desktopApp = &desktopApp{t: t, name: m.name + "'s app", core: c, engine: eng, runErr: make(chan error, 1),
-		logs: logs}
+		logs: logs, auth: auth}
 	d := a.desktopApp
 	events, unsub := c.Subscribe()
 	d.unsub = unsub

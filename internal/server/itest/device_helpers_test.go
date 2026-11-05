@@ -156,10 +156,8 @@ func linkManager(t *testing.T, srv *servertest.Server, mgr *deviceauth.Manager, 
 // core.Auth's; a test that hands it to 01's core wraps SessionEnded, as 03's session adapter does. Closed by
 // t.Cleanup. (DA11)
 //
-// Its callers are 01's desktop itests (README WA73), which drop the nolint directive below: device_test.go's cases
-// read what the app saved, so they pass their own store to newManager and link with linkManager.
-//
-//nolint:unused // M2 02 §16.2 and §17 fix it for 01's desktop itests (README WA73, group 8)
+// Its callers are 01's desktop itests (linkApp in desktop_helpers_test.go, README WA73): device_test.go's cases read
+// what the app saved, so they pass their own store to newManager and link with linkManager.
 func linkedManager(t *testing.T, srv *servertest.Server, cookie string) *deviceauth.Manager {
 	t.Helper()
 	mgr := newManager(t, srv, credstore.NewMemory())

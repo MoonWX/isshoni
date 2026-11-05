@@ -8,8 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"strings"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/MoonWX/isshoni/internal/client/core"
+	"github.com/MoonWX/isshoni/internal/client/deviceauth"
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/fake"
 	"github.com/MoonWX/isshoni/internal/protocol"
@@ -26,8 +26,10 @@ import (
 
 // The desktop cases of docs/m2/01-client-core.md §14 (desktop_*_test.go) run the client core (internal/client/core)
 // against the test's server, on fake.Engine, next to the harness's own clients, which watch what it publishes. The
-// core authenticates with its member's session cookie through Options.Header, until 02's bearer path: README WA73
-// switches this file to a device linked with linkedManager. Every share starts from fake.Engine.Pick, as in the app.
+// core authenticates as the desktop app does (01 §11.3, README WA73): with the bearer access token of a device that
+// its member linked through the real deviceauth.Manager (linkedManager in device_helpers_test.go, the member's
+// browser approving the code with its session cookie), handed to the core by appAuth, as 03's session adapter does.
+// Every share starts from fake.Engine.Pick, as in the app.
 
 // closeBound is what Close may take (01 §11.2: 3 s for the share.stop reply), plus the close handshake on loopback.
 const closeBound = 3*time.Second + time.Second
@@ -43,9 +45,11 @@ type desktopApp struct {
 	logs   *lockedBuffer
 	unsub  func()
 	rec    sync.WaitGroup
+	auth   *appAuth
 
 	mu     sync.Mutex
 	events []core.Event
+	ran    bool // a test's waitRun has read what Run returned
 }
 
 // desktopOptions configure a desktopApp.
@@ -53,29 +57,20 @@ type desktopOptions struct {
 	engine fake.EngineConfig
 }
 
-// desktop starts a desktop app for m and waits until its connection is online. Its core is closed when the test
-// ends (before the server stops), and the close is checked: within closeBound, Run returns nil, the engine's
+// desktop links a desktop app for m (linkApp) and starts its core, and waits until its connection is online. Its
+// core is closed when the test ends (before the server stops, and before its manager closes), and the close is
+// checked: within closeBound, Run returns nil (unless the test read a terminal stop with waitRun), the engine's
 // session has stopped. When the test failed, the core's log is printed.
 func (w *world) desktop(m *member, o desktopOptions) *desktopApp {
 	w.t.Helper()
 	t := w.t
-	site, err := url.Parse(w.srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cookies []string
-	for _, ck := range m.http.Jar.Cookies(site) {
-		cookies = append(cookies, ck.Name+"="+ck.Value)
-	}
-	if len(cookies) == 0 {
-		t.Fatalf("%s has no session cookie", m.name)
-	}
+	auth := w.linkApp(m)
 	logs := &lockedBuffer{}
 	engine := fake.NewEngine(o.engine)
 	se := sfutest.LoopbackSettings()
 	c, err := core.New(core.Options{
 		ServerURL:  w.srv.URL,
-		Header:     http.Header{"Cookie": {strings.Join(cookies, "; ")}},
+		Auth:       auth,
 		Engine:     engine,
 		Settings:   &se,
 		HTTPClient: &http.Client{Transport: w.srv.Client.Transport},
@@ -84,7 +79,8 @@ func (w *world) desktop(m *member, o desktopOptions) *desktopApp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &desktopApp{t: t, name: m.name + "'s app", core: c, engine: engine, runErr: make(chan error, 1), logs: logs}
+	d := &desktopApp{t: t, name: m.name + "'s app", core: c, engine: engine, runErr: make(chan error, 1), logs: logs,
+		auth: auth}
 	var events <-chan core.Event
 	events, d.unsub = c.Subscribe()
 	d.rec.Go(func() {
@@ -110,13 +106,18 @@ func (d *desktopApp) close() {
 	if took := time.Since(began); took > closeBound {
 		d.t.Errorf("%s: Close took %v, want at most %v", d.name, took, closeBound)
 	}
-	select {
-	case err := <-d.runErr:
-		if err != nil {
-			d.t.Errorf("%s: Run = %v, want nil after Close", d.name, err)
+	d.mu.Lock()
+	ran := d.ran
+	d.mu.Unlock()
+	if !ran {
+		select {
+		case err := <-d.runErr:
+			if err != nil {
+				d.t.Errorf("%s: Run = %v, want nil after Close", d.name, err)
+			}
+		case <-time.After(waitTimeout):
+			d.t.Errorf("%s: Run did not return after Close", d.name)
 		}
-	case <-time.After(waitTimeout):
-		d.t.Errorf("%s: Run did not return after Close", d.name)
 	}
 	if st := d.core.Status(); st.Conn != core.ConnStopped || st.Share != nil {
 		d.t.Errorf("%s: status after Close = %+v, want stopped without a share", d.name, st)
@@ -130,6 +131,98 @@ func (d *desktopApp) close() {
 	if d.t.Failed() {
 		d.t.Logf("%s's log:\n%s", d.name, d.logs.String())
 	}
+}
+
+// waitRun waits until Run returns by itself, after a terminal stop (01 §11.3), and returns what it returned; close
+// then checks the rest of the end without asking for nil.
+func (d *desktopApp) waitRun() error {
+	d.t.Helper()
+	select {
+	case err := <-d.runErr:
+		d.mu.Lock()
+		d.ran = true
+		d.mu.Unlock()
+		return err
+	case <-time.After(waitTimeout):
+		d.t.Fatalf("%s: Run did not return: status %+v", d.name, d.core.Status())
+		return nil
+	}
+}
+
+// appAuth is core.Auth over the app's deviceauth.Manager, as 03's session adapter makes it (01 §11.2: the Manager's
+// SessionEnded returns the resulting State, so the Manager itself is no core.Auth). It counts the core's token calls
+// and keeps its SessionEnded calls with the state each one left; it never keeps a token.
+type appAuth struct {
+	mgr *deviceauth.Manager
+
+	mu     sync.Mutex
+	tokens int                           // AccessToken calls that returned a token, forced or not
+	forced int                           // AccessToken(ctx, true) calls
+	ended  []endedCall                   // SessionEnded calls, in order
+	before func(code protocol.ErrorCode) // if set, SessionEnded runs it (outside mu) before the manager's
+}
+
+// endedCall is one SessionEnded call of the core: its code and the manager's state when it returned.
+type endedCall struct {
+	code  protocol.ErrorCode
+	state deviceauth.State
+}
+
+// linkApp links an app of m's to the test's server, as the user does from the app's sign-in screen and their
+// browser (linkedManager, m's session cookie approving the code), and returns the core.Auth over its manager.
+func (w *world) linkApp(m *member) *appAuth {
+	w.t.Helper()
+	return &appAuth{mgr: linkedManager(w.t, w.srv, sessionCookie(w.t, w.srv, m.http.Jar))}
+}
+
+// AccessToken is the manager's, counted.
+func (a *appAuth) AccessToken(ctx context.Context, force bool) (protocol.Secret, error) {
+	tok, err := a.mgr.AccessToken(ctx, force)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if force {
+		a.forced++
+	}
+	if err == nil {
+		a.tokens++
+	}
+	return tok, err
+}
+
+// SessionEnded is the manager's, recorded with the state it returned. The before hook, if set, runs first: a test
+// checks there what must already hold when the core calls SessionEnded.
+func (a *appAuth) SessionEnded(ctx context.Context, code protocol.ErrorCode) {
+	a.mu.Lock()
+	before := a.before
+	a.mu.Unlock()
+	if before != nil {
+		before(code)
+	}
+	st := a.mgr.SessionEnded(ctx, code)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ended = append(a.ended, endedCall{code: code, state: st})
+}
+
+// setBefore sets the hook SessionEnded runs before the manager's.
+func (a *appAuth) setBefore(f func(code protocol.ErrorCode)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.before = f
+}
+
+// counts returns how many tokens the core got and how many forced refreshes it asked for.
+func (a *appAuth) counts() (tokens, forced int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tokens, a.forced
+}
+
+// endedCalls returns the core's SessionEnded calls so far.
+func (a *appAuth) endedCalls() []endedCall {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.ended)
 }
 
 // start picks a source on the fake engine, as the app's share sheet does, and starts sharing it in room with the
@@ -182,6 +275,19 @@ func (d *desktopApp) shareEvents() []core.ShareSnapshot {
 	for _, ev := range d.events {
 		if ev.Kind == core.EventShare && ev.Share != nil {
 			out = append(out, *ev.Share)
+		}
+	}
+	return out
+}
+
+// statusEvents returns the EventStatus statuses so far.
+func (d *desktopApp) statusEvents() []core.Status {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []core.Status
+	for _, ev := range d.events {
+		if ev.Kind == core.EventStatus && ev.Status != nil {
+			out = append(out, *ev.Status)
 		}
 	}
 	return out
