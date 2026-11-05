@@ -251,24 +251,34 @@ test('W7: closing the window hides it; the app keeps running', async ({ app }) =
   expect(hwnd).toMatch(/^[1-9]\d*$/);
   // WM_CLOSE to the main window, as its close button sends it. False would mean it wasn't posted.
   expect(await ps(`(Get-Process -Id ${pid}).CloseMainWindow()`)).toBe('True');
-  // What M1's layer policy reads: the webview reports hidden (03 §4.4).
-  await expect.poll(() => app.page.evaluate(() => document.visibilityState), { timeout: 10_000 }).toBe('hidden');
   // The window itself, independent of Chromium: it still exists (not destroyed) and is hidden (Hide(), 03 §3.2 W7).
+  // Read first, and both polls soft, so the row below always records the window's state and the webview's
+  // separately: a WebView2 visibility quirk then reads apart from a broken close path.
   const user32 =
     "Add-Type -Namespace W -Name U -MemberDefinition '" +
     '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h); ' +
     '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);' +
     "'; ";
-  const [exists, visible] = (
-    await ps(`${user32}$h = [IntPtr]${hwnd}; '{0} {1}' -f [W.U]::IsWindow($h), [W.U]::IsWindowVisible($h)`)
-  ).split(' ');
+  const windowState = async (): Promise<string[]> =>
+    (await ps(`${user32}$h = [IntPtr]${hwnd}; '{0} {1}' -f [W.U]::IsWindow($h), [W.U]::IsWindowVisible($h)`)).split(
+      ' ',
+    );
+  await expect.soft.poll(async () => (await windowState())[1], { timeout: 10_000 }).toBe('False');
+  // What M1's layer policy reads: the webview reports hidden (03 §4.4).
+  await expect.soft.poll(() => app.page.evaluate(() => document.visibilityState), { timeout: 10_000 }).toBe('hidden');
+  const [exists, visible] = await windowState();
+  // A dead app has no page to read: the row still gets written, and the asserts below fail on it.
+  const state = await app.page
+    .evaluate(() => document.visibilityState)
+    .catch((e: unknown) => `unreadable (${String(e)})`);
   const alive = app.process?.exitCode === null;
   row(
     'W7',
-    `after WM_CLOSE: visibilityState hidden, IsWindow = ${String(exists)}, IsWindowVisible = ${String(visible)}, ` +
+    `after WM_CLOSE: IsWindow = ${String(exists)}, IsWindowVisible = ${String(visible)}, visibilityState = ${state}, ` +
       `process alive = ${String(alive)}`,
   );
   expect(exists).toBe('True');
   expect(visible).toBe('False');
+  expect(state).toBe('hidden');
   expect(alive).toBe(true);
 });
