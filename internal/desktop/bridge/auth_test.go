@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -290,6 +291,12 @@ func TestLinking(t *testing.T) {
 	m.linkErr = deviceauth.ErrNetwork
 	if err := s.Auth.Link(ctx); codeOf(t, err) != codes.CodeServerUnreachable {
 		t.Fatalf("Link offline: %v", err)
+	}
+	// A verification URI that failed 02 §11.2's check: the link step's generic text, not "can't reach" (03 §8.2).
+	m.linkErr = fmt.Errorf("deviceauth: verification_uri: %w", deviceauth.ErrBadResponse)
+	if err := s.Auth.Link(ctx); codeOf(t, err) != codes.CodeInternal ||
+		!strings.Contains(err.Error(), `"reason":"bad_response"`) {
+		t.Fatalf("Link bad response: %v", err)
 	}
 	s.Auth.CancelLink()
 	if m.cancels != 1 {

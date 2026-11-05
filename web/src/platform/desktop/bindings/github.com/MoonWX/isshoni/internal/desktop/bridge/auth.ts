@@ -7,8 +7,9 @@
  * origin (03 §5.8): AccessToken returns null for any other, SessionEnded and HelloRefused reject with not_found, and
  * none of them touches a manager's token for it.
  * 
- * Adding, switching and removing servers and Sign out change the active server and reload the window, which is the
- * app's (README WA71): they are not_implemented until then.
+ * Adding, switching and removing servers and Sign out are the app's (internal/desktop/app's ServerControl, found on
+ * Deps.App), because they change the active server, reload the window and stop a live share; a Core without them
+ * (cmd/isshoni-desktop's test core) answers not_implemented.
  * @module
  */
 
@@ -41,8 +42,9 @@ export function AccessToken(origin: string, force: boolean): $CancellablePromise
 }
 
 /**
- * AddServer adds the server and makes it active, then reloads the window at /desktop/setup?link=1 (03 §8.2):
- * README WA71.
+ * AddServer adds the server the page confirmed and makes it active (02's Servers.Add through the app); the window
+ * then reloads (03 §8.2: the page has put /desktop/setup?link=1 into its address first, so the new server's link
+ * step renders with its bridge.js). too_many_servers, invalid_address, busy (a share is live), server_unreachable.
  */
 export function AddServer(origin: string): $CancellablePromise<void> {
     return $Call.ByID(3053687479, origin);
@@ -68,7 +70,10 @@ export function HelloRefused(origin: string, refusal: $models.HelloRefusal): $Ca
 
 /**
  * Link starts a device-flow link on the active server (02 §11.3): it returns once the code is shown, and progress
- * arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server.
+ * arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server. 02's
+ * ErrBadResponse here is a server answer that failed §11.2's check (a verification URI on another origin): not the
+ * network's fault, so it is internal {reason: bad_response}, which the link step shows as its generic "Couldn't
+ * start linking with this server" (03 §8.2), not as server_unreachable (mapError's rule for every other call).
  */
 export function Link(): $CancellablePromise<void> {
     return $Call.ByID(3295379497);
@@ -107,7 +112,8 @@ export function Recheck(): $CancellablePromise<$models.AuthState> {
 }
 
 /**
- * RemoveServer unlinks a server and drops it from the list (02's Servers.Remove): README WA71.
+ * RemoveServer signs this PC out of a server and drops it from the list (02's Servers.Remove; 03 §8.3); when it was
+ * the active server the window reloads. not_found, busy (a share is live on it).
  */
 export function RemoveServer(origin: string): $CancellablePromise<void> {
     return $Call.ByID(2982538474, origin);
@@ -143,14 +149,15 @@ export function State(): $CancellablePromise<$models.AuthState> {
 }
 
 /**
- * SwitchServer makes a listed server active and reloads the window (03 §8.1): README WA71.
+ * SwitchServer makes a listed server active and reloads the window (03 §8.1). not_found, busy (a share is live).
  */
 export function SwitchServer(origin: string): $CancellablePromise<void> {
     return $Call.ByID(2493887254, origin);
 }
 
 /**
- * Unlink signs this PC out of the active server (03 §8.3), stopping a live share on it first: README WA71.
+ * Unlink signs this PC out of the active server (03 §8.3), stopping a live share on it first: 02's revoke and the
+ * credential's deletion; the server stays listed as "Not linked". confirmed is false when the server wasn't reached.
  */
 export function Unlink(): $CancellablePromise<$models.UnlinkResult> {
     return $Call.ByID(607674642).then(($result: any) => {

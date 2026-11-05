@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/client/compat"
+	"github.com/MoonWX/isshoni/internal/client/deeplink"
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
+	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/bridge/codes"
 	"github.com/MoonWX/isshoni/internal/desktop/servers"
 	"github.com/MoonWX/isshoni/internal/protocol"
@@ -19,13 +21,49 @@ import (
 // origin (03 §5.8): AccessToken returns null for any other, SessionEnded and HelloRefused reject with not_found, and
 // none of them touches a manager's token for it.
 //
-// Adding, switching and removing servers and Sign out change the active server and reload the window, which is the
-// app's (README WA71): they are not_implemented until then.
+// Adding, switching and removing servers and Sign out are the app's (internal/desktop/app's ServerControl, found on
+// Deps.App), because they change the active server, reload the window and stop a live share; a Core without them
+// (cmd/isshoni-desktop's test core) answers not_implemented.
 type Auth struct {
 	core    Core
 	servers ServerList
 	probe   ProbeFunc
 	log     *slog.Logger
+}
+
+// ServerControl is what Auth calls of the app to change the server list (03 §8.1–§8.3); *app.App implements it.
+type ServerControl interface {
+	AddServer(ctx context.Context, origin string) error
+	SwitchServer(origin string) error
+	RemoveServer(ctx context.Context, origin string) error
+	Unlink(ctx context.Context) (confirmed bool, err error)
+}
+
+var _ ServerControl = (*app.App)(nil)
+
+// authSource is the auth.state event's source on the app (03 §6.3); *app.App implements it.
+type authSource interface {
+	SubscribeAuth(fn func(deviceauth.State)) (cancel func())
+}
+
+var _ authSource = (*app.App)(nil)
+
+// control returns the app's ServerControl, or not_implemented for method when the Core has none.
+func (s *Auth) control(method string) (ServerControl, error) {
+	sc, ok := s.core.(ServerControl)
+	if !ok {
+		return nil, notImplemented(method)
+	}
+	return sc, nil
+}
+
+// forward sends the active server's link states to the page as auth.state (03 §6.3), when the Core has them.
+func (s *Auth) forward(emit func(name string, data any)) (cancel func()) {
+	src, ok := s.core.(authSource)
+	if !ok {
+		return func() {}
+	}
+	return src.SubscribeAuth(func(st deviceauth.State) { emit(EventAuthState, authState(st)) })
 }
 
 // AuthState is the active server's link state (02 §11.7): Auth.State() and the auth.state event. status is unlinked,
@@ -165,24 +203,54 @@ func (s *Auth) Probe(ctx context.Context, address string) (ServerProbe, error) {
 	return p, nil
 }
 
-// AddServer adds the server and makes it active, then reloads the window at /desktop/setup?link=1 (03 §8.2):
-// README WA71.
+// AddServer adds the server the page confirmed and makes it active (02's Servers.Add through the app); the window
+// then reloads (03 §8.2: the page has put /desktop/setup?link=1 into its address first, so the new server's link
+// step renders with its bridge.js). too_many_servers, invalid_address, busy (a share is live), server_unreachable.
 func (s *Auth) AddServer(ctx context.Context, origin string) error {
-	return notImplemented("Auth.AddServer")
+	sc, err := s.control("Auth.AddServer")
+	if err != nil {
+		return err
+	}
+	if origin == "" || len(origin) > maxOrigin {
+		return newError(codes.CodeInvalidAddress, nil)
+	}
+	ctx, cancel := withTimeout(ctx, ioTimeout)
+	defer cancel()
+	return s.authError(sc.AddServer(ctx, origin), nil)
 }
 
-// SwitchServer makes a listed server active and reloads the window (03 §8.1): README WA71.
+// SwitchServer makes a listed server active and reloads the window (03 §8.1). not_found, busy (a share is live).
 func (s *Auth) SwitchServer(origin string) error {
-	return notImplemented("Auth.SwitchServer")
+	sc, err := s.control("Auth.SwitchServer")
+	if err != nil {
+		return err
+	}
+	if origin == "" || len(origin) > maxOrigin {
+		return newError(codes.CodeNotFound, nil)
+	}
+	return s.authError(sc.SwitchServer(origin), nil)
 }
 
-// RemoveServer unlinks a server and drops it from the list (02's Servers.Remove): README WA71.
+// RemoveServer signs this PC out of a server and drops it from the list (02's Servers.Remove; 03 §8.3); when it was
+// the active server the window reloads. not_found, busy (a share is live on it).
 func (s *Auth) RemoveServer(ctx context.Context, origin string) error {
-	return notImplemented("Auth.RemoveServer")
+	sc, err := s.control("Auth.RemoveServer")
+	if err != nil {
+		return err
+	}
+	if origin == "" || len(origin) > maxOrigin {
+		return newError(codes.CodeNotFound, nil)
+	}
+	ctx, cancel := withTimeout(ctx, ioTimeout)
+	defer cancel()
+	return s.authError(sc.RemoveServer(ctx, origin), nil)
 }
 
 // Link starts a device-flow link on the active server (02 §11.3): it returns once the code is shown, and progress
-// arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server.
+// arrives as auth.state. server_unreachable, incompatible_server, rate_limited; not_found without a server. 02's
+// ErrBadResponse here is a server answer that failed §11.2's check (a verification URI on another origin): not the
+// network's fault, so it is internal {reason: bad_response}, which the link step shows as its generic "Couldn't
+// start linking with this server" (03 §8.2), not as server_unreachable (mapError's rule for every other call).
 func (s *Auth) Link(ctx context.Context) error {
 	m := s.servers.Active()
 	if m == nil {
@@ -190,7 +258,12 @@ func (s *Auth) Link(ctx context.Context) error {
 	}
 	ctx, cancel := withTimeout(ctx, linkTimeout)
 	defer cancel()
-	return s.authError(m.Link(ctx), m)
+	err := m.Link(ctx)
+	if errors.Is(err, deviceauth.ErrBadResponse) {
+		s.log.Warn("bridge: Auth.Link: the server's answer failed the check", "err", err)
+		return newError(codes.CodeInternal, map[string]any{"reason": "bad_response"})
+	}
+	return s.authError(err, m)
 }
 
 // CancelLink ends a running device-flow link on the active server; without one it does nothing.
@@ -224,9 +297,20 @@ func (s *Auth) LinkWithPassword(ctx context.Context, username string, password p
 	return authState(m.State()), nil
 }
 
-// Unlink signs this PC out of the active server (03 §8.3), stopping a live share on it first: README WA71.
+// Unlink signs this PC out of the active server (03 §8.3), stopping a live share on it first: 02's revoke and the
+// credential's deletion; the server stays listed as "Not linked". confirmed is false when the server wasn't reached.
 func (s *Auth) Unlink(ctx context.Context) (UnlinkResult, error) {
-	return UnlinkResult{}, notImplemented("Auth.Unlink")
+	sc, err := s.control("Auth.Unlink")
+	if err != nil {
+		return UnlinkResult{}, err
+	}
+	ctx, cancel := withTimeout(ctx, ioTimeout)
+	defer cancel()
+	confirmed, err := sc.Unlink(ctx)
+	if err != nil {
+		return UnlinkResult{}, s.authError(err, nil)
+	}
+	return UnlinkResult{Confirmed: confirmed}, nil
 }
 
 // Recheck re-runs the active server's compatibility check (the version screen's Try again, 02 §13.1).
@@ -313,12 +397,19 @@ func (s *Auth) activeFor(origin string) Manager {
 	return m
 }
 
-// authError maps an error of 02's manager or the probe; incompatible_server gets the manager's compat check as its
-// params when m is known. Every deadline here bounds a call to the server (Probe, Link, LinkWithPassword, Recheck,
-// AccessToken), so one that ran out is server_unreachable, where mapError's default is internal.
+// authError maps an error of 02's manager, the probe or the app's server changes; incompatible_server gets the
+// manager's compat check as its params when m is known. Every deadline here bounds a call to the server (Probe, Link,
+// LinkWithPassword, Recheck, AccessToken, AddServer's /info, Unlink's revoke), so one that ran out is
+// server_unreachable, where mapError's default is internal.
 func (s *Auth) authError(err error, m Manager) error {
 	if err == nil {
 		return nil
+	}
+	switch {
+	case errors.Is(err, app.ErrNotFound):
+		return newError(codes.CodeNotFound, nil)
+	case errors.Is(err, app.ErrInvalidAddress), errors.Is(err, deeplink.ErrInvalidOrigin):
+		return newError(codes.CodeInvalidAddress, nil)
 	}
 	if errors.Is(err, deviceauth.ErrIncompatible) && m != nil {
 		return newError(codes.CodeIncompatibleServer, compatParams(m.State().Compat))

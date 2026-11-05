@@ -294,7 +294,8 @@ func (a *App) offer(p *PendingLink) {
 }
 
 // switchServer makes origin the active server, keeps next as the pending link for the reloaded page, reloads the
-// window once and starts the new active server's manager (03 §8.1: every change of the active server reloads).
+// window once, starts the new active server's manager and has C2 look again (03 §8.1: every change of the active
+// server reloads).
 func (a *App) switchServer(origin string, next *PendingLink) error {
 	if err := a.d.Servers.SetActive(origin); err != nil {
 		return fmt.Errorf("app: %w", err)
@@ -302,9 +303,7 @@ func (a *App) switchServer(origin string, next *PendingLink) error {
 	a.mu.Lock()
 	a.pending = next
 	a.mu.Unlock()
-	a.d.Shell.ShowWindow(true)
-	a.d.Shell.Reload()
-	a.startActive()
+	a.activeChanged()
 	return nil
 }
 
