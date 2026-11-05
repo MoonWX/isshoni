@@ -16,6 +16,9 @@ import (
 // testAppID registers a random AppUserModelID for this test (HKCU\Software\Classes\AppUserModelId\<id> with a
 // DisplayName, which lets an unpackaged process show toasts under it) and removes it, with its toasts, afterwards.
 // The app's own io.isshoni.desktop is never touched: on the owner's PC its toasts are the installed app's.
+// It also makes id the test process's AppUserModelID, as cmd/isshoni-desktop does with its own first thing: Windows
+// removes only the caller's own toasts (ToastNotificationHistory.Remove), and an unpackaged process is the app its
+// AppUserModelID names. TestHooks sets another one later; the cleanup runs before it.
 func testAppID(t *testing.T) string {
 	t.Helper()
 	var b [6]byte
@@ -29,6 +32,9 @@ func testAppID(t *testing.T) string {
 	err = k.SetStringValue("DisplayName", "isshoni test")
 	_ = k.Close()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetAppUserModelID(id); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -84,10 +90,10 @@ func idsOf(ts []DeliveredToast) []string {
 
 // TestActionCenterRemovesStaleToasts is 03 §15's removal on Windows (README WA68 R3): three toasts as the shell
 // shows them through Wails (an untagged toast whose launch is Wails' payload) plus a tagged one; removing two by
-// their app.Notification IDs leaves the third in Action Center with its XML, now tagged, and removing that one
-// takes it by its tag. Toasts that are off for this user (a policy, the user's setting) skip it with the reason. A
-// fresh test AppUserModelID has no NotificationSetting until its first toast (errNoSetting), so the setting is read
-// again after the toasts are shown, before Action Center is checked; it must be readable then.
+// their app.Notification IDs leaves the third in Action Center with its XML, now tagged and grouped, and removing
+// that one takes it by its tag and group. Toasts that are off for this user (a policy, the user's setting) skip it with
+// the reason. A fresh test AppUserModelID has no NotificationSetting until its first toast (errNoSetting), so the
+// setting is read again after the toasts are shown, before Action Center is checked; it must be readable then.
 func TestActionCenterRemovesStaleToasts(t *testing.T) {
 	appID := testAppID(t)
 	if s, err := notificationSetting(appID); err != nil && !errors.Is(err, errNoSetting) {
@@ -136,7 +142,8 @@ func TestActionCenterRemovesStaleToasts(t *testing.T) {
 		t.Fatalf("removed %d: %v", n, err)
 	}
 	got = waitDelivered(t, appID, 1)
-	if d := got[0]; d.ID != "stopped-locked-3" || d.Nonce != nonceC || d.Launch != launchC || d.Tag == "" {
+	if d := got[0]; d.ID != "stopped-locked-3" || d.Nonce != nonceC || d.Launch != launchC || d.Tag == "" ||
+		d.Group != keepGroup {
 		t.Fatalf("the toast kept: %+v", d)
 	}
 

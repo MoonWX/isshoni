@@ -160,7 +160,7 @@ func TestRemoveDeliveredUntagged(t *testing.T) {
 	}
 	var ids []string
 	for _, s := range f.shown {
-		if !s.SuppressPopup || s.Tag != keepTag(s.XML) {
+		if !s.SuppressPopup || s.Tag != keepTag(s.XML) || s.Group != keepGroup {
 			t.Errorf("delivered again as %+v", s)
 		}
 		ids = append(ids, s.XML)

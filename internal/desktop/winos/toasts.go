@@ -45,7 +45,7 @@ type DeliveredToast struct {
 type Toast struct {
 	XML           string
 	Tag           string // at most 64 characters (16 before Windows 10 1703)
-	Group         string
+	Group         string // a tagged toast needs one: an unpackaged app removes a toast by its tag and group
 	SuppressPopup bool
 }
 
@@ -53,6 +53,9 @@ type Toast struct {
 // Action Center, and reports how many went. A toast that isn't there (dismissed, or never shown) is no error.
 // The app calls it when a toast's question was answered another way (the IDs toastBook.dropKind drops); off Windows
 // it does nothing.
+//
+// Windows removes only the caller's own toasts: the process's AppUserModelID must be InstanceID
+// (SetAppUserModelID, which cmd/isshoni-desktop calls first thing), or Windows may reject the removal (E_INVALIDARG).
 //
 // Contract for callers: callers must serialize RemoveToasts with Shell.Notify and must not call it under App.mu.
 // Removing an untagged toast clears the app's toasts and delivers the others again (removeDelivered); a toast the
@@ -128,8 +131,8 @@ type toastStore interface {
 
 // removeDelivered removes the store's toasts that match and reports how many went: a tagged one by its tag and
 // group; when an untagged one is among them, every toast of the app is cleared and the ones that don't match are
-// delivered again with their own XML, without a banner, each with a tag of its own (keepTag) so that the next removal
-// of one is a single one.
+// delivered again with their own XML, without a banner, each with a tag of its own (keepTag) and a group (keepGroup
+// when it had none) so that the next removal of one is a single one.
 //
 // The store is listed again just before the clear, and what is kept comes from that second list: a toast delivered
 // since the first list is kept (or removed, when it matches), and one the user dismissed meanwhile isn't brought
@@ -180,11 +183,14 @@ func removeDelivered(c toastStore, match func(DeliveredToast) bool) (int, error)
 	removed += pendingUntagged
 	var errs []error
 	for _, it := range keep {
-		tag := it.Tag
+		tag, group := it.Tag, it.Group
 		if tag == "" {
 			tag = keepTag(it.xml)
 		}
-		if err := c.show(Toast{XML: it.xml, Tag: tag, Group: it.Group, SuppressPopup: true}); err != nil {
+		if group == "" {
+			group = keepGroup
+		}
+		if err := c.show(Toast{XML: it.xml, Tag: tag, Group: group, SuppressPopup: true}); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -200,3 +206,8 @@ func keepTag(doc string) string {
 	sum := sha256.Sum256([]byte(doc))
 	return hex.EncodeToString(sum[:8])
 }
+
+// keepGroup is the group a toast delivered again gets when it had none (Wails' toasts): an unpackaged app can't
+// remove a tagged toast without a group (the Windows Community Toolkit's ToastNotifierCompat gives every tagged toast
+// one for this reason).
+const keepGroup = "isshoni"
