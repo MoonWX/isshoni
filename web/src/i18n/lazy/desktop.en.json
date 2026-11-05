@@ -351,7 +351,8 @@
       "signOutBody": "The server stays in the list as Not linked. A share on it stops.",
       "signOutAction": "Sign out",
       "signOutUnconfirmed": "Remove {{device}} on your Devices page to finish.",
-      "add": "Add a server"
+      "add": "Add a server",
+      "linkAgain": "Link again"
     },
     "settings": {
       "title": "Settings",
@@ -366,7 +367,190 @@
         "forget": "Decide for me",
         "locked": "Always kept out (voice app)",
         "soundCheck": "Run the sound check again"
+      },
+      "nav": "Settings sections",
+      "servers": {
+        "title": "Servers"
+      },
+      "sharing": {
+        "title": "Sharing",
+        "preset": "Optimize for, on this server",
+        "pill": {
+          "legend": "Sharing pill",
+          "auto": "Only when Windows shows no border",
+          "always": "Always",
+          "hint": "A small bar on top of everything with Pause and Stop, while you share."
+        },
+        "firstShare": "Show the first-share sheet again",
+        "firstShareNext": "The first-share sheet shows before your next share."
+      },
+      "hotkeys": {
+        "title": "Hotkeys",
+        "pause": "Pause and resume sharing",
+        "stop": "Stop sharing",
+        "change": "Change",
+        "changeLabel": "Change the hotkey: {{name}}",
+        "reset": "Use the default",
+        "resetLabel": "Use the default hotkey: {{name}}",
+        "press": "Press the new combination",
+        "recordLabel": "New combination for {{name}}. Press Escape to cancel.",
+        "taken": "Unavailable: another app uses {{combo}}",
+        "typesChar": "This combination types a character on your keyboard layout; typing it during a share would trigger the hotkey.",
+        "status": {
+          "registered": "Active while you share",
+          "idle": "Works while you share",
+          "invalid": "isshoni can't read this combination. Choose a new one."
+        },
+        "problem": {
+          "modifiers": "Use two of Ctrl, Alt and Shift with a key, or one of them with an F-key.",
+          "win": "The Windows key can't be part of an isshoni hotkey.",
+          "key": "That key can't be used. Use a letter, a digit, an F-key or a key like Insert or Page Up.",
+          "same": "Pause and Stop need different combinations.",
+          "invalid": "Windows doesn't accept this combination. Choose another one."
+        }
+      },
+      "encoder": {
+        "title": "Video encoder",
+        "found": "isshoni can use: {{encoders}}",
+        "unknown": "Checking what this PC can use…",
+        "names": {
+          "nvenc": "NVIDIA NVENC",
+          "qsv": "Intel Quick Sync",
+          "amf": "AMD AMF",
+          "mfHw": "Media Foundation (graphics card)",
+          "mfSw": "Media Foundation (software)",
+          "openh264": "Cisco OpenH264 (software)",
+          "fake": "Test pattern (development build)"
+        }
+      },
+      "openh264": {
+        "title": "Cisco OpenH264",
+        "notice": "When no other encoder works, isshoni can use Cisco's OpenH264 {{version}}. isshoni doesn't include it: it downloads Cisco's own binary from Cisco and checks it before using it. Cisco's license applies to it.",
+        "attribution": "OpenH264 Video Codec provided by Cisco Systems, Inc.",
+        "license": "Cisco's license for OpenH264",
+        "enable": "Enable Cisco OpenH264…",
+        "disable": "Turn off and delete",
+        "installing": "Downloading OpenH264 from Cisco…",
+        "on": "Cisco OpenH264 {{version}} is installed. isshoni uses it when no other encoder works.",
+        "error": {
+          "download": "Couldn't download OpenH264 from Cisco. Check your connection and try again.",
+          "corrupt": "The downloaded file didn't match the one isshoni expects, so it wasn't used. Try again later.",
+          "missing": "The OpenH264 file is gone. Enable it again to download it.",
+          "version": "This OpenH264 file is the wrong version for this isshoni. Enable it again to download the right one.",
+          "blockedByPolicy": "Windows (Smart App Control or your organization's policy) blocked OpenH264.",
+          "cancelled": "The download was stopped.",
+          "timeout": "The download took too long. Try again."
+        }
+      },
+      "app": {
+        "title": "App",
+        "autostart": "Start isshoni when I sign in to Windows",
+        "closeToTray": "Keep isshoni running in the tray when I close the window",
+        "hideFromCapture": "Hide isshoni windows from screen capture (recommended)",
+        "hideFromCaptureHint": "Friends never see isshoni itself in your share. Turn it off only to take a screenshot of isshoni; the Sharing pill stays hidden either way.",
+        "notifications": "Show notifications",
+        "notificationsHint": "Notices about your share, like a share that stopped, always show.",
+        "tray": "Keep the tray icon visible",
+        "trayHint": "Opens Windows settings: turn isshoni on under \"Other system tray icons\".",
+        "quit": "Quit isshoni",
+        "quitConfirm": "Stop sharing and quit?",
+        "quitBody": "Your share ends for everyone watching it.",
+        "quitAction": "Stop sharing and quit"
+      },
+      "updates": {
+        "title": "Updates",
+        "check": "Check for updates automatically",
+        "beta": "Get release candidates (beta channel)",
+        "betaHint": "Release candidates come before a release and may have more bugs.",
+        "checkNow": "Check now",
+        "source": "Updates come only from GitHub Releases, never from your server."
+      },
+      "about": {
+        "title": "About",
+        "version": "Version",
+        "windows": "Windows build",
+        "webView": "WebView2",
+        "encoders": "Video encoders",
+        "audio": "Sound capture",
+        "audioBackend": {
+          "processLoopback": "Per app (voice apps kept out)",
+          "endpoint": "Everything on this PC",
+          "none": "Not available"
+        },
+        "unknown": "Unknown",
+        "none": "None",
+        "copy": "Copy version info",
+        "copied": "Version info copied",
+        "copyFailed": "Couldn't copy the version info",
+        "logs": "Open logs folder",
+        "logLevel": "Log detail",
+        "logLevels": {
+          "info": "Normal",
+          "debug": "Detailed (for a bug report)"
+        },
+        "notices": "Third-party notices",
+        "webLicenses": "Web app licenses",
+        "licensesFailed": "Couldn't open the licenses.",
+        "privacy": "Privacy",
+        "codeSigning": "Code signing"
       }
+    },
+    "update": {
+      "state": {
+        "disabled": "Updates are off in this build",
+        "off": "Turned off",
+        "offPolicy": "Turned off by your administrator",
+        "idle": "Not checked yet",
+        "checking": "Checking for updates…",
+        "upToDate": "Up to date, checked {{time}}",
+        "upToDateNow": "Up to date",
+        "downloading": "Downloading {{version}}… {{progress}} %",
+        "ready": "isshoni {{version}} is ready"
+      },
+      "restart": "Restart and update",
+      "finishSharing": "Finish sharing first",
+      "help": "How isshoni updates",
+      "required": {
+        "label": "Important update",
+        "text": "An important update is ready"
+      },
+      "expired": {
+        "text": "Update info is out of date; get the new version from your server's Download page",
+        "clock": "Check that your PC's clock is right"
+      },
+      "installFailed": "The update didn't install",
+      "error": {
+        "network": "isshoni couldn't reach GitHub to check for updates. Check your connection.",
+        "rate_limited": "GitHub asked isshoni to wait. It checks again later.",
+        "bad_signature": "The update's signature didn't check out, so isshoni didn't use it.",
+        "bad_manifest": "The update info couldn't be read, so isshoni didn't use it.",
+        "manifest_unsupported": "This isshoni is too old to read the update info. Get the new version from your server's Download page.",
+        "manifest_expired": "Update info is out of date; get the new version from your server's Download page",
+        "wrong_channel": "The update info is for another channel, so isshoni didn't use it.",
+        "no_artifact": "There is no update for this PC in this release.",
+        "download_failed": "The update didn't download. isshoni tries again later.",
+        "size_mismatch": "The downloaded update wasn't the expected size, so isshoni didn't use it.",
+        "hash_mismatch": "The downloaded update didn't match its signature, so isshoni didn't use it.",
+        "disk": "There isn't enough room on this PC to download the update.",
+        "install_failed": "The update didn't install",
+        "not_installed": "This copy of isshoni wasn't installed, so it can't update itself.",
+        "no_keys": "Updates are off in this build",
+        "not_release": "Updates are off in this build",
+        "not_ready": "The update isn't ready yet. Check again.",
+        "unknown": "The update check didn't work. Try again later."
+      }
+    },
+    "version": {
+      "titleApp": "This server needs a newer isshoni app",
+      "titleServer": "This server needs an update",
+      "updateApp": "Update the app",
+      "openInBrowser": "Open in browser",
+      "tryAgain": "Try again",
+      "checking": "Checking for an update…",
+      "installing": "isshoni restarts to update.",
+      "upToDate": "No newer version is available yet",
+      "notInstalled": "This copy of isshoni can't update itself. Its release notes opened in your browser.",
+      "downloadPage": "Get it from your server's Download page"
     }
   }
 }
