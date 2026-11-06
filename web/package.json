@@ -60,5 +60,10 @@
   },
   "allowScripts": {
     "fsevents": false
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "11.0.4"
+    }
   }
 }
