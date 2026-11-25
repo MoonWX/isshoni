@@ -297,7 +297,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -363,7 +363,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -466,7 +466,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # the tools cache below is the only one this job needs
@@ -511,7 +511,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -575,7 +575,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -783,7 +783,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -859,7 +859,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -942,7 +942,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -1003,7 +1003,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -1071,7 +1071,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -1152,7 +1152,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod; for tools/relserve)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -1212,7 +1212,7 @@ jobs:
         run: node docs/scripts/check-site.mjs
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
@@ -1244,7 +1244,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go (version from go.mod)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: false # one cache per job below: setup-go's key is shared by every job
